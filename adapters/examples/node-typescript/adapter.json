@@ -1,0 +1,87 @@
+{
+  "version": "1.0",
+  "project": {
+    "name": "example-project",
+    "root": ".",
+    "taskDir": "docs/tasks",
+    "conventionsDir": "docs/conventions",
+    "testPatterns": {
+      "testDir": "tests",
+      "sourceDir": "src",
+      "suffixes": [".test.ts"],
+      "prefixes": [],
+      "autoConventions": ["mirror-source-structure"]
+    }
+  },
+  "agent": {
+    "model": "claude-sonnet-4-6",
+    "judgeModel": "claude-sonnet-4-6",
+    "enrichModel": "claude-sonnet-4-6",
+    "maxTurns": 80,
+    "maxBudgetPerTask": 5,
+    "maxRetries": 2
+  },
+  "sandbox": {
+    "writablePaths": ["src/", "tests/", "docs/", "package.json", "package-lock.json"],
+    "deniedPaths": [
+      ".git/",
+      ".env",
+      ".env.*",
+      "node_modules/",
+      "dist/",
+      ".quack/adapter.json",
+      ".quack/conventions.md",
+      ".quack/judge-criteria.md"
+    ],
+    "allowedBashPatterns": [
+      "npm test*",
+      "npm run build*",
+      "npm run lint*",
+      "npx jest*",
+      "npx tsc*",
+      "git status*",
+      "git diff*",
+      "git log*"
+    ],
+    "deniedBashPatterns": [
+      "git push*",
+      "git reset --hard*",
+      "npm publish*",
+      "curl *",
+      "wget *"
+    ]
+  },
+  "git": {
+    "baseBranch": "main",
+    "branchPrefix": "quack/",
+    "commitFormat": "[{taskId}] {message}",
+    "commitTrailer": "Automated-By: Quack Harness",
+    "autoCreatePr": false,
+    "autoPush": false,
+    "autoMerge": false,
+    "autoMergeStrategy": "squash",
+    "autoMergeTarget": "main"
+  },
+  "verification": {
+    "commands": [
+      { "name": "build", "command": "npm run build", "required": true, "timeout": 120000 },
+      { "name": "test", "command": "npm test", "required": true, "timeout": 300000 },
+      { "name": "lint", "command": "npm run lint", "required": true, "timeout": 120000 }
+    ],
+    "smartTesting": {
+      "enabled": true,
+      "mode": "related",
+      "baselineEnabled": true,
+      "failOnPreExisting": false,
+      "outputDir": ".quack/test-results"
+    }
+  },
+  "logging": {
+    "dir": ".quack/logs",
+    "level": "info",
+    "retainDays": 14
+  },
+  "isolation": {
+    "method": "worktree"
+  }
+}

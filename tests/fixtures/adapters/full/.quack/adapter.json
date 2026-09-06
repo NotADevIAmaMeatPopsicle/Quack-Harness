@@ -1,0 +1,67 @@
+{
+  "$schema": "https://quack.dev/adapter-schema.json",
+  "version": "1.0",
+  "project": {
+    "name": "full-project",
+    "root": ".",
+    "taskDir": "docs/tasks",
+    "conventionsDir": "docs/conventions"
+  },
+  "agent": {
+    "model": "claude-opus-4-6",
+    "judgeModel": "claude-sonnet-4-6",
+    "enrichModel": "claude-sonnet-4-6",
+    "maxTurns": 75,
+    "maxBudgetPerTask": 8.00,
+    "maxRetries": 2
+  },
+  "verification": {
+    "commands": [
+      {
+        "name": "tests",
+        "command": "npm test",
+        "required": true,
+        "timeout": 300
+      },
+      {
+        "name": "typecheck",
+        "command": "npx tsc --noEmit",
+        "required": false,
+        "timeout": 60
+      },
+      {
+        "name": "lint",
+        "command": "npm run lint",
+        "required": false,
+        "timeout": 60
+      }
+    ],
+    "conventionChecks": [
+      {
+        "name": "layer-violations",
+        "description": "No req/res objects in service or repository files",
+        "command": "node .quack/convention-checks/check-1.js",
+        "conventionRef": "ADR-012"
+      }
+    ]
+  },
+  "sandbox": {
+    "writablePaths": ["src/", "tests/", "docs/"],
+    "deniedPaths": [".env", ".env.*", "infrastructure/"],
+    "allowedBashPatterns": ["npm test *", "npm run *", "ls *"],
+    "deniedBashPatterns": ["rm *", "curl *", "wget *"]
+  },
+  "git": {
+    "baseBranch": "develop",
+    "branchPrefix": "quack/",
+    "commitFormat": "[{taskId}] {message}",
+    "commitTrailer": "Implemented-by: Quack Agent",
+    "autoCreatePr": false,
+    "autoPush": false
+  },
+  "logging": {
+    "dir": ".quack/logs",
+    "level": "info",
+    "retainDays": 14
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "version": "1.0",
+  "project": {
+    "name": "minimal-project",
+    "root": ".",
+    "taskDir": "docs/tasks",
+    "conventionsDir": "docs/conventions"
+  },
+  "verification": {
+    "commands": [
+      {
+        "name": "tests",
+        "command": "npm test",
+        "required": true,
+        "timeout": 300
+      }
+    ]
+  },
+  "git": {
+    "commitFormat": "[{taskId}] {message}",
+    "commitTrailer": "Implemented-by: Quack Agent"
+  },
+  "logging": {
+    "dir": ".quack/logs"
+  }
+}

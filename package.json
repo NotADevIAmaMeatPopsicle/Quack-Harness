@@ -1,0 +1,76 @@
+{
+  "name": "quack-harness",
+  "version": "0.2.0",
+  "description": "Codebase-agnostic harness for isolated coding-agent tasks and verification",
+  "author": "Quack Harness contributors",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NotADevIAmaMeatPopsicle/Quack-Harness.git"
+  },
+  "homepage": "https://github.com/NotADevIAmaMeatPopsicle/Quack-Harness#readme",
+  "bugs": {
+    "url": "https://github.com/NotADevIAmaMeatPopsicle/Quack-Harness/issues"
+  },
+  "keywords": [
+    "agent",
+    "coding-agent",
+    "llm",
+    "automation",
+    "claude",
+    "task-runner",
+    "background-agent"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "quack": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc && npm run build:frontend && npm run build:copy:legacy-ui && npm run build:copy:frontend-ui && npm run build:build-info",
+    "build:frontend": "npm --prefix frontend run build",
+    "build:copy:legacy-ui": "node -e \"require('fs').cpSync('src/monitor/public','dist/monitor/public',{recursive:true})\"",
+    "build:copy:frontend-ui": "node -e \"const fs=require('fs');fs.rmSync('dist/monitor/ui',{recursive:true,force:true});fs.cpSync('frontend/dist','dist/monitor/ui',{recursive:true})\"",
+    "build:build-info": "node -e \"const{execSync}=require('child_process');const git=(cmd)=>{try{return execSync(cmd,{stdio:['ignore','pipe','ignore']}).toString().trim()||'unknown'}catch{return'unknown'}};const pkg=require('./package.json');require('fs').writeFileSync('dist/build-info.json',JSON.stringify({version:pkg.version,commit:git('git rev-parse --short HEAD'),branch:git('git branch --show-current'),builtAt:new Date().toISOString()},null,2))\"",
+    "dev": "tsc --watch",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "lint": "eslint src tests --ext .ts",
+    "lint:fix": "eslint src tests --ext .ts --fix",
+    "lint:diff": "node scripts/lint-diff.js",
+    "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"tests/**/*.ts\""
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.42",
+    "better-sqlite3": "^12.8.0",
+    "chokidar": "^3.6.0",
+    "commander": "^13.1.0",
+    "express": "^4.22.2",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@playwright/cli": "^0.1.1",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.6",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^22.13.4",
+    "@typescript-eslint/eslint-plugin": "^8.24.1",
+    "@typescript-eslint/parser": "^8.24.1",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "eslint": "^8.57.1",
+    "jest": "^29.7.0",
+    "playwright": "^1.59.0-alpha-1771104257000",
+    "prettier": "^3.5.2",
+    "ts-jest": "^29.2.5",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "overrides": {
+    "qs": "6.16.0"
+  }
+}

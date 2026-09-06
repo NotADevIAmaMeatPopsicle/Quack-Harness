@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20.19.0, 22]
+        shard: [1, 2]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      - name: Install backend dependencies
+        run: npm ci
+
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Build
+        run: npm run build
+
+      - name: Run tests
+        env:
+          NODE_OPTIONS: --max-old-space-size=3072
+        # A few integration suites intentionally exercise long-lived servers.
+        # Jest reports the completed result before an inherited handle can linger.
+        run: npm test -- --maxWorkers=1 --forceExit --shard=${{ matrix.shard }}/2
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Format check
+        run: npm run format:check

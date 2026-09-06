@@ -1,0 +1,273 @@
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import * as os from "node:os";
+
+import { FleetController } from "../../src/dispatcher/fleet-controller";
+import { DispatchManager } from "../../src/monitor/dispatch-manager";
+import { PrepScheduler } from "../../src/monitor/prep-scheduler";
+import type { DispatchJob } from "../../src/monitor/dispatch-manager";
+
+// ─── Mocks ─────────────────────────────────────────────────────────
+
+class MockDispatchManager {
+  private jobs = new Map<string, DispatchJob>();
+  private mockPids = new Map<string, number>();
+
+  start(taskId: string): DispatchJob {
+    const pid = Math.floor(Math.random() * 100000);
+    const job: DispatchJob = {
+      taskId,
+      sessionId: `session-${taskId}`,
+      pid,
+      startedAt: new Date().toISOString(),
+      status: "running",
+      output: [],
+    };
+    this.jobs.set(taskId, job);
+    this.mockPids.set(taskId, pid);
+    return job;
+  }
+
+  stop(taskId: string): boolean {
+    const job = this.jobs.get(taskId);
+    if (job && job.status === "running") {
+      job.status = "stopped";
+      return true;
+    }
+    return false;
+  }
+
+  getActiveJobs(): DispatchJob[] {
+    return Array.from(this.jobs.values()).filter((j) => j.status === "running");
+  }
+
+  getAllJobs(): DispatchJob[] {
+    return Array.from(this.jobs.values());
+  }
+
+  getJob(taskId: string): DispatchJob | undefined {
+    return this.jobs.get(taskId);
+  }
+
+  getActiveJob(taskId: string): DispatchJob | undefined {
+    const job = this.jobs.get(taskId);
+    return job?.status === "running" ? job : undefined;
+  }
+
+  cleanup(): void {
+    // No-op for mock
+  }
+
+  cleanupAllContainersCalled = false;
+
+  cleanupAllContainers(): Promise<void> {
+    this.cleanupAllContainersCalled = true;
+    return Promise.resolve();
+  }
+
+  killAll(): void {
+    for (const job of this.jobs.values()) {
+      job.status = "stopped";
+    }
+  }
+}
+
+class MockPrepScheduler {
+  private running = false;
+
+  start(): void {
+    this.running = true;
+  }
+
+  stop(): void {
+    this.running = false;
+  }
+
+  isRunning(): boolean {
+    return this.running;
+  }
+
+  getStatus() {
+    return {
+      enabled: true,
+      running: this.running,
+      queueSize: 0,
+      activePreps: 0,
+      prepsThisHour: 0,
+      maxPerHour: 20,
+      costThisHour: 0,
+      maxBudgetPerHour: 2.0,
+      totalProcessed: 0,
+    };
+  }
+
+  getQueue(): string[] {
+    return [];
+  }
+
+  updateConfig(): void {
+    // No-op
+  }
+}
+
+// ─── Tests ─────────────────────────────────────────────────────────
+
+describe("FleetController", () => {
+  let tmpDir: string;
+  let dispatchManager: MockDispatchManager;
+  let prepScheduler: MockPrepScheduler;
+  let controller: FleetController;
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "quack-fleet-test-"));
+    dispatchManager = new MockDispatchManager();
+    prepScheduler = new MockPrepScheduler();
+    controller = new FleetController(
+      dispatchManager as unknown as DispatchManager,
+      prepScheduler as unknown as PrepScheduler,
+      tmpDir,
+    );
+  });
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  describe("State management", () => {
+    it("should initialize in running state", () => {
+      expect(controller.getState()).toBe("running");
+    });
+
+    it("should allow pause and resume", () => {
+      controller.pause("Test pause");
+      expect(controller.getState()).toBe("paused");
+
+      const status = controller.getStatus();
+      expect(status.state).toBe("paused");
+      expect(status.reason).toBe("Test pause");
+
+      controller.resume();
+      expect(controller.getState()).toBe("running");
+      expect(controller.getStatus().reason).toBeUndefined();
+    });
+
+    it("should block dispatch when paused", () => {
+      controller.pause();
+      const check = controller.canDispatch();
+      expect(check.allowed).toBe(false);
+      expect(check.reason).toContain("paused");
+    });
+
+    it("should block dispatch when emergency stopped", async () => {
+      await controller.emergencyStop();
+      const check = controller.canDispatch();
+      expect(check.allowed).toBe(false);
+      expect(check.reason).toContain("emergency stop");
+    });
+
+    it("should allow dispatch when running", () => {
+      const check = controller.canDispatch();
+      expect(check.allowed).toBe(true);
+      expect(check.reason).toBeUndefined();
+    });
+  });
+
+  describe("Emergency stop", () => {
+    it("should kill all active dispatches", async () => {
+      // Start some jobs
+      dispatchManager.start("TASK-001");
+      dispatchManager.start("TASK-002");
+      dispatchManager.start("TASK-003");
+
+      expect(dispatchManager.getActiveJobs().length).toBe(3);
+
+      const result = await controller.emergencyStop("Test emergency");
+      expect(result.killedTasks).toEqual(["TASK-001", "TASK-002", "TASK-003"]);
+      expect(result.killedPids.length).toBe(3);
+
+      // All jobs should be stopped
+      expect(dispatchManager.getActiveJobs().length).toBe(0);
+    });
+
+    it("should stop prep scheduler if running", async () => {
+      prepScheduler.start();
+      expect(prepScheduler.isRunning()).toBe(true);
+
+      const result = await controller.emergencyStop();
+      expect(result.prepStopped).toBe(true);
+      expect(prepScheduler.isRunning()).toBe(false);
+    });
+
+    it("should handle case when no jobs are running", async () => {
+      const result = await controller.emergencyStop();
+      expect(result.killedTasks).toEqual([]);
+      expect(result.killedPids).toEqual([]);
+      expect(result.errors).toEqual([]);
+    });
+
+    it("should set state to emergency_stopped", async () => {
+      await controller.emergencyStop();
+      expect(controller.getState()).toBe("emergency_stopped");
+    });
+
+    it("should include reason in status", async () => {
+      await controller.emergencyStop("Cost overrun detected");
+      const status = controller.getStatus();
+      expect(status.state).toBe("emergency_stopped");
+      expect(status.reason).toBe("Cost overrun detected");
+    });
+
+    it("should call cleanupAllContainers during emergency stop", async () => {
+      dispatchManager.start("TASK-001");
+      await controller.emergencyStop();
+      expect(dispatchManager.cleanupAllContainersCalled).toBe(true);
+    });
+  });
+
+  describe("Pause and resume", () => {
+    it("should pause fleet without stopping active jobs", () => {
+      dispatchManager.start("TASK-001");
+      dispatchManager.start("TASK-002");
+
+      controller.pause("Manual pause");
+      expect(controller.getState()).toBe("paused");
+
+      // Jobs should still be running
+      expect(dispatchManager.getActiveJobs().length).toBe(2);
+    });
+
+    it("should resume from paused state", () => {
+      controller.pause();
+      expect(controller.getState()).toBe("paused");
+
+      controller.resume();
+      expect(controller.getState()).toBe("running");
+      expect(controller.canDispatch().allowed).toBe(true);
+    });
+
+    it("should resume from emergency_stopped state", async () => {
+      await controller.emergencyStop();
+      expect(controller.getState()).toBe("emergency_stopped");
+
+      controller.resume();
+      expect(controller.getState()).toBe("running");
+      expect(controller.canDispatch().allowed).toBe(true);
+    });
+  });
+
+  describe("Fleet status", () => {
+    it("should report active job count", () => {
+      dispatchManager.start("TASK-001");
+      dispatchManager.start("TASK-002");
+
+      const status = controller.getStatus();
+      expect(status.activeJobs).toBe(2);
+      expect(status.state).toBe("running");
+    });
+
+    it("should report zero jobs when none active", () => {
+      const status = controller.getStatus();
+      expect(status.activeJobs).toBe(0);
+    });
+  });
+});

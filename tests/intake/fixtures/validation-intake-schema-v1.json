@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.test/schemas/validation-intake/v1.json",
+  "$comment": "Pinned example-side mirror of the Quack Validation Intake payload contract (schemaVersion:1). Source of truth: TASK-1106 (Quack platform — Validation Intake type) in example repo docs/page-by-page-audit/follow-up-tasks/TASK-1106-quack-validation-intake-platform-extension.md. Until TASK-1106 ships, this file IS the contract; once TASK-1106 publishes its Zod-derived schema, swap the $ref / pointer in /polish-handoff to TASK-1106's published version. Cross-repo coupling note: when bumping fields here, bump in Quack src/intake/task-intake.ts in lockstep — a Jest test (tests/intake/validation-intake-schema-compat.test.ts) asserts equal accept/reject sets across both validators.",
+  "title": "Quack Validation Intake Payload (schemaVersion:1)",
+  "description": "Evidence bundle a example teammate POSTs to Quack's /v1/intake/tasks endpoint with intakeType=validation. Inverts the Forward Intake contract (spec -> code -> verified) to branch + evidence -> validated -> verified. The submitter declares what changed, what is proven, what is NOT claimed (suppresses drift-detection REVISE), and what could still go wrong. additionalProperties:false at every level enforces the TASK-1107 anti-pattern guard: no secrets, .env contents, or untyped fields sneak through.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "project",
+    "branch",
+    "commitRange",
+    "scope",
+    "tests",
+    "screenshots",
+    "nonClaims",
+    "knownRisks",
+    "submitter",
+    "submittedAt"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1,
+      "description": "Pinned to 1. REQUIRED (not defaulted) so v2 callers fail loudly against a v1 server, and vice versa, until both sides catch up. No silent schema drift. Future migrations (e.g. multi-branch validation, partial-evidence accept) bump this literal and add a new branch in TASK-1106's route handler."
+    },
+    "project": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_.-]+$",
+      "description": "Target project key as registered in ~/.quack/config.json (e.g. 'example-service'). Drives the ?project= query param on the Quack intake route and the adapter-declared taskDir lookup for auto-generated spec landing path."
+    },
+    "branch": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[\\w./-]+$",
+      "not": {
+        "enum": ["dev", "staging", "prod", "main", "master"]
+      },
+      "description": "Personal/feature branch name. MUST resolve on origin (Quack-side gate verifies via git ls-remote, with explicit git fetch origin retry). Protected branches (dev/staging/prod/main/master) are rejected — Validation Intake is for branch-first work, not direct mainline edits."
+    },
+    "commitRange": {
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "pattern": "[`$;]"
+      },
+      "description": "Any revspec git rev-parse --verify can resolve: <sha>..<sha>, origin/dev..HEAD, main..feature/foo, HEAD~3..HEAD, tag ranges, etc. Intentionally NOT restricted to /^[a-f0-9]{7,40}\\.\\.[a-f0-9]{7,40}$/ — that pattern over-rejects legitimate handoffs. Shell metacharacters (backtick, $, ;) are forbidden to prevent injection on the server-side git rev-parse call."
+    },
+    "scope": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Claimed files/areas this branch touches. Quack's scope-hygiene gate intersects this with `git diff --name-only <commitRange>` to compute three sets: confirmed, claimed_but_unchanged (scope inflation), changed_but_unclaimed (scope drift). REVISE fires when claimed_but_unchanged is non-empty OR changed_but_unclaimed.length > driftThreshold (default 5, per-project override via adapter.json#validationIntake.driftThreshold) AND nonClaims is empty."
+    },
+    "tests": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "result", "evidence"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Test suite / spec / scenario name, e.g. 'tests/intake/scope-hygiene-gate.test.ts' or 'Playwright: client-detail-view smoke'."
+          },
+          "result": {
+            "type": "string",
+            "enum": ["PASS", "FAIL", "SKIP"],
+            "description": "Test outcome. Evidence gate REVISEs when no entry has result === 'PASS'. All-SKIP is REVISE — Validation Intake is not a bypass for unproven work."
+          },
+          "evidence": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Pointer to where the result can be verified: log path, screenshot, CI run URL, .quack/evidence/<taskId>/ manifest entry, etc. Submitter accountability — no 'trust me' entries."
+          }
+        }
+      },
+      "description": "Test run results. >=1 entry required, >=1 entry with result=PASS required by Quack-side evidence gate."
+    },
+    "screenshots": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "caption"],
+        "properties": {
+          "file": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Repo-relative path (preferred) or HTTPS URL to the screenshot. Local paths typically land under docs/handoffs/ or .quack/evidence/<taskId>/screenshots/."
+          },
+          "caption": {
+            "type": "string",
+            "minLength": 1,
+            "description": "What this screenshot proves. The judge reads captions to decide whether the visual evidence supports the scope description."
+          }
+        }
+      },
+      "description": "Visual evidence bundle. May be empty for backend-only work; UI changes without screenshots are an evidence-gate red flag (the gate does not REVISE on missing screenshots in MVP, but the auto-judge weighs the omission)."
+    },
+    "nonClaims": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Files / areas / behaviors this branch deliberately does NOT cover. LOAD-BEARING per TASK-1106 non-bypass rule: when changed_but_unclaimed.length > driftThreshold, the scope-hygiene gate suppresses REVISE if the offending files are explicitly enumerated here (treats them as out-of-scope incidental touches — generated files, lockfile updates, copy nits — rather than scope drift). A submitter who cannot list non-claims has not actually scoped their work and is using Validation Intake as a shortcut to skip Forward Intake's specifiability gate. NOTE: TASK-1106 requires non-empty; this v1 mirror permits empty array for submitters whose changed_but_unclaimed is already below the configured drift threshold — the Quack-side evidence gate is the enforcement point per the example TASK-1107 contract."
+    },
+    "knownRisks": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "What could still go wrong + what must be checked. Surfaces to the auto-judge and the admin /verify-task workflow. May be empty for genuinely low-risk changes — but 'we don't know what could go wrong' is itself a knownRisk worth declaring."
+    },
+    "submitter": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Slack handle, GitHub handle, or email of the human responsible for the submission, e.g. 'contributor', 'contributor@example.test', or '@contributor.lopez'. Feeds TASK-1106 §12 per-submitter quality scoring (REVISE rate, scope-drift rate, non-claim completeness over rolling 30 days)."
+    },
+    "submittedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 timestamp of submission (e.g. '2026-05-31T13:54:00-04:00'). Used for idempotency-key derivation alongside (project, branch, commitRange) and for the rolling-30-day quality-scoring window."
+    }
+  }
+}

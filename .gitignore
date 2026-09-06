@@ -1,0 +1,126 @@
+# Dependencies
+node_modules
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Test coverage
+coverage/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Quack runtime data (logs, worktrees, auth, prep cache, verification, DB)
+.quack/logs/
+.quack/logs
+!.quack/.gitkeep
+.quack/worktrees/
+.quack/auth.json
+.quack/prep/*.json
+.quack/prep
+.quack/quack.db
+.quack/quack.db-shm
+.quack/quack.db-wal
+.quack/cache/
+.quack/federation/
+.quack/intake/
+.quack/test-results/
+.quack/evidence/
+.quack/research/
+!.quack/verified.example.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Research workspace (TASK-090, autoresearch experiments, cloned repos)
+.quack/research/
+
+# Dev artifacts (one-off scripts, test run logs, scratch files)
+.dev/
+.quack/*.js
+.quack/*.sh
+.quack/*.bat
+.quack/*.py
+.quack/*.mjs
+.quack/*.json
+!.quack/adapter.json
+.quack/*.png
+.quack/*.log
+.quack/*.txt
+
+# Top-level ephemeral artifacts
+test-results/
+*.quackquack.db
+.quack-task-*.log
+.quack-tasks-*.json
+%SystemDrive%/
+.quack/*.md
+.quack/agents/
+.quack/claude-code-best-practice/
+.quack/compound-engineering-plugin/
+.quack/local-test-runs/
+.quack/overnight-*/
+.quack/reports/
+.quack/research-data.json
+.quack/example-tasks*.json
+.quack/tasks-dump.json
+.quack/test-output.json
+.quack/overnight-*.log
+.quack/workflow-projections/
+.quack/docs-pipeline/
+.quack/reviews/
+.quack/runtime-logs/
+
+# Local scratch artifacts
+.claude/*.lock
+.incomplete-table.md
+.task*.md
+.task*.patch
+.task*.py
+.task-table.py
+
+# Playwright CLI artifacts (from agent browser testing)
+.playwright-cli/
+.playwright-mcp/
+
+# Local agent configuration
+.codex/
+.agents/
+
+# Progress tracking (transient worktree artifact)
+PROGRESS.md
+claude-progress.txt
+
+# Local agent settings and memory
+.claude/settings.json
+.claude/settings.local.json
+.claude/agent-memory/
+.claude/plans/
+
+# Quack runtime subdirectories (prep cache, analytics)
+.quack/prep/
+.quack/analytics/
+
+# Debug logs
+npm-debug.log*
+yarn-error.log*
+
+# Laptop worker secret token (machine-specific)
+.quack/laptop-worker.env
+.quack/*-worker.env
+.quack/run-*-runtime.cmd
+.quack/run-*-runtime.ps1
+.quack/run-*-listener.ps1
+!.quack/run-laptop-listener.ps1
+!.quack/verified.example.json
