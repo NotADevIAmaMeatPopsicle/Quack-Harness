@@ -998,7 +998,10 @@ export async function dispatchTask(
         events.emit("blueprint_warning", {
           taskId,
           reason: "inline_blueprint_slow",
-          elapsedMs: Date.now() - blueprintStartedAt,
+          // Timer callbacks can run a millisecond before Date.now() reflects the
+          // requested delay on some platforms. A warning event must never report
+          // an elapsed duration below the threshold that caused it.
+          elapsedMs: Math.max(WARNING_MS, Date.now() - blueprintStartedAt),
         });
       }, WARNING_MS);
       // Don't keep the event loop alive purely for timer bookkeeping —
