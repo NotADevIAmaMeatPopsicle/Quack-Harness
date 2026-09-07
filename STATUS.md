@@ -1,7 +1,5 @@
 # Project status
 
-Quack Harness is a public, pre-`1.0` project. The implementation is substantial and actively tested, while APIs and configuration remain subject to change before the first stable release.
-
 ## Supported today
 
 - Node.js 20.19 or newer
@@ -38,6 +36,7 @@ reported zero known vulnerabilities.
 - Provider-backed stages require external credentials and can incur usage charges.
 - Distributed deployments require operator-supplied authentication, networking, and repository access.
 - Some integration tests exercise process, filesystem, network, Git, or Docker behavior and can be slower than unit tests.
-- Configuration and API compatibility are not guaranteed until `1.0`.
 
-This file describes the candidate repository only. It does not claim that production, hardware-specific, or external deployment checks have passed.
+The validation record above covers repository checks. Production,
+hardware-specific, and external deployments must be validated in their target
+environments.

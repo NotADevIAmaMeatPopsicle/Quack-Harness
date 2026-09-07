@@ -4,8 +4,6 @@ Quack Harness is a codebase-agnostic control plane for planning, executing, revi
 
 The current architecture combines a Claude Agent SDK implementation worker with optional cross-model review loops powered by the Codex CLI or the Claude SDK. Deterministic safety signals remain authoritative: model judgment can add scrutiny, but it cannot override a safety stop or silently widen an approval.
 
-> **Release status:** Quack Harness is a public, pre-`1.0` project. The core workflow is actively tested, but APIs and configuration may still change before the first stable release. See [STATUS.md](STATUS.md) for supported capabilities and current limitations.
-
 ## Why Quack Harness
 
 Coding agents are useful, but an agent session by itself is not a delivery system. Quack Harness supplies the surrounding machinery:
@@ -262,7 +260,6 @@ Secrets belong in environment variables or an external secret store. Do not comm
 - Codex cross-model review requires a separately installed and authenticated Codex CLI.
 - Docker verification is adapter-dependent and requires a working Docker installation.
 - Distributed mode requires explicit network, authentication, repository-access, and worker-enrollment configuration.
-- The API and adapter schema may change before a stable `1.0` release.
 - Hardware-specific, production-deployment, and multi-host behavior must be validated in the environment where it will run.
 
 ## Documentation

@@ -13,7 +13,7 @@ Please do not disclose a vulnerability publicly until maintainers have confirmed
 
 ## Supported versions
 
-Until the first stable release, security fixes target the current default branch. Older snapshots are not maintained.
+Security fixes target the current default branch. Older snapshots are not maintained.
 
 ## Deployment guidance
 
