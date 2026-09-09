@@ -2,6 +2,9 @@ import { DockerManager } from "../../src/dispatcher/docker-manager";
 import type { DockerIsolationConfig } from "../../src/core/types";
 import * as childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 type MockCallArgs = [string, string[], ...unknown[]];
 type ExecFileCallback = (err: Error | null, result: { stdout: string; stderr: string }) => void;
@@ -70,10 +73,16 @@ function mockExecFileSequence(responses: Array<{ stdout?: string; error?: string
 
 describe("DockerManager", () => {
   let manager: DockerManager;
+  let stateRoot: string;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    manager = new DockerManager("/project/root", defaultConfig());
+    stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "quack-docker-manager-"));
+    manager = new DockerManager("/project/root", defaultConfig(), stateRoot);
+  });
+
+  afterEach(() => {
+    fs.rmSync(stateRoot, { recursive: true, force: true });
   });
 
   // ─── checkDocker ─────────────────────────────────────────────
@@ -168,6 +177,36 @@ describe("DockerManager", () => {
       });
       expect(mockExecFile).toHaveBeenCalledTimes(2);
     });
+
+    test("persists an uncertain create and removes a late container after restart", async () => {
+      mockExecFileError("simulated interrupted docker create");
+      await expect(manager.createContainer("TASK-LATE-CREATE")).rejects.toThrow(
+        "simulated interrupted docker create",
+      );
+
+      const markerFiles = fs.readdirSync(stateRoot).filter((name) => name.endsWith(".json"));
+      expect(markerFiles).toHaveLength(1);
+      const marker = JSON.parse(fs.readFileSync(path.join(stateRoot, markerFiles[0]), "utf-8")) as {
+        containerName: string;
+      };
+
+      jest.clearAllMocks();
+      mockExecFileSequence([{ stdout: "" }, { stdout: "" }]);
+      const restarted = new DockerManager("/project/root", defaultConfig(), stateRoot);
+      await expect(restarted.reconcileExistingContainers()).resolves.toEqual({
+        discoveredTaskIds: [],
+        ambiguousContainerIds: [],
+        removedTaskIds: [],
+        failedTaskIds: [],
+      });
+
+      const calls = mockExecFile.mock.calls as MockCallArgs[];
+      expect(calls.map((call) => call[1])).toEqual([
+        ["rm", "-f", marker.containerName],
+        ["ps", "-a", "--filter", "label=quack.taskId", "--format", "{{.ID}}"],
+      ]);
+      expect(fs.readdirSync(stateRoot).filter((name) => name.endsWith(".json"))).toEqual([]);
+    });
   });
 
   // ─── createContainer ────────────────────────────────────────
@@ -214,6 +253,7 @@ describe("DockerManager", () => {
       const mgr = new DockerManager(
         "/project/root",
         defaultConfig({ preInstallCommand: "npm install" }),
+        stateRoot,
       );
 
       mockExecFileSequence([
@@ -256,6 +296,7 @@ describe("DockerManager", () => {
         defaultConfig({
           resourceLimits: { memoryMb: 8192, cpus: 4, storageMb: 10240 },
         }),
+        stateRoot,
       );
 
       mockExecFileSequence([{ stdout: "xyz789\n" }, { stdout: "" }]);
@@ -276,6 +317,7 @@ describe("DockerManager", () => {
       const mgr = new DockerManager(
         "/project/root",
         defaultConfig({ volumes: ["/host/data:/container/data:ro"] }),
+        stateRoot,
       );
 
       mockExecFileSequence([{ stdout: "vol123\n" }, { stdout: "" }]);
@@ -403,6 +445,7 @@ describe("DockerManager", () => {
       const mgr = new DockerManager(
         "/project/root",
         defaultConfig({ cleanupPolicy: "keep_on_failure" }),
+        stateRoot,
       );
 
       mockExecFileSequence([
@@ -634,7 +677,11 @@ describe("DockerManager", () => {
 
   describe("network mode", () => {
     test("uses none network when configured", async () => {
-      const mgr = new DockerManager("/project/root", defaultConfig({ networkMode: "none" }));
+      const mgr = new DockerManager(
+        "/project/root",
+        defaultConfig({ networkMode: "none" }),
+        stateRoot,
+      );
 
       mockExecFileSequence([{ stdout: "net123\n" }, { stdout: "" }]);
 

@@ -291,6 +291,49 @@ export function registerFleetRoutes(app: Express, deps: FleetRouteDeps): void {
     },
   );
 
+  app.get("/api/fleet/worktree-shutdown-survivors", (req: Request, res: Response) => {
+    const p = resolveProject(req);
+    if (!p.fleetController) {
+      res.status(500).json({ error: "Fleet controller not available" });
+      return;
+    }
+    res.json({ survivors: p.fleetController.getWorktreeShutdownSurvivors() });
+  });
+
+  app.post(
+    "/api/fleet/worktree-shutdown-survivors/:taskId/reconcile",
+    (req: Request, res: Response) => {
+      const p = resolveProject(req);
+      if (!p.fleetController) {
+        res.status(500).json({ error: "Fleet controller not available" });
+        return;
+      }
+      const body = req.body as Record<string, unknown> | undefined;
+      if (
+        typeof body?.sessionId !== "string" ||
+        typeof body.reconciliationToken !== "string" ||
+        body.processTreeConfirmedStopped !== true
+      ) {
+        res.status(400).json({
+          error:
+            "sessionId, reconciliationToken, and processTreeConfirmedStopped=true are required",
+        });
+        return;
+      }
+      const reconciled = p.fleetController.reconcileWorktreeShutdownSurvivor(
+        req.params.taskId as string,
+        body.sessionId,
+        body.reconciliationToken,
+        true,
+      );
+      if (!reconciled) {
+        res.status(409).json({ error: "Worktree shutdown survivor could not be reconciled" });
+        return;
+      }
+      res.json({ ok: true, taskId: req.params.taskId });
+    },
+  );
+
   app.post("/api/fleet/resume", async (req: Request, res: Response) => {
     const p = resolveProject(req);
     if (!p.fleetController) {
@@ -303,11 +346,18 @@ export function registerFleetRoutes(app: Express, deps: FleetRouteDeps): void {
       // Re-open manager admission before queue scheduling. An emergency stop
       // aborts (rather than pauses) the queue, so it must be started again.
       await p.fleetController.resume();
+      if (p.fleetController.getState() !== "running") {
+        throw new Error("Fleet resume was superseded before queue restart");
+      }
       if (p.dispatchQueue) {
         if (priorState === "emergency_stopped") {
           await p.dispatchQueue.start();
         } else {
           await p.dispatchQueue.resume();
+        }
+        if (p.fleetController.getState() !== "running") {
+          p.dispatchQueue.abort();
+          throw new Error("Fleet resume was superseded during queue restart");
         }
       }
 

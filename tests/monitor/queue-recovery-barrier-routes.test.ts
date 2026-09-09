@@ -147,7 +147,7 @@ it("POST /api/fleet/resume waits before fleet resumed state is emitted", async (
   const queue = { resume } as unknown as DispatchQueue;
   const fleetResume = jest.fn();
   const fleetController = {
-    getState: jest.fn(() => "paused"),
+    getState: jest.fn().mockReturnValueOnce("paused").mockReturnValue("running"),
     resume: fleetResume,
   } as unknown as FleetController;
   const emitted = jest.fn();
@@ -192,7 +192,7 @@ it("POST /api/fleet/resume restarts an emergency-aborted queue", async () => {
   const queue = { start, resume, abort: jest.fn() } as unknown as DispatchQueue;
   const fleetResume = jest.fn();
   const fleetController = {
-    getState: jest.fn(() => "emergency_stopped"),
+    getState: jest.fn().mockReturnValueOnce("emergency_stopped").mockReturnValue("running"),
     resume: fleetResume,
     emergencyStop: jest.fn().mockResolvedValue({}),
   } as unknown as FleetController;
@@ -276,6 +276,7 @@ it("exposes tokened prep and shared-checkout survivor reconciliation", async () 
     startedAt: "2026-09-09T12:00:00.000Z",
     recordedAt: "2026-09-09T12:01:00.000Z",
     confirmationToken: "prep-token",
+    strategy: "windows-process-tree" as const,
   };
   const getPrepShutdownSurvivors = jest.fn(() => [prepSurvivor]);
   const reconcilePrepShutdownSurvivor = jest.fn(() => true);
@@ -287,11 +288,25 @@ it("exposes tokened prep and shared-checkout survivor reconciliation", async () 
     reconciliationToken: "shared-token",
   }));
   const reconcileSharedCheckoutShutdownSurvivor = jest.fn(() => true);
+  const worktreeSurvivor = {
+    version: 1 as const,
+    taskId: "TASK-WORKTREE",
+    sessionId: "worktree-session",
+    worktreePath: "C:\\repo\\.quack\\worktrees\\TASK-WORKTREE",
+    processId: 789,
+    strategy: "windows-process-tree" as const,
+    recordedAt: "2026-09-09T12:02:00.000Z",
+    reconciliationToken: "worktree-token",
+  };
+  const getWorktreeShutdownSurvivors = jest.fn(() => [worktreeSurvivor]);
+  const reconcileWorktreeShutdownSurvivor = jest.fn(() => true);
   const fleetController = {
     getPrepShutdownSurvivors,
     reconcilePrepShutdownSurvivor,
     getSharedCheckoutShutdownSurvivor,
     reconcileSharedCheckoutShutdownSurvivor,
+    getWorktreeShutdownSurvivors,
+    reconcileWorktreeShutdownSurvivor,
   } as unknown as FleetController;
   const app = express();
   app.use(express.json());
@@ -337,6 +352,25 @@ it("exposes tokened prep and shared-checkout survivor reconciliation", async () 
       "TASK-SHARED",
       "shared-session",
       "shared-token",
+      true,
+    );
+
+    const worktreeList = await get(server.port, "/api/fleet/worktree-shutdown-survivors");
+    expect(worktreeList.status).toBe(200);
+    expect(JSON.parse(worktreeList.body)).toEqual({ survivors: [worktreeSurvivor] });
+    expect(
+      (
+        await post(server.port, "/api/fleet/worktree-shutdown-survivors/TASK-WORKTREE/reconcile", {
+          sessionId: "worktree-session",
+          reconciliationToken: "worktree-token",
+          processTreeConfirmedStopped: true,
+        })
+      ).status,
+    ).toBe(200);
+    expect(reconcileWorktreeShutdownSurvivor).toHaveBeenCalledWith(
+      "TASK-WORKTREE",
+      "worktree-session",
+      "worktree-token",
       true,
     );
   } finally {

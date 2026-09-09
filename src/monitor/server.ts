@@ -8105,6 +8105,11 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         });
       });
 
+      if (adapter.config.isolation?.method === "docker") {
+        if (!context.dispatchManager) throw new Error("Dispatch manager is unavailable");
+        await context.dispatchManager.checkDockerAvailability();
+      }
+
       // Register project
       registry.register(context);
 
@@ -9128,7 +9133,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     if (useMultiProject && registry && projectAdapters) {
       const quackBin = path.resolve(__dirname, "..", "index.js");
 
-      for (const adapter of projectAdapters) {
+      const initializedProjectContexts = projectAdapters.map((adapter) => {
         const context = buildProjectContext(adapter, quackBin, (stage, taskId, payload) => {
           const projectId = generateProjectId(adapter.config.project.name);
           sse.broadcast({
@@ -9141,7 +9146,29 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
           });
         });
         registry.register(context);
+        return { adapter, context };
+      });
 
+      // Reconcile Docker ownership for every registered project before any
+      // watcher or scheduler can admit work. A clean active project must not
+      // hide a survivor owned by another project context after restart.
+      for (const { adapter, context } of initializedProjectContexts) {
+        if (adapter.config.isolation?.method !== "docker") continue;
+        try {
+          if (!context.dispatchManager) {
+            throw new Error("dispatch manager is unavailable");
+          }
+          const version = await context.dispatchManager.checkDockerAvailability();
+          console.log(`[${context.name}] Docker isolation enabled (Docker ${version})`);
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new Error(
+            `Docker isolation is configured for ${context.name} but ownership reconciliation failed: ${detail}`,
+          );
+        }
+      }
+
+      for (const { adapter, context } of initializedProjectContexts) {
         // Start event watcher for this project's log directory
         const projId = context.id;
         const stopProjectWatcher = await context.eventReader.watch(

@@ -147,8 +147,9 @@ class MockPrepWorker {
 class MockPrepScheduler {
   private running = false;
 
-  start(): void {
+  start(): Promise<void> {
     this.running = true;
+    return Promise.resolve();
   }
 
   stop(): void {
@@ -268,7 +269,7 @@ describe("FleetController", () => {
     });
 
     it("should stop prep scheduler if running", async () => {
-      prepScheduler.start();
+      await prepScheduler.start();
       expect(prepScheduler.isRunning()).toBe(true);
 
       const result = await controller.emergencyStop();
@@ -405,7 +406,7 @@ describe("FleetController", () => {
     });
 
     it("restarts prep scheduling only when it was running before emergency stop", async () => {
-      prepScheduler.start();
+      await prepScheduler.start();
       await controller.emergencyStop();
       expect(prepScheduler.isRunning()).toBe(false);
 
@@ -422,6 +423,33 @@ describe("FleetController", () => {
       await stoppedController.emergencyStop();
       await stoppedController.resume();
       expect(initiallyStopped.isRunning()).toBe(false);
+    });
+
+    it("does not let an in-flight resume overwrite a later emergency stop", async () => {
+      await prepScheduler.start();
+      await controller.emergencyStop("first stop");
+
+      let releaseStart!: () => void;
+      const mayStart = new Promise<void>((resolve) => {
+        releaseStart = resolve;
+      });
+      const originalStart = prepScheduler.start.bind(prepScheduler);
+      jest.spyOn(prepScheduler, "start").mockImplementation(async () => {
+        await mayStart;
+        await originalStart();
+      });
+
+      const resume = controller.resume();
+      await Promise.resolve();
+      const laterEmergency = controller.emergencyStop("later stop");
+      expect(controller.getState()).toBe("emergency_stopped");
+
+      releaseStart();
+      await expect(resume).rejects.toThrow("superseded by an emergency stop");
+      await expect(laterEmergency).resolves.toBeDefined();
+      expect(controller.getState()).toBe("emergency_stopped");
+      expect(controller.getStatus().reason).toBe("later stop");
+      expect(prepScheduler.isRunning()).toBe(false);
     });
   });
 

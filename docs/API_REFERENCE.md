@@ -35,12 +35,12 @@ The monitor binds to loopback by default. If you deliberately bind it to another
 
 ## Health and projects
 
-| Method | Route | Purpose |
-| --- | --- | --- |
-| `GET` | `/api/health` | Process, build, and UI health |
-| `GET` | `/api/projects` | Registered projects |
-| `PUT` | `/api/projects/active/:projectId` | Select the active project |
-| `GET` | `/api/remotes` | Configured remote monitors |
+| Method | Route                             | Purpose                       |
+| ------ | --------------------------------- | ----------------------------- |
+| `GET`  | `/api/health`                     | Process, build, and UI health |
+| `GET`  | `/api/projects`                   | Registered projects           |
+| `PUT`  | `/api/projects/active/:projectId` | Select the active project     |
+| `GET`  | `/api/remotes`                    | Configured remote monitors    |
 
 ```bash
 curl -s http://127.0.0.1:3333/api/health
@@ -48,17 +48,17 @@ curl -s http://127.0.0.1:3333/api/health
 
 ## Tasks and sessions
 
-| Method | Route | Purpose |
-| --- | --- | --- |
-| `GET` | `/api/tasks` | List parsed tasks and parse errors |
-| `GET` | `/api/tasks/:taskId` | Read one task |
-| `POST` | `/api/tasks/:taskId/prep` | Run readiness preparation |
-| `POST` | `/api/tasks/:taskId/start` | Start an authorized local dispatch |
-| `POST` | `/api/tasks/:taskId/stop` | Stop a running dispatch |
-| `POST` | `/api/tasks/:taskId/resume` | Resume from a checkpoint |
-| `POST` | `/api/tasks/:taskId/verify` | Run verification |
-| `GET` | `/api/sessions` | List execution sessions |
-| `GET` | `/api/sessions/:sessionId/events` | Read session events |
+| Method | Route                             | Purpose                            |
+| ------ | --------------------------------- | ---------------------------------- |
+| `GET`  | `/api/tasks`                      | List parsed tasks and parse errors |
+| `GET`  | `/api/tasks/:taskId`              | Read one task                      |
+| `POST` | `/api/tasks/:taskId/prep`         | Run readiness preparation          |
+| `POST` | `/api/tasks/:taskId/start`        | Start an authorized local dispatch |
+| `POST` | `/api/tasks/:taskId/stop`         | Stop a running dispatch            |
+| `POST` | `/api/tasks/:taskId/resume`       | Resume from a checkpoint           |
+| `POST` | `/api/tasks/:taskId/verify`       | Run verification                   |
+| `GET`  | `/api/sessions`                   | List execution sessions            |
+| `GET`  | `/api/sessions/:sessionId/events` | Read session events                |
 
 ```bash
 curl -s "http://127.0.0.1:3333/api/tasks?projectId=<PROJECT_ID>"
@@ -66,35 +66,37 @@ curl -s "http://127.0.0.1:3333/api/tasks?projectId=<PROJECT_ID>"
 
 ## Queue and fleet
 
-| Method | Route | Purpose |
-| --- | --- | --- |
-| `GET` | `/api/queue` | Local queue state |
-| `POST` | `/api/queue/enqueue` | Enqueue task IDs |
-| `POST` | `/api/queue/start` | Start queue processing |
-| `POST` | `/api/queue/pause` | Pause queue processing |
-| `POST` | `/api/queue/resume` | Resume queue processing |
-| `POST` | `/api/queue/stop` | Stop queue processing |
-| `GET` | `/api/fleet/status` | Fleet state and limits |
-| `POST` | `/api/fleet/emergency-stop` | Stop active fleet work |
-| `GET` | `/api/fleet/prep-shutdown-survivors` | List unconfirmed Windows prep trees |
-| `POST` | `/api/fleet/prep-shutdown-survivors/:taskId/reconcile` | Acknowledge an independently verified stopped prep tree |
-| `GET` | `/api/fleet/shared-checkout-shutdown-survivor` | Read unconfirmed shared-checkout tree ownership |
-| `POST` | `/api/fleet/shared-checkout-shutdown-survivor/reconcile` | Acknowledge an independently verified stopped shared-checkout tree |
+| Method | Route                                                      | Purpose                                                             |
+| ------ | ---------------------------------------------------------- | ------------------------------------------------------------------- |
+| `GET`  | `/api/queue`                                               | Local queue state                                                   |
+| `POST` | `/api/queue/enqueue`                                       | Enqueue task IDs                                                    |
+| `POST` | `/api/queue/start`                                         | Start queue processing                                              |
+| `POST` | `/api/queue/pause`                                         | Pause queue processing                                              |
+| `POST` | `/api/queue/resume`                                        | Resume queue processing                                             |
+| `POST` | `/api/queue/stop`                                          | Stop queue processing                                               |
+| `GET`  | `/api/fleet/status`                                        | Fleet state and limits                                              |
+| `POST` | `/api/fleet/emergency-stop`                                | Stop active fleet work                                              |
+| `GET`  | `/api/fleet/prep-shutdown-survivors`                       | List unconfirmed Windows or POSIX prep trees                        |
+| `POST` | `/api/fleet/prep-shutdown-survivors/:taskId/reconcile`     | Acknowledge an independently verified stopped prep tree             |
+| `GET`  | `/api/fleet/shared-checkout-shutdown-survivor`             | Read unconfirmed shared-checkout tree ownership                     |
+| `POST` | `/api/fleet/shared-checkout-shutdown-survivor/reconcile`   | Acknowledge an independently verified stopped shared-checkout tree  |
+| `GET`  | `/api/fleet/worktree-shutdown-survivors`                   | List unconfirmed Windows worktree process trees                     |
+| `POST` | `/api/fleet/worktree-shutdown-survivors/:taskId/reconcile` | Acknowledge an independently verified stopped worktree process tree |
 
-Survivor reconciliation is deliberately explicit. Read the current record, independently verify that the entire process tree is gone, then post its exact confirmation token (and shared-checkout session ID when applicable) with `processTreeConfirmedStopped: true`. Stale tokens return `409`; the monitor never re-signals a PID recovered from disk.
+Survivor reconciliation is deliberately explicit. Read the current record, independently verify that the entire process tree is gone, then post its exact confirmation token (and session ID for shared-checkout or worktree records) with `processTreeConfirmedStopped: true`. Stale tokens return `409`; the monitor never re-signals a PID or process-group ID recovered from disk. Reconciling a worktree survivor clears only the shutdown evidence and does not delete the preserved worktree.
 
 ## Federation
 
-| Method | Route | Required scope | Purpose |
-| --- | --- | --- | --- |
-| `GET` | `/v1/federation/queue` | `federation:read` | Queue, host, and merge-lane state |
-| `POST` | `/v1/federation/queue` | `federation:write` | Enqueue a federated job |
-| `GET` | `/v1/federation/jobs/:jobId` | `federation:read` | Read one federated job |
-| `POST` | `/v1/federation/jobs/:jobId/events` | `federation:write` | Report worker progress or completion |
-| `POST` | `/v1/federation/jobs/:jobId/lease/renew` | `federation:write` | Renew a worker lease |
-| `POST` | `/v1/federation/jobs/:jobId/cancel` | `federation:write` | Cancel a job |
-| `GET` | `/v1/federation/verified` | `federation:read` | Read verification ledger rows |
-| `POST` | `/v1/federation/verified` | `federation:write` | Record verification rows |
+| Method | Route                                    | Required scope     | Purpose                              |
+| ------ | ---------------------------------------- | ------------------ | ------------------------------------ |
+| `GET`  | `/v1/federation/queue`                   | `federation:read`  | Queue, host, and merge-lane state    |
+| `POST` | `/v1/federation/queue`                   | `federation:write` | Enqueue a federated job              |
+| `GET`  | `/v1/federation/jobs/:jobId`             | `federation:read`  | Read one federated job               |
+| `POST` | `/v1/federation/jobs/:jobId/events`      | `federation:write` | Report worker progress or completion |
+| `POST` | `/v1/federation/jobs/:jobId/lease/renew` | `federation:write` | Renew a worker lease                 |
+| `POST` | `/v1/federation/jobs/:jobId/cancel`      | `federation:write` | Cancel a job                         |
+| `GET`  | `/v1/federation/verified`                | `federation:read`  | Read verification ledger rows        |
+| `POST` | `/v1/federation/verified`                | `federation:write` | Record verification rows             |
 
 ```bash
 curl -s http://127.0.0.1:3333/v1/federation/queue \
@@ -114,22 +116,22 @@ The main route families are:
 
 ## Reviews and verification
 
-| Route family | Purpose |
-| --- | --- |
-| `/v1/workflows/*` | Workflow state and evidence events |
-| `/v1/reviews/*` | Review bundle submission and inspection |
-| `/api/tasks/:taskId/verified` | Record a human verification decision |
-| `/api/tasks/:taskId/advisory` | Read task advisories |
+| Route family                  | Purpose                                 |
+| ----------------------------- | --------------------------------------- |
+| `/v1/workflows/*`             | Workflow state and evidence events      |
+| `/v1/reviews/*`               | Review bundle submission and inspection |
+| `/api/tasks/:taskId/verified` | Record a human verification decision    |
+| `/api/tasks/:taskId/advisory` | Read task advisories                    |
 
 ## Monitoring, testing, and documentation
 
-| Route family | Purpose |
-| --- | --- |
-| `/api/testing/*` | Verification command inventory, execution, and history |
-| `/api/monitoring/*` | Configured environment health |
-| `/api/wiki/*` | Local project documentation reads and authorized writes |
-| `/api/costs*` | Recorded usage and cost summaries |
-| `/api/analytics/*` | Aggregate outcomes and failure patterns |
+| Route family        | Purpose                                                 |
+| ------------------- | ------------------------------------------------------- |
+| `/api/testing/*`    | Verification command inventory, execution, and history  |
+| `/api/monitoring/*` | Configured environment health                           |
+| `/api/wiki/*`       | Local project documentation reads and authorized writes |
+| `/api/costs*`       | Recorded usage and cost summaries                       |
+| `/api/analytics/*`  | Aggregate outcomes and failure patterns                 |
 
 ## Server-sent events
 

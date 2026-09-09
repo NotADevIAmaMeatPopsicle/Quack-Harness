@@ -1157,6 +1157,48 @@ describe("DispatchManager", () => {
       }
     });
 
+    test("serializes old-owner restore and release before a same-task handoff", () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-handoff-"));
+      const logDir = path.join(tmpDir, ".quack", "logs");
+      const first = new DispatchManager(tmpDir, process.execPath, undefined, undefined, logDir);
+      const second = new DispatchManager(tmpDir, process.execPath, undefined, undefined, logDir);
+      const firstJob = makeJob({ taskId: "TASK-HANDOFF", sessionId: "old-session", pid: 999_999 });
+      const nextJob = makeJob({ taskId: "TASK-HANDOFF", sessionId: "new-session" });
+      const firstInternals = first as unknown as {
+        persistSharedCheckoutPause(job: DispatchJob, status: "running"): void;
+        restoreSharedCheckout(job: DispatchJob): boolean;
+        restoreAndReleaseSharedCheckout(job: DispatchJob): boolean;
+      };
+      const secondInternals = second as unknown as {
+        persistSharedCheckoutPause(
+          job: DispatchJob,
+          status: "running",
+          allowOwnershipTransfer: boolean,
+        ): void;
+      };
+      try {
+        firstInternals.persistSharedCheckoutPause(firstJob, "running");
+        expect(() => secondInternals.persistSharedCheckoutPause(nextJob, "running", true)).toThrow(
+          DegradedSharedCheckoutBusyError,
+        );
+
+        firstInternals.restoreSharedCheckout = () => {
+          expect(() =>
+            secondInternals.persistSharedCheckoutPause(nextJob, "running", true),
+          ).toThrow("ownership is locked");
+          return true;
+        };
+        expect(firstInternals.restoreAndReleaseSharedCheckout(firstJob)).toBe(true);
+        expect(() =>
+          secondInternals.persistSharedCheckoutPause(nextJob, "running", true),
+        ).not.toThrow();
+      } finally {
+        first.killAll();
+        second.killAll();
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
     test("never expires an unverified shared-checkout mutation lock by age", () => {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-lock-"));
       const logDir = path.join(tmpDir, ".quack", "logs");
@@ -1244,6 +1286,120 @@ describe("DispatchManager", () => {
         expect(internals.durableSharedOwnerMayBeLive(internals.readSharedCheckoutPause())).toBe(
           false,
         );
+      } finally {
+        mgr.killAll();
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    test("migrates a legacy Windows shared marker and preserves confirmation through admission", () => {
+      const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+      Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-win-legacy-"));
+      const logDir = path.join(tmpDir, ".quack", "logs");
+      const markerPath = path.join(logDir, "shared-checkout-pause.json");
+      fs.mkdirSync(logDir, { recursive: true });
+      fs.writeFileSync(
+        markerPath,
+        `${JSON.stringify({
+          version: 1,
+          taskId: "TASK-LEGACY-SHARED",
+          sessionId: "legacy-session",
+          startedAt: "2026-09-09T12:00:00.000Z",
+          pausedAt: "2026-09-09T12:01:00.000Z",
+          status: "failed",
+          processId: 4242,
+        })}\n`,
+        "utf-8",
+      );
+      const mgr = new DispatchManager(tmpDir, process.execPath, undefined, undefined, logDir);
+      const prior = makeJob({
+        taskId: "TASK-LEGACY-SHARED",
+        sessionId: "legacy-session",
+        status: "failed",
+      });
+      injectJob(mgr, prior);
+      const startWorktree = jest.fn(() => makeJob({ taskId: "TASK-LEGACY-SHARED" }));
+      (mgr as unknown as { startWorktree: typeof startWorktree }).startWorktree = startWorktree;
+      try {
+        const survivor = mgr.getSharedCheckoutShutdownSurvivor();
+        expect(survivor?.reconciliationToken).toEqual(expect.any(String));
+        expect(
+          mgr.reconcileSharedCheckoutShutdownSurvivor(
+            survivor!.taskId,
+            survivor!.sessionId,
+            survivor!.reconciliationToken!,
+            true,
+          ),
+        ).toBe(true);
+        expect(() =>
+          mgr.start("TASK-LEGACY-SHARED", { skipGate: true, resume: true }),
+        ).not.toThrow();
+        expect(startWorktree).toHaveBeenCalledWith(
+          "TASK-LEGACY-SHARED",
+          expect.objectContaining({ resume: true }),
+          true,
+          expect.any(Object),
+        );
+      } finally {
+        mgr.killAll();
+        Object.defineProperty(process, "platform", originalPlatform);
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    test("migrates and safely reconciles legacy Windows worktree survivor markers", () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-worktree-win-legacy-"));
+      const logDir = path.join(tmpDir, ".quack", "logs");
+      const worktreePath = path.join(tmpDir, ".quack", "worktrees", "TASK-WORKTREE");
+      const markerDir = path.join(logDir, "worktree-survivors");
+      const markerPath = path.join(markerDir, "TASK-WORKTREE.json");
+      fs.mkdirSync(worktreePath, { recursive: true });
+      fs.mkdirSync(markerDir, { recursive: true });
+      fs.writeFileSync(
+        markerPath,
+        `${JSON.stringify({
+          version: 1,
+          taskId: "TASK-WORKTREE",
+          sessionId: "worktree-session",
+          worktreePath,
+          processId: 7171,
+          strategy: "windows-process-tree",
+          recordedAt: "2026-09-09T12:00:00.000Z",
+        })}\n`,
+        "utf-8",
+      );
+      const mgr = new DispatchManager(tmpDir, process.execPath, undefined, undefined, logDir);
+      try {
+        const [survivor] = mgr.getWorktreeShutdownSurvivors();
+        expect(survivor.reconciliationToken).toEqual(expect.any(String));
+        expect(mgr.canResumeAfterShutdown()).toBe(false);
+        expect(
+          mgr.reconcileWorktreeShutdownSurvivor(
+            survivor.taskId,
+            survivor.sessionId,
+            "stale-token",
+            true,
+          ),
+        ).toBe(false);
+        expect(
+          mgr.reconcileWorktreeShutdownSurvivor(
+            survivor.taskId,
+            survivor.sessionId,
+            survivor.reconciliationToken!,
+            false,
+          ),
+        ).toBe(false);
+        expect(
+          mgr.reconcileWorktreeShutdownSurvivor(
+            survivor.taskId,
+            survivor.sessionId,
+            survivor.reconciliationToken!,
+            true,
+          ),
+        ).toBe(true);
+        expect(fs.existsSync(worktreePath)).toBe(true);
+        expect(mgr.getWorktreeShutdownSurvivors()).toEqual([]);
       } finally {
         mgr.killAll();
         fs.rmSync(tmpDir, { recursive: true, force: true });

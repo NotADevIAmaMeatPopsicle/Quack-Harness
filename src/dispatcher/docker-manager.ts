@@ -5,7 +5,8 @@
 // dispatch manager can branch between isolation methods transparently.
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import type { DockerIsolationConfig } from "../core/types.js";
@@ -46,21 +47,145 @@ interface DockerInspectRecord {
   Created?: unknown;
 }
 
+interface DockerCreateUncertainty {
+  version: 1;
+  containerName: string;
+  taskId: string;
+  projectFingerprint: string;
+  createdAt: string;
+  confirmAfter: string;
+  confirmationToken: string;
+}
+
 export class DockerManager {
   private containers = new Map<string, DockerContainer>();
   private pendingCommands = new Set<AbortController>();
-  /** Earliest time an absent container name is conclusive after an aborted create. */
-  private uncertainCreations = new Map<string, number>();
+  /** Durable create requests whose daemon outcome has not yet been proven. */
+  private uncertainCreations = new Map<string, DockerCreateUncertainty>();
+  private unreadableUncertaintyMarkers = new Set<string>();
   private readonly projectFingerprint: string;
+  private readonly uncertaintyDir: string;
 
   constructor(
     private readonly projectRoot: string,
     private readonly config: DockerIsolationConfig,
+    stateRoot?: string,
   ) {
     const resolvedRoot = path.resolve(projectRoot).replace(/\\/g, "/");
     this.projectFingerprint = createHash("sha256")
       .update(process.platform === "win32" ? resolvedRoot.toLowerCase() : resolvedRoot)
       .digest("hex");
+    this.uncertaintyDir =
+      stateRoot ?? path.join(projectRoot, ".quack", "logs", "docker-create-uncertainty");
+    this.refreshCreateUncertainty();
+  }
+
+  private uncertaintyPath(containerName: string): string {
+    return path.join(this.uncertaintyDir, `${containerName.replace(/[^A-Za-z0-9._-]/g, "_")}.json`);
+  }
+
+  private parseCreateUncertainty(markerPath: string): DockerCreateUncertainty | undefined {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(markerPath, "utf-8")) as unknown;
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        (parsed as { version?: unknown }).version !== 1 ||
+        typeof (parsed as { containerName?: unknown }).containerName !== "string" ||
+        typeof (parsed as { taskId?: unknown }).taskId !== "string" ||
+        (parsed as { projectFingerprint?: unknown }).projectFingerprint !==
+          this.projectFingerprint ||
+        typeof (parsed as { createdAt?: unknown }).createdAt !== "string" ||
+        typeof (parsed as { confirmAfter?: unknown }).confirmAfter !== "string" ||
+        !Number.isFinite(Date.parse((parsed as { confirmAfter: string }).confirmAfter)) ||
+        typeof (parsed as { confirmationToken?: unknown }).confirmationToken !== "string" ||
+        !(parsed as { confirmationToken: string }).confirmationToken
+      ) {
+        return undefined;
+      }
+      return parsed as DockerCreateUncertainty;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private refreshCreateUncertainty(): void {
+    const records = new Map<string, DockerCreateUncertainty>();
+    const unreadable = new Set<string>();
+    if (fs.existsSync(this.uncertaintyDir)) {
+      try {
+        for (const entry of fs.readdirSync(this.uncertaintyDir, { withFileTypes: true })) {
+          if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+          const markerPath = path.join(this.uncertaintyDir, entry.name);
+          const marker = this.parseCreateUncertainty(markerPath);
+          if (!marker || this.uncertaintyPath(marker.containerName) !== markerPath) {
+            unreadable.add(entry.name);
+            continue;
+          }
+          records.set(marker.containerName, marker);
+        }
+      } catch {
+        unreadable.add("unreadable-uncertainty-directory");
+      }
+    }
+    this.uncertainCreations = records;
+    this.unreadableUncertaintyMarkers = unreadable;
+  }
+
+  private persistCreateUncertainty(containerName: string, taskId: string): DockerCreateUncertainty {
+    const marker: DockerCreateUncertainty = {
+      version: 1,
+      containerName,
+      taskId,
+      projectFingerprint: this.projectFingerprint,
+      createdAt: new Date().toISOString(),
+      confirmAfter: new Date(Date.now() + UNCERTAIN_CREATE_CONFIRMATION_DELAY_MS).toISOString(),
+      confirmationToken: randomUUID(),
+    };
+    const markerPath = this.uncertaintyPath(containerName);
+    fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+    fs.writeFileSync(markerPath, `${JSON.stringify(marker, null, 2)}\n`, {
+      encoding: "utf-8",
+      flag: "wx",
+    });
+    this.uncertainCreations.set(containerName, marker);
+    return marker;
+  }
+
+  private clearCreateUncertainty(marker: DockerCreateUncertainty): boolean {
+    const markerPath = this.uncertaintyPath(marker.containerName);
+    const current = this.parseCreateUncertainty(markerPath);
+    if (!current || current.confirmationToken !== marker.confirmationToken) return false;
+    try {
+      fs.rmSync(markerPath);
+      this.uncertainCreations.delete(marker.containerName);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async reconcileCreateUncertainty(): Promise<{
+    failedTaskIds: string[];
+    ambiguousContainerIds: string[];
+  }> {
+    this.refreshCreateUncertainty();
+    const failedTaskIds: string[] = [];
+    const ambiguousContainerIds = Array.from(
+      this.unreadableUncertaintyMarkers,
+      (name) => `uncertainty:${name}`,
+    );
+    for (const marker of this.uncertainCreations.values()) {
+      const delayMs = Math.max(0, Date.parse(marker.confirmAfter) - Date.now());
+      if (delayMs > 0) {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, delayMs);
+        });
+      }
+      const removed = await this.forceRemoveContainer(marker.containerName);
+      if (!removed) failedTaskIds.push(marker.taskId);
+    }
+    return { failedTaskIds, ambiguousContainerIds };
   }
 
   private hostPathMatchesProjectRoot(source: string): boolean {
@@ -81,6 +206,15 @@ export class DockerManager {
    * ownership; ambiguous records fail closed and are never removed.
    */
   async reconcileExistingContainers(): Promise<DockerReconciliationResult> {
+    const uncertainty = await this.reconcileCreateUncertainty();
+    if (uncertainty.failedTaskIds.length > 0 || uncertainty.ambiguousContainerIds.length > 0) {
+      return {
+        discoveredTaskIds: [],
+        removedTaskIds: [],
+        failedTaskIds: uncertainty.failedTaskIds,
+        ambiguousContainerIds: uncertainty.ambiguousContainerIds,
+      };
+    }
     const { stdout } = await this.runDocker([
       "ps",
       "-a",
@@ -229,12 +363,28 @@ export class DockerManager {
       status: "creating",
     };
     this.containers.set(taskId, info);
+    let uncertainty: DockerCreateUncertainty;
+    try {
+      // Persist intent before Docker can accept the create. If the monitor is
+      // lost before stdout arrives, the next monitor owns a bounded name-based
+      // reconciliation rather than trusting a one-shot label scan.
+      uncertainty = this.persistCreateUncertainty(containerName, taskId);
+    } catch (error: unknown) {
+      this.containers.delete(taskId);
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Cannot create container for ${taskId}: durable create ownership could not be recorded (${detail})`,
+      );
+    }
 
     try {
       const createArgs = this.buildCreateArgs(taskId, containerName);
       const { stdout } = await this.runDocker(createArgs);
       const containerId = stdout.trim() || containerName;
       info.containerId = containerId;
+      if (!this.clearCreateUncertainty(uncertainty)) {
+        throw new Error(`could not clear durable create ownership for ${containerName}`);
+      }
 
       // Start the container
       await this.runDocker(["start", containerId]);
@@ -251,31 +401,11 @@ export class DockerManager {
       return info;
     } catch (err) {
       info.status = "stopped";
-      const errorCode =
-        typeof err === "object" && err !== null && "code" in err
-          ? String((err as { code?: unknown }).code)
-          : "";
-      const errorName = err instanceof Error ? err.name : "";
-      const commandKilled =
-        typeof err === "object" && err !== null && "killed" in err
-          ? (err as { killed?: unknown }).killed === true
-          : false;
-      if (
-        info.containerId === containerName &&
-        (errorName === "AbortError" ||
-          errorCode === "ABORT_ERR" ||
-          errorCode === "ETIMEDOUT" ||
-          commandKilled)
-      ) {
-        // The Docker CLI can be aborted after the daemon accepted `create` but
-        // before stdout returned its ID. An immediate "no such container"
-        // probe is not proof of absence while that request may still land.
-        this.uncertainCreations.set(
-          info.containerId,
-          Date.now() + UNCERTAIN_CREATE_CONFIRMATION_DELAY_MS,
-        );
-      }
-      await this.forceRemoveContainer(info.containerId);
+      // When `docker create` did not return, the durable marker remains. An
+      // immediate "no such container" probe is not proof of absence while the
+      // daemon request may still land; restart reconciliation waits first.
+      const removed = await this.forceRemoveContainer(info.containerId);
+      if (removed) this.clearCreateUncertainty(uncertainty);
       const msg = err instanceof Error ? err.message : String(err);
       throw new Error(`Failed to create container for ${taskId}: ${msg}`);
     }
@@ -390,8 +520,12 @@ export class DockerManager {
       }
     }
 
-    const uncertainUntil = this.uncertainCreations.get(containerId);
-    if (!removalCommandSucceeded && uncertainUntil !== undefined && Date.now() < uncertainUntil) {
+    const uncertainty = this.uncertainCreations.get(containerId);
+    if (
+      !removalCommandSucceeded &&
+      uncertainty !== undefined &&
+      Date.now() < Date.parse(uncertainty.confirmAfter)
+    ) {
       return false;
     }
 
@@ -400,10 +534,10 @@ export class DockerManager {
       if (info.containerId === containerId) {
         info.status = "removed";
         this.containers.delete(taskId);
-        this.uncertainCreations.delete(containerId);
         break;
       }
     }
+    if (uncertainty) this.clearCreateUncertainty(uncertainty);
     return true;
   }
 

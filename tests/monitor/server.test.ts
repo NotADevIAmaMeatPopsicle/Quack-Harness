@@ -1619,6 +1619,35 @@ describe("Monitor Server", () => {
       });
     }
 
+    it("reconciles Docker ownership for every project before startup completes", async () => {
+      const dockerCheck = jest
+        .spyOn(DispatchManager.prototype, "checkDockerAvailability")
+        .mockResolvedValue("test-version");
+      const adapters = makeAdapters();
+      for (const adapter of adapters) {
+        adapter.config.isolation = {
+          method: "docker",
+          docker: {
+            image: "node:20-slim",
+            volumes: [],
+            envPassthrough: [],
+            resourceLimits: { memoryMb: 1024, cpus: 1 },
+            networkMode: "none",
+            cleanupPolicy: "remove",
+          },
+        };
+      }
+      const port = await freePort();
+      try {
+        const serverObj = createMonitorServer({ port, projectAdapters: adapters });
+        const { stop } = await serverObj.start();
+        stopServer = stop;
+        expect(dockerCheck).toHaveBeenCalledTimes(2);
+      } finally {
+        dockerCheck.mockRestore();
+      }
+    });
+
     it("GET /api/projects returns all registered projects", async () => {
       const port = await freePort();
       const adapters = makeAdapters();

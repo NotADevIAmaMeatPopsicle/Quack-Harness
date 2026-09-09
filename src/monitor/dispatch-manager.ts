@@ -109,6 +109,18 @@ export interface SharedCheckoutShutdownSurvivor {
   reconciliationToken?: string;
 }
 
+export interface WorktreeShutdownSurvivor {
+  version: 1;
+  taskId: string;
+  sessionId: string;
+  worktreePath: string;
+  processId: number;
+  strategy: "posix-process-group" | "windows-process-tree";
+  recordedAt: string;
+  /** Opaque identity required before durable Windows evidence can be cleared. */
+  reconciliationToken?: string;
+}
+
 export interface DispatchShutdownOptions {
   /** Time allowed for a POSIX process group to exit after SIGTERM. */
   gracefulTimeoutMs?: number;
@@ -145,16 +157,6 @@ interface DurableSharedCheckoutPause {
 interface SharedCheckoutBaseline {
   originalBranch?: string;
   originalStatus?: string;
-}
-
-interface DurableWorktreeSurvivor {
-  version: 1;
-  taskId: string;
-  sessionId: string;
-  worktreePath: string;
-  processId: number;
-  strategy: "posix-process-group" | "windows-process-tree";
-  recordedAt: string;
 }
 
 const SHARED_CHECKOUT_PAUSE_VERSION = 1;
@@ -373,6 +375,8 @@ export class DispatchManager {
   >();
   /** Windows taskkill /T completions are the tree-level exit evidence. */
   private confirmedWindowsTreeKills = new Set<string>();
+  /** Unreadable survivor records are a global recovery barrier. */
+  private unreadableWorktreeSurvivorMarkers = new Set<string>();
   /** Never retry a Windows numeric PID after one tree-kill attempt. */
   private attemptedWindowsTreeKills = new WeakSet<ChildProcess>();
   /** Docker creation is asynchronous and must participate in shutdown. */
@@ -393,11 +397,15 @@ export class DispatchManager {
     logDir?: string,
     private readonly claimantResolver?: (taskId: string) => Promise<DuplicateClaimantCheck>,
   ) {
+    this.logDir = logDir ?? path.join(projectRoot, ".quack", "logs");
     if (isolationConfig?.method === "docker" && isolationConfig.docker) {
-      this.dockerManager = new DockerManager(projectRoot, isolationConfig.docker);
+      this.dockerManager = new DockerManager(
+        projectRoot,
+        isolationConfig.docker,
+        path.join(this.logDir, "docker-create-uncertainty"),
+      );
     }
     this.keyManager = keyManager;
-    this.logDir = logDir ?? path.join(projectRoot, ".quack", "logs");
   }
 
   private sharedCheckoutPausePath(): string {
@@ -456,9 +464,107 @@ export class DispatchManager {
     return path.join(this.logDir, "worktree-survivors", `${safeTaskId}.json`);
   }
 
+  private parseWorktreeSurvivor(markerPath: string): WorktreeShutdownSurvivor | undefined {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(markerPath, "utf-8")) as unknown;
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        (parsed as { version?: unknown }).version !== 1 ||
+        typeof (parsed as { taskId?: unknown }).taskId !== "string" ||
+        typeof (parsed as { sessionId?: unknown }).sessionId !== "string" ||
+        typeof (parsed as { worktreePath?: unknown }).worktreePath !== "string" ||
+        !Number.isSafeInteger((parsed as { processId?: unknown }).processId) ||
+        Number((parsed as { processId?: unknown }).processId) <= 0 ||
+        !["posix-process-group", "windows-process-tree"].includes(
+          String((parsed as { strategy?: unknown }).strategy),
+        ) ||
+        typeof (parsed as { recordedAt?: unknown }).recordedAt !== "string" ||
+        ((parsed as { reconciliationToken?: unknown }).reconciliationToken !== undefined &&
+          (typeof (parsed as { reconciliationToken?: unknown }).reconciliationToken !== "string" ||
+            !(parsed as { reconciliationToken: string }).reconciliationToken))
+      ) {
+        return undefined;
+      }
+      return parsed as WorktreeShutdownSurvivor;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Add a token to pre-token Windows markers without ever clearing them. */
+  private migrateLegacyWorktreeSurvivor(
+    markerPath: string,
+    marker: WorktreeShutdownSurvivor,
+  ): WorktreeShutdownSurvivor | undefined {
+    if (marker.strategy !== "windows-process-tree" || marker.reconciliationToken) return marker;
+    const lockPath = `${markerPath}.lock`;
+    try {
+      fs.writeFileSync(
+        lockPath,
+        `${JSON.stringify({ version: 1, pid: process.pid, acquiredAt: new Date().toISOString() })}\n`,
+        { encoding: "utf-8", flag: "wx" },
+      );
+    } catch {
+      return undefined;
+    }
+    try {
+      const current = this.parseWorktreeSurvivor(markerPath);
+      if (!current) return undefined;
+      if (current.reconciliationToken) return current;
+      const migrated: WorktreeShutdownSurvivor = {
+        ...current,
+        reconciliationToken: randomUUID(),
+      };
+      fs.writeFileSync(markerPath, `${JSON.stringify(migrated, null, 2)}\n`, "utf-8");
+      return migrated;
+    } catch {
+      return undefined;
+    } finally {
+      try {
+        fs.rmSync(lockPath);
+      } catch {
+        // A retained lock is deliberately admission-blocking.
+      }
+    }
+  }
+
+  private readWorktreeShutdownSurvivors(): WorktreeShutdownSurvivor[] {
+    const directory = path.join(this.logDir, "worktree-survivors");
+    const survivors: WorktreeShutdownSurvivor[] = [];
+    const unreadable = new Set<string>();
+    if (fs.existsSync(directory)) {
+      try {
+        for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+          if (entry.isFile() && entry.name.endsWith(".json.lock")) {
+            unreadable.add(entry.name);
+            continue;
+          }
+          if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+          const markerPath = path.join(directory, entry.name);
+          const parsed = this.parseWorktreeSurvivor(markerPath);
+          if (!parsed || this.worktreeSurvivorPath(parsed.taskId) !== markerPath) {
+            unreadable.add(entry.name);
+            continue;
+          }
+          const marker = this.migrateLegacyWorktreeSurvivor(markerPath, parsed);
+          if (!marker) {
+            unreadable.add(entry.name);
+            continue;
+          }
+          survivors.push(marker);
+        }
+      } catch {
+        unreadable.add("unreadable-survivor-directory");
+      }
+    }
+    this.unreadableWorktreeSurvivorMarkers = unreadable;
+    return survivors;
+  }
+
   private persistWorktreeSurvivor(job: DispatchJob, processId: number): void {
     if (!job.worktreePath || job.containerId) return;
-    const marker: DurableWorktreeSurvivor = {
+    const marker: WorktreeShutdownSurvivor = {
       version: 1,
       taskId: job.taskId,
       sessionId: job.sessionId,
@@ -466,6 +572,7 @@ export class DispatchManager {
       processId,
       strategy: process.platform === "win32" ? "windows-process-tree" : "posix-process-group",
       recordedAt: new Date().toISOString(),
+      ...(process.platform === "win32" ? { reconciliationToken: randomUUID() } : {}),
     };
     const markerPath = this.worktreeSurvivorPath(job.taskId);
     fs.mkdirSync(path.dirname(markerPath), { recursive: true });
@@ -474,29 +581,21 @@ export class DispatchManager {
 
   private clearWorktreeSurvivor(job: DispatchJob): void {
     if (!job.worktreePath) return;
-    fs.rmSync(this.worktreeSurvivorPath(job.taskId), { force: true });
+    const markerPath = this.worktreeSurvivorPath(job.taskId);
+    const marker = this.parseWorktreeSurvivor(markerPath);
+    if (marker?.sessionId === job.sessionId && marker.worktreePath === job.worktreePath) {
+      fs.rmSync(markerPath, { force: true });
+    }
   }
 
   private assertWorktreeHasNoLiveSurvivor(taskId: string, worktreePath: string): void {
     const markerPath = this.worktreeSurvivorPath(taskId);
     if (!fs.existsSync(markerPath)) return;
-    let marker: DurableWorktreeSurvivor;
-    try {
-      marker = JSON.parse(fs.readFileSync(markerPath, "utf-8")) as DurableWorktreeSurvivor;
-      if (
-        marker.version !== 1 ||
-        marker.taskId !== taskId ||
-        marker.worktreePath !== worktreePath ||
-        !Number.isSafeInteger(marker.processId) ||
-        marker.processId <= 0 ||
-        !["posix-process-group", "windows-process-tree"].includes(marker.strategy)
-      ) {
-        throw new Error("invalid survivor marker");
-      }
-    } catch (error: unknown) {
-      const detail = error instanceof Error ? error.message : String(error);
+    const parsed = this.parseWorktreeSurvivor(markerPath);
+    const marker = parsed ? this.migrateLegacyWorktreeSurvivor(markerPath, parsed) : undefined;
+    if (!marker || marker.taskId !== taskId || marker.worktreePath !== worktreePath) {
       throw new Error(
-        `Cannot replace ${worktreePath}: shutdown survivor evidence is unreadable (${detail}).`,
+        `Cannot replace ${worktreePath}: shutdown survivor evidence is unreadable or locked.`,
       );
     }
 
@@ -716,6 +815,45 @@ export class DispatchManager {
     }
   }
 
+  /** Migrate legacy or crash-stuck ownership evidence to a tokened recovery form. */
+  private ensureSharedCheckoutRecoveryMetadata(): DurableSharedCheckoutPause | undefined {
+    const marker = this.readSharedCheckoutPause();
+    const needsRecoveryMetadata =
+      marker !== undefined &&
+      (marker.processTreeStatus === "unconfirmed" ||
+        (marker.processTreeStatus === undefined &&
+          (process.platform === "win32" || marker.status === "running")));
+    if (
+      !marker ||
+      !needsRecoveryMetadata ||
+      (marker.processTreeStatus === "unconfirmed" && marker.reconciliationToken)
+    ) {
+      return marker;
+    }
+    try {
+      return this.withSharedCheckoutMutationLock(() => {
+        const current = this.readSharedCheckoutPause(true);
+        if (!current) return undefined;
+        if (current.processTreeStatus === "unconfirmed" && current.reconciliationToken) {
+          return current;
+        }
+        const migrated: DurableSharedCheckoutPause = {
+          ...current,
+          processTreeStatus: "unconfirmed",
+          reconciliationToken: randomUUID(),
+        };
+        fs.writeFileSync(
+          this.sharedCheckoutPausePath(),
+          `${JSON.stringify(migrated, null, 2)}\n`,
+          "utf-8",
+        );
+        return migrated;
+      });
+    } catch {
+      return undefined;
+    }
+  }
+
   private persistSharedCheckoutPause(
     job: DispatchJob,
     status: "running" | "awaiting_approval" | "stopped" | "failed" = "awaiting_approval",
@@ -845,14 +983,48 @@ export class DispatchManager {
     }
   }
 
+  /**
+   * Restore the checkout and release its durable owner as one serialized
+   * mutation. Holding the ownership lock across the synchronous Git restore
+   * prevents another monitor from transferring the same-task marker and
+   * spawning into projectRoot before the old owner finishes restoration.
+   */
+  private restoreAndReleaseSharedCheckout(job: DispatchJob): boolean {
+    try {
+      return this.withSharedCheckoutMutationLock(() => {
+        const marker = this.readSharedCheckoutPause(true);
+        if (!marker || marker.taskId !== job.taskId || marker.sessionId !== job.sessionId) {
+          job.output.push(
+            "[dispatch] Shared-checkout ownership changed before restore; ownership remains blocked.",
+          );
+          return false;
+        }
+        if (!this.restoreSharedCheckout(job)) return false;
+        fs.rmSync(this.sharedCheckoutPausePath());
+        return true;
+      });
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : String(error);
+      job.output.push(
+        `[dispatch] Shared-checkout restore/release could not be serialized (${detail}); ownership remains blocked.`,
+      );
+      return false;
+    }
+  }
+
   private durableSharedOwnerMayBeLive(marker: DurableSharedCheckoutPause): boolean {
+    // A still-running marker may belong to an old monitor whose exit callback
+    // is restoring the checkout. Root/group absence (or a tree confirmation)
+    // cannot authorize an automatic cross-process handoff before that
+    // serialized restore releases ownership.
+    if (marker.status === "running") return true;
     if (marker.processTreeStatus === "unconfirmed") return true;
     if (marker.processTreeStatus === "confirmed-stopped") return false;
     // Legacy Windows markers never carried tree-level evidence. Root-PID
     // absence is insufficient because taskkill /T is the only proof available
     // here that descendants cannot still mutate the shared checkout.
     if (process.platform === "win32") return true;
-    if (!marker.processId) return marker.status === "running";
+    if (!marker.processId) return false;
     return this.processGroupExists(marker.processId);
   }
 
@@ -1258,22 +1430,26 @@ export class DispatchManager {
     if (!this.dockerManager) return Promise.resolve();
     if (!this.dockerReconciliationPromise) {
       const dockerManager = this.dockerManager;
-      this.dockerReconciliationPromise = dockerManager
-        .reconcileExistingContainers()
-        .then((result) => {
-          if (result.ambiguousContainerIds.length > 0) {
-            throw new Error(
-              "Docker ownership reconciliation found ambiguous Quack containers: " +
-                result.ambiguousContainerIds.join(", "),
-            );
-          }
-          if (result.failedTaskIds.length > 0) {
-            throw new Error(
-              "Docker ownership reconciliation could not remove prior containers for: " +
-                result.failedTaskIds.join(", "),
-            );
-          }
-        });
+      const reconciliation = dockerManager.reconcileExistingContainers().then((result) => {
+        if (result.ambiguousContainerIds.length > 0) {
+          throw new Error(
+            "Docker ownership reconciliation found ambiguous Quack containers: " +
+              result.ambiguousContainerIds.join(", "),
+          );
+        }
+        if (result.failedTaskIds.length > 0) {
+          throw new Error(
+            "Docker ownership reconciliation could not remove prior containers for: " +
+              result.failedTaskIds.join(", "),
+          );
+        }
+      });
+      const sharedReconciliation = reconciliation.finally(() => {
+        if (this.dockerReconciliationPromise === sharedReconciliation) {
+          this.dockerReconciliationPromise = null;
+        }
+      });
+      this.dockerReconciliationPromise = sharedReconciliation;
     }
     return this.dockerReconciliationPromise;
   }
@@ -1907,8 +2083,6 @@ export class DispatchManager {
     if (this.shutdownInProgress) {
       throw new Error(`Cannot start ${taskId}: dispatch manager shutdown is in progress.`);
     }
-    this.confirmedWindowsTreeKills.delete(taskId);
-
     // Prevent double-dispatch
     const existing = this.getActiveJob(taskId);
     let deleteAwaitingApproval = false;
@@ -1990,11 +2164,10 @@ export class DispatchManager {
       priorJob !== undefined &&
       priorJob.worktreePath === undefined &&
       priorJob.status !== "completed";
-    if (
-      process.platform === "win32" &&
-      inMemorySharedRecovery &&
-      !this.confirmedWindowsTreeKills.has(taskId)
-    ) {
+    const windowsSharedTreeConfirmed =
+      this.confirmedWindowsTreeKills.has(taskId) ||
+      durableSharedPause?.processTreeStatus === "confirmed-stopped";
+    if (process.platform === "win32" && inMemorySharedRecovery && !windowsSharedTreeConfirmed) {
       throw new DegradedSharedCheckoutBusyError(taskId, [
         { taskId, status: priorJob?.status ?? "stopped" },
       ]);
@@ -2229,6 +2402,9 @@ export class DispatchManager {
     // ownership before spawning so a new monitor cannot mistake a potentially
     // dirty in-flight checkout for a free fallback directory.
     if (!worktreePath) {
+      // A confirmation belongs to the old tree only. Clear it immediately
+      // before atomically transferring/persisting ownership for the new child.
+      if (process.platform === "win32") this.confirmedWindowsTreeKills.delete(taskId);
       this.persistSharedCheckoutPause(job, "running", recoverSharedCheckout);
     }
 
@@ -2514,9 +2690,7 @@ export class DispatchManager {
               "[dispatch] Shared-checkout root exited, but descendant termination is unconfirmed on Windows; ownership remains blocked pending reconciliation.",
             );
             this.preserveInterruptedSharedCheckout(job, "stopped");
-          } else if (this.restoreSharedCheckout(job)) {
-            this.clearSharedCheckoutPause(job);
-          } else {
+          } else if (!this.restoreAndReleaseSharedCheckout(job)) {
             job.status = "failed";
             this.preserveInterruptedSharedCheckout(job, "failed");
           }
@@ -3070,12 +3244,13 @@ export class DispatchManager {
     return occupants;
   }
 
-  /** Return durable Windows tree evidence needed for explicit operator recovery. */
+  /** Return durable shared-checkout tree evidence needed for explicit recovery. */
   getSharedCheckoutShutdownSurvivor(): SharedCheckoutShutdownSurvivor | undefined {
-    const marker = this.readSharedCheckoutPause();
+    const marker = this.ensureSharedCheckoutRecoveryMetadata();
     if (
       !marker ||
       (marker.processTreeStatus !== "unconfirmed" &&
+        !(marker.status === "running" && marker.processTreeStatus === undefined) &&
         !(process.platform === "win32" && marker.processTreeStatus === undefined))
     ) {
       return undefined;
@@ -3117,6 +3292,7 @@ export class DispatchManager {
         const reconciled: DurableSharedCheckoutPause = {
           ...marker,
           pausedAt: new Date().toISOString(),
+          status: marker.status === "running" ? "stopped" : marker.status,
           processTreeStatus: "confirmed-stopped",
         };
         fs.writeFileSync(
@@ -3124,10 +3300,80 @@ export class DispatchManager {
           `${JSON.stringify(reconciled, null, 2)}\n`,
           "utf-8",
         );
+        if (process.platform === "win32") this.confirmedWindowsTreeKills.add(taskId);
         return true;
       });
     } catch {
       return false;
+    }
+  }
+
+  /** List durable worktree process-tree evidence without deleting any worktree. */
+  getWorktreeShutdownSurvivors(): WorktreeShutdownSurvivor[] {
+    const survivors = this.readWorktreeShutdownSurvivors();
+    const unresolved: WorktreeShutdownSurvivor[] = [];
+    for (const marker of survivors) {
+      if (
+        marker.strategy === "posix-process-group" &&
+        process.platform !== "win32" &&
+        !this.processGroupExists(marker.processId)
+      ) {
+        try {
+          fs.rmSync(this.worktreeSurvivorPath(marker.taskId));
+        } catch {
+          unresolved.push(marker);
+        }
+      } else {
+        unresolved.push(marker);
+      }
+    }
+    return unresolved.map((marker) => ({ ...marker }));
+  }
+
+  /**
+   * Clear a Windows worktree survivor only after exact tokened attestation.
+   * This deliberately leaves the worktree and its recoverable changes intact.
+   */
+  reconcileWorktreeShutdownSurvivor(
+    taskId: string,
+    sessionId: string,
+    reconciliationToken: string,
+    processTreeConfirmedStopped: boolean,
+  ): boolean {
+    if (!processTreeConfirmedStopped || this.processes.has(taskId)) return false;
+    const markerPath = this.worktreeSurvivorPath(taskId);
+    const lockPath = `${markerPath}.lock`;
+    try {
+      fs.writeFileSync(
+        lockPath,
+        `${JSON.stringify({ version: 1, pid: process.pid, acquiredAt: new Date().toISOString() })}\n`,
+        { encoding: "utf-8", flag: "wx" },
+      );
+    } catch {
+      return false;
+    }
+    try {
+      const marker = this.parseWorktreeSurvivor(markerPath);
+      if (
+        !marker ||
+        marker.strategy !== "windows-process-tree" ||
+        marker.taskId !== taskId ||
+        marker.sessionId !== sessionId ||
+        !marker.reconciliationToken ||
+        marker.reconciliationToken !== reconciliationToken
+      ) {
+        return false;
+      }
+      fs.rmSync(markerPath);
+      return !fs.existsSync(markerPath);
+    } catch {
+      return false;
+    } finally {
+      try {
+        fs.rmSync(lockPath);
+      } catch {
+        // A retained lock continues to fail closed.
+      }
     }
   }
 
@@ -3666,11 +3912,20 @@ export class DispatchManager {
       ({ processGroupId }) => processGroupId && this.processGroupExists(processGroupId),
     );
     const hasActiveContainer = (this.dockerManager?.getTrackedContainers().length ?? 0) > 0;
+    const sharedCheckoutOwner =
+      this.isolationConfig?.method === "docker" ? undefined : this.readSharedCheckoutPause();
+    const hasUnconfirmedSharedCheckoutTree =
+      sharedCheckoutOwner !== undefined && this.durableSharedOwnerMayBeLive(sharedCheckoutOwner);
+    const hasWorktreeSurvivor =
+      this.getWorktreeShutdownSurvivors().length > 0 ||
+      this.unreadableWorktreeSurvivorMarkers.size > 0;
     if (
       this.processes.size > 0 ||
       this.pendingDockerStarts.size > 0 ||
       hasLiveGroup ||
-      hasActiveContainer
+      hasActiveContainer ||
+      hasUnconfirmedSharedCheckoutTree ||
+      hasWorktreeSurvivor
     ) {
       return false;
     }

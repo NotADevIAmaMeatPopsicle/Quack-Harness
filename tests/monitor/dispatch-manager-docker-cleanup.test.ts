@@ -221,6 +221,46 @@ describe("DispatchManager docker cleanup integration", () => {
     );
   });
 
+  test("re-runs ownership reconciliation after a successful scan", async () => {
+    const dockerManager = {
+      reconcileExistingContainers: jest
+        .fn()
+        .mockResolvedValueOnce({
+          discoveredTaskIds: [],
+          ambiguousContainerIds: [],
+          removedTaskIds: [],
+          failedTaskIds: [],
+        })
+        .mockResolvedValueOnce({
+          discoveredTaskIds: ["TASK-LATE"],
+          ambiguousContainerIds: [],
+          removedTaskIds: [],
+          failedTaskIds: ["TASK-LATE"],
+        }),
+    };
+    const mgr = new DispatchManager("/fake/project", "/fake/bin.js", {
+      method: "docker",
+      docker: {
+        image: "node:20-slim",
+        volumes: [],
+        envPassthrough: [],
+        resourceLimits: { memoryMb: 2048, cpus: 1 },
+        networkMode: "bridge",
+        cleanupPolicy: "remove",
+      },
+    });
+    (mgr as unknown as { dockerManager: typeof dockerManager }).dockerManager = dockerManager;
+    const reconcile = (
+      mgr as unknown as { ensureDockerOwnershipReconciled(): Promise<void> }
+    ).ensureDockerOwnershipReconciled.bind(mgr);
+
+    await expect(reconcile()).resolves.toBeUndefined();
+    await expect(reconcile()).rejects.toThrow(
+      "Docker ownership reconciliation could not remove prior containers for: TASK-LATE",
+    );
+    expect(dockerManager.reconcileExistingContainers).toHaveBeenCalledTimes(2);
+  });
+
   test("stop cancels pending container creation before an agent can spawn", async () => {
     let resolveContainer!: (value: {
       containerId: string;

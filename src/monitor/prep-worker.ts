@@ -43,12 +43,14 @@ export interface PrepShutdownSurvivor {
   startedAt: string;
   recordedAt: string;
   confirmationToken: string;
+  strategy: "windows-process-tree" | "posix-process-group";
 }
 
 export interface PrepWorkerRuntime {
   platform?: NodeJS.Platform;
   spawnProcess?: typeof spawn;
   execFileSync?: typeof execFileSync;
+  killProcess?: typeof process.kill;
 }
 
 const PREP_SHUTDOWN_SURVIVOR_VERSION = 1;
@@ -58,8 +60,8 @@ export class PrepWorker {
   private processes = new Map<string, ChildProcess>();
   private stopRequestedTasks = new Set<string>();
   private unconfirmedProcessGroups = new Map<string, number>();
-  private unconfirmedWindowsTrees = new Map<string, PrepShutdownSurvivor>();
-  private unreadableWindowsSurvivorMarkers = new Set<string>();
+  private shutdownSurvivors = new Map<string, PrepShutdownSurvivor>();
+  private unreadableSurvivorMarkers = new Set<string>();
   /** A Windows PID may be recycled, so each live ChildProcess handle is signalled at most once. */
   private attemptedWindowsTreeKills = new WeakSet<ChildProcess>();
   private confirmedWindowsTreeKills = new Set<string>();
@@ -71,19 +73,19 @@ export class PrepWorker {
     private readonly quackBin: string,
     private readonly runtime: PrepWorkerRuntime = {},
   ) {
-    this.refreshWindowsShutdownSurvivors();
+    this.refreshShutdownSurvivors();
   }
 
-  private windowsShutdownSurvivorDir(): string {
+  private shutdownSurvivorDir(): string {
     return path.join(this.projectRoot, ".quack", "logs", "prep-shutdown-survivors");
   }
 
-  private windowsShutdownSurvivorPath(taskId: string): string {
+  private shutdownSurvivorPath(taskId: string): string {
     const safeTaskId = Buffer.from(taskId, "utf-8").toString("base64url");
-    return path.join(this.windowsShutdownSurvivorDir(), `${safeTaskId}.json`);
+    return path.join(this.shutdownSurvivorDir(), `${safeTaskId}.json`);
   }
 
-  private parseWindowsShutdownSurvivor(markerPath: string): PrepShutdownSurvivor | undefined {
+  private parseShutdownSurvivor(markerPath: string): PrepShutdownSurvivor | undefined {
     try {
       const parsed = JSON.parse(fs.readFileSync(markerPath, "utf-8")) as unknown;
       if (
@@ -96,22 +98,31 @@ export class PrepWorker {
         typeof (parsed as { startedAt?: unknown }).startedAt !== "string" ||
         typeof (parsed as { recordedAt?: unknown }).recordedAt !== "string" ||
         typeof (parsed as { confirmationToken?: unknown }).confirmationToken !== "string" ||
-        !(parsed as { confirmationToken: string }).confirmationToken
+        !(parsed as { confirmationToken: string }).confirmationToken ||
+        ((parsed as { strategy?: unknown }).strategy !== undefined &&
+          !["windows-process-tree", "posix-process-group"].includes(
+            String((parsed as { strategy?: unknown }).strategy),
+          ))
       ) {
         return undefined;
       }
-      return parsed as PrepShutdownSurvivor;
+      return {
+        ...(parsed as Omit<PrepShutdownSurvivor, "strategy">),
+        strategy:
+          (parsed as { strategy?: PrepShutdownSurvivor["strategy"] }).strategy ??
+          "windows-process-tree",
+      };
     } catch {
       return undefined;
     }
   }
 
   /**
-   * Reload durable Windows survivor evidence. Unreadable records remain a
+   * Reload durable survivor evidence. Unreadable records remain a
    * global admission barrier; guessing their PID or task ownership is unsafe.
    */
-  private refreshWindowsShutdownSurvivors(): void {
-    const directory = this.windowsShutdownSurvivorDir();
+  private refreshShutdownSurvivors(): void {
+    const directory = this.shutdownSurvivorDir();
     const survivors = new Map<string, PrepShutdownSurvivor>();
     const unreadable = new Set<string>();
     if (fs.existsSync(directory)) {
@@ -123,8 +134,8 @@ export class PrepWorker {
           }
           if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
           const markerPath = path.join(directory, entry.name);
-          const marker = this.parseWindowsShutdownSurvivor(markerPath);
-          if (!marker || this.windowsShutdownSurvivorPath(marker.taskId) !== markerPath) {
+          const marker = this.parseShutdownSurvivor(markerPath);
+          if (!marker || this.shutdownSurvivorPath(marker.taskId) !== markerPath) {
             unreadable.add(entry.name);
             continue;
           }
@@ -134,21 +145,26 @@ export class PrepWorker {
         unreadable.add("unreadable-survivor-directory");
       }
     }
-    this.unconfirmedWindowsTrees = survivors;
-    this.unreadableWindowsSurvivorMarkers = unreadable;
+    this.shutdownSurvivors = survivors;
+    this.unreadableSurvivorMarkers = unreadable;
   }
 
-  private recordWindowsShutdownAttempt(taskId: string, child: ChildProcess): PrepShutdownSurvivor {
-    if (!child.pid) throw new Error(`Cannot record Windows process-tree identity for ${taskId}`);
-    this.refreshWindowsShutdownSurvivors();
-    const existing = this.unconfirmedWindowsTrees.get(taskId);
+  private recordShutdownAttempt(
+    taskId: string,
+    child: ChildProcess,
+    strategy: PrepShutdownSurvivor["strategy"],
+  ): PrepShutdownSurvivor {
+    if (!child.pid) throw new Error(`Cannot record process-tree identity for ${taskId}`);
+    this.refreshShutdownSurvivors();
+    const existing = this.shutdownSurvivors.get(taskId);
     if (existing) {
+      if (existing.pid === child.pid && existing.strategy === strategy) return existing;
       throw new Error(
         `Prep process-tree shutdown for ${taskId} is already unconfirmed; refusing to re-signal stored PID ${existing.pid}`,
       );
     }
 
-    const markerPath = this.windowsShutdownSurvivorPath(taskId);
+    const markerPath = this.shutdownSurvivorPath(taskId);
     if (fs.existsSync(`${markerPath}.lock`)) {
       throw new Error(`Prep shutdown reconciliation is locked for ${taskId}`);
     }
@@ -159,6 +175,7 @@ export class PrepWorker {
       startedAt: this.jobs.get(taskId)?.startedAt ?? new Date().toISOString(),
       recordedAt: new Date().toISOString(),
       confirmationToken: randomUUID(),
+      strategy,
     };
     fs.mkdirSync(path.dirname(markerPath), { recursive: true });
     try {
@@ -167,8 +184,8 @@ export class PrepWorker {
         flag: "wx",
       });
     } catch (error: unknown) {
-      this.refreshWindowsShutdownSurvivors();
-      const winner = this.unconfirmedWindowsTrees.get(taskId);
+      this.refreshShutdownSurvivors();
+      const winner = this.shutdownSurvivors.get(taskId);
       if (winner) {
         throw new Error(
           `Prep process-tree shutdown for ${taskId} is already unconfirmed; refusing to re-signal stored PID ${winner.pid}`,
@@ -176,31 +193,43 @@ export class PrepWorker {
       }
       throw error;
     }
-    this.unconfirmedWindowsTrees.set(taskId, marker);
+    this.shutdownSurvivors.set(taskId, marker);
     return marker;
   }
 
-  private clearWindowsShutdownSurvivor(marker: PrepShutdownSurvivor): boolean {
-    const markerPath = this.windowsShutdownSurvivorPath(marker.taskId);
-    const current = this.parseWindowsShutdownSurvivor(markerPath);
+  private clearShutdownSurvivor(marker: PrepShutdownSurvivor): boolean {
+    const markerPath = this.shutdownSurvivorPath(marker.taskId);
+    const current = this.parseShutdownSurvivor(markerPath);
     if (!current || current.confirmationToken !== marker.confirmationToken) return false;
     try {
       fs.rmSync(markerPath);
-      this.unconfirmedWindowsTrees.delete(marker.taskId);
+      this.shutdownSurvivors.delete(marker.taskId);
       return true;
     } catch {
       return false;
     }
   }
 
-  /** Durable records that require an operator to confirm the Windows tree is gone. */
+  private clearExitedOwnedProcessGroups(): void {
+    for (const [taskId, processGroupId] of this.unconfirmedProcessGroups) {
+      if (this.processGroupExists(processGroupId)) continue;
+      this.unconfirmedProcessGroups.delete(taskId);
+      const marker = this.shutdownSurvivors.get(taskId);
+      if (marker?.strategy === "posix-process-group" && marker.pid === processGroupId) {
+        this.clearShutdownSurvivor(marker);
+      }
+    }
+  }
+
+  /** Durable records that require an operator to confirm the process tree is gone. */
   getShutdownSurvivors(): PrepShutdownSurvivor[] {
-    this.refreshWindowsShutdownSurvivors();
-    return Array.from(this.unconfirmedWindowsTrees.values(), (marker) => ({ ...marker }));
+    this.clearExitedOwnedProcessGroups();
+    this.refreshShutdownSurvivors();
+    return Array.from(this.shutdownSurvivors.values(), (marker) => ({ ...marker }));
   }
 
   /**
-   * Reconcile a failed Windows tree kill after an operator independently
+   * Reconcile a failed process-tree kill after an operator independently
    * confirms that the original tree is stopped. The opaque token prevents a
    * stale acknowledgement from clearing a newer survivor record.
    */
@@ -210,11 +239,13 @@ export class PrepWorker {
     processTreeConfirmedStopped: boolean,
   ): boolean {
     if (!processTreeConfirmedStopped || this.processes.has(taskId)) return false;
-    this.refreshWindowsShutdownSurvivors();
-    const marker = this.unconfirmedWindowsTrees.get(taskId);
+    const locallyOwnedGroup = this.unconfirmedProcessGroups.get(taskId);
+    if (locallyOwnedGroup && this.processGroupExists(locallyOwnedGroup)) return false;
+    this.refreshShutdownSurvivors();
+    const marker = this.shutdownSurvivors.get(taskId);
     if (!marker || marker.confirmationToken !== confirmationToken) return false;
 
-    const markerPath = this.windowsShutdownSurvivorPath(taskId);
+    const markerPath = this.shutdownSurvivorPath(taskId);
     const lockPath = `${markerPath}.lock`;
     try {
       fs.writeFileSync(
@@ -226,11 +257,11 @@ export class PrepWorker {
       return false;
     }
     try {
-      const current = this.parseWindowsShutdownSurvivor(markerPath);
+      const current = this.parseShutdownSurvivor(markerPath);
       if (!current || current.confirmationToken !== confirmationToken) return false;
       fs.rmSync(markerPath);
-      this.refreshWindowsShutdownSurvivors();
-      return !this.unconfirmedWindowsTrees.has(taskId);
+      this.refreshShutdownSurvivors();
+      return !this.shutdownSurvivors.has(taskId);
     } catch {
       return false;
     } finally {
@@ -250,10 +281,11 @@ export class PrepWorker {
     if (this.shutdownInProgress) {
       throw new Error("Prep worker is shutting down; resume the fleet before starting new prep");
     }
-    this.refreshWindowsShutdownSurvivors();
-    if (this.unconfirmedWindowsTrees.size > 0 || this.unreadableWindowsSurvivorMarkers.size > 0) {
+    this.clearExitedOwnedProcessGroups();
+    this.refreshShutdownSurvivors();
+    if (this.shutdownSurvivors.size > 0 || this.unreadableSurvivorMarkers.size > 0) {
       throw new Error(
-        "Prep worker has unresolved Windows shutdown survivor evidence; reconcile it before starting new prep",
+        "Prep worker has unresolved Windows shutdown survivor evidence or POSIX process-group evidence; reconcile it before starting new prep",
       );
     }
 
@@ -324,6 +356,17 @@ export class PrepWorker {
       if (this.processes.get(taskId) === child) {
         this.processes.delete(taskId);
       }
+      if ((this.runtime.platform ?? process.platform) !== "win32" && child.pid) {
+        const marker = this.shutdownSurvivors.get(taskId);
+        if (
+          marker?.strategy === "posix-process-group" &&
+          marker.pid === child.pid &&
+          !this.processGroupExists(child.pid)
+        ) {
+          this.clearShutdownSurvivor(marker);
+          this.unconfirmedProcessGroups.delete(taskId);
+        }
+      }
     });
 
     child.on("error", (err) => {
@@ -350,6 +393,9 @@ export class PrepWorker {
     if (!child) return false;
 
     this.stopRequestedTasks.add(taskId);
+    if ((this.runtime.platform ?? process.platform) !== "win32" && child.pid) {
+      this.unconfirmedProcessGroups.set(taskId, child.pid);
+    }
     try {
       this.signalProcessTree(taskId, child, "SIGTERM", 1_000);
     } catch {
@@ -396,7 +442,7 @@ export class PrepWorker {
   private processGroupExists(processGroupId: number): boolean {
     if ((this.runtime.platform ?? process.platform) === "win32") return false;
     try {
-      process.kill(-processGroupId, 0);
+      (this.runtime.killProcess ?? process.kill)(-processGroupId, 0);
       return true;
     } catch (error: unknown) {
       const code =
@@ -419,7 +465,7 @@ export class PrepWorker {
           `Refusing to retry Windows process-tree shutdown for ${taskId}; its numeric PID may have been recycled`,
         );
       }
-      const marker = this.recordWindowsShutdownAttempt(taskId, child);
+      const marker = this.recordShutdownAttempt(taskId, child, "windows-process-tree");
       this.attemptedWindowsTreeKills.add(child);
       (this.runtime.execFileSync ?? execFileSync)(
         "taskkill",
@@ -430,7 +476,7 @@ export class PrepWorker {
           timeout: Math.max(1, windowsTimeoutMs),
         },
       );
-      if (!this.clearWindowsShutdownSurvivor(marker)) {
+      if (!this.clearShutdownSurvivor(marker)) {
         throw new Error(`Could not clear durable Windows shutdown evidence for ${taskId}`);
       }
       this.confirmedWindowsTreeKills.add(taskId);
@@ -438,8 +484,9 @@ export class PrepWorker {
     }
 
     if ((this.runtime.platform ?? process.platform) !== "win32" && child.pid) {
+      this.recordShutdownAttempt(taskId, child, "posix-process-group");
       try {
-        process.kill(-child.pid, signal);
+        (this.runtime.killProcess ?? process.kill)(-child.pid, signal);
         return;
       } catch {
         // Compatibility for a child created before process-group isolation was
@@ -458,20 +505,20 @@ export class PrepWorker {
       taskId,
       processGroupId,
     })).filter(({ taskId }) => !trackedIds.has(taskId));
-    this.refreshWindowsShutdownSurvivors();
-    const pendingWindowsTrees = Array.from(this.unconfirmedWindowsTrees.values()).filter(
+    this.refreshShutdownSurvivors();
+    const pendingDurableSurvivors = Array.from(this.shutdownSurvivors.values()).filter(
       ({ taskId }) => !trackedIds.has(taskId),
     );
-    const unreadableWindowsTrees = Array.from(
-      this.unreadableWindowsSurvivorMarkers,
+    const unreadableSurvivors = Array.from(
+      this.unreadableSurvivorMarkers,
       (name) => `unreadable:${name}`,
     );
     const requested = Array.from(
       new Set([
         ...tracked.map(({ taskId }) => taskId),
         ...pendingGroups.map(({ taskId }) => taskId),
-        ...pendingWindowsTrees.map(({ taskId }) => taskId),
-        ...unreadableWindowsTrees,
+        ...pendingDurableSurvivors.map(({ taskId }) => taskId),
+        ...unreadableSurvivors,
       ]),
     );
     const escalated: string[] = [];
@@ -553,20 +600,31 @@ export class PrepWorker {
       if (!this.processGroupExists(entry.processGroupId)) continue;
       if (!escalated.includes(entry.taskId)) escalated.push(entry.taskId);
       try {
-        process.kill(-entry.processGroupId, "SIGKILL");
+        (this.runtime.killProcess ?? process.kill)(-entry.processGroupId, "SIGKILL");
       } catch {
         // A concurrent exit is distinguished by the evidence check below.
       }
     }
     const remainingGroups = await waitForGroups(pendingGroups, forceTimeoutMs);
 
-    // Durable Windows markers intentionally are not re-signalled. After the
-    // original taskkill attempt failed, only a numeric PID remains and Windows
-    // may already have recycled it for an unrelated process.
-    this.refreshWindowsShutdownSurvivors();
-    const remainingWindowsTrees = Array.from(this.unconfirmedWindowsTrees.values());
-    const remainingUnreadableWindowsTrees = Array.from(
-      this.unreadableWindowsSurvivorMarkers,
+    // Clear only evidence tied to a process handle/group owned by this worker
+    // and now proven absent. Durable records restored after restart are never
+    // re-signalled by numeric PID/group ID because either may have been reused.
+    for (const { taskId, child } of tracked) {
+      if (!child.pid || !trackedHasExited({ taskId, child })) continue;
+      const marker = this.shutdownSurvivors.get(taskId);
+      if (marker) this.clearShutdownSurvivor(marker);
+    }
+    for (const { taskId, processGroupId } of pendingGroups) {
+      if (this.processGroupExists(processGroupId)) continue;
+      const marker = this.shutdownSurvivors.get(taskId);
+      if (marker?.pid === processGroupId) this.clearShutdownSurvivor(marker);
+    }
+
+    this.refreshShutdownSurvivors();
+    const remainingDurableSurvivors = Array.from(this.shutdownSurvivors.values());
+    const remainingUnreadableSurvivors = Array.from(
+      this.unreadableSurvivorMarkers,
       (name) => `unreadable:${name}`,
     );
 
@@ -574,8 +632,8 @@ export class PrepWorker {
       new Set([
         ...remaining.map(({ taskId }) => taskId),
         ...remainingGroups.map(({ taskId }) => taskId),
-        ...remainingWindowsTrees.map(({ taskId }) => taskId),
-        ...remainingUnreadableWindowsTrees,
+        ...remainingDurableSurvivors.map(({ taskId }) => taskId),
+        ...remainingUnreadableSurvivors,
       ]),
     );
     const timedOutSet = new Set(timedOut);
@@ -613,18 +671,14 @@ export class PrepWorker {
   }
 
   canResumeAfterShutdown(): boolean {
-    for (const [taskId, processGroupId] of this.unconfirmedProcessGroups) {
-      if (!this.processGroupExists(processGroupId)) {
-        this.unconfirmedProcessGroups.delete(taskId);
-      }
-    }
-    this.refreshWindowsShutdownSurvivors();
+    this.clearExitedOwnedProcessGroups();
+    this.refreshShutdownSurvivors();
     return (
       this.shutdownPromise === null &&
       this.processes.size === 0 &&
       this.unconfirmedProcessGroups.size === 0 &&
-      this.unconfirmedWindowsTrees.size === 0 &&
-      this.unreadableWindowsSurvivorMarkers.size === 0
+      this.shutdownSurvivors.size === 0 &&
+      this.unreadableSurvivorMarkers.size === 0
     );
   }
 
