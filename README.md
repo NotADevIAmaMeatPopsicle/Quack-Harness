@@ -168,9 +168,13 @@ The monitor serves a React/Vite operator interface backed by an Express API, SQL
 git clone https://github.com/NotADevIAmaMeatPopsicle/Quack-Harness.git
 cd Quack-Harness
 npm ci
-npm --prefix frontend ci
 cp .env.example .env
 ```
+
+The root `npm ci` also installs the locked packages in `frontend/`. This is
+required because the top-level build compiles both the TypeScript service and
+the Vite monitor UI. Use `--ignore-scripts` only when you do not intend to run
+the full build.
 
 Set `ANTHROPIC_API_KEY` in `.env`, then build and inspect the CLI:
 

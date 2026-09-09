@@ -1,9 +1,9 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 import { describe, it, expect, jest, beforeEach } from "@jest/globals";
-import { promisify } from "node:util";
 import type { AdapterConfig } from "../../src/core/types";
 
-// Mock child_process.exec with custom promisify support
+// Mock child_process.exec at its callback contract. Verification owns timeout
+// and process-tree cleanup now, so a promisify-only mock would never settle.
 type MockExecResult = {
   stdout?: string;
   stderr?: string;
@@ -25,31 +25,6 @@ function findResult(command: string): MockExecResult | undefined {
 jest.mock("node:child_process", () => {
   const actual = jest.requireActual<typeof import("node:child_process")>("node:child_process");
 
-  const customPromisified = (
-    command: string,
-    options: Record<string, unknown>,
-  ): Promise<{ stdout: string; stderr: string }> => {
-    void options;
-    const matchedResult = findResult(command);
-    if (!matchedResult) {
-      return Promise.resolve({ stdout: "OK", stderr: "" });
-    }
-    if (matchedResult.error) {
-      const err = Object.assign(new Error("Command failed"), {
-        code: matchedResult.code ?? 1,
-        killed: false,
-        signal: null,
-        stdout: matchedResult.stdout ?? "",
-        stderr: matchedResult.stderr ?? "",
-      });
-      return Promise.reject(err);
-    }
-    return Promise.resolve({
-      stdout: matchedResult.stdout ?? "",
-      stderr: matchedResult.stderr ?? "",
-    });
-  };
-
   const mockExec = jest.fn(
     (
       command: string,
@@ -64,10 +39,8 @@ jest.mock("node:child_process", () => {
             code: matchedResult.code ?? 1,
             killed: false,
             signal: null,
-            stdout: matchedResult.stdout ?? "",
-            stderr: matchedResult.stderr ?? "",
           });
-          callback(err, err.stdout, err.stderr);
+          callback(err, matchedResult.stdout ?? "", matchedResult.stderr ?? "");
           return;
         }
         callback(null, matchedResult?.stdout ?? "OK", matchedResult?.stderr ?? "");
@@ -75,8 +48,6 @@ jest.mock("node:child_process", () => {
       return { pid: undefined };
     },
   );
-  (mockExec as unknown as Record<symbol, unknown>)[promisify.custom] = customPromisified;
-
   return {
     ...actual,
     exec: mockExec,

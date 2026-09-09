@@ -5,6 +5,7 @@ import * as os from "node:os";
 import { parseAllTasks, isTaskEligible } from "../../src/dispatcher/dependency-resolver";
 import type { TaskSummary } from "../../src/dispatcher/dependency-resolver";
 import type { TaskStatus, TaskPriority } from "../../src/core/types";
+import { formatNoEligibleTasksMessage } from "../../src/cli/status";
 
 // ─── Test helpers ──────────────────────────────────────────────────────
 
@@ -271,6 +272,27 @@ describe("status command logic", () => {
       }
 
       expect(eligible).toHaveLength(0);
+    });
+  });
+
+  describe("no eligible task message", () => {
+    test("distinguishes READY tasks from blocked BACKLOG tasks", () => {
+      expect(formatNoEligibleTasksMessage(0, 12)).toBe(
+        "No automatically eligible BACKLOG tasks (12 READY tasks can be started explicitly).",
+      );
+    });
+
+    test("reports the actual number of blocked BACKLOG tasks", () => {
+      expect(formatNoEligibleTasksMessage(2, 0)).toBe(
+        "No eligible tasks (2 BACKLOG tasks are blocked).",
+      );
+      expect(formatNoEligibleTasksMessage(1, 0)).toBe(
+        "No eligible tasks (1 BACKLOG task is blocked).",
+      );
+    });
+
+    test("reports when there are no BACKLOG or READY tasks", () => {
+      expect(formatNoEligibleTasksMessage(0, 0)).toBe("No BACKLOG tasks are available.");
     });
   });
 });

@@ -154,11 +154,13 @@ describe("Templates API", () => {
 
   it("GET /api/templates returns empty registry when none exists", async () => {
     const projectRoot = makeTempDir();
+    fs.mkdirSync(path.join(projectRoot, ".quack"), { recursive: true });
 
     const port = await freePort();
     const serverObj = createMonitorServer({ logDir, port, projectRoot });
     const { stop } = await serverObj.start();
     stopServer = stop;
+    expect(fs.existsSync(path.join(projectRoot, ".quack", "quack.db"))).toBe(true);
 
     const { status, body } = await httpGet(`http://localhost:${port}/api/templates`);
     expect(status).toBe(200);
@@ -399,11 +401,13 @@ describe("Templates API", () => {
 
   it("POST /api/templates/extract returns 400 when taskId missing", async () => {
     const projectRoot = makeTempDir();
+    fs.mkdirSync(path.join(projectRoot, ".quack"), { recursive: true });
 
     const port = await freePort();
     const serverObj = createMonitorServer({ logDir, port, projectRoot });
     const { stop } = await serverObj.start();
     stopServer = stop;
+    expect(fs.existsSync(path.join(projectRoot, ".quack", "quack.db"))).toBe(true);
 
     const { status } = await httpPost(`http://localhost:${port}/api/templates/extract`, {});
     expect(status).toBe(400);

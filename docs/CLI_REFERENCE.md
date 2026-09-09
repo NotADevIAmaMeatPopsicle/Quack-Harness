@@ -22,7 +22,7 @@ Both forms are identical. All examples below use the `quack` shorthand.
 | Command | Arguments | Description |
 |---------|-----------|-------------|
 | `run` | `<taskId>` | Execute a single task through the full pipeline |
-| `wave` | `<waveNumber>` | Show and batch-schedule a wave of tasks |
+| `wave` | `<waveNumber>` | Execute the dependency-ready task frontier |
 | `verify` | `<taskId>` | Run verification checks only (no agent) |
 | `enrich` | `<taskId>` | Run readiness gate and auto-enrichment only |
 | `init` | `<projectPath>` | Bootstrap a `.quack/` adapter for a new project |
@@ -117,33 +117,48 @@ quack run TASK-001 --resume
 
 ## wave
 
-Show and batch-schedule a wave of tasks. Wave numbers are determined by dependency chains: wave 1 tasks have no dependencies, wave 2 depends on wave 1, etc.
+Dispatch the current dependency-ready frontier as a numbered wave. The number is
+an operator-facing run label; readiness is always computed from current task/DB
+status and declared dependencies.
 
 ```
 quack wave <waveNumber> [flags]
 ```
 
-> **Note:** Full parallel execution is not yet implemented. `wave` currently
-> resolves and ranks eligible tasks but does not dispatch them. Use `quack run`
-> for local CLI execution or `POST /v1/federation/queue` for live admin
-> dispatch.
+Every selected task runs through the same `quack run` child path used by the
+monitor. Dispatch normally uses an isolated worktree; if worktree creation
+fails, the shared-checkout fallback is serialized. `--parallel` limits
+concurrent children, and remaining ready tasks wait for a slot. A failed task is
+reported without cancelling its siblings, and the command exits nonzero after
+the whole selected wave settles.
+If degraded isolation leaves the shared checkout paused for human approval,
+later tasks are refused until that pause is resolved or stopped.
+`SIGINT` and `SIGTERM` stop active dispatches, stop the wave watchdog, and wait
+briefly for worker cleanup before returning a signal-specific exit code.
 
 ### Flags
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--project <path>` | string | cwd | Path to project root |
-| `--parallel <count>` | integer | `1` | Number of parallel tasks to show |
+| `--parallel <count>` | integer | `1` | Maximum number of tasks running concurrently |
 
 ### Examples
 
 ```bash
-# Show eligible tasks for wave 1
+# Run the current ready frontier as wave 1
 quack wave 1 --project /path/to/project
 
-# Show up to 3 parallel tasks for wave 2
+# Run the current ready frontier with up to 3 concurrent tasks
 quack wave 2 --parallel 3 --project /path/to/project
 ```
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Every selected task completed successfully (or no task was ready and no parse error occurred) |
+| `1` | At least one task failed, stopped, paused for approval, could not start, disappeared, or a task spec could not be parsed |
 
 ---
 
@@ -312,6 +327,7 @@ quack monitor [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--port <port>` | integer | `3333` | HTTP port to listen on |
+| `--host <host>` | string | `127.0.0.1` | Bind host; IPv6 addresses are bracketed in displayed URLs |
 | `--project <path>` | string | cwd | Path to project root. Repeatable for multi-project mode |
 
 The `--project` flag can be specified multiple times to load multiple projects:

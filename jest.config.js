@@ -20,7 +20,7 @@ module.exports = {
   transform: {
     "^.+\\.ts$": [
       "ts-jest",
-      { tsconfig: "tsconfig.eslint.json", diagnostics: { ignoreDiagnostics: [151002] } },
+      { tsconfig: "tsconfig.eslint.json", diagnostics: { ignoreCodes: [151002] } },
     ],
   },
 };

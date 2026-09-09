@@ -104,30 +104,45 @@ export interface FreshnessMonitorOptions {
   onDrift: (diskCount: number, parsedCount: number) => void;
 }
 
-export function startFreshnessMonitor(opts: FreshnessMonitorOptions): () => void {
+export function startFreshnessMonitor(opts: FreshnessMonitorOptions): () => Promise<void> {
   const intervalMs = opts.intervalMs ?? 60_000;
+  let stopped = false;
+  let scanInFlight: Promise<void> | undefined;
 
-  const timer = setInterval(() => {
-    void (async () => {
-      try {
-        const diskCount = await freshDirectoryCount(opts.taskDir);
-        const parsedCount = opts.getLastParsedCount();
-        if (diskCount !== parsedCount) {
-          console.log(
-            `[task-service] Stale directory detected: ${diskCount} on disk, ${parsedCount} parsed`,
-          );
-          opts.onDrift(diskCount, parsedCount);
-        }
-      } catch (err) {
+  const scan = async (): Promise<void> => {
+    try {
+      const diskCount = await freshDirectoryCount(opts.taskDir);
+      if (stopped) return;
+
+      const parsedCount = opts.getLastParsedCount();
+      if (diskCount !== parsedCount) {
+        console.log(
+          `[task-service] Stale directory detected: ${diskCount} on disk, ${parsedCount} parsed`,
+        );
+        opts.onDrift(diskCount, parsedCount);
+      }
+    } catch (err) {
+      if (!stopped) {
         console.error("[task-freshness] Re-scan error:", err);
       }
-    })();
+    }
+  };
+
+  const timer = setInterval(() => {
+    if (stopped || scanInFlight) return;
+    scanInFlight = scan().finally(() => {
+      scanInFlight = undefined;
+    });
   }, intervalMs);
 
   // Prevent timer from keeping Jest workers / the process alive
   timer.unref();
 
-  return () => clearInterval(timer);
+  return async () => {
+    stopped = true;
+    clearInterval(timer);
+    await scanInFlight;
+  };
 }
 
 // ─── Startup validation ────────────────────────────────────────────

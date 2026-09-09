@@ -93,7 +93,7 @@ describe.each(DUPLICATE_FIXTURE_CASES)(
         (manager as unknown as { startWorktree: typeof startWorktree }).startWorktree =
           startWorktree;
         (manager as unknown as { worktreeDegraded: boolean }).worktreeDegraded = true;
-        jest.spyOn(manager, "getActiveJobs").mockReturnValue([job("TASK-200")]);
+        jest.spyOn(manager, "getSharedCheckoutOccupants").mockReturnValue([job("TASK-200")]);
 
         expect(() =>
           manager.start("TASK-100", undefined, {
@@ -101,7 +101,7 @@ describe.each(DUPLICATE_FIXTURE_CASES)(
             claimants: fixture.claimants,
           }),
         ).toThrow(
-          "Worktree isolation is degraded (creation failed). Cannot dispatch TASK-100 while TASK-200 is running in the shared directory. Wait for active tasks to finish, or restart the monitor to retry worktree creation.",
+          "Worktree isolation is degraded (creation failed). Cannot dispatch TASK-100 while the shared directory is occupied by TASK-200 (running). Wait for running tasks to finish, or restart the monitor to retry worktree creation.",
         );
         expect(startWorktree).not.toHaveBeenCalled();
       } finally {

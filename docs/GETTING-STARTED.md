@@ -14,9 +14,11 @@ Requirements:
 git clone https://github.com/NotADevIAmaMeatPopsicle/Quack-Harness.git
 cd Quack-Harness
 npm ci
-npm --prefix frontend ci
 npm run build
 ```
+
+The root `npm ci` installs the locked frontend dependencies through the
+repository's `postinstall` script.
 
 Confirm the CLI starts:
 

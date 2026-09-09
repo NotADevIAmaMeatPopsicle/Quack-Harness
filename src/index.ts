@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { Command } from "commander";
+import packageJson from "../package.json";
 
 import { runCommand } from "./cli/run.js";
 import { waveCommand } from "./cli/wave.js";
@@ -31,7 +32,7 @@ const program = new Command();
 program
   .name("quack")
   .description("Codebase-agnostic background coding agent system")
-  .version("0.1.0");
+  .version(packageJson.version);
 
 program
   .command("run <taskId>")

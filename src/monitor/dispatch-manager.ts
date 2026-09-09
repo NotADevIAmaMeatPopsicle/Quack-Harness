@@ -91,6 +91,41 @@ export interface DispatchJob {
   provenance?: JobProvenance;
 }
 
+export interface SharedCheckoutOccupant {
+  taskId: string;
+  status: DispatchJob["status"];
+}
+
+/**
+ * Typed admission refusal raised when degraded isolation leaves the shared
+ * checkout occupied. Callers may retry running occupants, but an approval
+ * pause requires operator action and must fail promptly.
+ */
+export class DegradedSharedCheckoutBusyError extends Error {
+  readonly occupants: SharedCheckoutOccupant[];
+  readonly hasApprovalPause: boolean;
+
+  constructor(taskId: string, jobs: readonly DispatchJob[]) {
+    const occupants = jobs.map((job) => ({ taskId: job.taskId, status: job.status }));
+    const occupantSummary = occupants
+      .map((occupant) => `${occupant.taskId} (${occupant.status})`)
+      .join(", ");
+    const hasApprovalPause = occupants.some((occupant) => occupant.status === "awaiting_approval");
+    const recovery = hasApprovalPause
+      ? "Resolve or stop approval-paused tasks before starting another task."
+      : "Wait for running tasks to finish, or restart the monitor to retry worktree creation.";
+
+    super(
+      `Worktree isolation is degraded (creation failed). ` +
+        `Cannot dispatch ${taskId} while the shared directory is occupied by ${occupantSummary}. ` +
+        recovery,
+    );
+    this.name = "DegradedSharedCheckoutBusyError";
+    this.occupants = occupants;
+    this.hasApprovalPause = hasApprovalPause;
+  }
+}
+
 export interface StartOptions {
   skipGate?: boolean;
   skipDepthOnly?: boolean;
@@ -1225,16 +1260,11 @@ export class DispatchManager {
     // Without worktrees, all tasks share the same git directory — parallel
     // dispatches would race on branch checkouts and contaminate each other.
     if (this.worktreeDegraded) {
-      const activeJobs = this.getActiveJobs().filter(
+      const checkoutOccupants = this.getSharedCheckoutOccupants().filter(
         (job) => !(deleteAwaitingApproval && job.taskId === taskId),
       );
-      if (activeJobs.length > 0) {
-        const running = activeJobs.map((j) => j.taskId).join(", ");
-        throw new Error(
-          `Worktree isolation is degraded (creation failed). ` +
-            `Cannot dispatch ${taskId} while ${running} is running in the shared directory. ` +
-            `Wait for active tasks to finish, or restart the monitor to retry worktree creation.`,
-        );
+      if (checkoutOccupants.length > 0) {
+        throw new DegradedSharedCheckoutBusyError(taskId, checkoutOccupants);
       }
     }
 
@@ -1988,6 +2018,19 @@ export class DispatchManager {
   getActiveJobs(): DispatchJob[] {
     this.reconcileRunningJobs();
     return Array.from(this.jobs.values()).filter((j) => j.status === "running");
+  }
+
+  /**
+   * Jobs that still own the shared project checkout while worktree isolation
+   * is degraded. Approval-paused jobs have no live child process, but they
+   * intentionally preserve the shared checkout and must still block admission.
+   */
+  getSharedCheckoutOccupants(): DispatchJob[] {
+    this.reconcileRunningJobs();
+    return Array.from(this.jobs.values()).filter(
+      (job) =>
+        !job.worktreePath && (job.status === "running" || job.status === "awaiting_approval"),
+    );
   }
 
   /**

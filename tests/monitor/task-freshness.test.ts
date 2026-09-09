@@ -120,11 +120,15 @@ describe("task-freshness", () => {
   // ─── startFreshnessMonitor ─────────────────────────────────────
 
   describe("startFreshnessMonitor", () => {
+    let stopMonitors: Array<() => Promise<void>>;
+
     beforeEach(() => {
       jest.useFakeTimers();
+      stopMonitors = [];
     });
 
-    afterEach(() => {
+    afterEach(async () => {
+      await Promise.allSettled(stopMonitors.map((stop) => stop()));
       jest.useRealTimers();
     });
 
@@ -140,13 +144,14 @@ describe("task-freshness", () => {
         getLastParsedCount: () => 1, // Pretend we only know about 1 task
         onDrift,
       });
+      stopMonitors.push(stop);
 
       // Wait for the interval to fire and async callback to resolve
       await new Promise((r) => setTimeout(r, 300));
 
       expect(onDrift).toHaveBeenCalledWith(2, 1);
 
-      stop();
+      await stop();
     });
 
     it("does not call onDrift when counts match", async () => {
@@ -160,12 +165,13 @@ describe("task-freshness", () => {
         getLastParsedCount: () => 1,
         onDrift,
       });
+      stopMonitors.push(stop);
 
       await new Promise((r) => setTimeout(r, 300));
 
       expect(onDrift).not.toHaveBeenCalled();
 
-      stop();
+      await stop();
     });
 
     it("stops when stop function is called", async () => {
@@ -177,11 +183,30 @@ describe("task-freshness", () => {
         getLastParsedCount: () => 0,
         onDrift,
       });
+      stopMonitors.push(stop);
 
-      stop();
+      await stop();
 
       await fs.writeFile(path.join(tmpDir, "TASK-001-test.md"), makeTask("TASK-001"));
       await new Promise((r) => setTimeout(r, 300));
+
+      expect(onDrift).not.toHaveBeenCalled();
+    });
+
+    it("waits for an in-flight scan and suppresses callbacks after stop", async () => {
+      await fs.writeFile(path.join(tmpDir, "TASK-001-test.md"), makeTask("TASK-001"));
+
+      const onDrift = jest.fn();
+      const stop = startFreshnessMonitor({
+        taskDir: tmpDir,
+        intervalMs: 100,
+        getLastParsedCount: () => 0,
+        onDrift,
+      });
+      stopMonitors.push(stop);
+
+      jest.advanceTimersByTime(100);
+      await stop();
 
       expect(onDrift).not.toHaveBeenCalled();
     });

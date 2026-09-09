@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment */
 import { QuackDB } from "../../src/db/quack-db";
+import { migrations } from "../../src/db/migrations";
 import type {
   SessionRow,
   DispatchJobRow,
@@ -13,6 +14,7 @@ import type {
 
 describe("QuackDB", () => {
   let db: QuackDB;
+  const latestMigrationVersion = Math.max(...migrations.map((migration) => migration.version));
 
   beforeEach(() => {
     db = new QuackDB(":memory:");
@@ -51,7 +53,7 @@ describe("QuackDB", () => {
     it("should set user_version to latest migration", () => {
       const raw = db.raw();
       const version = raw.pragma("user_version", { simple: true });
-      expect(version).toBe(6);
+      expect(version).toBe(latestMigrationVersion);
     });
 
     it("should not re-run migrations on second open", () => {
@@ -60,7 +62,7 @@ describe("QuackDB", () => {
       db = new QuackDB(":memory:");
       const raw = db.raw();
       const version = raw.pragma("user_version", { simple: true });
-      expect(version).toBe(6);
+      expect(version).toBe(latestMigrationVersion);
     });
 
     it("should enable WAL mode", () => {

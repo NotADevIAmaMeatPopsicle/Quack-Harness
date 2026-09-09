@@ -2,7 +2,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
-import { DispatchManager, type DispatchJob } from "../../src/monitor/dispatch-manager";
+import {
+  DegradedSharedCheckoutBusyError,
+  DispatchManager,
+  type DispatchJob,
+} from "../../src/monitor/dispatch-manager";
 
 async function waitForFile(filePath: string, timeoutMs = 5000): Promise<void> {
   const startedAt = Date.now();
@@ -810,6 +814,39 @@ describe("DispatchManager", () => {
 
       // getActiveJobs returns only "running" — awaiting_approval has no process
       expect(manager.getActiveJobs()).toEqual([]);
+    });
+
+    test("shared checkout occupants include approval-paused jobs without worktrees", () => {
+      const running = makeJob({ taskId: "TASK-202-A", status: "running", pid: process.pid });
+      const awaiting = makeJob({ taskId: "TASK-202-B", status: "awaiting_approval" });
+      const isolated = makeJob({
+        taskId: "TASK-202-C",
+        status: "awaiting_approval",
+        worktreePath: "/fake/wt",
+      });
+      injectJob(manager, running);
+      injectJob(manager, awaiting);
+      injectJob(manager, isolated);
+
+      expect(manager.getSharedCheckoutOccupants()).toEqual([running, awaiting]);
+    });
+
+    test("degraded admission rejects a different task while shared checkout awaits approval", () => {
+      injectJob(manager, makeJob({ taskId: "TASK-202-D", status: "awaiting_approval" }));
+      (manager as unknown as { worktreeDegraded: boolean }).worktreeDegraded = true;
+
+      let thrown: unknown;
+      try {
+        manager.start("TASK-202-E");
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBeInstanceOf(DegradedSharedCheckoutBusyError);
+      expect((thrown as DegradedSharedCheckoutBusyError).hasApprovalPause).toBe(true);
+      expect((thrown as Error).message).toContain(
+        "shared directory is occupied by TASK-202-D (awaiting_approval)",
+      );
     });
 
     test("start throws for awaiting_approval without resume flag", () => {

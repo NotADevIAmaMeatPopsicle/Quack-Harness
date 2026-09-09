@@ -2,13 +2,16 @@
 
 ## The build cannot find frontend dependencies
 
-The root install does not install the nested Vite project. Install both dependency sets:
+The root `npm ci` installs the nested Vite project through `postinstall`. If the
+frontend packages are missing, rerun the root install without `--ignore-scripts`:
 
 ```bash
 npm ci
-npm --prefix frontend ci
 npm run build
 ```
+
+If you intentionally installed with `--ignore-scripts`, install the frontend
+dependencies explicitly with `npm --prefix frontend ci` before building.
 
 ## The monitor starts but no project appears
 

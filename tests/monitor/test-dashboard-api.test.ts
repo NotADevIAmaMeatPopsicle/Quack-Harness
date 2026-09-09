@@ -13,6 +13,8 @@ jest.mock("node:fs", () => ({
   readdirSync: jest.fn(),
   statSync: jest.fn(() => ({ mtimeMs: Date.now() })),
   unlinkSync: jest.fn(),
+  appendFileSync: jest.fn(),
+  mkdirSync: jest.fn(),
 }));
 
 import * as fs from "node:fs";
@@ -473,18 +475,7 @@ describe("test dashboard API", () => {
 // ─── TestRunner Persistence Tests ─────────────────────────────────
 // Tests for TestRunner JSONL history persistence (writes JSONL and loads on startup).
 
-// Reset fs mock to include appendFileSync and mkdirSync for TestRunner tests
-jest.mock("node:fs", () => ({
-  existsSync: jest.fn(),
-  readFileSync: jest.fn(),
-  readdirSync: jest.fn(),
-  statSync: jest.fn(() => ({ mtimeMs: Date.now() })),
-  unlinkSync: jest.fn(),
-  appendFileSync: jest.fn(),
-  mkdirSync: jest.fn(),
-}));
-
-// Re-import mocks after extending the mock
+// Additional mocks used by TestRunner persistence tests.
 const mockAppendFileSync = (fs as unknown as Record<string, ReturnType<typeof jest.fn>>)
   .appendFileSync;
 const mockMkdirSync = (fs as unknown as Record<string, ReturnType<typeof jest.fn>>).mkdirSync;

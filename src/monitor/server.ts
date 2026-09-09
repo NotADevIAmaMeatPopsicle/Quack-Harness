@@ -9399,7 +9399,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     }, 60 * 1000).unref();
 
     // â”€â”€â”€ Task freshness monitor (Fix 1 + Fix 3) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    const stopFreshnessMonitors: (() => void)[] = [];
+    const stopFreshnessMonitors: Array<() => Promise<void>> = [];
     if (taskService && taskDir) {
       const absTaskDir = path.resolve(projectRoot ?? "", taskDir);
       // Fix 3: startup validation
@@ -10045,7 +10045,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
             process.off("unhandledRejection", onUnhandledRejection);
             process.off("SIGINT", onSigint);
             process.off("SIGTERM", onSigterm);
-            for (const stopFm of stopFreshnessMonitors) stopFm();
+            await Promise.allSettled(stopFreshnessMonitors.map((stopFm) => stopFm()));
             for (const stopRecorder of stopOnMergeRecorders) stopRecorder();
             for (const stopSync of stopVerifiedSyncs) stopSync();
             for (const proj of resolveProjects()) {

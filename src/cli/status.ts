@@ -13,6 +13,20 @@ import {
 import type { TaskSummary } from "../dispatcher/dependency-resolver.js";
 import type { TaskPriority, TaskStatus } from "../core/types.js";
 
+export function formatNoEligibleTasksMessage(backlogCount: number, readyCount: number): string {
+  if (backlogCount > 0) {
+    const noun = backlogCount === 1 ? "task is" : "tasks are";
+    return `No eligible tasks (${backlogCount} BACKLOG ${noun} blocked).`;
+  }
+
+  if (readyCount > 0) {
+    const noun = readyCount === 1 ? "task" : "tasks";
+    return `No automatically eligible BACKLOG tasks (${readyCount} READY ${noun} can be started explicitly).`;
+  }
+
+  return "No BACKLOG tasks are available.";
+}
+
 // ─── Formatting helpers ───────────────────────────────────────────
 
 const PRIORITY_ORDER: TaskPriority[] = ["P0-CRITICAL", "P1-HIGH", "P2-MEDIUM", "P3-LOW"];
@@ -151,7 +165,12 @@ export async function statusCommand(options: { project?: string }): Promise<void
       }
       console.log();
     } else {
-      console.log("No eligible tasks (all BACKLOG tasks are blocked).\n");
+      console.log(
+        `${formatNoEligibleTasksMessage(
+          statusCounts.get("BACKLOG") ?? 0,
+          statusCounts.get("READY") ?? 0,
+        )}\n`,
+      );
     }
 
     // Show errors if any
