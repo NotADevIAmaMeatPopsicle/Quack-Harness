@@ -5,6 +5,7 @@
 // dispatch manager can branch between isolation methods transparently.
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import type { DockerIsolationConfig } from "../core/types.js";
@@ -32,16 +33,135 @@ export interface DockerCleanupResult {
   failedTaskIds: string[];
 }
 
+export interface DockerReconciliationResult extends DockerCleanupResult {
+  discoveredTaskIds: string[];
+  ambiguousContainerIds: string[];
+}
+
+interface DockerInspectRecord {
+  Id?: unknown;
+  Config?: { Image?: unknown; Labels?: Record<string, unknown> | null };
+  Mounts?: Array<{ Source?: unknown; Destination?: unknown }>;
+  State?: { Running?: unknown };
+  Created?: unknown;
+}
+
 export class DockerManager {
   private containers = new Map<string, DockerContainer>();
   private pendingCommands = new Set<AbortController>();
   /** Earliest time an absent container name is conclusive after an aborted create. */
   private uncertainCreations = new Map<string, number>();
+  private readonly projectFingerprint: string;
 
   constructor(
     private readonly projectRoot: string,
     private readonly config: DockerIsolationConfig,
-  ) {}
+  ) {
+    const resolvedRoot = path.resolve(projectRoot).replace(/\\/g, "/");
+    this.projectFingerprint = createHash("sha256")
+      .update(process.platform === "win32" ? resolvedRoot.toLowerCase() : resolvedRoot)
+      .digest("hex");
+  }
+
+  private hostPathMatchesProjectRoot(source: string): boolean {
+    const normalize = (value: string): string => {
+      const normalized = value
+        .replace(/\\/g, "/")
+        .replace(/^\/host_mnt\/([a-z])\//i, "$1:/")
+        .replace(/\/$/, "");
+      return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+    };
+    return normalize(source) === normalize(path.resolve(this.projectRoot));
+  }
+
+  /**
+   * Discover Quack containers that survived a monitor process and remove this
+   * project's containers before new admission. Legacy containers without a
+   * project fingerprint are accepted only when their /workspace mount proves
+   * ownership; ambiguous records fail closed and are never removed.
+   */
+  async reconcileExistingContainers(): Promise<DockerReconciliationResult> {
+    const { stdout } = await this.runDocker([
+      "ps",
+      "-a",
+      "--filter",
+      "label=quack.taskId",
+      "--format",
+      "{{.ID}}",
+    ]);
+    const containerIds = stdout
+      .split(/\r?\n/)
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const discoveredTaskIds: string[] = [];
+    const ambiguousContainerIds: string[] = [];
+
+    for (const containerId of containerIds) {
+      let record: DockerInspectRecord;
+      try {
+        const inspected = await this.runDocker(["inspect", "--type", "container", containerId]);
+        const parsed = JSON.parse(inspected.stdout) as unknown;
+        if (!Array.isArray(parsed) || parsed.length !== 1) throw new Error("invalid inspect data");
+        record = parsed[0] as DockerInspectRecord;
+      } catch {
+        ambiguousContainerIds.push(containerId);
+        continue;
+      }
+
+      const labels = record.Config?.Labels;
+      const taskId = labels?.["quack.taskId"];
+      const owner = labels?.["quack.projectFingerprint"];
+      if (typeof taskId !== "string" || !taskId) {
+        ambiguousContainerIds.push(containerId);
+        continue;
+      }
+      if (owner !== undefined && typeof owner !== "string") {
+        ambiguousContainerIds.push(containerId);
+        continue;
+      }
+      if (typeof owner === "string" && owner !== this.projectFingerprint) continue;
+      if (
+        owner === undefined &&
+        !record.Mounts?.some(
+          (mount) =>
+            mount.Destination === "/workspace" &&
+            typeof mount.Source === "string" &&
+            this.hostPathMatchesProjectRoot(mount.Source),
+        )
+      ) {
+        ambiguousContainerIds.push(containerId);
+        continue;
+      }
+
+      const info: DockerContainer = {
+        containerId:
+          typeof record.Id === "string" && record.Id.length > 0 ? record.Id : containerId,
+        taskId,
+        image: typeof record.Config?.Image === "string" ? record.Config.Image : this.config.image,
+        workDir: "/workspace",
+        logsVolume: "/workspace/.quack/logs",
+        startedAt: typeof record.Created === "string" ? record.Created : new Date().toISOString(),
+        status: record.State?.Running === true ? "running" : "stopped",
+      };
+      if (this.containers.has(taskId)) {
+        ambiguousContainerIds.push(containerId);
+        continue;
+      }
+      this.containers.set(taskId, info);
+      discoveredTaskIds.push(taskId);
+    }
+
+    if (ambiguousContainerIds.length > 0) {
+      return {
+        discoveredTaskIds,
+        ambiguousContainerIds,
+        removedTaskIds: [],
+        failedTaskIds: discoveredTaskIds,
+      };
+    }
+    const cleanup = await this.cleanupAll();
+    return { discoveredTaskIds, ambiguousContainerIds, ...cleanup };
+  }
 
   private async runDocker(
     args: string[],
@@ -420,6 +540,7 @@ export class DockerManager {
 
     // Label for identification
     args.push("--label", `quack.taskId=${taskId}`);
+    args.push("--label", `quack.projectFingerprint=${this.projectFingerprint}`);
 
     // Image
     args.push(this.config.image);

@@ -41,6 +41,21 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
+function confirmWindowsSharedCheckoutTree(markerPath: string): void {
+  if (process.platform !== "win32") return;
+  const marker = JSON.parse(fs.readFileSync(markerPath, "utf-8")) as Record<string, unknown>;
+  marker.processTreeStatus = "confirmed-stopped";
+  marker.reconciliationToken ??= "test-confirmation-token";
+  fs.writeFileSync(markerPath, `${JSON.stringify(marker, null, 2)}\n`, "utf-8");
+}
+
+function markWindowsTreeKillConfirmed(manager: DispatchManager, taskId: string): void {
+  if (process.platform !== "win32") return;
+  (manager as unknown as { confirmedWindowsTreeKills: Set<string> }).confirmedWindowsTreeKills.add(
+    taskId,
+  );
+}
+
 describe("DispatchManager", () => {
   let manager: DispatchManager;
   let suiteLogDir: string;
@@ -1098,6 +1113,202 @@ describe("DispatchManager", () => {
       );
     });
 
+    test("atomically preserves the first shared-checkout owner across manager instances", () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-atomic-"));
+      const logDir = path.join(tmpDir, ".quack", "logs");
+      const first = new DispatchManager(tmpDir, process.execPath, undefined, undefined, logDir);
+      const second = new DispatchManager(tmpDir, process.execPath, undefined, undefined, logDir);
+      const firstJob = makeJob({ taskId: "TASK-FIRST", sessionId: "first-session" });
+      const secondJob = makeJob({ taskId: "TASK-SECOND", sessionId: "second-session" });
+      const firstInternals = first as unknown as {
+        readSharedCheckoutPause(): unknown;
+        persistSharedCheckoutPause(job: DispatchJob, status: "running"): void;
+      };
+      const secondInternals = second as unknown as {
+        readSharedCheckoutPause(): unknown;
+        persistSharedCheckoutPause(job: DispatchJob, status: "running"): void;
+      };
+      try {
+        // Both processes can observe the pre-claim state; the exclusive lock
+        // and in-lock owner check still allow exactly one durable winner.
+        expect(firstInternals.readSharedCheckoutPause()).toBeUndefined();
+        expect(secondInternals.readSharedCheckoutPause()).toBeUndefined();
+        firstInternals.persistSharedCheckoutPause(firstJob, "running");
+        const markerPath = path.join(logDir, "shared-checkout-pause.json");
+        const agedMarker = JSON.parse(fs.readFileSync(markerPath, "utf-8")) as Record<
+          string,
+          unknown
+        >;
+        agedMarker.pausedAt = "2000-01-01T00:00:00.000Z";
+        fs.writeFileSync(markerPath, `${JSON.stringify(agedMarker, null, 2)}\n`, "utf-8");
+        expect(() => secondInternals.persistSharedCheckoutPause(secondJob, "running")).toThrow(
+          DegradedSharedCheckoutBusyError,
+        );
+
+        const marker = JSON.parse(fs.readFileSync(markerPath, "utf-8")) as {
+          taskId: string;
+          sessionId: string;
+        };
+        expect(marker).toMatchObject({ taskId: "TASK-FIRST", sessionId: "first-session" });
+      } finally {
+        first.killAll();
+        second.killAll();
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    test("never expires an unverified shared-checkout mutation lock by age", () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-lock-"));
+      const logDir = path.join(tmpDir, ".quack", "logs");
+      const lockPath = path.join(logDir, "shared-checkout-pause.lock");
+      fs.mkdirSync(logDir, { recursive: true });
+      fs.writeFileSync(
+        lockPath,
+        JSON.stringify({ version: 1, pid: 1, acquiredAt: "2000-01-01T00:00:00.000Z" }),
+        "utf-8",
+      );
+      const mgr = new DispatchManager(tmpDir, process.execPath, undefined, undefined, logDir);
+      const internals = mgr as unknown as {
+        persistSharedCheckoutPause(job: DispatchJob, status: "running"): void;
+      };
+      try {
+        expect(() =>
+          internals.persistSharedCheckoutPause(
+            makeJob({ taskId: "TASK-LOCKED", sessionId: "locked-session" }),
+            "running",
+          ),
+        ).toThrow("unverified stale lock");
+        expect(fs.existsSync(lockPath)).toBe(true);
+        expect(mgr.getSharedCheckoutOccupants()).toEqual([
+          expect.objectContaining({ taskId: "unknown-shared-checkout-owner" }),
+        ]);
+      } finally {
+        mgr.killAll();
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    test("requires exact reconciliation before reusing a Windows-unconfirmed shared tree", () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-win-tree-"));
+      const logDir = path.join(tmpDir, ".quack", "logs");
+      const markerPath = path.join(logDir, "shared-checkout-pause.json");
+      fs.mkdirSync(logDir, { recursive: true });
+      fs.writeFileSync(
+        markerPath,
+        `${JSON.stringify({
+          version: 1,
+          taskId: "TASK-WINDOWS-TREE",
+          sessionId: "tree-session",
+          startedAt: "2026-09-09T12:00:00.000Z",
+          pausedAt: "2026-09-09T12:01:00.000Z",
+          status: "stopped",
+          processId: 2_147_483_000,
+          processTreeStatus: "unconfirmed",
+          reconciliationToken: "tree-token",
+        })}\n`,
+        "utf-8",
+      );
+      const mgr = new DispatchManager(tmpDir, process.execPath, undefined, undefined, logDir);
+      const internals = mgr as unknown as {
+        durableSharedOwnerMayBeLive(marker: unknown): boolean;
+        readSharedCheckoutPause(): unknown;
+      };
+      try {
+        expect(internals.durableSharedOwnerMayBeLive(internals.readSharedCheckoutPause())).toBe(
+          true,
+        );
+        expect(
+          mgr.reconcileSharedCheckoutShutdownSurvivor(
+            "TASK-WINDOWS-TREE",
+            "tree-session",
+            "stale-token",
+            true,
+          ),
+        ).toBe(false);
+        expect(
+          mgr.reconcileSharedCheckoutShutdownSurvivor(
+            "TASK-WINDOWS-TREE",
+            "tree-session",
+            "tree-token",
+            false,
+          ),
+        ).toBe(false);
+        expect(
+          mgr.reconcileSharedCheckoutShutdownSurvivor(
+            "TASK-WINDOWS-TREE",
+            "tree-session",
+            "tree-token",
+            true,
+          ),
+        ).toBe(true);
+        expect(internals.durableSharedOwnerMayBeLive(internals.readSharedCheckoutPause())).toBe(
+          false,
+        );
+      } finally {
+        mgr.killAll();
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    test("blocks shared-checkout resume when a Windows wrapper exits before its descendant", async () => {
+      if (process.platform !== "win32") return;
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-win-descendant-"));
+      const descendantPidPath = path.join(tmpDir, "descendant.pid");
+      const touchedPath = path.join(tmpDir, "descendant-touch.txt");
+      const scriptPath = path.join(tmpDir, "wrapper.cjs");
+      fs.writeFileSync(
+        scriptPath,
+        [
+          "const fs = require('node:fs');",
+          "const { spawn } = require('node:child_process');",
+          `const touchPath = ${JSON.stringify(touchedPath)};`,
+          "const code = `const fs = require('node:fs'); const p = ${JSON.stringify(touchPath)}; setInterval(() => fs.appendFileSync(p, 'x'), 25);`;",
+          "const child = spawn(process.execPath, ['-e', code], { detached: true, stdio: 'ignore', windowsHide: true });",
+          `fs.writeFileSync(${JSON.stringify(descendantPidPath)}, String(child.pid));`,
+          "child.unref();",
+          "process.exit(0);",
+        ].join("\n"),
+        "utf-8",
+      );
+      const first = new DispatchManager(tmpDir, scriptPath);
+      const restarted = new DispatchManager(tmpDir, scriptPath);
+      (first as unknown as { createWorktree(): undefined }).createWorktree = () => undefined;
+      (restarted as unknown as { createWorktree(): undefined }).createWorktree = () => undefined;
+      let descendantPid = 0;
+      try {
+        const job = first.start("TASK-WINDOWS-DESCENDANT", { skipGate: true });
+        await waitForFile(descendantPidPath);
+        descendantPid = Number.parseInt(fs.readFileSync(descendantPidPath, "utf-8"), 10);
+        await waitForCondition(() => job.status === "completed", "wrapper exit");
+        await waitForFile(touchedPath);
+
+        expect(processIsAlive(descendantPid)).toBe(true);
+        expect(() =>
+          restarted.start("TASK-WINDOWS-DESCENDANT", { skipGate: true, resume: true }),
+        ).toThrow(DegradedSharedCheckoutBusyError);
+        expect(restarted.getSharedCheckoutShutdownSurvivor()).toEqual(
+          expect.objectContaining({
+            taskId: "TASK-WINDOWS-DESCENDANT",
+            status: "stopped",
+          }),
+        );
+      } finally {
+        if (descendantPid > 0 && processIsAlive(descendantPid)) {
+          try {
+            execFileSync("taskkill", ["/pid", String(descendantPid), "/t", "/f"], {
+              stdio: "ignore",
+              windowsHide: true,
+            });
+          } catch {
+            // Best-effort cleanup of the test-only child.
+          }
+        }
+        await first.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
+        await restarted.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
     test("refuses shared-checkout fallback when the original Git checkout is dirty", () => {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-dirty-"));
       const scriptPath = path.join(tmpDir, "should-not-start.cjs");
@@ -1349,10 +1560,12 @@ describe("DispatchManager", () => {
           DegradedSharedCheckoutBusyError,
         );
 
+        confirmWindowsSharedCheckoutTree(markerPath);
         const resumed = restartedManager.start("TASK-PAUSED", {
           skipGate: true,
           resume: true,
         });
+        markWindowsTreeKillConfirmed(restartedManager, "TASK-PAUSED");
         expect(resumed.worktreePath).toBeUndefined();
         await waitForFile(nextStarted);
         await waitForCondition(() => resumed.status === "completed", "shared-checkout resume");
@@ -1425,7 +1638,14 @@ describe("DispatchManager", () => {
         >;
         fs.writeFileSync(approvalPath, JSON.stringify({ ...approval, state: "approved" }), "utf-8");
 
+        confirmWindowsSharedCheckoutTree(
+          approvalPath.replace(
+            path.join("approvals", "TASK-RESTORE.json"),
+            "shared-checkout-pause.json",
+          ),
+        );
         const resumed = restartedManager.start("TASK-RESTORE", { skipGate: true, resume: true });
+        markWindowsTreeKillConfirmed(restartedManager, "TASK-RESTORE");
         await waitForCondition(() => resumed.status === "completed", "branch restore completion");
         expect(
           execFileSync("git", ["branch", "--show-current"], {
@@ -1483,6 +1703,7 @@ describe("DispatchManager", () => {
           startedAt: now,
           pausedAt: now,
           status: "stopped",
+          ...(process.platform === "win32" ? { processTreeStatus: "confirmed-stopped" } : {}),
         })}\n`,
         "utf-8",
       );
@@ -1561,6 +1782,12 @@ describe("DispatchManager", () => {
           }),
           "utf-8",
         );
+        if (process.platform === "win32") {
+          expect(() => mgr.start("TASK-PAUSED", { skipGate: true, resume: true })).toThrow(
+            DegradedSharedCheckoutBusyError,
+          );
+          return;
+        }
         const resumed = mgr.start("TASK-PAUSED", { skipGate: true, resume: true });
         expect(resumed.worktreePath).toBeUndefined();
         await waitForFile(resumedPath);
@@ -1618,7 +1845,10 @@ describe("DispatchManager", () => {
           "utf-8",
         );
 
+        const resumedMarkerPath = path.join(tmpDir, ".quack", "logs", "shared-checkout-pause.json");
+        confirmWindowsSharedCheckoutTree(resumedMarkerPath);
         const resumed = resumedManager.start("TASK-PAUSED", { skipGate: true, resume: true });
+        markWindowsTreeKillConfirmed(resumedManager, "TASK-PAUSED");
         expect(resumed.worktreePath).toBeUndefined();
         await waitForFile(readyPath);
         const shutdown = await resumedManager.shutdownAll({

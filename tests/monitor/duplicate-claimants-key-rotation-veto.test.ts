@@ -129,6 +129,12 @@ describe.each(DUPLICATE_FIXTURE_CASES)("key rotation claimant matrix (%s, %s)", 
       const child = new FakeChild();
       const stopContainer = jest.fn().mockResolvedValue(undefined);
       const dockerManager = {
+        reconcileExistingContainers: jest.fn().mockResolvedValue({
+          discoveredTaskIds: [],
+          ambiguousContainerIds: [],
+          removedTaskIds: [],
+          failedTaskIds: [],
+        }),
         createContainer: jest
           .fn()
           .mockResolvedValue({ containerId: "container-1", image: "fixture" }),

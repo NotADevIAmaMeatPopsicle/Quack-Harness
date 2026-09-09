@@ -8939,7 +8939,27 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       }
       return [...managers];
     };
+    const abortDispatchQueuesForShutdown = (): void => {
+      const queues = new Set<DispatchQueue>();
+      if (dispatchQueue) queues.add(dispatchQueue);
+      if (registry) {
+        for (const context of registry.listProjects()) {
+          if (context.dispatchQueue) queues.add(context.dispatchQueue);
+        }
+      }
+      for (const queue of queues) {
+        try {
+          queue.abort();
+        } catch (error: unknown) {
+          console.error("[monitor] Dispatch queue abort failed:", error);
+        }
+      }
+    };
     const shutdownDispatchManagers = async (): Promise<void> => {
+      // Queue pollers can schedule work or propagate a transient failure while
+      // manager shutdown spends several seconds draining children. Admission
+      // must close before every normal, signal, or fatal shutdown path.
+      abortDispatchQueuesForShutdown();
       const managers = dispatchManagersForShutdown();
       for (const manager of managers) {
         try {

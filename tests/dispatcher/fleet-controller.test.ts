@@ -214,7 +214,7 @@ describe("FleetController", () => {
       expect(controller.getState()).toBe("running");
     });
 
-    it("should allow pause and resume", () => {
+    it("should allow pause and resume", async () => {
       dispatchManager.start("TASK-ACTIVE");
       controller.pause("Test pause");
       expect(controller.getState()).toBe("paused");
@@ -223,7 +223,7 @@ describe("FleetController", () => {
       expect(status.state).toBe("paused");
       expect(status.reason).toBe("Test pause");
 
-      controller.resume();
+      await controller.resume();
       expect(controller.getState()).toBe("running");
       expect(controller.getStatus().reason).toBeUndefined();
       expect(dispatchManager.resumeAfterShutdownCalled).toBe(false);
@@ -326,7 +326,7 @@ describe("FleetController", () => {
 
       expect(result.prepTimedOutTasks).toEqual(["TASK-PREP-STUCK"]);
       expect(result.errors).toContain("Timed out stopping prep resources for: TASK-PREP-STUCK");
-      expect(() => controller.resume()).toThrow(
+      await expect(controller.resume()).rejects.toThrow(
         "Fleet cannot resume while agent resources are still shutting down",
       );
       expect(dispatchManager.resumeAfterShutdownCalled).toBe(false);
@@ -386,11 +386,11 @@ describe("FleetController", () => {
       expect(dispatchManager.getActiveJobs().length).toBe(2);
     });
 
-    it("should resume from paused state", () => {
+    it("should resume from paused state", async () => {
       controller.pause();
       expect(controller.getState()).toBe("paused");
 
-      controller.resume();
+      await controller.resume();
       expect(controller.getState()).toBe("running");
       expect(controller.canDispatch().allowed).toBe(true);
     });
@@ -399,9 +399,29 @@ describe("FleetController", () => {
       await controller.emergencyStop();
       expect(controller.getState()).toBe("emergency_stopped");
 
-      controller.resume();
+      await controller.resume();
       expect(controller.getState()).toBe("running");
       expect(controller.canDispatch().allowed).toBe(true);
+    });
+
+    it("restarts prep scheduling only when it was running before emergency stop", async () => {
+      prepScheduler.start();
+      await controller.emergencyStop();
+      expect(prepScheduler.isRunning()).toBe(false);
+
+      await controller.resume();
+      expect(prepScheduler.isRunning()).toBe(true);
+
+      const initiallyStopped = new MockPrepScheduler();
+      const stoppedController = new FleetController(
+        dispatchManager as unknown as DispatchManager,
+        initiallyStopped as unknown as PrepScheduler,
+        tmpDir,
+        prepWorker as unknown as PrepWorker,
+      );
+      await stoppedController.emergencyStop();
+      await stoppedController.resume();
+      expect(initiallyStopped.isRunning()).toBe(false);
     });
   });
 

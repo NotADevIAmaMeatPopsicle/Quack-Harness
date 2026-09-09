@@ -76,6 +76,12 @@ curl -s "http://127.0.0.1:3333/api/tasks?projectId=<PROJECT_ID>"
 | `POST` | `/api/queue/stop` | Stop queue processing |
 | `GET` | `/api/fleet/status` | Fleet state and limits |
 | `POST` | `/api/fleet/emergency-stop` | Stop active fleet work |
+| `GET` | `/api/fleet/prep-shutdown-survivors` | List unconfirmed Windows prep trees |
+| `POST` | `/api/fleet/prep-shutdown-survivors/:taskId/reconcile` | Acknowledge an independently verified stopped prep tree |
+| `GET` | `/api/fleet/shared-checkout-shutdown-survivor` | Read unconfirmed shared-checkout tree ownership |
+| `POST` | `/api/fleet/shared-checkout-shutdown-survivor/reconcile` | Acknowledge an independently verified stopped shared-checkout tree |
+
+Survivor reconciliation is deliberately explicit. Read the current record, independently verify that the entire process tree is gone, then post its exact confirmation token (and shared-checkout session ID when applicable) with `processTreeConfirmedStopped: true`. Stale tokens return `409`; the monitor never re-signals a PID recovered from disk.
 
 ## Federation
 

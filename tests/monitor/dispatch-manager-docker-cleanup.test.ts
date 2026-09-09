@@ -122,6 +122,12 @@ describe("DispatchManager docker cleanup integration", () => {
       resolveContainer = resolve;
     });
     const dockerManager = {
+      reconcileExistingContainers: jest.fn().mockResolvedValue({
+        discoveredTaskIds: [],
+        ambiguousContainerIds: [],
+        removedTaskIds: [],
+        failedTaskIds: [],
+      }),
       createContainer: jest.fn(() => containerCreated),
       execAgent: jest.fn(),
       removeContainer: jest.fn().mockResolvedValue(undefined),
@@ -174,6 +180,47 @@ describe("DispatchManager docker cleanup integration", () => {
     expect(job.status).toBe("stopped");
   });
 
+  test("restart reconciliation blocks new container admission when prior ownership is unresolved", async () => {
+    const dockerManager = {
+      reconcileExistingContainers: jest.fn().mockResolvedValue({
+        discoveredTaskIds: ["TASK-OLD"],
+        ambiguousContainerIds: [],
+        removedTaskIds: [],
+        failedTaskIds: ["TASK-OLD"],
+      }),
+      createContainer: jest.fn(),
+      execAgent: jest.fn(),
+      forceRemoveContainer: jest.fn().mockResolvedValue(true),
+      getActiveContainers: jest.fn().mockReturnValue([]),
+      getTrackedContainers: jest.fn().mockReturnValue([]),
+      abortPendingCommands: jest.fn(),
+      cleanupAll: jest.fn().mockResolvedValue({ removedTaskIds: [], failedTaskIds: [] }),
+    };
+    const mgr = new DispatchManager("/fake/project", "/fake/bin.js", {
+      method: "docker",
+      docker: {
+        image: "node:20-slim",
+        volumes: [],
+        envPassthrough: [],
+        resourceLimits: { memoryMb: 2048, cpus: 1 },
+        networkMode: "bridge",
+        cleanupPolicy: "remove",
+      },
+    });
+    (mgr as unknown as { dockerManager: typeof dockerManager }).dockerManager = dockerManager;
+
+    const job = mgr.start("TASK-NEW", { skipGate: true });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(dockerManager.reconcileExistingContainers).toHaveBeenCalledTimes(1);
+    expect(dockerManager.createContainer).not.toHaveBeenCalled();
+    expect(job.status).toBe("failed");
+    expect(job.output.join("\n")).toContain(
+      "Docker ownership reconciliation could not remove prior containers for: TASK-OLD",
+    );
+  });
+
   test("stop cancels pending container creation before an agent can spawn", async () => {
     let resolveContainer!: (value: {
       containerId: string;
@@ -196,6 +243,12 @@ describe("DispatchManager docker cleanup integration", () => {
       resolveContainer = resolve;
     });
     const dockerManager = {
+      reconcileExistingContainers: jest.fn().mockResolvedValue({
+        discoveredTaskIds: [],
+        ambiguousContainerIds: [],
+        removedTaskIds: [],
+        failedTaskIds: [],
+      }),
       createContainer: jest.fn(() => containerCreated),
       execAgent: jest.fn(),
       forceRemoveContainer: jest.fn().mockResolvedValue(true),
@@ -239,6 +292,12 @@ describe("DispatchManager docker cleanup integration", () => {
 
   test("shutdown reports Docker cleanup failures instead of claiming exit", async () => {
     const dockerManager = {
+      reconcileExistingContainers: jest.fn().mockResolvedValue({
+        discoveredTaskIds: [],
+        ambiguousContainerIds: [],
+        removedTaskIds: [],
+        failedTaskIds: [],
+      }),
       getActiveContainers: jest.fn().mockReturnValue([
         {
           containerId: "survivor",
@@ -289,6 +348,12 @@ describe("DispatchManager docker cleanup integration", () => {
 
   test("removes a created container when startup fails before docker exec", async () => {
     const dockerManager = {
+      reconcileExistingContainers: jest.fn().mockResolvedValue({
+        discoveredTaskIds: [],
+        ambiguousContainerIds: [],
+        removedTaskIds: [],
+        failedTaskIds: [],
+      }),
       createContainer: jest.fn().mockResolvedValue({
         containerId: "created-before-key-failure",
         taskId: "TASK-DOCKER-STARTUP-FAIL",
@@ -339,6 +404,12 @@ describe("DispatchManager docker cleanup integration", () => {
     const firstChild = new FakeChild();
     const secondChild = new FakeChild();
     const dockerManager = {
+      reconcileExistingContainers: jest.fn().mockResolvedValue({
+        discoveredTaskIds: [],
+        ambiguousContainerIds: [],
+        removedTaskIds: [],
+        failedTaskIds: [],
+      }),
       createContainer: jest
         .fn()
         .mockResolvedValueOnce({

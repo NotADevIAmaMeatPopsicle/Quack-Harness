@@ -11,7 +11,7 @@
 // existing chokidar watcher picks them up and streams via SSE.
 
 import { spawn, execSync, execFileSync, type ChildProcess } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
@@ -101,6 +101,14 @@ export interface SharedCheckoutOccupant {
   status: DispatchJob["status"];
 }
 
+export interface SharedCheckoutShutdownSurvivor {
+  taskId: string;
+  sessionId: string;
+  processId?: number;
+  status: DispatchJob["status"];
+  reconciliationToken?: string;
+}
+
 export interface DispatchShutdownOptions {
   /** Time allowed for a POSIX process group to exit after SIGTERM. */
   gracefulTimeoutMs?: number;
@@ -125,6 +133,10 @@ interface DurableSharedCheckoutPause {
   status?: "running" | "awaiting_approval" | "stopped" | "failed";
   /** Root PID/process-group ID for a running shared-checkout child. */
   processId?: number;
+  /** Windows root exit alone cannot prove that descendants stopped. */
+  processTreeStatus?: "unconfirmed" | "confirmed-stopped";
+  /** Guards operator reconciliation from clearing a newer ownership record. */
+  reconciliationToken?: string;
   /** Git state that must be restored before shared-checkout ownership is released. */
   originalBranch?: string;
   originalStatus?: string;
@@ -350,6 +362,8 @@ export class DispatchManager {
   private jobs = new Map<string, DispatchJob>();
   private processes = new Map<string, ChildProcess>();
   private dockerManager: DockerManager | null = null;
+  /** Startup ownership scan shared by availability checks and first admission. */
+  private dockerReconciliationPromise: Promise<void> | null = null;
   private onEvent?: DispatchEventCallback;
   private keyManager?: KeyManager;
   private watchdogTimer?: ReturnType<typeof setInterval>;
@@ -359,6 +373,8 @@ export class DispatchManager {
   >();
   /** Windows taskkill /T completions are the tree-level exit evidence. */
   private confirmedWindowsTreeKills = new Set<string>();
+  /** Never retry a Windows numeric PID after one tree-kill attempt. */
+  private attemptedWindowsTreeKills = new WeakSet<ChildProcess>();
   /** Docker creation is asynchronous and must participate in shutdown. */
   private pendingDockerStarts = new Map<string, Promise<void>>();
   /** Once shutdown begins this manager must never spawn or retry another child. */
@@ -386,6 +402,53 @@ export class DispatchManager {
 
   private sharedCheckoutPausePath(): string {
     return path.join(this.logDir, "shared-checkout-pause.json");
+  }
+
+  private sharedCheckoutMutationLockPath(): string {
+    return path.join(this.logDir, "shared-checkout-pause.lock");
+  }
+
+  /**
+   * Serialize shared-checkout marker mutations across monitor processes. A
+   * pre-existing lock is never expired by age: after a crash its provenance
+   * cannot be proved, so shared-checkout admission must remain fail-closed
+   * until an operator inspects and removes it.
+   */
+  private withSharedCheckoutMutationLock<T>(operation: () => T): T {
+    const lockPath = this.sharedCheckoutMutationLockPath();
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    try {
+      fs.writeFileSync(
+        lockPath,
+        `${JSON.stringify({ version: 1, pid: process.pid, acquiredAt: new Date().toISOString() })}\n`,
+        { encoding: "utf-8", flag: "wx" },
+      );
+    } catch (error: unknown) {
+      const code =
+        typeof error === "object" && error !== null && "code" in error
+          ? String((error as { code?: unknown }).code)
+          : "";
+      if (code === "EEXIST") {
+        throw new Error(
+          "Shared-checkout ownership is locked by another monitor or an unverified stale lock; " +
+            "inspect the checkout before removing shared-checkout-pause.lock.",
+        );
+      }
+      throw error;
+    }
+
+    try {
+      return operation();
+    } finally {
+      try {
+        fs.rmSync(lockPath);
+      } catch (error: unknown) {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.error(
+          `[dispatch] Could not release shared-checkout ownership lock (${detail}); admission remains blocked.`,
+        );
+      }
+    }
   }
 
   private worktreeSurvivorPath(taskId: string): string {
@@ -566,6 +629,9 @@ export class DispatchManager {
       startedAt: evidence.pausedAt,
       pausedAt: evidence.eventAt,
       status: "awaiting_approval",
+      ...(process.platform === "win32"
+        ? { processTreeStatus: "unconfirmed" as const, reconciliationToken: randomUUID() }
+        : {}),
     };
   }
 
@@ -574,8 +640,20 @@ export class DispatchManager {
    * marker fails closed: a restart must never interpret unreadable ownership
    * evidence as permission to reuse the checkout.
    */
-  private readSharedCheckoutPause(): DurableSharedCheckoutPause | undefined {
+  private readSharedCheckoutPause(
+    ignoreMutationLock = false,
+  ): DurableSharedCheckoutPause | undefined {
     const markerPath = this.sharedCheckoutPausePath();
+    if (!ignoreMutationLock && fs.existsSync(this.sharedCheckoutMutationLockPath())) {
+      return {
+        version: SHARED_CHECKOUT_PAUSE_VERSION,
+        taskId: "unknown-shared-checkout-owner",
+        sessionId: "unknown",
+        startedAt: "unknown",
+        pausedAt: "unknown",
+        status: "stopped",
+      };
+    }
     if (!fs.existsSync(markerPath)) {
       const recovered = this.inferSharedCheckoutPause();
       if (!recovered) return undefined;
@@ -609,6 +687,12 @@ export class DispatchManager {
         ((parsed as { processId?: unknown }).processId !== undefined &&
           (!Number.isSafeInteger((parsed as { processId?: unknown }).processId) ||
             Number((parsed as { processId?: unknown }).processId) <= 0)) ||
+        ((parsed as { processTreeStatus?: unknown }).processTreeStatus !== undefined &&
+          !["unconfirmed", "confirmed-stopped"].includes(
+            String((parsed as { processTreeStatus?: unknown }).processTreeStatus),
+          )) ||
+        ((parsed as { reconciliationToken?: unknown }).reconciliationToken !== undefined &&
+          typeof (parsed as { reconciliationToken?: unknown }).reconciliationToken !== "string") ||
         ((parsed as { originalBranch?: unknown }).originalBranch !== undefined &&
           typeof (parsed as { originalBranch?: unknown }).originalBranch !== "string") ||
         ((parsed as { originalStatus?: unknown }).originalStatus !== undefined &&
@@ -635,33 +719,97 @@ export class DispatchManager {
   private persistSharedCheckoutPause(
     job: DispatchJob,
     status: "running" | "awaiting_approval" | "stopped" | "failed" = "awaiting_approval",
+    allowOwnershipTransfer = false,
   ): void {
-    const markerPath = this.sharedCheckoutPausePath();
-    const existing = this.readSharedCheckoutPause();
-    if (existing && existing.taskId !== job.taskId) {
-      throw new Error(
-        `Cannot record shared-checkout pause for ${job.taskId}; ` +
-          `${existing.taskId} already owns the durable marker.`,
-      );
-    }
+    this.withSharedCheckoutMutationLock(() => {
+      const markerPath = this.sharedCheckoutPausePath();
+      const existing = this.readSharedCheckoutPause(true);
+      if (existing && existing.taskId !== job.taskId) {
+        throw new DegradedSharedCheckoutBusyError(job.taskId, [
+          {
+            taskId: existing.taskId,
+            status: existing.status ?? "awaiting_approval",
+          },
+        ]);
+      }
+      if (existing && existing.sessionId !== job.sessionId) {
+        if (!allowOwnershipTransfer || this.durableSharedOwnerMayBeLive(existing)) {
+          throw new DegradedSharedCheckoutBusyError(job.taskId, [
+            {
+              taskId: existing.taskId,
+              status: existing.status ?? "awaiting_approval",
+            },
+          ]);
+        }
+      }
 
-    const record: DurableSharedCheckoutPause = {
-      version: SHARED_CHECKOUT_PAUSE_VERSION,
-      taskId: job.taskId,
-      sessionId: job.sessionId,
-      startedAt: job.startedAt,
-      pausedAt: new Date().toISOString(),
-      status,
-      ...(status === "running" && job.pid > 0 ? { processId: job.pid } : {}),
-      ...(job.sharedCheckoutOriginalBranch !== undefined
-        ? { originalBranch: job.sharedCheckoutOriginalBranch }
-        : {}),
-      ...(job.sharedCheckoutOriginalStatus !== undefined
-        ? { originalStatus: job.sharedCheckoutOriginalStatus }
-        : {}),
-    };
-    fs.mkdirSync(path.dirname(markerPath), { recursive: true });
-    fs.writeFileSync(markerPath, `${JSON.stringify(record, null, 2)}\n`, "utf-8");
+      const record: DurableSharedCheckoutPause = {
+        version: SHARED_CHECKOUT_PAUSE_VERSION,
+        taskId: job.taskId,
+        sessionId: job.sessionId,
+        startedAt: job.startedAt,
+        pausedAt: new Date().toISOString(),
+        status,
+        ...(status === "running" && job.pid > 0 ? { processId: job.pid } : {}),
+        ...(process.platform === "win32"
+          ? {
+              ...(job.pid > 0
+                ? { processId: job.pid }
+                : existing?.processId
+                  ? { processId: existing.processId }
+                  : {}),
+              processTreeStatus: this.confirmedWindowsTreeKills.has(job.taskId)
+                ? ("confirmed-stopped" as const)
+                : ("unconfirmed" as const),
+              reconciliationToken:
+                existing?.sessionId === job.sessionId && existing.reconciliationToken
+                  ? existing.reconciliationToken
+                  : randomUUID(),
+            }
+          : existing?.sessionId === job.sessionId && existing.processTreeStatus
+            ? {
+                processId: existing.processId,
+                processTreeStatus: existing.processTreeStatus,
+                reconciliationToken: existing.reconciliationToken,
+              }
+            : {}),
+        ...(job.sharedCheckoutOriginalBranch !== undefined
+          ? { originalBranch: job.sharedCheckoutOriginalBranch }
+          : {}),
+        ...(job.sharedCheckoutOriginalStatus !== undefined
+          ? { originalStatus: job.sharedCheckoutOriginalStatus }
+          : {}),
+      };
+      fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+      if (!existing) {
+        try {
+          fs.writeFileSync(markerPath, `${JSON.stringify(record, null, 2)}\n`, {
+            encoding: "utf-8",
+            flag: "wx",
+          });
+        } catch (error: unknown) {
+          const code =
+            typeof error === "object" && error !== null && "code" in error
+              ? String((error as { code?: unknown }).code)
+              : "";
+          if (code === "EEXIST") {
+            const winner = this.readSharedCheckoutPause(true);
+            throw new DegradedSharedCheckoutBusyError(job.taskId, [
+              {
+                taskId: winner?.taskId ?? "unknown-shared-checkout-owner",
+                status: winner?.status ?? "stopped",
+              },
+            ]);
+          }
+          throw error;
+        }
+      } else {
+        // Updates are permitted only for the owner/session validated above.
+        // A truncated write still fails closed because the reader treats an
+        // unreadable marker as unknown ownership.
+        fs.writeFileSync(markerPath, `${JSON.stringify(record, null, 2)}\n`, "utf-8");
+      }
+    });
   }
 
   private preserveInterruptedSharedCheckout(
@@ -680,24 +828,32 @@ export class DispatchManager {
     }
   }
 
-  private clearSharedCheckoutPause(taskId: string): void {
-    const marker = this.readSharedCheckoutPause();
-    if (!marker || marker.taskId !== taskId) return;
+  private clearSharedCheckoutPause(job: DispatchJob): void {
     try {
-      fs.rmSync(this.sharedCheckoutPausePath());
+      this.withSharedCheckoutMutationLock(() => {
+        const marker = this.readSharedCheckoutPause(true);
+        if (!marker || marker.taskId !== job.taskId || marker.sessionId !== job.sessionId) {
+          return;
+        }
+        fs.rmSync(this.sharedCheckoutPausePath());
+      });
     } catch (error: unknown) {
       const detail = error instanceof Error ? error.message : String(error);
       console.error(
-        `[dispatch] Could not clear the shared-checkout pause marker for ${taskId} (${detail}).`,
+        `[dispatch] Could not clear the shared-checkout pause marker for ${job.taskId} (${detail}).`,
       );
     }
   }
 
   private durableSharedOwnerMayBeLive(marker: DurableSharedCheckoutPause): boolean {
+    if (marker.processTreeStatus === "unconfirmed") return true;
+    if (marker.processTreeStatus === "confirmed-stopped") return false;
+    // Legacy Windows markers never carried tree-level evidence. Root-PID
+    // absence is insufficient because taskkill /T is the only proof available
+    // here that descendants cannot still mutate the shared checkout.
+    if (process.platform === "win32") return true;
     if (!marker.processId) return marker.status === "running";
-    return process.platform === "win32"
-      ? this.processExists(marker.processId) !== false
-      : this.processGroupExists(marker.processId);
+    return this.processGroupExists(marker.processId);
   }
 
   /**
@@ -1093,7 +1249,33 @@ export class DispatchManager {
     if (!this.dockerManager) {
       throw new Error("Docker isolation is not configured");
     }
-    return this.dockerManager.checkDocker();
+    const version = await this.dockerManager.checkDocker();
+    await this.ensureDockerOwnershipReconciled();
+    return version;
+  }
+
+  private ensureDockerOwnershipReconciled(): Promise<void> {
+    if (!this.dockerManager) return Promise.resolve();
+    if (!this.dockerReconciliationPromise) {
+      const dockerManager = this.dockerManager;
+      this.dockerReconciliationPromise = dockerManager
+        .reconcileExistingContainers()
+        .then((result) => {
+          if (result.ambiguousContainerIds.length > 0) {
+            throw new Error(
+              "Docker ownership reconciliation found ambiguous Quack containers: " +
+                result.ambiguousContainerIds.join(", "),
+            );
+          }
+          if (result.failedTaskIds.length > 0) {
+            throw new Error(
+              "Docker ownership reconciliation could not remove prior containers for: " +
+                result.failedTaskIds.join(", "),
+            );
+          }
+        });
+    }
+    return this.dockerReconciliationPromise;
   }
 
   /**
@@ -1782,11 +1964,21 @@ export class DispatchManager {
       throw new PausedRunRefusalError(taskId, paused);
     }
 
-    const durableSharedPause = this.readSharedCheckoutPause();
+    // Claimant admission is still side-effect free, so preserve its established
+    // precedence ahead of restart-recovery checks. The active/degraded/paused
+    // guards above remain authoritative, while a contested resume cannot be
+    // misreported as a Windows tree-recovery problem.
+    assertUncontestedClaimant(claimantCheck ?? options?.duplicateClaimantCheck);
+
+    const durableSharedPause =
+      this.isolationConfig?.method === "docker" ? undefined : this.readSharedCheckoutPause();
     const priorJob = this.jobs.get(taskId);
     if (durableSharedPause && this.durableSharedOwnerMayBeLive(durableSharedPause)) {
       throw new DegradedSharedCheckoutBusyError(taskId, [
-        { taskId: durableSharedPause.taskId, status: "running" },
+        {
+          taskId: durableSharedPause.taskId,
+          status: durableSharedPause.status ?? "awaiting_approval",
+        },
       ]);
     }
     const durableSharedStatus =
@@ -1798,6 +1990,15 @@ export class DispatchManager {
       priorJob !== undefined &&
       priorJob.worktreePath === undefined &&
       priorJob.status !== "completed";
+    if (
+      process.platform === "win32" &&
+      inMemorySharedRecovery &&
+      !this.confirmedWindowsTreeKills.has(taskId)
+    ) {
+      throw new DegradedSharedCheckoutBusyError(taskId, [
+        { taskId, status: priorJob?.status ?? "stopped" },
+      ]);
+    }
     const recoverSharedCheckout =
       durableSharedPause?.taskId === taskId ||
       (deleteAwaitingApproval && existing?.worktreePath === undefined) ||
@@ -1817,9 +2018,6 @@ export class DispatchManager {
     if (recoverSharedCheckout && options?.resume !== true && options?.overridePausedRun !== true) {
       throw new DegradedSharedCheckoutBusyError(taskId, [{ taskId, status: durableSharedStatus }]);
     }
-
-    assertUncontestedClaimant(claimantCheck ?? options?.duplicateClaimantCheck);
-
     if (deleteAwaitingApproval) {
       this.jobs.delete(taskId);
     }
@@ -2031,7 +2229,7 @@ export class DispatchManager {
     // ownership before spawning so a new monitor cannot mistake a potentially
     // dirty in-flight checkout for a free fallback directory.
     if (!worktreePath) {
-      this.persistSharedCheckoutPause(job, "running");
+      this.persistSharedCheckoutPause(job, "running", recoverSharedCheckout);
     }
 
     let child: ChildProcess;
@@ -2311,8 +2509,13 @@ export class DispatchManager {
             );
           }
         } else if (code === 0 && !stopRequested) {
-          if (this.restoreSharedCheckout(job)) {
-            this.clearSharedCheckoutPause(taskId);
+          if (process.platform === "win32" && !this.confirmedWindowsTreeKills.has(taskId)) {
+            job.output.push(
+              "[dispatch] Shared-checkout root exited, but descendant termination is unconfirmed on Windows; ownership remains blocked pending reconciliation.",
+            );
+            this.preserveInterruptedSharedCheckout(job, "stopped");
+          } else if (this.restoreSharedCheckout(job)) {
+            this.clearSharedCheckoutPause(job);
           } else {
             job.status = "failed";
             this.preserveInterruptedSharedCheckout(job, "failed");
@@ -2411,8 +2614,8 @@ export class DispatchManager {
 
     // Container creation is async — kick it off and wire up the exec
     const dockerMgr = this.dockerManager!;
-    const startupPromise = dockerMgr
-      .createContainer(taskId)
+    const startupPromise = this.ensureDockerOwnershipReconciled()
+      .then(() => dockerMgr.createContainer(taskId))
       .then(async (containerInfo) => {
         job.containerId = containerInfo.containerId;
 
@@ -2867,6 +3070,67 @@ export class DispatchManager {
     return occupants;
   }
 
+  /** Return durable Windows tree evidence needed for explicit operator recovery. */
+  getSharedCheckoutShutdownSurvivor(): SharedCheckoutShutdownSurvivor | undefined {
+    const marker = this.readSharedCheckoutPause();
+    if (
+      !marker ||
+      (marker.processTreeStatus !== "unconfirmed" &&
+        !(process.platform === "win32" && marker.processTreeStatus === undefined))
+    ) {
+      return undefined;
+    }
+    return {
+      taskId: marker.taskId,
+      sessionId: marker.sessionId,
+      processId: marker.processId,
+      status: marker.status ?? "awaiting_approval",
+      reconciliationToken: marker.reconciliationToken,
+    };
+  }
+
+  /**
+   * Mark a Windows shared-checkout tree stopped only after independent
+   * operator verification. Session and token checks prevent stale recovery
+   * requests from releasing a newer owner.
+   */
+  reconcileSharedCheckoutShutdownSurvivor(
+    taskId: string,
+    sessionId: string,
+    reconciliationToken: string,
+    processTreeConfirmedStopped: boolean,
+  ): boolean {
+    if (!processTreeConfirmedStopped || this.processes.has(taskId)) return false;
+    try {
+      return this.withSharedCheckoutMutationLock(() => {
+        const marker = this.readSharedCheckoutPause(true);
+        if (
+          !marker ||
+          marker.taskId !== taskId ||
+          marker.sessionId !== sessionId ||
+          !marker.reconciliationToken ||
+          marker.reconciliationToken !== reconciliationToken ||
+          marker.processTreeStatus === "confirmed-stopped"
+        ) {
+          return false;
+        }
+        const reconciled: DurableSharedCheckoutPause = {
+          ...marker,
+          pausedAt: new Date().toISOString(),
+          processTreeStatus: "confirmed-stopped",
+        };
+        fs.writeFileSync(
+          this.sharedCheckoutPausePath(),
+          `${JSON.stringify(reconciled, null, 2)}\n`,
+          "utf-8",
+        );
+        return true;
+      });
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * Get the active job for a specific task, if any.
    */
@@ -3111,6 +3375,12 @@ export class DispatchManager {
   ): void {
     const job = this.jobs.get(taskId);
     if (process.platform === "win32" && child.pid) {
+      if (this.attemptedWindowsTreeKills.has(child)) {
+        throw new Error(
+          `Refusing to retry Windows process-tree shutdown for ${taskId}; its numeric PID may have been recycled`,
+        );
+      }
+      this.attemptedWindowsTreeKills.add(child);
       execFileSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
         stdio: "ignore",
         windowsHide: true,

@@ -157,12 +157,11 @@ export function registerFleetRoutes(app: Express, deps: FleetRouteDeps): void {
     const reason = typeof body?.reason === "string" ? body.reason : "Emergency stop";
 
     try {
+      // Close queue admission before the potentially multi-second process
+      // drain. Otherwise the queue can schedule or propagate another task
+      // while the managers are still shutting down.
+      p.dispatchQueue?.abort();
       const result = await p.fleetController.emergencyStop(reason);
-
-      // Also abort the dispatch queue
-      if (p.dispatchQueue) {
-        p.dispatchQueue.abort();
-      }
 
       emitFleetEvent("fleet_emergency_stop", {
         reason,
@@ -204,6 +203,94 @@ export function registerFleetRoutes(app: Express, deps: FleetRouteDeps): void {
     }
   });
 
+  app.get("/api/fleet/prep-shutdown-survivors", (req: Request, res: Response) => {
+    const p = resolveProject(req);
+    if (!p.fleetController) {
+      res.status(500).json({ error: "Fleet controller not available" });
+      return;
+    }
+    res.json({ survivors: p.fleetController.getPrepShutdownSurvivors() });
+  });
+
+  app.post(
+    "/api/fleet/prep-shutdown-survivors/:taskId/reconcile",
+    (req: Request, res: Response) => {
+      const p = resolveProject(req);
+      if (!p.fleetController) {
+        res.status(500).json({ error: "Fleet controller not available" });
+        return;
+      }
+      const body = req.body as Record<string, unknown> | undefined;
+      if (
+        typeof body?.confirmationToken !== "string" ||
+        body.confirmationToken.length === 0 ||
+        body.processTreeConfirmedStopped !== true
+      ) {
+        res.status(400).json({
+          error:
+            "confirmationToken and processTreeConfirmedStopped=true are required after independently verifying the process tree is gone",
+        });
+        return;
+      }
+      const reconciled = p.fleetController.reconcilePrepShutdownSurvivor(
+        req.params.taskId as string,
+        body.confirmationToken,
+        true,
+      );
+      if (!reconciled) {
+        res.status(409).json({ error: "Prep shutdown survivor could not be reconciled" });
+        return;
+      }
+      res.json({ ok: true, taskId: req.params.taskId });
+    },
+  );
+
+  app.get("/api/fleet/shared-checkout-shutdown-survivor", (req: Request, res: Response) => {
+    const p = resolveProject(req);
+    if (!p.fleetController) {
+      res.status(500).json({ error: "Fleet controller not available" });
+      return;
+    }
+    res.json({ survivor: p.fleetController.getSharedCheckoutShutdownSurvivor() ?? null });
+  });
+
+  app.post(
+    "/api/fleet/shared-checkout-shutdown-survivor/reconcile",
+    (req: Request, res: Response) => {
+      const p = resolveProject(req);
+      if (!p.fleetController) {
+        res.status(500).json({ error: "Fleet controller not available" });
+        return;
+      }
+      const body = req.body as Record<string, unknown> | undefined;
+      if (
+        typeof body?.taskId !== "string" ||
+        typeof body.sessionId !== "string" ||
+        typeof body.reconciliationToken !== "string" ||
+        body.processTreeConfirmedStopped !== true
+      ) {
+        res.status(400).json({
+          error:
+            "taskId, sessionId, reconciliationToken, and processTreeConfirmedStopped=true are required",
+        });
+        return;
+      }
+      const reconciled = p.fleetController.reconcileSharedCheckoutShutdownSurvivor(
+        body.taskId,
+        body.sessionId,
+        body.reconciliationToken,
+        true,
+      );
+      if (!reconciled) {
+        res
+          .status(409)
+          .json({ error: "Shared-checkout shutdown survivor could not be reconciled" });
+        return;
+      }
+      res.json({ ok: true, taskId: body.taskId });
+    },
+  );
+
   app.post("/api/fleet/resume", async (req: Request, res: Response) => {
     const p = resolveProject(req);
     if (!p.fleetController) {
@@ -215,7 +302,7 @@ export function registerFleetRoutes(app: Express, deps: FleetRouteDeps): void {
     try {
       // Re-open manager admission before queue scheduling. An emergency stop
       // aborts (rather than pauses) the queue, so it must be started again.
-      p.fleetController.resume();
+      await p.fleetController.resume();
       if (p.dispatchQueue) {
         if (priorState === "emergency_stopped") {
           await p.dispatchQueue.start();

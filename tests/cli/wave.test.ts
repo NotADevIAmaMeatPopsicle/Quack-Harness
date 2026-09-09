@@ -561,18 +561,27 @@ describe("waveCommand", () => {
       markStarted = resolve;
     });
     const manager = new FakeDispatchManager({}, 10_000, () => markStarted());
-    const shutdownAll = jest.fn(() => {
+    let releaseDurableEvidence!: () => void;
+    const durableEvidenceReady = new Promise<void>((resolve) => {
+      releaseDurableEvidence = resolve;
+    });
+    let durableEvidencePersisted = false;
+    const shutdownAll = jest.fn(async () => {
       manager.stop("TASK-001");
-      return Promise.resolve({
+      await durableEvidenceReady;
+      durableEvidencePersisted = true;
+      return {
         requested: ["TASK-001"],
         exited: [],
         escalated: ["TASK-001"],
         timedOut: ["TASK-001"],
-      });
+      };
     });
     manager.shutdownAll = shutdownAll;
     const listeners = new Map<WaveSignal, () => void>();
-    const exitProcess = jest.fn();
+    const exitProcess = jest.fn(() => {
+      expect(durableEvidencePersisted).toBe(true);
+    });
     let exitCode: number | undefined;
 
     const run = waveCommand(
@@ -594,6 +603,9 @@ describe("waveCommand", () => {
     );
     await started;
     listeners.get("SIGINT")?.();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(exitProcess).not.toHaveBeenCalled();
+    releaseDurableEvidence();
     await run;
 
     expect(exitCode).toBe(130);

@@ -2,9 +2,12 @@
 // Manages fleet-wide operational state for agent dispatches.
 // Provides emergency stop, pause/resume controls, and state queries.
 
-import type { DispatchManager } from "../monitor/dispatch-manager.js";
+import type {
+  DispatchManager,
+  SharedCheckoutShutdownSurvivor,
+} from "../monitor/dispatch-manager.js";
 import type { PrepScheduler } from "../monitor/prep-scheduler.js";
-import type { PrepWorker } from "../monitor/prep-worker.js";
+import type { PrepShutdownSurvivor, PrepWorker } from "../monitor/prep-worker.js";
 import { execSync } from "node:child_process";
 
 export type FleetState = "running" | "paused" | "emergency_stopped";
@@ -27,6 +30,7 @@ export interface FleetStatus {
 export class FleetController {
   private state: FleetState = "running";
   private reason?: string;
+  private restartPrepSchedulerAfterEmergencyStop = false;
 
   constructor(
     private readonly dispatchManager: DispatchManager,
@@ -77,7 +81,7 @@ export class FleetController {
   /**
    * Resume the fleet from paused or emergency_stopped state.
    */
-  resume(): void {
+  async resume(): Promise<void> {
     if (this.state === "emergency_stopped") {
       if (
         !this.dispatchManager.canResumeAfterShutdown() ||
@@ -94,9 +98,54 @@ export class FleetController {
       ) {
         throw new Error("Fleet cannot resume while agent resources are still shutting down");
       }
+      if (this.restartPrepSchedulerAfterEmergencyStop && this.prepScheduler) {
+        try {
+          await this.prepScheduler.start();
+        } catch (error) {
+          this.prepScheduler.stop();
+          throw error;
+        }
+      }
+      this.restartPrepSchedulerAfterEmergencyStop = false;
     }
     this.state = "running";
     this.reason = undefined;
+  }
+
+  getPrepShutdownSurvivors(): PrepShutdownSurvivor[] {
+    return this.prepWorker?.getShutdownSurvivors() ?? [];
+  }
+
+  reconcilePrepShutdownSurvivor(
+    taskId: string,
+    confirmationToken: string,
+    processTreeConfirmedStopped: boolean,
+  ): boolean {
+    return (
+      this.prepWorker?.reconcileShutdownSurvivor(
+        taskId,
+        confirmationToken,
+        processTreeConfirmedStopped,
+      ) ?? false
+    );
+  }
+
+  getSharedCheckoutShutdownSurvivor(): SharedCheckoutShutdownSurvivor | undefined {
+    return this.dispatchManager.getSharedCheckoutShutdownSurvivor();
+  }
+
+  reconcileSharedCheckoutShutdownSurvivor(
+    taskId: string,
+    sessionId: string,
+    reconciliationToken: string,
+    processTreeConfirmedStopped: boolean,
+  ): boolean {
+    return this.dispatchManager.reconcileSharedCheckoutShutdownSurvivor(
+      taskId,
+      sessionId,
+      reconciliationToken,
+      processTreeConfirmedStopped,
+    );
   }
 
   /**
@@ -105,6 +154,9 @@ export class FleetController {
    * after timeout if they don't exit gracefully.
    */
   async emergencyStop(reason = "Emergency stop"): Promise<EmergencyStopResult> {
+    if (this.state !== "emergency_stopped") {
+      this.restartPrepSchedulerAfterEmergencyStop = this.prepScheduler?.isRunning() ?? false;
+    }
     this.state = "emergency_stopped";
     this.reason = reason;
 

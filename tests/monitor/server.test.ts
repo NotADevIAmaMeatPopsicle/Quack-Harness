@@ -6,6 +6,7 @@ import * as http from "node:http";
 import { createMonitorServer } from "../../src/monitor/server";
 import { DispatchManager } from "../../src/monitor/dispatch-manager";
 import { PrepWorker } from "../../src/monitor/prep-worker";
+import { DispatchQueue } from "../../src/queue";
 import { computeContentHash } from "../../src/monitor/prep-cache";
 import { runReadinessGate } from "../../src/gate/gate";
 import type {
@@ -262,6 +263,7 @@ describe("Monitor Server", () => {
           timedOut: [],
         }));
       });
+    const queueAbortSpy = jest.spyOn(DispatchQueue.prototype, "abort");
     let stopPromise: Promise<void> | undefined;
 
     try {
@@ -279,6 +281,10 @@ describe("Monitor Server", () => {
       });
 
       await Promise.all([shutdownStarted, prepShutdownStarted]);
+      expect(queueAbortSpy).toHaveBeenCalledTimes(1);
+      expect(queueAbortSpy.mock.invocationCallOrder[0]).toBeLessThan(
+        shutdownSpy.mock.invocationCallOrder[0],
+      );
       expect(stopped).toBe(false);
       releaseShutdown();
       await Promise.resolve();
@@ -292,6 +298,7 @@ describe("Monitor Server", () => {
       await stopPromise?.catch(() => undefined);
       shutdownSpy.mockRestore();
       prepShutdownSpy.mockRestore();
+      queueAbortSpy.mockRestore();
       removeTempDir(projectRoot);
     }
   });

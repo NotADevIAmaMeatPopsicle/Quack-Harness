@@ -305,25 +305,27 @@ export async function runWaveWithSignalCleanup(
     if (first.kind === "completed") return { interrupted: false, results: first.results };
     if (first.kind === "failed") throw first.error;
 
-    let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<{ kind: "timeout" }>((resolve) => {
-      cleanupTimer = setTimeout(() => resolve({ kind: "timeout" }), cleanupTimeoutMs);
-    });
-    const cleanup = Promise.all([operationResult, shutdownResult!]).then(
-      ([operation, shutdown]) => ({ kind: "cleaned" as const, operation, shutdown }),
-    );
-    const settled = await Promise.race([cleanup, timeout]);
-    if (cleanupTimer) clearTimeout(cleanupTimer);
-    const managerTimedOut =
-      settled.kind === "cleaned" &&
-      settled.shutdown.kind === "shutdown" &&
-      settled.shutdown.result.timedOut.length > 0;
+    // Bound only the cooperative wave workers here. DispatchManager owns the
+    // bounded TERM/KILL/Docker cleanup sequence and must always reach its
+    // durable survivor/ownership writes before this function can authorize a
+    // forced process exit.
+    let operationTimer: ReturnType<typeof setTimeout> | undefined;
+    const operationSettlement = Promise.race([
+      operationResult,
+      new Promise<{ kind: "timeout" }>((resolve) => {
+        operationTimer = setTimeout(() => resolve({ kind: "timeout" }), cleanupTimeoutMs);
+      }),
+    ]);
+    const shutdown = await shutdownResult!;
+    const operationOutcome = await operationSettlement;
+    if (operationTimer) clearTimeout(operationTimer);
+    const managerTimedOut = shutdown.kind === "shutdown" && shutdown.result.timedOut.length > 0;
     return {
       interrupted: true,
       signal: first.signal,
       cleanupTimedOut:
-        settled.kind === "timeout" ||
-        settled.shutdown.kind === "shutdown_failed" ||
+        operationOutcome.kind === "timeout" ||
+        shutdown.kind === "shutdown_failed" ||
         managerTimedOut,
     };
   } finally {
@@ -459,7 +461,7 @@ export async function waveCommand(
     );
     if (outcome.interrupted) {
       const timeoutNote = outcome.cleanupTimedOut
-        ? ` Worker shutdown did not settle within ${runtime.signalCleanupTimeoutMs ?? 2_000}ms.`
+        ? " Worker shutdown reported unresolved resources after bounded cleanup."
         : "";
       writeStderr(
         `Wave interrupted by ${outcome.signal}; dispatch cleanup requested.${timeoutNote}`,

@@ -22,15 +22,23 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
-function post(port: number, pathname: string): Promise<{ status: number; body: string }> {
+function post(
+  port: number,
+  pathname: string,
+  body?: unknown,
+): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
+    const payload = body === undefined ? "" : JSON.stringify(body);
     const request = http.request(
       {
         hostname: "127.0.0.1",
         port,
         path: pathname,
         method: "POST",
-        headers: { "Content-Type": "application/json", "Content-Length": 0 },
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+        },
       },
       (response) => {
         let body = "";
@@ -42,7 +50,7 @@ function post(port: number, pathname: string): Promise<{ status: number; body: s
       },
     );
     request.on("error", reject);
-    request.end();
+    request.end(payload);
   });
 }
 
@@ -206,6 +214,131 @@ it("POST /api/fleet/resume restarts an emergency-aborted queue", async () => {
     expect(fleetResume).toHaveBeenCalledTimes(1);
     expect(start).toHaveBeenCalledTimes(1);
     expect(resume).not.toHaveBeenCalled();
+  } finally {
+    await server.close();
+  }
+});
+
+it("POST /api/fleet/emergency-stop aborts queue admission before awaiting agent drain", async () => {
+  const gate = deferred();
+  const abort = jest.fn();
+  const queue = { abort } as unknown as DispatchQueue;
+  const emergencyStop = jest.fn(async () => {
+    await gate.promise;
+    return {
+      killedTasks: [],
+      killedPids: [],
+      prepStopped: false,
+      prepKilledTasks: [],
+      prepTimedOutTasks: [],
+      errors: [],
+    };
+  });
+  const fleetController = { emergencyStop } as unknown as FleetController;
+  const app = express();
+  app.use(express.json());
+  registerFleetRoutes(app, {
+    resolveProject: () => ({
+      dispatchQueue: queue,
+      fleetController,
+      costVelocityTracker: {} as CostVelocityTracker,
+      progressDetector: {} as ProgressDetector,
+    }),
+    fleetBudget: {} as FleetBudgetChecker,
+    emitFleetEvent: jest.fn(),
+  });
+  const server = await listen(app);
+  try {
+    const response = post(server.port, "/api/fleet/emergency-stop");
+    for (let attempt = 0; attempt < 20 && emergencyStop.mock.calls.length === 0; attempt++) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(emergencyStop).toHaveBeenCalledTimes(1);
+    expect(abort.mock.invocationCallOrder[0]).toBeLessThan(
+      emergencyStop.mock.invocationCallOrder[0],
+    );
+
+    gate.resolve();
+    expect((await response).status).toBe(200);
+  } finally {
+    gate.resolve();
+    await server.close();
+  }
+});
+
+it("exposes tokened prep and shared-checkout survivor reconciliation", async () => {
+  const prepSurvivor = {
+    version: 1 as const,
+    taskId: "TASK-PREP",
+    pid: 123,
+    startedAt: "2026-09-09T12:00:00.000Z",
+    recordedAt: "2026-09-09T12:01:00.000Z",
+    confirmationToken: "prep-token",
+  };
+  const getPrepShutdownSurvivors = jest.fn(() => [prepSurvivor]);
+  const reconcilePrepShutdownSurvivor = jest.fn(() => true);
+  const getSharedCheckoutShutdownSurvivor = jest.fn(() => ({
+    taskId: "TASK-SHARED",
+    sessionId: "shared-session",
+    processId: 456,
+    status: "stopped" as const,
+    reconciliationToken: "shared-token",
+  }));
+  const reconcileSharedCheckoutShutdownSurvivor = jest.fn(() => true);
+  const fleetController = {
+    getPrepShutdownSurvivors,
+    reconcilePrepShutdownSurvivor,
+    getSharedCheckoutShutdownSurvivor,
+    reconcileSharedCheckoutShutdownSurvivor,
+  } as unknown as FleetController;
+  const app = express();
+  app.use(express.json());
+  registerFleetRoutes(app, {
+    resolveProject: () => ({
+      fleetController,
+      costVelocityTracker: {} as CostVelocityTracker,
+      progressDetector: {} as ProgressDetector,
+    }),
+    fleetBudget: {} as FleetBudgetChecker,
+    emitFleetEvent: jest.fn(),
+  });
+  const server = await listen(app);
+  try {
+    const prepList = await get(server.port, "/api/fleet/prep-shutdown-survivors");
+    expect(prepList.status).toBe(200);
+    expect(JSON.parse(prepList.body)).toEqual({ survivors: [prepSurvivor] });
+    expect(
+      (
+        await post(server.port, "/api/fleet/prep-shutdown-survivors/TASK-PREP/reconcile", {
+          confirmationToken: "prep-token",
+          processTreeConfirmedStopped: true,
+        })
+      ).status,
+    ).toBe(200);
+    expect(reconcilePrepShutdownSurvivor).toHaveBeenCalledWith("TASK-PREP", "prep-token", true);
+
+    const sharedList = await get(server.port, "/api/fleet/shared-checkout-shutdown-survivor");
+    expect(sharedList.status).toBe(200);
+    const sharedBody = JSON.parse(sharedList.body) as { survivor: unknown };
+    expect(sharedBody.survivor).toMatchObject({ taskId: "TASK-SHARED" });
+    expect(
+      (
+        await post(server.port, "/api/fleet/shared-checkout-shutdown-survivor/reconcile", {
+          taskId: "TASK-SHARED",
+          sessionId: "shared-session",
+          reconciliationToken: "shared-token",
+          processTreeConfirmedStopped: true,
+        })
+      ).status,
+    ).toBe(200);
+    expect(reconcileSharedCheckoutShutdownSurvivor).toHaveBeenCalledWith(
+      "TASK-SHARED",
+      "shared-session",
+      "shared-token",
+      true,
+    );
   } finally {
     await server.close();
   }

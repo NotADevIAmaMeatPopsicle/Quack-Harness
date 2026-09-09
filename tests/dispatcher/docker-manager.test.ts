@@ -101,6 +101,75 @@ describe("DockerManager", () => {
     });
   });
 
+  describe("restart ownership reconciliation", () => {
+    test("discovers and removes a labeled container left by an earlier monitor", async () => {
+      const projectFingerprint = (manager as unknown as { projectFingerprint: string })
+        .projectFingerprint;
+      mockExecFileSequence([
+        { stdout: "survivor-id\n" },
+        {
+          stdout: JSON.stringify([
+            {
+              Id: "survivor-id",
+              Config: {
+                Image: "node:20-slim",
+                Labels: {
+                  "quack.taskId": "TASK-RESTART",
+                  "quack.projectFingerprint": projectFingerprint,
+                },
+              },
+              Mounts: [{ Source: "/project/root", Destination: "/workspace" }],
+              State: { Running: true },
+              Created: "2026-09-09T12:00:00.000Z",
+            },
+          ]),
+        },
+        { stdout: "" },
+      ]);
+
+      await expect(manager.reconcileExistingContainers()).resolves.toEqual({
+        discoveredTaskIds: ["TASK-RESTART"],
+        ambiguousContainerIds: [],
+        removedTaskIds: ["TASK-RESTART"],
+        failedTaskIds: [],
+      });
+      const execCalls = mockExecFile.mock.calls as MockCallArgs[];
+      expect(execCalls.map((call) => call[1])).toEqual([
+        ["ps", "-a", "--filter", "label=quack.taskId", "--format", "{{.ID}}"],
+        ["inspect", "--type", "container", "survivor-id"],
+        ["rm", "-f", "survivor-id"],
+      ]);
+      expect(manager.getTrackedContainers()).toEqual([]);
+    });
+
+    test("fails closed without removing an ambiguously owned legacy container", async () => {
+      mockExecFileSequence([
+        { stdout: "ambiguous-id\n" },
+        {
+          stdout: JSON.stringify([
+            {
+              Id: "ambiguous-id",
+              Config: {
+                Image: "node:20-slim",
+                Labels: { "quack.taskId": "TASK-OTHER" },
+              },
+              Mounts: [{ Source: "/another/project", Destination: "/workspace" }],
+              State: { Running: true },
+            },
+          ]),
+        },
+      ]);
+
+      await expect(manager.reconcileExistingContainers()).resolves.toEqual({
+        discoveredTaskIds: [],
+        ambiguousContainerIds: ["ambiguous-id"],
+        removedTaskIds: [],
+        failedTaskIds: [],
+      });
+      expect(mockExecFile).toHaveBeenCalledTimes(2);
+    });
+  });
+
   // ─── createContainer ────────────────────────────────────────
 
   describe("createContainer", () => {
@@ -231,6 +300,12 @@ describe("DockerManager", () => {
       const labelValue = createArgs[labelIdx + 1];
       expect(labelValue).not.toContain("sk-test-secret-key");
       expect(labelValue).toBe("quack.taskId=TASK-005");
+      expect(createArgs).toEqual(
+        expect.arrayContaining([
+          "--label",
+          expect.stringMatching(/^quack\.projectFingerprint=[a-f0-9]{64}$/),
+        ]),
+      );
 
       delete process.env.ANTHROPIC_API_KEY;
     });
