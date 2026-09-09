@@ -794,6 +794,8 @@ export interface FleetEmergencyStopPayload {
   reason: string;
   killedTasks: string[];
   killedPids: number[];
+  prepKilledTasks: string[];
+  prepTimedOutTasks: string[];
 }
 
 export interface FleetPausedPayload {
@@ -1249,6 +1251,8 @@ export interface DispatchChildExitPayload {
   signal: string | null;
   killed: boolean;
   worktreePath: string | null;
+  /** Explicitly distinguishes a shared fallback from Docker's null worktree. */
+  isolation?: "worktree" | "shared-checkout" | "docker";
   at: string;
   /** Which session file received the durable write (see child-exit-log.ts). */
   sessionResolution?: "child-session" | "latest-task-session" | "job-fallback";

@@ -1383,7 +1383,20 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
   delete process.env.ANTHROPIC_API_KEY;
 
   const app = express();
+  let shutdownAdmissionClosed = false;
   app.use(express.json({ limit: "2mb" }));
+  app.use((req, res, next) => {
+    if (
+      shutdownAdmissionClosed &&
+      req.method !== "GET" &&
+      req.method !== "HEAD" &&
+      req.method !== "OPTIONS"
+    ) {
+      res.status(503).json({ error: "Monitor shutdown is in progress" });
+      return;
+    }
+    next();
+  });
 
   // Multi-project mode or legacy single-project mode
   const useMultiProject = projectAdapters && projectAdapters.length > 0;
@@ -1683,7 +1696,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
   // â”€â”€â”€ Fleet controller â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const fleetController =
     dispatchManager && projectRoot
-      ? new FleetController(dispatchManager, prepScheduler, projectRoot)
+      ? new FleetController(dispatchManager, prepScheduler, projectRoot, prepWorker)
       : null;
 
   const emitFleetEvent = (
@@ -8916,6 +8929,133 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     }
     const crashLogPath = path.join(crashLogDir, "monitor-crash.log");
 
+    const dispatchManagersForShutdown = (): DispatchManager[] => {
+      const managers = new Set<DispatchManager>();
+      if (dispatchManager) managers.add(dispatchManager);
+      if (registry) {
+        for (const context of registry.listProjects()) {
+          if (context.dispatchManager) managers.add(context.dispatchManager);
+        }
+      }
+      return [...managers];
+    };
+    const shutdownDispatchManagers = async (): Promise<void> => {
+      const managers = dispatchManagersForShutdown();
+      for (const manager of managers) {
+        try {
+          manager.stopWatchdog();
+        } catch {
+          /* best effort */
+        }
+      }
+      const results = await Promise.allSettled(
+        managers.map((manager) =>
+          manager.shutdownAll({ gracefulTimeoutMs: 1_000, forceTimeoutMs: 2_000 }),
+        ),
+      );
+      for (const result of results) {
+        if (result.status === "rejected") {
+          console.error("[monitor] Dispatch shutdown failed:", result.reason);
+        } else if (result.value.timedOut.length > 0) {
+          console.error(
+            `[monitor] Dispatch shutdown timed out for: ${result.value.timedOut.join(", ")}`,
+          );
+        }
+      }
+    };
+    const stopPrepSchedulers = (): void => {
+      try {
+        prepScheduler?.stop();
+      } catch {
+        /* best effort */
+      }
+      if (registry) {
+        for (const context of registry.listProjects()) {
+          try {
+            context.prepScheduler?.stop();
+          } catch {
+            /* best effort */
+          }
+        }
+      }
+    };
+    const prepWorkersForShutdown = (): PrepWorker[] => {
+      const workers = new Set<PrepWorker>();
+      if (prepWorker) workers.add(prepWorker);
+      if (registry) {
+        for (const context of registry.listProjects()) {
+          if (context.prepWorker) workers.add(context.prepWorker);
+        }
+      }
+      return [...workers];
+    };
+    const shutdownPrepWorkers = async (): Promise<void> => {
+      const results = await Promise.allSettled(
+        prepWorkersForShutdown().map((worker) =>
+          worker.shutdownAll({ gracefulTimeoutMs: 1_000, forceTimeoutMs: 2_000 }),
+        ),
+      );
+      for (const result of results) {
+        if (result.status === "rejected") {
+          console.error("[monitor] Prep worker shutdown failed:", result.reason);
+        } else if (result.value.timedOut.length > 0) {
+          console.error(
+            `[monitor] Prep worker shutdown timed out for: ${result.value.timedOut.join(", ")}`,
+          );
+        }
+      }
+    };
+    const stopAuxiliaryWorkers = (): void => {
+      try {
+        testRunner?.killAll();
+      } catch {
+        /* best effort */
+      }
+      try {
+        adminRuns.stopAll();
+      } catch {
+        /* best effort */
+      }
+    };
+    const stopProgressWatchersBounded = async (timeoutMs = 2_000): Promise<void> => {
+      const stops = Array.from(activeProgressWatchers.values(), (watcher) =>
+        Promise.resolve()
+          .then(() => watcher.stop())
+          .catch(() => undefined),
+      );
+      activeProgressWatchers.clear();
+      if (stops.length === 0) return;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          Promise.allSettled(stops),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, timeoutMs);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+    const settleBounded = async (
+      operations: Array<Promise<unknown>>,
+      timeoutMs = 2_000,
+    ): Promise<void> => {
+      if (operations.length === 0) return;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          Promise.allSettled(operations),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, timeoutMs);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+
+    let fatalShutdownStarted = false;
     const onUncaughtException = (err: Error) => {
       const timestamp = new Date().toISOString();
       const entry = `[${timestamp}] UNCAUGHT EXCEPTION: ${err.message}\n${err.stack ?? "no stack"}\n\n`;
@@ -8926,14 +9066,22 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         process.stderr.write(entry);
       }
       console.error("[monitor] FATAL uncaughtException:", err.message);
-      // Attempt graceful shutdown before exit
-      try {
-        dispatchManager?.killAll();
-        sse.closeAll();
-      } catch {
-        /* best effort */
-      }
-      process.exit(1);
+      if (fatalShutdownStarted) return;
+      fatalShutdownStarted = true;
+      shutdownAdmissionClosed = true;
+      stopPrepSchedulers();
+      stopAuxiliaryWorkers();
+      // The monitor must not exit until agent process trees have either exited
+      // or exhausted the bounded forced-shutdown window.
+      void Promise.allSettled([shutdownDispatchManagers(), shutdownPrepWorkers()]).finally(() => {
+        stopAuxiliaryWorkers();
+        try {
+          sse.closeAll();
+        } catch {
+          /* best effort */
+        }
+        process.exit(1);
+      });
     };
 
     const onUnhandledRejection = (reason: unknown) => {
@@ -9206,54 +9354,51 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
     // â”€â”€â”€ SIGINT/SIGTERM graceful shutdown â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Clean up all watchers, heartbeats, and child processes on signal.
-    const gracefulShutdown = (signal: string) => {
+    let signalShutdownStarted = false;
+    const gracefulShutdown = (signal: string): void => {
+      if (signalShutdownStarted) return;
+      signalShutdownStarted = true;
       console.log(`[monitor] Received ${signal}, shutting down gracefully...`);
-      for (const [, hb] of activeHeartbeats) {
-        try {
-          hb.stop();
-        } catch {
-          /* best effort */
-        }
-      }
-      activeHeartbeats.clear();
-      for (const [, pw] of activeProgressWatchers) {
-        try {
-          void pw.stop();
-        } catch {
-          /* best effort */
-        }
-      }
-      activeProgressWatchers.clear();
-      try {
-        dispatchManager?.killAll();
-      } catch {
-        /* best effort */
-      }
-      try {
-        adminRuns.stopAll();
-      } catch {
-        /* best effort */
-      }
-      try {
-        legacyDb.close();
-      } catch {
-        /* best effort */
-      }
-      if (registry) {
-        for (const ctx of registry.listProjects()) {
+      shutdownAdmissionClosed = true;
+      stopPrepSchedulers();
+      stopAuxiliaryWorkers();
+      void (async () => {
+        for (const [, hb] of activeHeartbeats) {
           try {
-            ctx.db.close();
+            hb.stop();
           } catch {
             /* best effort */
           }
         }
-      }
-      try {
-        sse.closeAll();
-      } catch {
-        /* best effort */
-      }
-      process.exit(0);
+        activeHeartbeats.clear();
+        // Start child termination before waiting on watcher close. A stuck
+        // chokidar close must never prevent dispatch TERM/KILL escalation.
+        const dispatchShutdown = shutdownDispatchManagers();
+        const prepShutdown = shutdownPrepWorkers();
+        const progressShutdown = stopProgressWatchersBounded();
+        await Promise.allSettled([dispatchShutdown, prepShutdown, progressShutdown]);
+        stopAuxiliaryWorkers();
+        try {
+          legacyDb.close();
+        } catch {
+          /* best effort */
+        }
+        if (registry) {
+          for (const ctx of registry.listProjects()) {
+            try {
+              ctx.db.close();
+            } catch {
+              /* best effort */
+            }
+          }
+        }
+        try {
+          sse.closeAll();
+        } catch {
+          /* best effort */
+        }
+        process.exit(0);
+      })();
     };
     const onSigint = () => gracefulShutdown("SIGINT");
     const onSigterm = () => gracefulShutdown("SIGTERM");
@@ -10013,6 +10158,15 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         resolve({
           port,
           stop: async () => {
+            shutdownAdmissionClosed = true;
+            stopPrepSchedulers();
+            // Start dispatch termination before any watcher or telemetry
+            // teardown. Those integrations are third-party async boundaries
+            // and must never delay TERM/KILL escalation for worker children.
+            const dispatchShutdown = shutdownDispatchManagers();
+            const prepShutdown = shutdownPrepWorkers();
+            const progressShutdown = stopProgressWatchersBounded();
+            stopAuxiliaryWorkers();
             // Kill in-flight ccusage refresh to prevent "Cannot log after tests are done"
             ccusageAborted = true;
             if (ccusageChild) {
@@ -10045,7 +10199,9 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
             process.off("unhandledRejection", onUnhandledRejection);
             process.off("SIGINT", onSigint);
             process.off("SIGTERM", onSigterm);
-            await Promise.allSettled(stopFreshnessMonitors.map((stopFm) => stopFm()));
+            await settleBounded(
+              stopFreshnessMonitors.map((stopFm) => Promise.resolve().then(() => stopFm())),
+            );
             for (const stopRecorder of stopOnMergeRecorders) stopRecorder();
             for (const stopSync of stopVerifiedSyncs) stopSync();
             for (const proj of resolveProjects()) {
@@ -10053,12 +10209,12 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
             }
             if (githubPollInterval) clearInterval(githubPollInterval);
             if (githubSyncInterval) clearInterval(githubSyncInterval);
-            if (adapterWatcher) {
-              await adapterWatcher.close();
-            }
-            if (taskWatcherInstance) {
-              await taskWatcherInstance.close();
-            }
+            await settleBounded([
+              ...(adapterWatcher ? [Promise.resolve().then(() => adapterWatcher.close())] : []),
+              ...(taskWatcherInstance
+                ? [Promise.resolve().then(() => taskWatcherInstance.close())]
+                : []),
+            ]);
             for (const hb of activeHeartbeats.values()) {
               try {
                 hb.stop();
@@ -10067,27 +10223,21 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
               }
             }
             activeHeartbeats.clear();
-            for (const pw of activeProgressWatchers.values()) {
-              pw.stop().catch(() => {
-                /* best effort */
-              });
-            }
-            activeProgressWatchers.clear();
-            dispatchManager?.killAll();
-            adminRuns.stopAll();
-            prepWorker?.killAll();
-            testRunner?.killAll();
+            await Promise.allSettled([dispatchShutdown, prepShutdown, progressShutdown]);
+            stopAuxiliaryWorkers();
             // Stop multi-project watchers and services
             for (const stopFn of projectWatcherStops) {
               stopFn();
             }
+            const registryWatcherCloses: Array<Promise<unknown>> = [];
             if (registry) {
               for (const ctx of registry.listProjects()) {
                 ctx.progressDetector.stopChecking();
-                ctx.dispatchManager?.killAll();
                 ctx.prepScheduler?.stop();
                 if (ctx.taskWatcher) {
-                  await ctx.taskWatcher.close();
+                  registryWatcherCloses.push(
+                    Promise.resolve().then(() => ctx.taskWatcher?.close()),
+                  );
                 }
                 try {
                   ctx.db.close();
@@ -10096,6 +10246,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
                 }
               }
             }
+            await settleBounded(registryWatcherCloses);
             sse.closeAll();
             authService.destroy();
             try {
@@ -10105,7 +10256,18 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
             }
             stopWatcher();
             await new Promise<void>((resolveClose) => {
-              server.close(() => resolveClose());
+              let settled = false;
+              const finish = (): void => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(closeTimer);
+                resolveClose();
+              };
+              const closeTimer = setTimeout(() => {
+                server.closeAllConnections();
+                finish();
+              }, 2_000);
+              server.close(finish);
             });
             await new Promise<void>((resolveSettle) => setTimeout(resolveSettle, 25));
           },

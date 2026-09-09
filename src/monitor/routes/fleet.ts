@@ -168,6 +168,8 @@ export function registerFleetRoutes(app: Express, deps: FleetRouteDeps): void {
         reason,
         killedTasks: result.killedTasks,
         killedPids: result.killedPids,
+        prepKilledTasks: result.prepKilledTasks,
+        prepTimedOutTasks: result.prepTimedOutTasks,
       });
       res.json(result);
     } catch (err: unknown) {
@@ -209,17 +211,26 @@ export function registerFleetRoutes(app: Express, deps: FleetRouteDeps): void {
       return;
     }
 
+    const priorState = p.fleetController.getState();
     try {
-      // Settle recovered queue admission before publishing resumed state.
-      if (p.dispatchQueue) {
-        await p.dispatchQueue.resume();
-      }
-
+      // Re-open manager admission before queue scheduling. An emergency stop
+      // aborts (rather than pauses) the queue, so it must be started again.
       p.fleetController.resume();
+      if (p.dispatchQueue) {
+        if (priorState === "emergency_stopped") {
+          await p.dispatchQueue.start();
+        } else {
+          await p.dispatchQueue.resume();
+        }
+      }
 
       emitFleetEvent("fleet_resumed", {});
       res.json({ ok: true, state: "running" });
     } catch (err: unknown) {
+      if (priorState === "emergency_stopped") {
+        p.dispatchQueue?.abort();
+        await p.fleetController.emergencyStop("Emergency resume failed").catch(() => undefined);
+      }
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ error: `Resume failed: ${msg}` });
     }

@@ -4,6 +4,7 @@ import * as childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
 
 type MockCallArgs = [string, string[], ...unknown[]];
+type ExecFileCallback = (err: Error | null, result: { stdout: string; stderr: string }) => void;
 
 // Mock child_process
 jest.mock("node:child_process", () => ({
@@ -31,34 +32,20 @@ function defaultConfig(overrides?: Partial<DockerIsolationConfig>): DockerIsolat
  * Supports sequential calls by chaining implementations.
  */
 function mockExecFileSuccess(stdout = "", stderr = ""): void {
-  mockExecFile.mockImplementation(
-    (
-      _cmd: string,
-      _args: string[],
-      cb?: (err: Error | null, result: { stdout: string; stderr: string }) => void,
-    ) => {
-      if (cb) {
-        cb(null, { stdout, stderr });
-      }
-    },
-  );
+  mockExecFile.mockImplementation((...args: unknown[]) => {
+    const cb = args.at(-1) as ExecFileCallback | undefined;
+    if (typeof cb === "function") cb(null, { stdout, stderr });
+  });
 }
 
 /**
  * Helper: make mockExecFile reject with an error.
  */
 function mockExecFileError(message: string): void {
-  mockExecFile.mockImplementation(
-    (
-      _cmd: string,
-      _args: string[],
-      cb?: (err: Error | null, result: { stdout: string; stderr: string }) => void,
-    ) => {
-      if (cb) {
-        cb(new Error(message), { stdout: "", stderr: "" });
-      }
-    },
-  );
+  mockExecFile.mockImplementation((...args: unknown[]) => {
+    const cb = args.at(-1) as ExecFileCallback | undefined;
+    if (typeof cb === "function") cb(new Error(message), { stdout: "", stderr: "" });
+  });
 }
 
 /**
@@ -66,23 +53,19 @@ function mockExecFileError(message: string): void {
  */
 function mockExecFileSequence(responses: Array<{ stdout?: string; error?: string }>): void {
   let callIndex = 0;
-  mockExecFile.mockImplementation(
-    (
-      _cmd: string,
-      _args: string[],
-      cb?: (err: Error | null, result: { stdout: string; stderr: string }) => void,
-    ) => {
-      const resp = responses[callIndex] ?? responses[responses.length - 1];
-      callIndex++;
-      if (cb) {
-        if (resp.error) {
-          cb(new Error(resp.error), { stdout: "", stderr: "" });
-        } else {
-          cb(null, { stdout: resp.stdout ?? "", stderr: "" });
-        }
+  mockExecFile.mockImplementation((...args: unknown[]) => {
+    const cb = args.at(-1) as ExecFileCallback | undefined;
+    const resp = responses[callIndex] ?? responses[responses.length - 1];
+    callIndex++;
+    if (typeof cb === "function") {
+      if (resp.error) {
+        const error = Object.assign(new Error(resp.error), { stderr: resp.error });
+        cb(error, { stdout: "", stderr: resp.error });
+      } else {
+        cb(null, { stdout: resp.stdout ?? "", stderr: "" });
       }
-    },
-  );
+    }
+  });
 }
 
 describe("DockerManager", () => {
@@ -104,6 +87,7 @@ describe("DockerManager", () => {
       expect(mockExecFile).toHaveBeenCalledWith(
         "docker",
         ["info", "--format", "{{.ServerVersion}}"],
+        expect.objectContaining({ timeout: 30_000 }),
         expect.any(Function),
       );
     });
@@ -176,6 +160,7 @@ describe("DockerManager", () => {
       const execCall = mockExecFile.mock.calls[2] as MockCallArgs;
       expect(execCall[0]).toBe("docker");
       expect(execCall[1]).toEqual(["exec", "abc123", "sh", "-c", "npm install"]);
+      expect((execCall[2] as { timeout: number }).timeout).toBeGreaterThan(30_000);
     });
 
     test("throws on double-create for same task", async () => {
@@ -184,7 +169,7 @@ describe("DockerManager", () => {
       await manager.createContainer("TASK-001");
 
       await expect(manager.createContainer("TASK-001")).rejects.toThrow(
-        "Container already exists for TASK-001",
+        "Container cleanup is unresolved for TASK-001",
       );
     });
 
@@ -422,7 +407,12 @@ describe("DockerManager", () => {
       const logs = await manager.getLogs("log123");
 
       expect(logs).toContain("line 1");
-      expect(mockExecFile).toHaveBeenCalledWith("docker", ["logs", "log123"], expect.any(Function));
+      expect(mockExecFile).toHaveBeenCalledWith(
+        "docker",
+        ["logs", "log123"],
+        expect.objectContaining({ timeout: 30_000 }),
+        expect.any(Function),
+      );
     });
 
     test("passes tail option when specified", async () => {
@@ -433,6 +423,7 @@ describe("DockerManager", () => {
       expect(mockExecFile).toHaveBeenCalledWith(
         "docker",
         ["logs", "log123", "--tail", "50"],
+        expect.objectContaining({ timeout: 30_000 }),
         expect.any(Function),
       );
     });
@@ -488,9 +479,57 @@ describe("DockerManager", () => {
 
       expect(manager.getActiveContainers()).toHaveLength(2);
 
-      await manager.cleanupAll();
+      const result = await manager.cleanupAll();
 
       expect(manager.getActiveContainers()).toHaveLength(0);
+      expect(result).toEqual({
+        removedTaskIds: ["TASK-A", "TASK-B"],
+        failedTaskIds: [],
+      });
+    });
+
+    test("retains and reports a container when force removal fails", async () => {
+      mockExecFileSequence([
+        { stdout: "survivor123\n" },
+        { stdout: "" },
+        { error: "daemon unavailable" },
+        { stdout: "{}" },
+      ]);
+
+      await manager.createContainer("TASK-SURVIVOR");
+      const result = await manager.cleanupAll();
+
+      expect(result).toEqual({
+        removedTaskIds: [],
+        failedTaskIds: ["TASK-SURVIVOR"],
+      });
+      expect(manager.getActiveContainers()).toEqual([
+        expect.objectContaining({ taskId: "TASK-SURVIVOR", status: "running" }),
+      ]);
+    });
+
+    test("does not treat immediate absence as proof after an aborted create", async () => {
+      const createError = Object.assign(new Error("The operation was aborted"), {
+        code: null,
+        killed: true,
+        signal: "SIGTERM",
+      });
+      mockExecFile.mockImplementationOnce((...args: unknown[]) => {
+        const cb = args.at(-1) as ExecFileCallback;
+        cb(createError, { stdout: "", stderr: "" });
+      });
+      mockExecFileSequence([{ error: "No such container" }, { error: "No such container" }]);
+
+      await expect(manager.createContainer("TASK-ABORTED-CREATE")).rejects.toThrow(
+        "Failed to create container",
+      );
+      expect(await manager.cleanupAll()).toEqual({
+        removedTaskIds: [],
+        failedTaskIds: ["TASK-ABORTED-CREATE"],
+      });
+      await expect(manager.createContainer("TASK-ABORTED-CREATE")).rejects.toThrow(
+        "Container cleanup is unresolved",
+      );
     });
 
     test("does not throw when no containers exist", async () => {

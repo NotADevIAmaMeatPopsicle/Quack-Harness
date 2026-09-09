@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, type ChildProcess } from "node:child_process";
 import {
   DegradedSharedCheckoutBusyError,
   DispatchManager,
@@ -19,16 +19,47 @@ async function waitForFile(filePath: string, timeoutMs = 5000): Promise<void> {
   throw new Error(`Timed out waiting for ${filePath}`);
 }
 
+async function waitForCondition(
+  predicate: () => boolean,
+  description: string,
+  timeoutMs = 5000,
+): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`Timed out waiting for ${description}`);
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 describe("DispatchManager", () => {
   let manager: DispatchManager;
+  let suiteLogDir: string;
 
   beforeEach(() => {
     // Use a dummy project root and bin path — we won't actually spawn
-    manager = new DispatchManager("/fake/project", "/fake/bin.js");
+    suiteLogDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-dispatch-manager-suite-"));
+    manager = new DispatchManager(
+      "/fake/project",
+      "/fake/bin.js",
+      undefined,
+      undefined,
+      suiteLogDir,
+    );
   });
 
   afterEach(() => {
     manager.killAll();
+    fs.rmSync(suiteLogDir, { recursive: true, force: true });
   });
 
   test("getActiveJobs returns empty when no jobs", () => {
@@ -86,6 +117,224 @@ describe("DispatchManager", () => {
     // Internal state test — just verify cleanup doesn't throw
     manager.cleanup(0);
     expect(manager.getAllJobs()).toEqual([]);
+  });
+
+  test("bounded shutdown confirms a real child exit and preserves its worktree", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shutdown-"));
+    const worktreePath = path.join(tmpDir, "worktree");
+    const readyPath = path.join(tmpDir, "child-ready");
+    const scriptPath = path.join(tmpDir, "signal-resistant-child.cjs");
+    fs.mkdirSync(worktreePath, { recursive: true });
+    fs.writeFileSync(path.join(worktreePath, "uncommitted.txt"), "preserve me\n", "utf-8");
+    fs.writeFileSync(
+      scriptPath,
+      [
+        "const fs = require('node:fs');",
+        "const { spawn } = require('node:child_process');",
+        "if (process.platform !== 'win32') process.on('SIGTERM', () => undefined);",
+        "const grandchild = spawn(process.execPath, ['-e', \"if (process.platform !== 'win32') process.on('SIGTERM', () => undefined); setInterval(() => undefined, 1000);\"], { stdio: 'ignore' });",
+        `fs.writeFileSync(${JSON.stringify(readyPath)}, JSON.stringify({ grandchildPid: grandchild.pid }), 'utf-8');`,
+        "setInterval(() => undefined, 1000);",
+      ].join("\n"),
+      "utf-8",
+    );
+
+    const mgr = new DispatchManager(tmpDir, scriptPath, {
+      method: "worktree",
+      dockerCleanup: false,
+    });
+    (
+      mgr as unknown as {
+        createWorktree(taskId: string): string | undefined;
+      }
+    ).createWorktree = () => worktreePath;
+
+    try {
+      const job = mgr.start("TASK-SHUTDOWN", { skipGate: true });
+      await waitForFile(readyPath);
+      const { grandchildPid } = JSON.parse(fs.readFileSync(readyPath, "utf-8")) as {
+        grandchildPid: number;
+      };
+
+      expect(mgr.stop("TASK-SHUTDOWN")).toBe(true);
+      expect(job.status).toBe("running");
+      expect(fs.existsSync(worktreePath)).toBe(true);
+
+      const result = await mgr.shutdownAll({ gracefulTimeoutMs: 50, forceTimeoutMs: 2_000 });
+      await waitForCondition(() => job.status !== "running", "real child exit handling");
+      await waitForCondition(() => !processIsAlive(grandchildPid), "real grandchild exit");
+
+      expect(result.requested).toEqual(["TASK-SHUTDOWN"]);
+      expect(result.exited).toEqual(["TASK-SHUTDOWN"]);
+      expect(result.escalated).toEqual(["TASK-SHUTDOWN"]);
+      expect(result.timedOut).toEqual([]);
+      expect(job.status).toBe("stopped");
+      expect(fs.readFileSync(path.join(worktreePath, "uncommitted.txt"), "utf-8")).toBe(
+        "preserve me\n",
+      );
+      expect(fs.existsSync(worktreePath)).toBe(true);
+    } finally {
+      await mgr.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a failed stop signal keeps a live child tracked and preserves its worktree", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-stop-error-"));
+    const worktreePath = path.join(tmpDir, ".quack", "worktrees", "TASK-STOP-ERROR");
+    const scriptPath = path.join(tmpDir, "long-running-child.cjs");
+    fs.mkdirSync(worktreePath, { recursive: true });
+    fs.writeFileSync(path.join(worktreePath, "uncommitted.txt"), "preserve me\n", "utf-8");
+    fs.writeFileSync(scriptPath, "setInterval(() => undefined, 1000);\n", "utf-8");
+
+    const mgr = new DispatchManager(tmpDir, scriptPath, {
+      method: "worktree",
+      dockerCleanup: false,
+    });
+    type TreeSignaler = (
+      taskId: string,
+      child: ChildProcess,
+      signal: NodeJS.Signals,
+      windowsTimeoutMs: number,
+    ) => void;
+    const internals = mgr as unknown as {
+      createWorktree(taskId: string): string | undefined;
+      processes: Map<string, ChildProcess>;
+      signalProcessTree: TreeSignaler;
+    };
+    internals.createWorktree = () => worktreePath;
+    const signalProcessTree = internals.signalProcessTree.bind(mgr);
+    let rejectSignals = true;
+    internals.signalProcessTree = (...args) => {
+      if (rejectSignals) throw new Error("simulated signal delivery failure");
+      signalProcessTree(...args);
+    };
+
+    try {
+      const job = mgr.start("TASK-STOP-ERROR", { skipGate: true });
+      const child = internals.processes.get("TASK-STOP-ERROR");
+      if (!child) throw new Error("Expected tracked child");
+      await waitForCondition(() => processIsAlive(job.pid), "long-running child startup");
+
+      expect(mgr.stop("TASK-STOP-ERROR")).toBe(true);
+      child.emit("error", new Error("simulated signal delivery failure"));
+
+      expect(job.status).toBe("running");
+      expect(internals.processes.get("TASK-STOP-ERROR")).toBe(child);
+      expect(fs.readFileSync(path.join(worktreePath, "uncommitted.txt"), "utf-8")).toBe(
+        "preserve me\n",
+      );
+      expect(fs.existsSync(worktreePath)).toBe(true);
+
+      const firstShutdown = await mgr.shutdownAll({ gracefulTimeoutMs: 10, forceTimeoutMs: 10 });
+      expect(firstShutdown.timedOut).toEqual(["TASK-STOP-ERROR"]);
+      const survivorMarker = path.join(
+        tmpDir,
+        ".quack",
+        "logs",
+        "worktree-survivors",
+        "TASK-STOP-ERROR.json",
+      );
+      expect(fs.existsSync(survivorMarker)).toBe(true);
+      const restartedManager = new DispatchManager(tmpDir, scriptPath, {
+        method: "worktree",
+        dockerCleanup: false,
+      });
+      expect(() =>
+        (
+          restartedManager as unknown as {
+            createWorktree(taskId: string): string | undefined;
+          }
+        ).createWorktree("TASK-STOP-ERROR"),
+      ).toThrow("has not been confirmed stopped");
+
+      rejectSignals = false;
+      const result = await mgr.shutdownAll({ gracefulTimeoutMs: 1_000, forceTimeoutMs: 1_000 });
+      expect(result.timedOut).toEqual([]);
+      await waitForCondition(() => job.status === "stopped", "failed-stop child exit handling");
+      expect(fs.existsSync(worktreePath)).toBe(true);
+      expect(fs.existsSync(survivorMarker)).toBe(false);
+    } finally {
+      rejectSignals = false;
+      await mgr.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("shutdown inherits a stopped root's process group and kills its resistant descendant", async () => {
+    if (process.platform === "win32") return;
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-stop-tree-"));
+    const worktreePath = path.join(tmpDir, "worktree");
+    const readyPath = path.join(tmpDir, "child-ready");
+    const scriptPath = path.join(tmpDir, "cooperative-root.cjs");
+    fs.mkdirSync(worktreePath, { recursive: true });
+    fs.writeFileSync(path.join(worktreePath, "uncommitted.txt"), "preserve me\n", "utf-8");
+    fs.writeFileSync(
+      scriptPath,
+      [
+        "const fs = require('node:fs');",
+        "const { spawn } = require('node:child_process');",
+        "const grandchild = spawn(process.execPath, ['-e', \"process.on('SIGTERM', () => undefined); setInterval(() => undefined, 1000);\"], { stdio: 'ignore' });",
+        `fs.writeFileSync(${JSON.stringify(readyPath)}, JSON.stringify({ grandchildPid: grandchild.pid }), 'utf-8');`,
+        "process.on('SIGTERM', () => process.exit(0));",
+        "setInterval(() => undefined, 1000);",
+      ].join("\n"),
+      "utf-8",
+    );
+
+    const mgr = new DispatchManager(tmpDir, scriptPath, {
+      method: "worktree",
+      dockerCleanup: false,
+    });
+    (
+      mgr as unknown as {
+        createWorktree(taskId: string): string | undefined;
+      }
+    ).createWorktree = () => worktreePath;
+
+    let grandchildPid: number | undefined;
+    try {
+      const job = mgr.start("TASK-STOP-TREE", { skipGate: true });
+      await waitForFile(readyPath);
+      grandchildPid = (JSON.parse(fs.readFileSync(readyPath, "utf-8")) as { grandchildPid: number })
+        .grandchildPid;
+      const trackedProcesses = (mgr as unknown as { processes: Map<string, ChildProcess> })
+        .processes;
+
+      expect(mgr.stop("TASK-STOP-TREE")).toBe(true);
+      await waitForCondition(
+        () => !trackedProcesses.has("TASK-STOP-TREE"),
+        "cooperative root exit",
+      );
+      expect(job.status).toBe("running");
+      expect(processIsAlive(grandchildPid)).toBe(true);
+      const shutdown = await mgr.shutdownAll({ gracefulTimeoutMs: 50, forceTimeoutMs: 2_000 });
+      await waitForCondition(
+        () => !processIsAlive(grandchildPid as number),
+        "resistant descendant escalation",
+        3_000,
+      );
+
+      expect(shutdown.requested).toContain("TASK-STOP-TREE");
+      expect(shutdown.escalated).toContain("TASK-STOP-TREE");
+      expect(shutdown.timedOut).toEqual([]);
+      expect(job.status).toBe("stopped");
+      expect(fs.existsSync(worktreePath)).toBe(true);
+      expect(fs.readFileSync(path.join(worktreePath, "uncommitted.txt"), "utf-8")).toBe(
+        "preserve me\n",
+      );
+    } finally {
+      await mgr.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
+      if (grandchildPid && processIsAlive(grandchildPid)) {
+        try {
+          process.kill(grandchildPid, "SIGKILL");
+        } catch {
+          // Already exited.
+        }
+      }
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 
   describe("isolation method branching", () => {
@@ -849,6 +1098,593 @@ describe("DispatchManager", () => {
       );
     });
 
+    test("refuses shared-checkout fallback when the original Git checkout is dirty", () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-dirty-"));
+      const scriptPath = path.join(tmpDir, "should-not-start.cjs");
+      const startedPath = path.join(tmpDir, "unsafe-started");
+      try {
+        execFileSync("git", ["init"], { cwd: tmpDir, stdio: "ignore" });
+        execFileSync("git", ["config", "user.email", "quack@example.test"], {
+          cwd: tmpDir,
+          stdio: "ignore",
+        });
+        execFileSync("git", ["config", "user.name", "Quack Test"], {
+          cwd: tmpDir,
+          stdio: "ignore",
+        });
+        fs.writeFileSync(path.join(tmpDir, ".gitignore"), ".quack/\n", "utf-8");
+        fs.writeFileSync(path.join(tmpDir, "tracked.txt"), "original\n", "utf-8");
+        fs.writeFileSync(
+          scriptPath,
+          `require("node:fs").writeFileSync(${JSON.stringify(startedPath)}, "started");\n`,
+          "utf-8",
+        );
+        execFileSync("git", ["add", ".gitignore", "tracked.txt", path.basename(scriptPath)], {
+          cwd: tmpDir,
+          stdio: "ignore",
+        });
+        execFileSync("git", ["commit", "-m", "initial"], { cwd: tmpDir, stdio: "ignore" });
+        fs.writeFileSync(path.join(tmpDir, "tracked.txt"), "pre-existing user edit\n", "utf-8");
+
+        const mgr = new DispatchManager(tmpDir, scriptPath);
+        (mgr as unknown as { createWorktree(): undefined }).createWorktree = () => undefined;
+
+        expect(() => mgr.start("TASK-DIRTY", { skipGate: true })).toThrow(
+          "shared checkout because it was already dirty",
+        );
+        expect(fs.readFileSync(path.join(tmpDir, "tracked.txt"), "utf-8")).toBe(
+          "pre-existing user edit\n",
+        );
+        expect(fs.existsSync(startedPath)).toBe(false);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    test("refuses shared-checkout fallback when the Git branch baseline is unverifiable", () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-detached-"));
+      const scriptPath = path.join(tmpDir, "should-not-start.cjs");
+      const startedPath = path.join(tmpDir, "unsafe-started");
+      try {
+        execFileSync("git", ["init"], { cwd: tmpDir, stdio: "ignore" });
+        execFileSync("git", ["config", "user.email", "quack@example.test"], {
+          cwd: tmpDir,
+          stdio: "ignore",
+        });
+        execFileSync("git", ["config", "user.name", "Quack Test"], {
+          cwd: tmpDir,
+          stdio: "ignore",
+        });
+        fs.writeFileSync(path.join(tmpDir, ".gitignore"), ".quack/\n", "utf-8");
+        fs.writeFileSync(
+          scriptPath,
+          `require("node:fs").writeFileSync(${JSON.stringify(startedPath)}, "started");\n`,
+          "utf-8",
+        );
+        execFileSync("git", ["add", ".gitignore", path.basename(scriptPath)], {
+          cwd: tmpDir,
+          stdio: "ignore",
+        });
+        execFileSync("git", ["commit", "-m", "initial"], { cwd: tmpDir, stdio: "ignore" });
+        execFileSync("git", ["checkout", "--detach"], { cwd: tmpDir, stdio: "ignore" });
+
+        const mgr = new DispatchManager(tmpDir, scriptPath);
+        (mgr as unknown as { createWorktree(): undefined }).createWorktree = () => undefined;
+
+        expect(() => mgr.start("TASK-DETACHED", { skipGate: true })).toThrow(
+          "Git restoration baseline could not be verified",
+        );
+        expect(fs.existsSync(startedPath)).toBe(false);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    test("does not refresh projectRoot while another task owns the shared checkout", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-refresh-"));
+      const isolatedDir = path.join(tmpDir, "isolated-task");
+      const scriptPath = path.join(tmpDir, "concurrent-children.cjs");
+      const isolatedReady = path.join(tmpDir, "isolated-ready");
+      const sharedReady = path.join(tmpDir, "shared-ready");
+      const releaseIsolated = path.join(tmpDir, "release-isolated");
+      const trackedPath = path.join(tmpDir, "tracked.txt");
+      let mgr: DispatchManager | undefined;
+      fs.mkdirSync(isolatedDir, { recursive: true });
+      try {
+        execFileSync("git", ["init"], { cwd: tmpDir, stdio: "ignore" });
+        execFileSync("git", ["config", "user.email", "quack@example.test"], {
+          cwd: tmpDir,
+          stdio: "ignore",
+        });
+        execFileSync("git", ["config", "user.name", "Quack Test"], {
+          cwd: tmpDir,
+          stdio: "ignore",
+        });
+        fs.writeFileSync(
+          path.join(tmpDir, ".gitignore"),
+          ".quack/\nisolated-task/\nisolated-ready\nshared-ready\nrelease-isolated\n",
+          "utf-8",
+        );
+        fs.writeFileSync(trackedPath, "baseline\n", "utf-8");
+        fs.writeFileSync(
+          scriptPath,
+          [
+            "const fs = require('node:fs');",
+            "const taskId = process.argv[3];",
+            `const isolatedReady = ${JSON.stringify(isolatedReady)};`,
+            `const sharedReady = ${JSON.stringify(sharedReady)};`,
+            `const releaseIsolated = ${JSON.stringify(releaseIsolated)};`,
+            `const trackedPath = ${JSON.stringify(trackedPath)};`,
+            "if (taskId === 'TASK-ISOLATED') {",
+            "  fs.writeFileSync(isolatedReady, 'ready');",
+            "  const timer = setInterval(() => {",
+            "    if (fs.existsSync(releaseIsolated)) { clearInterval(timer); process.exit(0); }",
+            "  }, 10);",
+            "} else {",
+            "  fs.writeFileSync(trackedPath, 'shared worker edit\\n');",
+            "  fs.writeFileSync(sharedReady, 'ready');",
+            "  setInterval(() => undefined, 1000);",
+            "}",
+          ].join("\n"),
+          "utf-8",
+        );
+        execFileSync("git", ["add", ".gitignore", "tracked.txt", path.basename(scriptPath)], {
+          cwd: tmpDir,
+          stdio: "ignore",
+        });
+        execFileSync("git", ["commit", "-m", "initial"], { cwd: tmpDir, stdio: "ignore" });
+
+        mgr = new DispatchManager(tmpDir, scriptPath);
+        const internals = mgr as unknown as {
+          createWorktree(taskId: string): string | undefined;
+          worktreeDegraded: boolean;
+        };
+        internals.createWorktree = (taskId) => {
+          if (taskId === "TASK-ISOLATED") return isolatedDir;
+          internals.worktreeDegraded = true;
+          return undefined;
+        };
+
+        const isolated = mgr.start("TASK-ISOLATED", { skipGate: true });
+        await waitForFile(isolatedReady);
+        const shared = mgr.start("TASK-SHARED", { skipGate: true });
+        await waitForFile(sharedReady);
+        fs.writeFileSync(releaseIsolated, "release", "utf-8");
+        await waitForCondition(() => isolated.status === "completed", "isolated completion");
+
+        expect(shared.status).toBe("running");
+        expect(fs.readFileSync(trackedPath, "utf-8")).toBe("shared worker edit\n");
+        expect(isolated.output.join("\n")).toContain("Skipped main checkout refresh");
+
+        const shutdown = await mgr.shutdownAll({ gracefulTimeoutMs: 50, forceTimeoutMs: 2_000 });
+        expect(shutdown.timedOut).toEqual([]);
+      } finally {
+        if (mgr) {
+          await mgr.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 2_000 });
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    test("restores shared-checkout pause ownership after restart before fallback spawn", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-pause-"));
+      const approvalDir = path.join(tmpDir, ".quack", "logs", "approvals");
+      const firstScript = path.join(tmpDir, "pause-child.cjs");
+      const nextStarted = path.join(tmpDir, "unsafe-next-started");
+      const nextScript = path.join(tmpDir, "next-child.cjs");
+      fs.mkdirSync(approvalDir, { recursive: true });
+      fs.writeFileSync(
+        firstScript,
+        [
+          "const fs = require('node:fs');",
+          "const path = require('node:path');",
+          "const approvalDir = path.join(process.cwd(), '.quack', 'logs', 'approvals');",
+          "fs.mkdirSync(approvalDir, { recursive: true });",
+          "fs.writeFileSync(path.join(approvalDir, 'TASK-PAUSED.json'), JSON.stringify({",
+          "  taskId: 'TASK-PAUSED', state: 'pending', createdAt: new Date().toISOString()",
+          "}), 'utf-8');",
+          "setTimeout(() => process.exit(1), 25);",
+        ].join("\n"),
+        "utf-8",
+      );
+      fs.writeFileSync(
+        nextScript,
+        [
+          "const fs = require('node:fs');",
+          `fs.writeFileSync(${JSON.stringify(nextStarted)}, 'started', 'utf-8');`,
+        ].join("\n"),
+        "utf-8",
+      );
+
+      const firstManager = new DispatchManager(tmpDir, firstScript);
+      const restartedManager = new DispatchManager(tmpDir, nextScript);
+      try {
+        const pausedJob = firstManager.start("TASK-PAUSED", { skipGate: true });
+        await waitForCondition(
+          () => pausedJob.status === "awaiting_approval",
+          "shared-checkout approval pause",
+        );
+
+        const markerPath = path.join(tmpDir, ".quack", "logs", "shared-checkout-pause.json");
+        expect(fs.existsSync(markerPath)).toBe(true);
+
+        // Simulate upgrading a pause created before durable markers existed,
+        // or a crash after the durable exit event but before marker creation.
+        fs.rmSync(markerPath);
+        // A failed worktree setup may leave a partial directory behind even
+        // though the durable exit event proves the child used projectRoot.
+        fs.mkdirSync(path.join(tmpDir, ".quack", "worktrees", "TASK-PAUSED"), {
+          recursive: true,
+        });
+        expect(restartedManager.getAllJobs()).toEqual([]);
+        expect(restartedManager.getSharedCheckoutOccupants()).toEqual([
+          expect.objectContaining({
+            taskId: "TASK-PAUSED",
+            status: "awaiting_approval",
+          }),
+        ]);
+        expect(fs.existsSync(markerPath)).toBe(true);
+
+        let thrown: unknown;
+        try {
+          restartedManager.start("TASK-NEXT", { skipGate: true });
+        } catch (error) {
+          thrown = error;
+        }
+        expect(thrown).toBeInstanceOf(DegradedSharedCheckoutBusyError);
+        expect((thrown as Error).message).toContain("TASK-PAUSED (awaiting_approval)");
+        expect(restartedManager.getJob("TASK-NEXT")).toBeUndefined();
+        expect(fs.existsSync(nextStarted)).toBe(false);
+
+        fs.writeFileSync(
+          path.join(approvalDir, "TASK-PAUSED.json"),
+          JSON.stringify({
+            taskId: "TASK-PAUSED",
+            state: "approved",
+            createdAt: new Date().toISOString(),
+          }),
+          "utf-8",
+        );
+        expect(() => restartedManager.start("TASK-PAUSED", { skipGate: true })).toThrow(
+          DegradedSharedCheckoutBusyError,
+        );
+
+        const resumed = restartedManager.start("TASK-PAUSED", {
+          skipGate: true,
+          resume: true,
+        });
+        expect(resumed.worktreePath).toBeUndefined();
+        await waitForFile(nextStarted);
+        await waitForCondition(() => resumed.status === "completed", "shared-checkout resume");
+        expect(fs.existsSync(markerPath)).toBe(false);
+      } finally {
+        await firstManager.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
+        await restartedManager.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    test("restores the original branch from durable shared-checkout evidence after restart", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-branch-restore-"));
+      const approvalPath = path.join(tmpDir, ".quack", "logs", "approvals", "TASK-RESTORE.json");
+      const scriptPath = path.join(tmpDir, "pause-and-restore.cjs");
+      fs.mkdirSync(path.dirname(approvalPath), { recursive: true });
+      execFileSync("git", ["init"], { cwd: tmpDir, stdio: "ignore" });
+      execFileSync("git", ["config", "user.email", "quack@example.test"], {
+        cwd: tmpDir,
+        stdio: "ignore",
+      });
+      execFileSync("git", ["config", "user.name", "Quack Test"], {
+        cwd: tmpDir,
+        stdio: "ignore",
+      });
+      fs.writeFileSync(path.join(tmpDir, ".gitignore"), ".quack/\n", "utf-8");
+      fs.writeFileSync(
+        scriptPath,
+        [
+          "const fs = require('node:fs');",
+          "const { execFileSync } = require('node:child_process');",
+          `const approvalPath = ${JSON.stringify(approvalPath)};`,
+          "if (!fs.existsSync(approvalPath)) {",
+          "  execFileSync('git', ['checkout', '-b', 'quack/TASK-RESTORE'], { stdio: 'ignore' });",
+          "  fs.mkdirSync(require('node:path').dirname(approvalPath), { recursive: true });",
+          "  fs.writeFileSync(approvalPath, JSON.stringify({ taskId: 'TASK-RESTORE', state: 'pending', createdAt: new Date().toISOString() }));",
+          "  process.exit(1);",
+          "}",
+          "process.exit(0);",
+        ].join("\n"),
+        "utf-8",
+      );
+      execFileSync("git", ["add", ".gitignore", path.basename(scriptPath)], {
+        cwd: tmpDir,
+        stdio: "ignore",
+      });
+      execFileSync("git", ["commit", "-m", "initial"], { cwd: tmpDir, stdio: "ignore" });
+      const originalBranch = execFileSync("git", ["branch", "--show-current"], {
+        cwd: tmpDir,
+        encoding: "utf-8",
+      }).trim();
+
+      const firstManager = new DispatchManager(tmpDir, scriptPath);
+      const restartedManager = new DispatchManager(tmpDir, scriptPath);
+      (firstManager as unknown as { createWorktree(): undefined }).createWorktree = () => undefined;
+      (restartedManager as unknown as { createWorktree(): undefined }).createWorktree = () =>
+        undefined;
+      try {
+        const paused = firstManager.start("TASK-RESTORE", { skipGate: true });
+        await waitForCondition(() => paused.status === "awaiting_approval", "branch restore pause");
+        expect(
+          execFileSync("git", ["branch", "--show-current"], {
+            cwd: tmpDir,
+            encoding: "utf-8",
+          }).trim(),
+        ).toBe("quack/TASK-RESTORE");
+        const approval = JSON.parse(fs.readFileSync(approvalPath, "utf-8")) as Record<
+          string,
+          unknown
+        >;
+        fs.writeFileSync(approvalPath, JSON.stringify({ ...approval, state: "approved" }), "utf-8");
+
+        const resumed = restartedManager.start("TASK-RESTORE", { skipGate: true, resume: true });
+        await waitForCondition(() => resumed.status === "completed", "branch restore completion");
+        expect(
+          execFileSync("git", ["branch", "--show-current"], {
+            cwd: tmpDir,
+            encoding: "utf-8",
+          }).trim(),
+        ).toBe(originalBranch);
+        expect(
+          fs.existsSync(path.join(tmpDir, ".quack", "logs", "shared-checkout-pause.json")),
+        ).toBe(false);
+      } finally {
+        await firstManager.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
+        await restartedManager.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    test("keeps durable ownership when a shared resume lacks a restoration baseline", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-restore-fail-"));
+      const markerPath = path.join(tmpDir, ".quack", "logs", "shared-checkout-pause.json");
+      const scriptPath = path.join(tmpDir, "successful-child.cjs");
+      const startedPath = path.join(tmpDir, "unsafe-resume-started");
+      execFileSync("git", ["init"], { cwd: tmpDir, stdio: "ignore" });
+      execFileSync("git", ["config", "user.email", "quack@example.test"], {
+        cwd: tmpDir,
+        stdio: "ignore",
+      });
+      execFileSync("git", ["config", "user.name", "Quack Test"], {
+        cwd: tmpDir,
+        stdio: "ignore",
+      });
+      fs.writeFileSync(path.join(tmpDir, ".gitignore"), ".quack/\n", "utf-8");
+      fs.writeFileSync(
+        scriptPath,
+        `require("node:fs").writeFileSync(${JSON.stringify(startedPath)}, "started");\n`,
+        "utf-8",
+      );
+      execFileSync("git", ["add", ".gitignore", path.basename(scriptPath)], {
+        cwd: tmpDir,
+        stdio: "ignore",
+      });
+      execFileSync("git", ["commit", "-m", "initial"], { cwd: tmpDir, stdio: "ignore" });
+      execFileSync("git", ["checkout", "-b", "quack/TASK-NO-BASELINE"], {
+        cwd: tmpDir,
+        stdio: "ignore",
+      });
+      fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+      const now = new Date().toISOString();
+      fs.writeFileSync(
+        markerPath,
+        `${JSON.stringify({
+          version: 1,
+          taskId: "TASK-NO-BASELINE",
+          sessionId: "legacy-session",
+          startedAt: now,
+          pausedAt: now,
+          status: "stopped",
+        })}\n`,
+        "utf-8",
+      );
+
+      const mgr = new DispatchManager(tmpDir, scriptPath);
+      (mgr as unknown as { createWorktree(): undefined }).createWorktree = () => undefined;
+      try {
+        expect(() => mgr.start("TASK-NO-BASELINE", { skipGate: true, resume: true })).toThrow(
+          "Git restoration baseline could not be verified",
+        );
+        expect(fs.existsSync(markerPath)).toBe(true);
+        expect(fs.existsSync(startedPath)).toBe(false);
+      } finally {
+        await mgr.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    test("resumes the in-memory shared checkout when durable marker persistence failed", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-pause-memory-"));
+      const approvalDir = path.join(tmpDir, ".quack", "logs", "approvals");
+      const approvalPath = path.join(approvalDir, "TASK-PAUSED.json");
+      const resumedPath = path.join(tmpDir, "resumed-in-shared-checkout");
+      const scriptPath = path.join(tmpDir, "pause-then-resume.cjs");
+      fs.mkdirSync(approvalDir, { recursive: true });
+      fs.writeFileSync(
+        scriptPath,
+        [
+          "const fs = require('node:fs');",
+          `const approvalPath = ${JSON.stringify(approvalPath)};`,
+          "if (fs.existsSync(approvalPath) && JSON.parse(fs.readFileSync(approvalPath, 'utf-8')).state === 'approved') {",
+          `  fs.writeFileSync(${JSON.stringify(resumedPath)}, process.cwd(), 'utf-8');`,
+          "  process.exit(0);",
+          "}",
+          "fs.writeFileSync(approvalPath, JSON.stringify({ taskId: 'TASK-PAUSED', state: 'pending', createdAt: new Date().toISOString() }), 'utf-8');",
+          "setTimeout(() => process.exit(1), 25);",
+        ].join("\n"),
+        "utf-8",
+      );
+
+      const mgr = new DispatchManager(tmpDir, scriptPath);
+      const internals = mgr as unknown as {
+        persistSharedCheckoutPause(job: DispatchJob, status?: string): void;
+      };
+      const persistMarker = internals.persistSharedCheckoutPause.bind(mgr);
+      let markerWrites = 0;
+      internals.persistSharedCheckoutPause = (job, status) => {
+        markerWrites += 1;
+        if (markerWrites <= 2) {
+          persistMarker(job, status);
+          return;
+        }
+        fs.rmSync(path.join(tmpDir, ".quack", "logs", "shared-checkout-pause.json"), {
+          force: true,
+        });
+        throw new Error("simulated marker write failure");
+      };
+
+      try {
+        const pausedJob = mgr.start("TASK-PAUSED", { skipGate: true });
+        await waitForCondition(
+          () => pausedJob.status === "awaiting_approval",
+          "in-memory shared-checkout pause",
+        );
+        expect(
+          fs.existsSync(path.join(tmpDir, ".quack", "logs", "shared-checkout-pause.json")),
+        ).toBe(false);
+        internals.persistSharedCheckoutPause = persistMarker;
+
+        fs.writeFileSync(
+          approvalPath,
+          JSON.stringify({
+            taskId: "TASK-PAUSED",
+            state: "approved",
+            createdAt: new Date().toISOString(),
+          }),
+          "utf-8",
+        );
+        const resumed = mgr.start("TASK-PAUSED", { skipGate: true, resume: true });
+        expect(resumed.worktreePath).toBeUndefined();
+        await waitForFile(resumedPath);
+        await waitForCondition(() => resumed.status === "completed", "in-memory shared resume");
+        expect(fs.readFileSync(resumedPath, "utf-8")).toBe(tmpDir);
+      } finally {
+        await mgr.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    test("keeps shared-checkout ownership after a recovered run is stopped", async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-pause-stop-"));
+      const approvalDir = path.join(tmpDir, ".quack", "logs", "approvals");
+      const approvalPath = path.join(approvalDir, "TASK-PAUSED.json");
+      const pauseScript = path.join(tmpDir, "pause-child.cjs");
+      const resumeScript = path.join(tmpDir, "resume-child.cjs");
+      const readyPath = path.join(tmpDir, "resume-ready");
+      fs.mkdirSync(approvalDir, { recursive: true });
+      fs.writeFileSync(
+        pauseScript,
+        [
+          "const fs = require('node:fs');",
+          `fs.writeFileSync(${JSON.stringify(approvalPath)}, JSON.stringify({ taskId: 'TASK-PAUSED', state: 'pending', createdAt: new Date().toISOString() }), 'utf-8');`,
+          "setTimeout(() => process.exit(1), 25);",
+        ].join("\n"),
+        "utf-8",
+      );
+      fs.writeFileSync(
+        resumeScript,
+        [
+          "const fs = require('node:fs');",
+          `fs.writeFileSync(${JSON.stringify(readyPath)}, 'ready', 'utf-8');`,
+          "setInterval(() => undefined, 1000);",
+        ].join("\n"),
+        "utf-8",
+      );
+
+      const firstManager = new DispatchManager(tmpDir, pauseScript);
+      const resumedManager = new DispatchManager(tmpDir, resumeScript);
+      const restartedManager = new DispatchManager(tmpDir, resumeScript);
+      try {
+        const paused = firstManager.start("TASK-PAUSED", { skipGate: true });
+        await waitForCondition(
+          () => paused.status === "awaiting_approval",
+          "durable shared-checkout pause",
+        );
+        fs.writeFileSync(
+          approvalPath,
+          JSON.stringify({
+            taskId: "TASK-PAUSED",
+            state: "approved",
+            createdAt: new Date().toISOString(),
+          }),
+          "utf-8",
+        );
+
+        const resumed = resumedManager.start("TASK-PAUSED", { skipGate: true, resume: true });
+        expect(resumed.worktreePath).toBeUndefined();
+        await waitForFile(readyPath);
+        const shutdown = await resumedManager.shutdownAll({
+          gracefulTimeoutMs: 100,
+          forceTimeoutMs: 2_000,
+        });
+        expect(shutdown.timedOut).toEqual([]);
+        expect(resumed.status).toBe("stopped");
+
+        expect(restartedManager.getSharedCheckoutOccupants()).toEqual([
+          expect.objectContaining({ taskId: "TASK-PAUSED", status: "stopped" }),
+        ]);
+      } finally {
+        await firstManager.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
+        await resumedManager.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
+        await restartedManager.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    test("does not infer shared-checkout ownership from Docker exit evidence", () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-docker-pause-evidence-"));
+      const logDir = path.join(tmpDir, ".quack", "logs");
+      const approvalDir = path.join(logDir, "approvals");
+      fs.mkdirSync(approvalDir, { recursive: true });
+      const now = new Date().toISOString();
+      fs.writeFileSync(
+        path.join(approvalDir, "TASK-DOCKER.json"),
+        JSON.stringify({ taskId: "TASK-DOCKER", state: "pending", createdAt: now }),
+        "utf-8",
+      );
+      fs.writeFileSync(
+        path.join(logDir, "events-docker-session.jsonl"),
+        `${JSON.stringify({
+          stage: "dispatch_child_exit",
+          timestamp: now,
+          payload: {
+            taskId: "TASK-DOCKER",
+            worktreePath: null,
+            isolation: "docker",
+            killed: false,
+            at: now,
+          },
+        })}\n`,
+        "utf-8",
+      );
+
+      try {
+        const mgr = new DispatchManager(tmpDir, "/fake/bin.js", {
+          method: "docker",
+          docker: {
+            image: "node:20-slim",
+            volumes: [],
+            envPassthrough: [],
+            resourceLimits: { memoryMb: 2048, cpus: 1 },
+            networkMode: "bridge",
+            cleanupPolicy: "remove",
+          },
+        });
+        expect(mgr.getSharedCheckoutOccupants()).toEqual([]);
+        expect(fs.existsSync(path.join(logDir, "shared-checkout-pause.json"))).toBe(false);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
     test("start throws for awaiting_approval without resume flag", () => {
       const job = makeJob({ taskId: "TASK-203", status: "awaiting_approval" });
       injectJob(manager, job);
@@ -903,9 +1739,9 @@ describe("DispatchManager", () => {
 
       manager.cleanup(3600000); // 1 hour cutoff
 
-      // awaiting_approval preserved, failed cleaned up
+      // Both jobs still own a degraded shared checkout and are preserved.
       expect(manager.getJob("TASK-206")).toBeDefined();
-      expect(manager.getJob("TASK-207")).toBeUndefined();
+      expect(manager.getJob("TASK-207")).toBeDefined();
     });
 
     describe("isApprovalPending", () => {

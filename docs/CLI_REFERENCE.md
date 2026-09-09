@@ -132,7 +132,8 @@ concurrent children, and remaining ready tasks wait for a slot. A failed task is
 reported without cancelling its siblings, and the command exits nonzero after
 the whole selected wave settles.
 If degraded isolation leaves the shared checkout paused for human approval,
-later tasks are refused until that pause is resolved or stopped.
+later tasks are refused until that task's pause is resolved and its run is
+resumed.
 `SIGINT` and `SIGTERM` stop active dispatches, stop the wave watchdog, and wait
 briefly for worker cleanup before returning a signal-specific exit code.
 
@@ -159,6 +160,8 @@ quack wave 2 --parallel 3 --project /path/to/project
 |------|---------|
 | `0` | Every selected task completed successfully (or no task was ready and no parse error occurred) |
 | `1` | At least one task failed, stopped, paused for approval, could not start, disappeared, or a task spec could not be parsed |
+| `130` | The wave was interrupted by `SIGINT` after bounded dispatch cleanup |
+| `143` | The wave was terminated by `SIGTERM` after bounded dispatch cleanup |
 
 ---
 

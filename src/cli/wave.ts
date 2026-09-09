@@ -16,6 +16,8 @@ import {
   DegradedSharedCheckoutBusyError,
   DispatchManager,
   type DispatchJob,
+  type DispatchShutdownOptions,
+  type DispatchShutdownResult,
   type StartOptions,
 } from "../monitor/dispatch-manager.js";
 
@@ -31,8 +33,7 @@ export interface WaveDispatchManager {
   getJob(taskId: string): DispatchJob | undefined;
   getSharedCheckoutOccupants(): DispatchJob[];
   isWorktreeDegraded(): boolean;
-  stop(taskId: string): boolean;
-  killAll(): void;
+  shutdownAll(options?: DispatchShutdownOptions): Promise<DispatchShutdownResult>;
   startWatchdog(): void;
   stopWatchdog(): void;
 }
@@ -50,6 +51,8 @@ export interface WaveCommandRuntime {
   writeStdout?: (text: string) => void;
   writeStderr?: (text: string) => void;
   setExitCode?: (code: number) => void;
+  /** Force termination only after bounded cleanup reports a surviving child. */
+  exitProcess?: (code: number) => void;
   addSignalListener?: (signal: WaveSignal, listener: WaveSignalListener) => void;
   removeSignalListener?: (signal: WaveSignal, listener: WaveSignalListener) => void;
   signalCleanupTimeoutMs?: number;
@@ -88,10 +91,30 @@ async function waitForTerminalJob(
   manager: WaveDispatchManager,
   initialJob: DispatchJob,
   pollIntervalMs: number,
+  shouldStop?: () => boolean,
 ): Promise<WaveTaskResult> {
   let job: DispatchJob | undefined = initialJob;
   while (job.status === "running") {
-    await delay(pollIntervalMs);
+    if (shouldStop?.()) {
+      return {
+        taskId: initialJob.taskId,
+        status: "stopped",
+        error: "Wave interrupted while dispatch cleanup was in progress",
+      };
+    }
+    let remainingDelay = pollIntervalMs;
+    while (remainingDelay > 0 && !shouldStop?.()) {
+      const slice = Math.min(remainingDelay, 25);
+      await delay(slice);
+      remainingDelay -= slice;
+    }
+    if (shouldStop?.()) {
+      return {
+        taskId: initialJob.taskId,
+        status: "stopped",
+        error: "Wave interrupted while dispatch cleanup was in progress",
+      };
+    }
     job = manager.getJob(initialJob.taskId);
     if (!job) {
       return {
@@ -126,8 +149,8 @@ export async function executeSelectedWaveTasks(
     while (manager.isWorktreeDegraded()) {
       if (shouldStop?.()) return;
       const occupants = manager.getSharedCheckoutOccupants();
-      const approvalPaused = occupants.filter((job) => job.status === "awaiting_approval");
-      if (approvalPaused.length > 0) {
+      const unresolved = occupants.filter((job) => job.status !== "running");
+      if (unresolved.length > 0) {
         throw new DegradedSharedCheckoutBusyError(taskId, occupants);
       }
       if (occupants.length === 0) return;
@@ -149,16 +172,23 @@ export async function executeSelectedWaveTasks(
         await waitForSafeStart(selection.taskId);
         if (shouldStop?.()) return;
 
-        const claimantCheck = resolveClaimantCheck
-          ? await resolveClaimantCheck(selection.taskId)
-          : undefined;
-        if (shouldStop?.()) return;
-
-        // The claimant scan is asynchronous. Another worker can degrade the
-        // manager while this worker is awaiting it, so re-check immediately
-        // before the synchronous start call.
         let job: DispatchJob | undefined;
         while (!job) {
+          await waitForSafeStart(selection.taskId);
+          if (shouldStop?.()) return;
+
+          // Refresh this evidence on every retry. Another worker can hold the
+          // degraded checkout while task files change, so reusing the scan
+          // that preceded the wait would make duplicate-claimant admission
+          // stale at the exact point start() finally proceeds.
+          const claimantCheck = resolveClaimantCheck
+            ? await resolveClaimantCheck(selection.taskId)
+            : undefined;
+          if (shouldStop?.()) return;
+
+          // The claimant scan is asynchronous. Another worker can degrade the
+          // manager while this worker is awaiting it, so re-check immediately
+          // before the synchronous start call.
           await waitForSafeStart(selection.taskId);
           if (shouldStop?.()) return;
           try {
@@ -178,7 +208,7 @@ export async function executeSelectedWaveTasks(
             // If a sibling degrades isolation in that gap, the manager's
             // typed refusal is authoritative. A live occupant is retryable;
             // an approval pause requires operator action and fails promptly.
-            if (err instanceof DegradedSharedCheckoutBusyError && !err.hasApprovalPause) {
+            if (err instanceof DegradedSharedCheckoutBusyError && !err.hasUnresolvedOccupant) {
               await delay(pollIntervalMs);
               if (shouldStop?.()) return;
               continue;
@@ -186,7 +216,7 @@ export async function executeSelectedWaveTasks(
             throw err;
           }
         }
-        results[index] = await waitForTerminalJob(manager, job, pollIntervalMs);
+        results[index] = await waitForTerminalJob(manager, job, pollIntervalMs, shouldStop);
       } catch (err: unknown) {
         results[index] = {
           taskId: selection.taskId,
@@ -228,6 +258,12 @@ export async function runWaveWithSignalCleanup(
   const cleanupTimeoutMs = runtime.signalCleanupTimeoutMs ?? 2_000;
 
   let interruptedBy: WaveSignal | undefined;
+  let shutdownResult:
+    | Promise<
+        | { kind: "shutdown"; result: DispatchShutdownResult }
+        | { kind: "shutdown_failed"; error: unknown }
+      >
+    | undefined;
   let resolveSignal!: (signal: WaveSignal) => void;
   const signalPromise = new Promise<{ kind: "signal"; signal: WaveSignal }>((resolve) => {
     resolveSignal = (signal) => resolve({ kind: "signal", signal });
@@ -236,25 +272,16 @@ export async function runWaveWithSignalCleanup(
   const requestCleanup = (signal: WaveSignal): void => {
     if (interruptedBy) return;
     interruptedBy = signal;
-
-    let sharedOccupants: DispatchJob[] = [];
-    try {
-      sharedOccupants = manager.getSharedCheckoutOccupants();
-    } catch {
-      // killAll below remains the authoritative best-effort fallback.
-    }
-    for (const job of sharedOccupants) {
-      try {
-        manager.stop(job.taskId);
-      } catch {
-        // Continue cleanup for the remaining jobs.
-      }
-    }
-    try {
-      manager.killAll();
-    } catch {
-      // Signal cleanup is best-effort and must still release the waiter.
-    }
+    const phaseTimeoutMs = Math.max(1, Math.floor(cleanupTimeoutMs / 2));
+    shutdownResult = manager
+      .shutdownAll({
+        gracefulTimeoutMs: phaseTimeoutMs,
+        forceTimeoutMs: Math.max(1, cleanupTimeoutMs - phaseTimeoutMs),
+      })
+      .then(
+        (result) => ({ kind: "shutdown" as const, result }),
+        (error: unknown) => ({ kind: "shutdown_failed" as const, error }),
+      );
     resolveSignal(signal);
   };
 
@@ -282,12 +309,22 @@ export async function runWaveWithSignalCleanup(
     const timeout = new Promise<{ kind: "timeout" }>((resolve) => {
       cleanupTimer = setTimeout(() => resolve({ kind: "timeout" }), cleanupTimeoutMs);
     });
-    const settled = await Promise.race([operationResult, timeout]);
+    const cleanup = Promise.all([operationResult, shutdownResult!]).then(
+      ([operation, shutdown]) => ({ kind: "cleaned" as const, operation, shutdown }),
+    );
+    const settled = await Promise.race([cleanup, timeout]);
     if (cleanupTimer) clearTimeout(cleanupTimer);
+    const managerTimedOut =
+      settled.kind === "cleaned" &&
+      settled.shutdown.kind === "shutdown" &&
+      settled.shutdown.result.timedOut.length > 0;
     return {
       interrupted: true,
       signal: first.signal,
-      cleanupTimedOut: settled.kind === "timeout",
+      cleanupTimedOut:
+        settled.kind === "timeout" ||
+        settled.shutdown.kind === "shutdown_failed" ||
+        managerTimedOut,
     };
   } finally {
     removeSignalListener("SIGINT", onSigint);
@@ -427,7 +464,11 @@ export async function waveCommand(
       writeStderr(
         `Wave interrupted by ${outcome.signal}; dispatch cleanup requested.${timeoutNote}`,
       );
-      setExitCode(outcome.signal === "SIGINT" ? 130 : 143);
+      const signalExitCode = outcome.signal === "SIGINT" ? 130 : 143;
+      setExitCode(signalExitCode);
+      if (outcome.cleanupTimedOut) {
+        (runtime.exitProcess ?? ((code: number) => process.exit(code)))(signalExitCode);
+      }
       return;
     }
     const results = outcome.results;

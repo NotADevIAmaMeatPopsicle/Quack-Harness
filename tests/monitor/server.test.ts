@@ -5,6 +5,7 @@ import * as http from "node:http";
 
 import { createMonitorServer } from "../../src/monitor/server";
 import { DispatchManager } from "../../src/monitor/dispatch-manager";
+import { PrepWorker } from "../../src/monitor/prep-worker";
 import { computeContentHash } from "../../src/monitor/prep-cache";
 import { runReadinessGate } from "../../src/gate/gate";
 import type {
@@ -218,6 +219,81 @@ describe("Monitor Server", () => {
     const data = JSON.parse(body) as { status: string; logDir: string };
     expect(data.status).toBe("ok");
     expect(data.logDir).toBe(logDir);
+  });
+
+  it("waits for bounded dispatch and prep shutdown before the server stop resolves", async () => {
+    const projectRoot = makeTempDir();
+    fs.mkdirSync(path.join(projectRoot, "docs", "tasks"), { recursive: true });
+    let releaseShutdown!: () => void;
+    let markShutdownStarted!: () => void;
+    const shutdownMayFinish = new Promise<void>((resolve) => {
+      releaseShutdown = resolve;
+    });
+    const shutdownStarted = new Promise<void>((resolve) => {
+      markShutdownStarted = resolve;
+    });
+    let releasePrepShutdown!: () => void;
+    let markPrepShutdownStarted!: () => void;
+    const prepShutdownMayFinish = new Promise<void>((resolve) => {
+      releasePrepShutdown = resolve;
+    });
+    const prepShutdownStarted = new Promise<void>((resolve) => {
+      markPrepShutdownStarted = resolve;
+    });
+    const shutdownSpy = jest
+      .spyOn(DispatchManager.prototype, "shutdownAll")
+      .mockImplementation(() => {
+        markShutdownStarted();
+        return shutdownMayFinish.then(() => ({
+          requested: [],
+          exited: [],
+          escalated: [],
+          timedOut: [],
+        }));
+      });
+    const prepShutdownSpy = jest
+      .spyOn(PrepWorker.prototype, "shutdownAll")
+      .mockImplementation(() => {
+        markPrepShutdownStarted();
+        return prepShutdownMayFinish.then(() => ({
+          requested: [],
+          exited: [],
+          escalated: [],
+          timedOut: [],
+        }));
+      });
+    let stopPromise: Promise<void> | undefined;
+
+    try {
+      const port = await freePort();
+      const serverObj = createMonitorServer({
+        logDir: path.join(projectRoot, ".quack", "logs"),
+        port,
+        projectRoot,
+        taskDir: "docs/tasks",
+      });
+      const { stop } = await serverObj.start();
+      let stopped = false;
+      stopPromise = stop().then(() => {
+        stopped = true;
+      });
+
+      await Promise.all([shutdownStarted, prepShutdownStarted]);
+      expect(stopped).toBe(false);
+      releaseShutdown();
+      await Promise.resolve();
+      expect(stopped).toBe(false);
+      releasePrepShutdown();
+      await stopPromise;
+      expect(stopped).toBe(true);
+    } finally {
+      releaseShutdown();
+      releasePrepShutdown();
+      await stopPromise?.catch(() => undefined);
+      shutdownSpy.mockRestore();
+      prepShutdownSpy.mockRestore();
+      removeTempDir(projectRoot);
+    }
   });
 
   it("lists sessions from JSONL", async () => {
@@ -727,7 +803,7 @@ describe("Monitor Server", () => {
     });
 
     afterEach(async () => {
-      // Wait for server to shut down (which calls dispatchManager.killAll())
+      // Wait for the server and its bounded dispatch shutdown to settle.
       if (stopServer) {
         await stopServer();
         stopServer = undefined;

@@ -14,6 +14,8 @@ import {
 import {
   DegradedSharedCheckoutBusyError,
   type DispatchJob,
+  type DispatchShutdownOptions,
+  type DispatchShutdownResult,
 } from "../../src/monitor/dispatch-manager";
 import type { TaskSelection } from "../../src/core/types";
 
@@ -37,7 +39,7 @@ class FakeDispatchManager implements WaveDispatchManager {
   readonly stops: string[] = [];
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
   maxActive = 0;
-  killAllCalls = 0;
+  shutdownAllCalls = 0;
   watchdogStarted = false;
   watchdogStopped = false;
 
@@ -119,16 +121,15 @@ class FakeDispatchManager implements WaveDispatchManager {
     return true;
   }
 
-  killAll(): void {
-    this.killAllCalls += 1;
+  shutdownAll(_options?: DispatchShutdownOptions): Promise<DispatchShutdownResult> {
+    this.shutdownAllCalls += 1;
+    const requested: string[] = [];
     for (const job of this.jobs.values()) {
-      if (job.status === "running") {
-        job.status = "stopped";
-        const timer = this.timers.get(job.taskId);
-        if (timer) clearTimeout(timer);
-        this.timers.delete(job.taskId);
-      }
+      if (job.status !== "running" && job.status !== "awaiting_approval") continue;
+      requested.push(job.taskId);
+      this.stop(job.taskId);
     }
+    return Promise.resolve({ requested, exited: requested, escalated: [], timedOut: [] });
   }
 
   startWatchdog(): void {
@@ -172,6 +173,19 @@ class DegradingDispatchManager extends FakeDispatchManager {
 
   override isWorktreeDegraded(): boolean {
     return this.degraded;
+  }
+}
+
+class ClaimantGuardedDegradingManager extends DegradingDispatchManager {
+  override start(
+    taskId: string,
+    options?: Parameters<WaveDispatchManager["start"]>[1],
+    claimantCheck?: Parameters<WaveDispatchManager["start"]>[2],
+  ): DispatchJob {
+    if ((claimantCheck?.claimants.length ?? 0) > 1) {
+      throw new Error(`duplicate claimants for ${taskId}`);
+    }
+    return super.start(taskId, options, claimantCheck);
   }
 }
 
@@ -325,8 +339,46 @@ describe("executeSelectedWaveTasks", () => {
 
     expect(results.map((result) => result.status)).toEqual(["completed", "completed"]);
     expect(manager.busyRefusals).toBe(1);
+    expect(claimantArrivals).toBe(3);
     expect(manager.starts).toEqual(["TASK-001", "TASK-002"]);
     expect(manager.maxActive).toBe(1);
+  });
+
+  it("refreshes claimant evidence after a degraded-busy retry", async () => {
+    let claimantArrivals = 0;
+    let releaseClaimants!: () => void;
+    const claimantBarrier = new Promise<void>((resolve) => {
+      releaseClaimants = resolve;
+    });
+    const callsByTask = new Map<string, number>();
+    const manager = new ClaimantGuardedDegradingManager(() => undefined);
+    const selections = [selection("TASK-001"), selection("TASK-002")];
+
+    const results = await executeSelectedWaveTasks(
+      selections,
+      2,
+      manager,
+      "1",
+      1,
+      async (taskId) => {
+        const taskCalls = (callsByTask.get(taskId) ?? 0) + 1;
+        callsByTask.set(taskId, taskCalls);
+        claimantArrivals += 1;
+        if (claimantArrivals === selections.length) releaseClaimants();
+        await claimantBarrier;
+        return {
+          taskId,
+          claimants: taskCalls > 1 ? [`${taskId}-a.md`, `${taskId}-b.md`] : [],
+        };
+      },
+    );
+
+    expect(results.filter((result) => result.status === "completed")).toHaveLength(1);
+    const [refused] = results.filter((result) => result.status === "start_failed");
+    expect(refused?.error).toContain("duplicate claimants");
+    expect(manager.busyRefusals).toBe(1);
+    expect(claimantArrivals).toBe(3);
+    expect(manager.starts).toHaveLength(1);
   });
 
   it("fails the next selection instead of sharing a checkout paused for approval", async () => {
@@ -358,6 +410,16 @@ describe("executeSelectedWaveTasks", () => {
 });
 
 describe("runWaveWithSignalCleanup", () => {
+  it("documents signal-specific exit codes", async () => {
+    const reference = await fs.readFile(
+      path.resolve(__dirname, "../../docs/CLI_REFERENCE.md"),
+      "utf-8",
+    );
+
+    expect(reference).toContain("| `130` | The wave was interrupted by `SIGINT`");
+    expect(reference).toContain("| `143` | The wave was terminated by `SIGTERM`");
+  });
+
   it("runs bounded, once-only cleanup on signals without forcing process exit", async () => {
     const manager = new FakeDispatchManager();
     manager.jobs.set("TASK-001", {
@@ -388,7 +450,7 @@ describe("runWaveWithSignalCleanup", () => {
 
     expect(outcome).toEqual({ interrupted: true, signal: "SIGINT", cleanupTimedOut: true });
     expect(manager.stops).toEqual(["TASK-001"]);
-    expect(manager.killAllCalls).toBe(1);
+    expect(manager.shutdownAllCalls).toBe(1);
     expect(manager.watchdogStarted).toBe(true);
     expect(manager.watchdogStopped).toBe(true);
     expect(listeners.size).toBe(0);
@@ -421,7 +483,7 @@ describe("runWaveWithSignalCleanup", () => {
     expect(outcome).toEqual({ interrupted: true, signal: "SIGTERM", cleanupTimedOut: false });
     expect(manager.starts).toEqual(["TASK-001"]);
     expect(manager.stops).toEqual(["TASK-001"]);
-    expect(manager.killAllCalls).toBe(1);
+    expect(manager.shutdownAllCalls).toBe(1);
     expect(manager.watchdogStopped).toBe(true);
   });
 });
@@ -487,6 +549,56 @@ describe("waveCommand", () => {
     expect(stdout.join("\n")).toContain("Blocked tasks: 1");
     expect(stdout.join("\n")).toContain("Summary: 2/2 completed");
     expect(stdout.join("\n")).not.toContain("not yet implemented");
+  });
+
+  it("forces process termination only after bounded signal cleanup reports a survivor", async () => {
+    await fs.writeFile(
+      path.join(projectRoot, "docs", "tasks", "TASK-001-ready.md"),
+      taskDoc("TASK-001", "P0-CRITICAL"),
+    );
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const manager = new FakeDispatchManager({}, 10_000, () => markStarted());
+    const shutdownAll = jest.fn(() => {
+      manager.stop("TASK-001");
+      return Promise.resolve({
+        requested: ["TASK-001"],
+        exited: [],
+        escalated: ["TASK-001"],
+        timedOut: ["TASK-001"],
+      });
+    });
+    manager.shutdownAll = shutdownAll;
+    const listeners = new Map<WaveSignal, () => void>();
+    const exitProcess = jest.fn();
+    let exitCode: number | undefined;
+
+    const run = waveCommand(
+      "1",
+      { parallel: "1", project: projectRoot },
+      {
+        createManager: () => manager,
+        pollIntervalMs: 1,
+        writeStdout: () => undefined,
+        writeStderr: () => undefined,
+        setExitCode: (code) => {
+          exitCode = code;
+        },
+        exitProcess,
+        addSignalListener: (signal, listener) => listeners.set(signal, listener),
+        removeSignalListener: (signal) => listeners.delete(signal),
+        signalCleanupTimeoutMs: 100,
+      },
+    );
+    await started;
+    listeners.get("SIGINT")?.();
+    await run;
+
+    expect(exitCode).toBe(130);
+    expect(exitProcess).toHaveBeenCalledWith(130);
+    expect(shutdownAll).toHaveBeenCalledTimes(1);
   });
 
   it("reports parse errors deterministically and returns a nonzero exit", async () => {

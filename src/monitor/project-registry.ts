@@ -298,7 +298,12 @@ export function buildProjectContext(
       )
     : null;
 
-  const fleetController = new FleetController(dispatchManager, prepScheduler, adapter.projectRoot);
+  const fleetController = new FleetController(
+    dispatchManager,
+    prepScheduler,
+    adapter.projectRoot,
+    prepWorker,
+  );
 
   const costVelocityTracker = new CostVelocityTracker(adapter.config.costVelocity);
   const progressDetector = new ProgressDetector(adapter.config.stuckDetection);

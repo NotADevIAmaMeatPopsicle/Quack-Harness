@@ -58,6 +58,7 @@ describe("appendDispatchChildExit (QPI-043)", () => {
       exitCode: null,
       signal: null,
       worktreePath: "C:\\repo\\.quack\\worktrees\\TASK-1273",
+      isolation: "worktree",
       ...overrides,
     };
   }
@@ -86,6 +87,7 @@ describe("appendDispatchChildExit (QPI-043)", () => {
     const payload = events[0].payload as DispatchChildExitPayload;
     expect(payload.exitCode).toBe(0);
     expect(payload.killed).toBe(false);
+    expect(payload.isolation).toBe("worktree");
     expect(payload.sessionResolution).toBe("child-session");
   });
 

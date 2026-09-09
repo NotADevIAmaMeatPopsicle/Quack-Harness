@@ -11,6 +11,10 @@ import type { DockerIsolationConfig } from "../core/types.js";
 import { resolvePrepStorageDirSync } from "../core/prep-storage.js";
 
 const execFileAsync = promisify(execFile);
+const DOCKER_COMMAND_TIMEOUT_MS = 30_000;
+const DOCKER_CLEANUP_TIMEOUT_MS = 5_000;
+const DOCKER_SETUP_TIMEOUT_MS = 15 * 60_000;
+const UNCERTAIN_CREATE_CONFIRMATION_DELAY_MS = 1_000;
 
 export interface DockerContainer {
   containerId: string;
@@ -23,13 +27,45 @@ export interface DockerContainer {
   exitCode?: number;
 }
 
+export interface DockerCleanupResult {
+  removedTaskIds: string[];
+  failedTaskIds: string[];
+}
+
 export class DockerManager {
   private containers = new Map<string, DockerContainer>();
+  private pendingCommands = new Set<AbortController>();
+  /** Earliest time an absent container name is conclusive after an aborted create. */
+  private uncertainCreations = new Map<string, number>();
 
   constructor(
     private readonly projectRoot: string,
     private readonly config: DockerIsolationConfig,
   ) {}
+
+  private async runDocker(
+    args: string[],
+    timeoutMs = DOCKER_COMMAND_TIMEOUT_MS,
+  ): Promise<{ stdout: string; stderr: string }> {
+    const controller = new AbortController();
+    this.pendingCommands.add(controller);
+    try {
+      const result = await execFileAsync("docker", args, {
+        encoding: "utf-8",
+        timeout: Math.max(1, timeoutMs),
+        windowsHide: true,
+        signal: controller.signal,
+      });
+      return { stdout: String(result.stdout), stderr: String(result.stderr) };
+    } finally {
+      this.pendingCommands.delete(controller);
+    }
+  }
+
+  /** Cancel Docker CLI calls so bounded shutdown does not leave helper processes behind. */
+  abortPendingCommands(): void {
+    for (const controller of this.pendingCommands) controller.abort();
+  }
 
   /**
    * Check that Docker is available and return the server version.
@@ -37,7 +73,7 @@ export class DockerManager {
    */
   async checkDocker(): Promise<string> {
     try {
-      const { stdout } = await execFileAsync("docker", ["info", "--format", "{{.ServerVersion}}"]);
+      const { stdout } = await this.runDocker(["info", "--format", "{{.ServerVersion}}"]);
       return stdout.trim();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -53,12 +89,18 @@ export class DockerManager {
   async createContainer(taskId: string): Promise<DockerContainer> {
     // Prevent double-create
     const existing = this.containers.get(taskId);
-    if (existing && (existing.status === "creating" || existing.status === "running")) {
-      throw new Error(`Container already exists for ${taskId} (${existing.containerId})`);
+    if (existing && existing.status !== "removed") {
+      throw new Error(
+        `Container cleanup is unresolved for ${taskId} (${existing.containerId}, ${existing.status})`,
+      );
     }
 
+    const containerName = `quack-${taskId}-${Date.now()}`;
     const info: DockerContainer = {
-      containerId: "",
+      // Docker commands accept the unique name as well as the eventual ID,
+      // which lets shutdown clean up even if `docker create` is interrupted
+      // before stdout returns the ID.
+      containerId: containerName,
       taskId,
       image: this.config.image,
       workDir: "/workspace",
@@ -69,29 +111,51 @@ export class DockerManager {
     this.containers.set(taskId, info);
 
     try {
-      const createArgs = this.buildCreateArgs(taskId);
-      const { stdout } = await execFileAsync("docker", createArgs);
-      const containerId = stdout.trim();
+      const createArgs = this.buildCreateArgs(taskId, containerName);
+      const { stdout } = await this.runDocker(createArgs);
+      const containerId = stdout.trim() || containerName;
       info.containerId = containerId;
 
       // Start the container
-      await execFileAsync("docker", ["start", containerId]);
+      await this.runDocker(["start", containerId]);
       info.status = "running";
 
       // Run pre-install command if configured
       if (this.config.preInstallCommand) {
-        await execFileAsync("docker", [
-          "exec",
-          containerId,
-          "sh",
-          "-c",
-          this.config.preInstallCommand,
-        ]);
+        await this.runDocker(
+          ["exec", containerId, "sh", "-c", this.config.preInstallCommand],
+          DOCKER_SETUP_TIMEOUT_MS,
+        );
       }
 
       return info;
     } catch (err) {
       info.status = "stopped";
+      const errorCode =
+        typeof err === "object" && err !== null && "code" in err
+          ? String((err as { code?: unknown }).code)
+          : "";
+      const errorName = err instanceof Error ? err.name : "";
+      const commandKilled =
+        typeof err === "object" && err !== null && "killed" in err
+          ? (err as { killed?: unknown }).killed === true
+          : false;
+      if (
+        info.containerId === containerName &&
+        (errorName === "AbortError" ||
+          errorCode === "ABORT_ERR" ||
+          errorCode === "ETIMEDOUT" ||
+          commandKilled)
+      ) {
+        // The Docker CLI can be aborted after the daemon accepted `create` but
+        // before stdout returned its ID. An immediate "no such container"
+        // probe is not proof of absence while that request may still land.
+        this.uncertainCreations.set(
+          info.containerId,
+          Date.now() + UNCERTAIN_CREATE_CONFIRMATION_DELAY_MS,
+        );
+      }
+      await this.forceRemoveContainer(info.containerId);
       const msg = err instanceof Error ? err.message : String(err);
       throw new Error(`Failed to create container for ${taskId}: ${msg}`);
     }
@@ -132,7 +196,7 @@ export class DockerManager {
    */
   async stopContainer(containerId: string, failed = false): Promise<void> {
     try {
-      await execFileAsync("docker", ["stop", "-t", "10", containerId]);
+      await this.runDocker(["stop", "-t", "10", containerId], DOCKER_CLEANUP_TIMEOUT_MS);
     } catch {
       // Container may already be stopped
     }
@@ -159,10 +223,56 @@ export class DockerManager {
    * Force-remove a container.
    */
   async removeContainer(containerId: string): Promise<void> {
+    await this.forceRemoveContainer(containerId);
+  }
+
+  /**
+   * Force-remove a container and retain its tracking record when Docker cannot
+   * confirm removal. Shutdown paths use the boolean result as lifecycle
+   * evidence instead of treating a swallowed CLI error as success.
+   */
+  async forceRemoveContainer(containerId: string): Promise<boolean> {
+    let removalCommandSucceeded = false;
     try {
-      await execFileAsync("docker", ["rm", "-f", containerId]);
-    } catch {
-      // Container may already be removed
+      await this.runDocker(["rm", "-f", containerId], DOCKER_CLEANUP_TIMEOUT_MS);
+      removalCommandSucceeded = true;
+    } catch (error: unknown) {
+      const errorCode =
+        typeof error === "object" && error !== null && "code" in error
+          ? String((error as { code?: unknown }).code)
+          : "";
+      const errorName = error instanceof Error ? error.name : "";
+      if (errorName === "AbortError" || errorCode === "ABORT_ERR" || errorCode === "ETIMEDOUT") {
+        return false;
+      }
+      const detail =
+        typeof error === "object" && error !== null && "stderr" in error
+          ? String((error as { stderr?: unknown }).stderr)
+          : error instanceof Error
+            ? error.message
+            : String(error);
+      if (!/no such (?:object|container)/i.test(detail)) {
+        try {
+          await this.runDocker(
+            ["inspect", "--type", "container", containerId],
+            DOCKER_CLEANUP_TIMEOUT_MS,
+          );
+          return false;
+        } catch (inspectError: unknown) {
+          const inspectDetail =
+            typeof inspectError === "object" && inspectError !== null && "stderr" in inspectError
+              ? String((inspectError as { stderr?: unknown }).stderr)
+              : inspectError instanceof Error
+                ? inspectError.message
+                : String(inspectError);
+          if (!/no such (?:object|container)/i.test(inspectDetail)) return false;
+        }
+      }
+    }
+
+    const uncertainUntil = this.uncertainCreations.get(containerId);
+    if (!removalCommandSucceeded && uncertainUntil !== undefined && Date.now() < uncertainUntil) {
+      return false;
     }
 
     // Update tracking
@@ -170,9 +280,11 @@ export class DockerManager {
       if (info.containerId === containerId) {
         info.status = "removed";
         this.containers.delete(taskId);
+        this.uncertainCreations.delete(containerId);
         break;
       }
     }
+    return true;
   }
 
   /**
@@ -182,20 +294,15 @@ export class DockerManager {
     containerId: string,
   ): Promise<{ diff: string; log: string; branch: string }> {
     const [diffResult, logResult, branchResult] = await Promise.all([
-      execFileAsync("docker", ["exec", containerId, "git", "diff", "HEAD"]).catch(() => ({
+      this.runDocker(["exec", containerId, "git", "diff", "HEAD"]).catch(() => ({
         stdout: "",
       })),
-      execFileAsync("docker", ["exec", containerId, "git", "log", "--oneline", "-10"]).catch(
+      this.runDocker(["exec", containerId, "git", "log", "--oneline", "-10"]).catch(() => ({
+        stdout: "",
+      })),
+      this.runDocker(["exec", containerId, "git", "rev-parse", "--abbrev-ref", "HEAD"]).catch(
         () => ({ stdout: "" }),
       ),
-      execFileAsync("docker", [
-        "exec",
-        containerId,
-        "git",
-        "rev-parse",
-        "--abbrev-ref",
-        "HEAD",
-      ]).catch(() => ({ stdout: "" })),
     ]);
 
     return {
@@ -214,7 +321,7 @@ export class DockerManager {
       if (tail !== undefined) {
         args.push("--tail", String(tail));
       }
-      const { stdout } = await execFileAsync("docker", args);
+      const { stdout } = await this.runDocker(args);
       return stdout;
     } catch {
       return "";
@@ -230,6 +337,13 @@ export class DockerManager {
     );
   }
 
+  /** Containers that still require confirmed removal, including stopped ones. */
+  getTrackedContainers(): DockerContainer[] {
+    return Array.from(this.containers.values()).filter(
+      (container) => container.status !== "removed",
+    );
+  }
+
   /**
    * Get container info by task ID.
    */
@@ -240,33 +354,30 @@ export class DockerManager {
   /**
    * Stop and remove all tracked containers (for kill switch / shutdown).
    */
-  async cleanupAll(): Promise<void> {
-    const active = this.getActiveContainers();
-    await Promise.all(
+  async cleanupAll(): Promise<DockerCleanupResult> {
+    const active = this.getTrackedContainers();
+    const outcomes = await Promise.all(
       active.map(async (c) => {
-        try {
-          await execFileAsync("docker", ["stop", "-t", "5", c.containerId]);
-        } catch {
-          // ignore
-        }
-        try {
-          await execFileAsync("docker", ["rm", "-f", c.containerId]);
-        } catch {
-          // ignore
-        }
+        // Shutdown is already in its forced phase. `rm -f` both terminates and
+        // removes without spending the entire bound on Docker's stop grace.
+        const removed = await this.forceRemoveContainer(c.containerId);
+        return { taskId: c.taskId, removed };
       }),
     );
-    this.containers.clear();
+    return {
+      removedTaskIds: outcomes.filter((outcome) => outcome.removed).map(({ taskId }) => taskId),
+      failedTaskIds: outcomes.filter((outcome) => !outcome.removed).map(({ taskId }) => taskId),
+    };
   }
 
   /**
    * Build the `docker create` argument list.
    */
-  private buildCreateArgs(taskId: string): string[] {
+  private buildCreateArgs(taskId: string, containerName?: string): string[] {
     const args = ["create"];
 
     // Container name for easy identification
-    args.push("--name", `quack-${taskId}-${Date.now()}`);
+    args.push("--name", containerName ?? `quack-${taskId}-${Date.now()}`);
 
     // Resource limits
     args.push("--memory", `${this.config.resourceLimits.memoryMb}m`);

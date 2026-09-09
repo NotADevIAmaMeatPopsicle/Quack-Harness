@@ -137,7 +137,11 @@ it("POST /api/fleet/resume waits before fleet resumed state is emitted", async (
   const gate = deferred();
   const resume = jest.fn(() => gate.promise);
   const queue = { resume } as unknown as DispatchQueue;
-  const fleetController = { resume: jest.fn() } as unknown as FleetController;
+  const fleetResume = jest.fn();
+  const fleetController = {
+    getState: jest.fn(() => "paused"),
+    resume: fleetResume,
+  } as unknown as FleetController;
   const emitted = jest.fn();
   const app = express();
   app.use(express.json());
@@ -162,12 +166,46 @@ it("POST /api/fleet/resume waits before fleet resumed state is emitted", async (
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
     expect(resume).toHaveBeenCalledTimes(1);
+    expect(fleetResume).toHaveBeenCalledTimes(1);
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(responded).toBe(false);
     expect(emitted).not.toHaveBeenCalled();
     gate.resolve();
     expect((await response).status).toBe(200);
     expect(emitted).toHaveBeenCalledWith("fleet_resumed", {});
+  } finally {
+    await server.close();
+  }
+});
+
+it("POST /api/fleet/resume restarts an emergency-aborted queue", async () => {
+  const start = jest.fn().mockResolvedValue(undefined);
+  const resume = jest.fn();
+  const queue = { start, resume, abort: jest.fn() } as unknown as DispatchQueue;
+  const fleetResume = jest.fn();
+  const fleetController = {
+    getState: jest.fn(() => "emergency_stopped"),
+    resume: fleetResume,
+    emergencyStop: jest.fn().mockResolvedValue({}),
+  } as unknown as FleetController;
+  const app = express();
+  app.use(express.json());
+  registerFleetRoutes(app, {
+    resolveProject: () => ({
+      dispatchQueue: queue,
+      fleetController,
+      costVelocityTracker: {} as CostVelocityTracker,
+      progressDetector: {} as ProgressDetector,
+    }),
+    fleetBudget: {} as FleetBudgetChecker,
+    emitFleetEvent: jest.fn(),
+  });
+  const server = await listen(app);
+  try {
+    expect((await post(server.port, "/api/fleet/resume")).status).toBe(200);
+    expect(fleetResume).toHaveBeenCalledTimes(1);
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(resume).not.toHaveBeenCalled();
   } finally {
     await server.close();
   }

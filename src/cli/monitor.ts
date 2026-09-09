@@ -135,20 +135,11 @@ export async function monitorCommand(options: {
         runtimeRole: "headnode",
         host: network.bindHost,
       });
-      const { stop } = await server.start();
+      await server.start();
 
       for (const line of network.lines) console.log(line);
       console.log(`\nPress Ctrl+C to stop.\n`);
-
-      // Graceful shutdown
-      const shutdown = async () => {
-        console.log("\nShutting down monitor...");
-        await stop();
-        process.exit(0);
-      };
-
-      process.on("SIGINT", () => void shutdown());
-      process.on("SIGTERM", () => void shutdown());
+      // createMonitorServer owns the once-only SIGINT/SIGTERM lifecycle.
     } else {
       // Multi-project mode
       console.log(`Projects: ${adapters.map((a) => a.config.project.name).join(", ")}`);
@@ -161,7 +152,7 @@ export async function monitorCommand(options: {
         runtimeRole: "headnode",
         host: network.bindHost,
       });
-      const { stop } = await server.start();
+      await server.start();
 
       for (const line of network.lines) console.log(line);
       console.log(`\nProjects:`);
@@ -169,16 +160,7 @@ export async function monitorCommand(options: {
         console.log(`  - ${adapter.config.project.name} (${adapter.projectRoot})`);
       }
       console.log(`\nPress Ctrl+C to stop.\n`);
-
-      // Graceful shutdown
-      const shutdown = async () => {
-        console.log("\nShutting down monitor...");
-        await stop();
-        process.exit(0);
-      };
-
-      process.on("SIGINT", () => void shutdown());
-      process.on("SIGTERM", () => void shutdown());
+      // createMonitorServer owns the once-only SIGINT/SIGTERM lifecycle.
     }
   } catch (err: unknown) {
     if (err instanceof Error) {

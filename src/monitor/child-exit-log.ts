@@ -30,6 +30,7 @@ export interface AppendDispatchChildExitOptions {
   exitCode: number | null;
   signal: string | null;
   worktreePath: string | null;
+  isolation: "worktree" | "shared-checkout" | "docker";
 }
 
 export interface AppendDispatchChildExitResult {
@@ -76,6 +77,7 @@ export function appendDispatchChildExit(
     signal: options.signal,
     killed: Boolean(options.signal),
     worktreePath: options.worktreePath,
+    isolation: options.isolation,
     at: new Date().toISOString(),
     sessionResolution: resolution,
   };

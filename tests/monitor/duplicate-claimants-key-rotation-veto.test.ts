@@ -4,6 +4,9 @@
 // container. Each absence oracle red at its intended first observable.
 
 import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { PassThrough } from "node:stream";
 
 import type { ChildProcess } from "node:child_process";
@@ -149,6 +152,66 @@ describe.each(DUPLICATE_FIXTURE_CASES)("key rotation claimant matrix (%s, %s)", 
     } finally {
       keys.restore();
       removeFixture(fixture.root);
+    }
+  });
+});
+
+describe("key rotation shutdown arbitration", () => {
+  it("preserves the worktree when shutdown starts during an asynchronous claimant refresh", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "quack-key-rotation-shutdown-"));
+    const keys = keyManager();
+    let releaseClaimants!: (value: ClaimantCheck) => void;
+    let markResolverStarted!: () => void;
+    const resolverStarted = new Promise<void>((resolve) => {
+      markResolverStarted = resolve;
+    });
+    const claimantResult = new Promise<ClaimantCheck>((resolve) => {
+      releaseClaimants = resolve;
+    });
+
+    try {
+      const Manager = DispatchManager as unknown as ManagerConstructor;
+      const manager = new Manager(
+        root,
+        "fixture-bin.js",
+        { method: "worktree" },
+        keys.manager,
+        path.join(root, ".quack", "logs"),
+        () => {
+          markResolverStarted();
+          return claimantResult;
+        },
+      );
+      const worktreePath = path.join(root, ".quack", "worktrees", "TASK-100");
+      const createWorktree = jest.fn(() => worktreePath);
+      const removeWorktree = jest.fn();
+      (manager as unknown as { createWorktree: typeof createWorktree }).createWorktree =
+        createWorktree;
+      (manager as unknown as { removeWorktree: typeof removeWorktree }).removeWorktree =
+        removeWorktree;
+
+      const spawnCount = spawned.length;
+      const job = manager.start("TASK-100", { skipGate: true });
+      const child = spawned.at(-1);
+      if (!child) throw new Error("Expected spawned child");
+      child.stderr.write("429 rate limit exceeded\n");
+      child.emit("exit", 1, null);
+      await resolverStarted;
+
+      await manager.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 0 });
+      releaseClaimants({ taskId: "TASK-100", claimants: [] });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(job.status).toBe("stopped");
+      expect(job.output).toContain(
+        "[key-rotation] Re-dispatch cancelled because shutdown is in progress; worktree preserved.",
+      );
+      expect(removeWorktree).not.toHaveBeenCalled();
+      expect(spawned).toHaveLength(spawnCount + 1);
+    } finally {
+      keys.restore();
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });
