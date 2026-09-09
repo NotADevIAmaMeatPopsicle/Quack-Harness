@@ -51,9 +51,11 @@ function confirmWindowsSharedCheckoutTree(markerPath: string): void {
 
 function markWindowsTreeKillConfirmed(manager: DispatchManager, taskId: string): void {
   if (process.platform !== "win32") return;
-  (manager as unknown as { confirmedWindowsTreeKills: Set<string> }).confirmedWindowsTreeKills.add(
-    taskId,
-  );
+  const sessionId = manager.getJob(taskId)?.sessionId;
+  if (!sessionId) throw new Error(`No job found for ${taskId}`);
+  (
+    manager as unknown as { confirmedWindowsTreeKills: Map<string, string> }
+  ).confirmedWindowsTreeKills.set(taskId, sessionId);
 }
 
 describe("DispatchManager", () => {
@@ -175,7 +177,7 @@ describe("DispatchManager", () => {
       expect(job.status).toBe("running");
       expect(fs.existsSync(worktreePath)).toBe(true);
 
-      const result = await mgr.shutdownAll({ gracefulTimeoutMs: 50, forceTimeoutMs: 2_000 });
+      const result = await mgr.shutdownAll({ gracefulTimeoutMs: 50, forceTimeoutMs: 5_000 });
       await waitForCondition(() => job.status !== "running", "real child exit handling");
       await waitForCondition(() => !processIsAlive(grandchildPid), "real grandchild exit");
 
@@ -1199,6 +1201,131 @@ describe("DispatchManager", () => {
       }
     });
 
+    test("uses a UUID ownership generation to reject same-session ABA callbacks", () => {
+      const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+      Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-aba-"));
+      const logDir = path.join(tmpDir, ".quack", "logs");
+      const first = new DispatchManager(tmpDir, process.execPath, undefined, undefined, logDir);
+      const second = new DispatchManager(tmpDir, process.execPath, undefined, undefined, logDir);
+      const oldJob = makeJob({ taskId: "TASK-ABA", sessionId: "same-millisecond", pid: 0 });
+      const newJob = makeJob({ taskId: "TASK-ABA", sessionId: "same-millisecond", pid: 0 });
+      const firstInternals = first as unknown as {
+        persistSharedCheckoutPause(
+          job: DispatchJob,
+          status: "running" | "stopped" | "failed",
+        ): void;
+        restoreAndReleaseSharedCheckout(job: DispatchJob): boolean;
+      };
+      const secondInternals = second as unknown as {
+        persistSharedCheckoutPause(
+          job: DispatchJob,
+          status: "running" | "stopped" | "failed",
+          allowOwnershipTransfer?: boolean,
+        ): void;
+      };
+      try {
+        firstInternals.persistSharedCheckoutPause(oldJob, "running");
+        firstInternals.persistSharedCheckoutPause(oldJob, "stopped");
+        const oldOwnershipId = oldJob.sharedCheckoutOwnershipId;
+
+        secondInternals.persistSharedCheckoutPause(newJob, "running", true);
+        expect(newJob.sharedCheckoutOwnershipId).toEqual(expect.any(String));
+        expect(newJob.sharedCheckoutOwnershipId).not.toBe(oldOwnershipId);
+
+        expect(() => firstInternals.persistSharedCheckoutPause(oldJob, "failed")).toThrow(
+          DegradedSharedCheckoutBusyError,
+        );
+        expect(firstInternals.restoreAndReleaseSharedCheckout(oldJob)).toBe(false);
+        const marker = JSON.parse(
+          fs.readFileSync(path.join(logDir, "shared-checkout-pause.json"), "utf-8"),
+        ) as { ownershipId: string; status: string };
+        expect(marker).toMatchObject({
+          ownershipId: newJob.sharedCheckoutOwnershipId,
+          status: "running",
+        });
+      } finally {
+        first.killAll();
+        second.killAll();
+        Object.defineProperty(process, "platform", originalPlatform);
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    test("does not carry Windows tree confirmation into a same-millisecond shared resume", async () => {
+      const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+      Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+      const fixedNow = 1_789_000_000_000;
+      const nowSpy = jest.spyOn(Date, "now").mockReturnValue(fixedNow);
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-win-aba-"));
+      const logDir = path.join(tmpDir, ".quack", "logs");
+      const scriptPath = path.join(tmpDir, "quick-exit.cjs");
+      fs.writeFileSync(scriptPath, "setTimeout(() => process.exit(0), 25);\n", "utf-8");
+      const mgr = new DispatchManager(tmpDir, scriptPath, undefined, undefined, logDir);
+      const oldJob = makeJob({
+        taskId: "TASK-WIN-ABA",
+        sessionId: `quack-TASK-WIN-ABA-${fixedNow}`,
+        status: "stopped",
+        pid: 0,
+      });
+      const internals = mgr as unknown as {
+        jobs: Map<string, DispatchJob>;
+        confirmedWindowsTreeKills: Map<string, string>;
+        persistSharedCheckoutPause(job: DispatchJob, status: "stopped"): void;
+      };
+      internals.confirmedWindowsTreeKills.set(oldJob.taskId, oldJob.sessionId);
+      internals.persistSharedCheckoutPause(oldJob, "stopped");
+      internals.jobs.set(oldJob.taskId, oldJob);
+      const oldOwnershipId = oldJob.sharedCheckoutOwnershipId;
+
+      try {
+        const resumed = mgr.start(oldJob.taskId, { skipGate: true, resume: true });
+        nowSpy.mockRestore();
+        const marker = JSON.parse(
+          fs.readFileSync(path.join(logDir, "shared-checkout-pause.json"), "utf-8"),
+        ) as { sessionId: string; ownershipId: string; processTreeStatus: string };
+        expect(resumed.sessionId).toBe(oldJob.sessionId);
+        expect(marker.ownershipId).not.toBe(oldOwnershipId);
+        expect(marker.processTreeStatus).toBe("unconfirmed");
+        expect(internals.confirmedWindowsTreeKills.has(oldJob.taskId)).toBe(false);
+        await waitForCondition(() => resumed.status !== "running", "same-millisecond fixture exit");
+      } finally {
+        nowSpy.mockRestore();
+        Object.defineProperty(process, "platform", originalPlatform);
+        await mgr.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    test("clears a stale Windows tree confirmation before an isolated child starts", async () => {
+      const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+      Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-worktree-win-session-"));
+      const scriptPath = path.join(tmpDir, "quick-exit.cjs");
+      fs.writeFileSync(scriptPath, "setTimeout(() => process.exit(0), 25);\n", "utf-8");
+      const mgr = new DispatchManager(tmpDir, scriptPath);
+      const internals = mgr as unknown as {
+        startWorktree(taskId: string): DispatchJob;
+        createWorktree(taskId: string): string;
+        ensureWorktreeAdapterFreshness(worktreePath: string): undefined;
+        removeWorktree(worktreePath: string): void;
+        confirmedWindowsTreeKills: Map<string, string>;
+      };
+      internals.createWorktree = () => tmpDir;
+      internals.ensureWorktreeAdapterFreshness = () => undefined;
+      internals.removeWorktree = jest.fn();
+      internals.confirmedWindowsTreeKills.set("TASK-WIN-SESSION", "old-session");
+      try {
+        const job = internals.startWorktree("TASK-WIN-SESSION");
+        expect(job.worktreePath).toBe(tmpDir);
+        expect(internals.confirmedWindowsTreeKills.has("TASK-WIN-SESSION")).toBe(false);
+        await waitForCondition(() => job.status !== "running", "isolated Windows fixture exit");
+      } finally {
+        Object.defineProperty(process, "platform", originalPlatform);
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
     test("never expires an unverified shared-checkout mutation lock by age", () => {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-lock-"));
       const logDir = path.join(tmpDir, ".quack", "logs");
@@ -1241,6 +1368,7 @@ describe("DispatchManager", () => {
           version: 1,
           taskId: "TASK-WINDOWS-TREE",
           sessionId: "tree-session",
+          ownershipId: "tree-owner",
           startedAt: "2026-09-09T12:00:00.000Z",
           pausedAt: "2026-09-09T12:01:00.000Z",
           status: "stopped",
@@ -1263,6 +1391,7 @@ describe("DispatchManager", () => {
           mgr.reconcileSharedCheckoutShutdownSurvivor(
             "TASK-WINDOWS-TREE",
             "tree-session",
+            "tree-owner",
             "stale-token",
             true,
           ),
@@ -1271,6 +1400,7 @@ describe("DispatchManager", () => {
           mgr.reconcileSharedCheckoutShutdownSurvivor(
             "TASK-WINDOWS-TREE",
             "tree-session",
+            "tree-owner",
             "tree-token",
             false,
           ),
@@ -1279,6 +1409,7 @@ describe("DispatchManager", () => {
           mgr.reconcileSharedCheckoutShutdownSurvivor(
             "TASK-WINDOWS-TREE",
             "tree-session",
+            "tree-owner",
             "tree-token",
             true,
           ),
@@ -1328,6 +1459,7 @@ describe("DispatchManager", () => {
           mgr.reconcileSharedCheckoutShutdownSurvivor(
             survivor!.taskId,
             survivor!.sessionId,
+            survivor!.ownershipId!,
             survivor!.reconciliationToken!,
             true,
           ),

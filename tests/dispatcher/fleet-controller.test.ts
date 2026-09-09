@@ -451,6 +451,31 @@ describe("FleetController", () => {
       expect(controller.getStatus().reason).toBe("later stop");
       expect(prepScheduler.isRunning()).toBe(false);
     });
+
+    it("does not let pause downgrade an in-flight emergency stop", async () => {
+      let releaseShutdown!: () => void;
+      const mayShutdown = new Promise<void>((resolve) => {
+        releaseShutdown = resolve;
+      });
+      jest.spyOn(dispatchManager, "shutdownAll").mockImplementation(async () => {
+        await mayShutdown;
+        return { requested: [], exited: [], escalated: [], timedOut: [] };
+      });
+
+      const emergency = controller.emergencyStop("draining agents");
+      expect(controller.getState()).toBe("emergency_stopped");
+      expect(() => controller.pause("ordinary pause")).toThrow(
+        "complete shutdown recovery with resume before pausing",
+      );
+      expect(controller.getState()).toBe("emergency_stopped");
+
+      releaseShutdown();
+      await emergency;
+      await controller.resume();
+      expect(dispatchManager.resumeAfterShutdownCalled).toBe(true);
+      expect(prepWorker.resumeAfterShutdownCalled).toBe(true);
+      expect(controller.getState()).toBe("running");
+    });
   });
 
   describe("Fleet status", () => {

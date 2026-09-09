@@ -1643,6 +1643,9 @@ describe("Monitor Server", () => {
         const { stop } = await serverObj.start();
         stopServer = stop;
         expect(dockerCheck).toHaveBeenCalledTimes(2);
+        const expectedRoots = [projectRoot1, projectRoot2];
+        expect(dockerCheck).toHaveBeenNthCalledWith(1, expectedRoots);
+        expect(dockerCheck).toHaveBeenNthCalledWith(2, expectedRoots);
       } finally {
         dockerCheck.mockRestore();
       }

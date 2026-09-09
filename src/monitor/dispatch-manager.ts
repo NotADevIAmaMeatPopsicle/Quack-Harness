@@ -87,6 +87,8 @@ export interface DispatchJob {
   /** Branch/status that existed before a degraded shared-checkout run started. */
   sharedCheckoutOriginalBranch?: string;
   sharedCheckoutOriginalStatus?: string;
+  /** UUID-backed durable checkout lease; callbacks must CAS against this value. */
+  sharedCheckoutOwnershipId?: string;
   federatedJobId?: string;
   federatedHostId?: string;
   federatedHostAlias?: string;
@@ -104,6 +106,7 @@ export interface SharedCheckoutOccupant {
 export interface SharedCheckoutShutdownSurvivor {
   taskId: string;
   sessionId: string;
+  ownershipId?: string;
   processId?: number;
   status: DispatchJob["status"];
   reconciliationToken?: string;
@@ -139,6 +142,8 @@ interface DurableSharedCheckoutPause {
   version: 1;
   taskId: string;
   sessionId: string;
+  /** Unique ownership generation; session IDs are not collision-safe CAS keys. */
+  ownershipId?: string;
   startedAt: string;
   pausedAt: string;
   /** Absent on legacy markers, where awaiting_approval is implied. */
@@ -366,6 +371,9 @@ export class DispatchManager {
   private dockerManager: DockerManager | null = null;
   /** Startup ownership scan shared by availability checks and first admission. */
   private dockerReconciliationPromise: Promise<void> | null = null;
+  /** Reconciliation and create form one admission transaction per manager. */
+  private dockerAdmissionTail: Promise<void> = Promise.resolve();
+  private dockerRegisteredProjectRoots: readonly string[] = [];
   private onEvent?: DispatchEventCallback;
   private keyManager?: KeyManager;
   private watchdogTimer?: ReturnType<typeof setInterval>;
@@ -374,7 +382,7 @@ export class DispatchManager {
     { timer: ReturnType<typeof setTimeout>; processGroupId?: number }
   >();
   /** Windows taskkill /T completions are the tree-level exit evidence. */
-  private confirmedWindowsTreeKills = new Set<string>();
+  private confirmedWindowsTreeKills = new Map<string, string>();
   /** Unreadable survivor records are a global recovery barrier. */
   private unreadableWorktreeSurvivorMarkers = new Set<string>();
   /** Never retry a Windows numeric PID after one tree-kill attempt. */
@@ -403,6 +411,7 @@ export class DispatchManager {
         projectRoot,
         isolationConfig.docker,
         path.join(this.logDir, "docker-create-uncertainty"),
+        { logDir: this.logDir },
       );
     }
     this.keyManager = keyManager;
@@ -473,6 +482,9 @@ export class DispatchManager {
         (parsed as { version?: unknown }).version !== 1 ||
         typeof (parsed as { taskId?: unknown }).taskId !== "string" ||
         typeof (parsed as { sessionId?: unknown }).sessionId !== "string" ||
+        ((parsed as { ownershipId?: unknown }).ownershipId !== undefined &&
+          (typeof (parsed as { ownershipId?: unknown }).ownershipId !== "string" ||
+            !(parsed as { ownershipId: string }).ownershipId)) ||
         typeof (parsed as { worktreePath?: unknown }).worktreePath !== "string" ||
         !Number.isSafeInteger((parsed as { processId?: unknown }).processId) ||
         Number((parsed as { processId?: unknown }).processId) <= 0 ||
@@ -506,7 +518,10 @@ export class DispatchManager {
         { encoding: "utf-8", flag: "wx" },
       );
     } catch {
-      return undefined;
+      // Migration is best-effort, but the legacy marker is still durable
+      // survivor evidence. Keep exposing it while another reconciler holds
+      // the lock instead of making the preserved worktree appear safe.
+      return marker;
     }
     try {
       const current = this.parseWorktreeSurvivor(markerPath);
@@ -725,6 +740,7 @@ export class DispatchManager {
       version: SHARED_CHECKOUT_PAUSE_VERSION,
       taskId,
       sessionId: evidence.sessionId,
+      ownershipId: randomUUID(),
       startedAt: evidence.pausedAt,
       pausedAt: evidence.eventAt,
       status: "awaiting_approval",
@@ -763,8 +779,17 @@ export class DispatchManager {
           flag: "wx",
         });
       } catch {
-        // The inferred record still protects this process. A concurrent writer
-        // will be read on the next admission check.
+        // Never return our losing generation after a concurrent create. Read
+        // the durable winner so every caller observes the same ownership ID.
+        return (
+          this.readSharedCheckoutPause(true) ?? {
+            version: SHARED_CHECKOUT_PAUSE_VERSION,
+            taskId: "unknown-shared-checkout-owner",
+            sessionId: "unknown",
+            startedAt: "unknown",
+            pausedAt: "unknown",
+          }
+        );
       }
       return recovered;
     }
@@ -818,15 +843,17 @@ export class DispatchManager {
   /** Migrate legacy or crash-stuck ownership evidence to a tokened recovery form. */
   private ensureSharedCheckoutRecoveryMetadata(): DurableSharedCheckoutPause | undefined {
     const marker = this.readSharedCheckoutPause();
-    const needsRecoveryMetadata =
+    const needsTreeRecoveryMetadata =
       marker !== undefined &&
       (marker.processTreeStatus === "unconfirmed" ||
         (marker.processTreeStatus === undefined &&
           (process.platform === "win32" || marker.status === "running")));
     if (
       !marker ||
-      !needsRecoveryMetadata ||
-      (marker.processTreeStatus === "unconfirmed" && marker.reconciliationToken)
+      (!needsTreeRecoveryMetadata && marker.ownershipId) ||
+      (marker.ownershipId &&
+        marker.processTreeStatus === "unconfirmed" &&
+        marker.reconciliationToken)
     ) {
       return marker;
     }
@@ -834,13 +861,26 @@ export class DispatchManager {
       return this.withSharedCheckoutMutationLock(() => {
         const current = this.readSharedCheckoutPause(true);
         if (!current) return undefined;
-        if (current.processTreeStatus === "unconfirmed" && current.reconciliationToken) {
+        const currentNeedsTreeMetadata =
+          current.processTreeStatus === "unconfirmed" ||
+          (current.processTreeStatus === undefined &&
+            (process.platform === "win32" || current.status === "running"));
+        if (
+          current.ownershipId &&
+          (!currentNeedsTreeMetadata ||
+            (current.processTreeStatus === "unconfirmed" && current.reconciliationToken))
+        ) {
           return current;
         }
         const migrated: DurableSharedCheckoutPause = {
           ...current,
-          processTreeStatus: "unconfirmed",
-          reconciliationToken: randomUUID(),
+          ownershipId: current.ownershipId ?? randomUUID(),
+          ...(currentNeedsTreeMetadata
+            ? {
+                processTreeStatus: "unconfirmed" as const,
+                reconciliationToken: current.reconciliationToken ?? randomUUID(),
+              }
+            : {}),
         };
         fs.writeFileSync(
           this.sharedCheckoutPausePath(),
@@ -850,7 +890,10 @@ export class DispatchManager {
         return migrated;
       });
     } catch {
-      return undefined;
+      // Migration is best-effort, but the pre-migration marker is still
+      // durable ownership evidence. Keep exposing it so a contended or
+      // unverifiable lock cannot make the shared checkout appear vacant.
+      return marker;
     }
   }
 
@@ -870,7 +913,11 @@ export class DispatchManager {
           },
         ]);
       }
-      if (existing && existing.sessionId !== job.sessionId) {
+      const exactOwner =
+        existing?.ownershipId !== undefined &&
+        existing.sessionId === job.sessionId &&
+        job.sharedCheckoutOwnershipId === existing.ownershipId;
+      if (existing && !exactOwner) {
         if (!allowOwnershipTransfer || this.durableSharedOwnerMayBeLive(existing)) {
           throw new DegradedSharedCheckoutBusyError(job.taskId, [
             {
@@ -881,10 +928,14 @@ export class DispatchManager {
         }
       }
 
+      const ownershipId = exactOwner && existing?.ownershipId ? existing.ownershipId : randomUUID();
+      job.sharedCheckoutOwnershipId = ownershipId;
+
       const record: DurableSharedCheckoutPause = {
         version: SHARED_CHECKOUT_PAUSE_VERSION,
         taskId: job.taskId,
         sessionId: job.sessionId,
+        ownershipId,
         startedAt: job.startedAt,
         pausedAt: new Date().toISOString(),
         status,
@@ -893,18 +944,18 @@ export class DispatchManager {
           ? {
               ...(job.pid > 0
                 ? { processId: job.pid }
-                : existing?.processId
+                : exactOwner && existing?.processId
                   ? { processId: existing.processId }
                   : {}),
-              processTreeStatus: this.confirmedWindowsTreeKills.has(job.taskId)
+              processTreeStatus: this.hasConfirmedWindowsTreeKill(job)
                 ? ("confirmed-stopped" as const)
                 : ("unconfirmed" as const),
               reconciliationToken:
-                existing?.sessionId === job.sessionId && existing.reconciliationToken
+                exactOwner && existing?.reconciliationToken
                   ? existing.reconciliationToken
                   : randomUUID(),
             }
-          : existing?.sessionId === job.sessionId && existing.processTreeStatus
+          : exactOwner && existing?.processTreeStatus
             ? {
                 processId: existing.processId,
                 processTreeStatus: existing.processTreeStatus,
@@ -970,7 +1021,12 @@ export class DispatchManager {
     try {
       this.withSharedCheckoutMutationLock(() => {
         const marker = this.readSharedCheckoutPause(true);
-        if (!marker || marker.taskId !== job.taskId || marker.sessionId !== job.sessionId) {
+        if (
+          !marker ||
+          marker.taskId !== job.taskId ||
+          !job.sharedCheckoutOwnershipId ||
+          marker.ownershipId !== job.sharedCheckoutOwnershipId
+        ) {
           return;
         }
         fs.rmSync(this.sharedCheckoutPausePath());
@@ -993,7 +1049,12 @@ export class DispatchManager {
     try {
       return this.withSharedCheckoutMutationLock(() => {
         const marker = this.readSharedCheckoutPause(true);
-        if (!marker || marker.taskId !== job.taskId || marker.sessionId !== job.sessionId) {
+        if (
+          !marker ||
+          marker.taskId !== job.taskId ||
+          !job.sharedCheckoutOwnershipId ||
+          marker.ownershipId !== job.sharedCheckoutOwnershipId
+        ) {
           job.output.push(
             "[dispatch] Shared-checkout ownership changed before restore; ownership remains blocked.",
           );
@@ -1417,9 +1478,12 @@ export class DispatchManager {
    * Check Docker availability. Call on startup when isolation.method is "docker".
    * Throws if Docker daemon is not reachable.
    */
-  async checkDockerAvailability(): Promise<string> {
+  async checkDockerAvailability(registeredProjectRoots?: readonly string[]): Promise<string> {
     if (!this.dockerManager) {
       throw new Error("Docker isolation is not configured");
+    }
+    if (registeredProjectRoots) {
+      this.dockerRegisteredProjectRoots = [...registeredProjectRoots];
     }
     const version = await this.dockerManager.checkDocker();
     await this.ensureDockerOwnershipReconciled();
@@ -1430,20 +1494,22 @@ export class DispatchManager {
     if (!this.dockerManager) return Promise.resolve();
     if (!this.dockerReconciliationPromise) {
       const dockerManager = this.dockerManager;
-      const reconciliation = dockerManager.reconcileExistingContainers().then((result) => {
-        if (result.ambiguousContainerIds.length > 0) {
-          throw new Error(
-            "Docker ownership reconciliation found ambiguous Quack containers: " +
-              result.ambiguousContainerIds.join(", "),
-          );
-        }
-        if (result.failedTaskIds.length > 0) {
-          throw new Error(
-            "Docker ownership reconciliation could not remove prior containers for: " +
-              result.failedTaskIds.join(", "),
-          );
-        }
-      });
+      const reconciliation = dockerManager
+        .reconcileExistingContainers(this.dockerRegisteredProjectRoots)
+        .then((result) => {
+          if (result.ambiguousContainerIds.length > 0) {
+            throw new Error(
+              "Docker ownership reconciliation found ambiguous Quack containers: " +
+                result.ambiguousContainerIds.join(", "),
+            );
+          }
+          if (result.failedTaskIds.length > 0) {
+            throw new Error(
+              "Docker ownership reconciliation could not remove prior containers for: " +
+                result.failedTaskIds.join(", "),
+            );
+          }
+        });
       const sharedReconciliation = reconciliation.finally(() => {
         if (this.dockerReconciliationPromise === sharedReconciliation) {
           this.dockerReconciliationPromise = null;
@@ -1452,6 +1518,15 @@ export class DispatchManager {
       this.dockerReconciliationPromise = sharedReconciliation;
     }
     return this.dockerReconciliationPromise;
+  }
+
+  private serializeDockerAdmission<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.dockerAdmissionTail.then(operation, operation);
+    this.dockerAdmissionTail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
   /**
@@ -2145,7 +2220,9 @@ export class DispatchManager {
     assertUncontestedClaimant(claimantCheck ?? options?.duplicateClaimantCheck);
 
     const durableSharedPause =
-      this.isolationConfig?.method === "docker" ? undefined : this.readSharedCheckoutPause();
+      this.isolationConfig?.method === "docker"
+        ? undefined
+        : this.ensureSharedCheckoutRecoveryMetadata();
     const priorJob = this.jobs.get(taskId);
     if (durableSharedPause && this.durableSharedOwnerMayBeLive(durableSharedPause)) {
       throw new DegradedSharedCheckoutBusyError(taskId, [
@@ -2165,7 +2242,7 @@ export class DispatchManager {
       priorJob.worktreePath === undefined &&
       priorJob.status !== "completed";
     const windowsSharedTreeConfirmed =
-      this.confirmedWindowsTreeKills.has(taskId) ||
+      (priorJob !== undefined && this.hasConfirmedWindowsTreeKill(priorJob)) ||
       durableSharedPause?.processTreeStatus === "confirmed-stopped";
     if (process.platform === "win32" && inMemorySharedRecovery && !windowsSharedTreeConfirmed) {
       throw new DegradedSharedCheckoutBusyError(taskId, [
@@ -2402,14 +2479,18 @@ export class DispatchManager {
     // ownership before spawning so a new monitor cannot mistake a potentially
     // dirty in-flight checkout for a free fallback directory.
     if (!worktreePath) {
-      // A confirmation belongs to the old tree only. Clear it immediately
-      // before atomically transferring/persisting ownership for the new child.
+      // Admission already consumed any prior session's recovery evidence.
+      // Clear it before writing the new ownership generation so a same-
+      // millisecond session ID collision cannot mark the new tree confirmed.
       if (process.platform === "win32") this.confirmedWindowsTreeKills.delete(taskId);
       this.persistSharedCheckoutPause(job, "running", recoverSharedCheckout);
     }
 
     let child: ChildProcess;
     try {
+      // A task-level PID confirmation belongs to an older session. Clear it
+      // before every new child, including isolated worktrees.
+      if (process.platform === "win32") this.confirmedWindowsTreeKills.delete(taskId);
       child = spawn("node", [this.quackBin, ...args], {
         cwd: workDir,
         stdio: ["ignore", "pipe", "pipe"],
@@ -2685,7 +2766,7 @@ export class DispatchManager {
             );
           }
         } else if (code === 0 && !stopRequested) {
-          if (process.platform === "win32" && !this.confirmedWindowsTreeKills.has(taskId)) {
+          if (process.platform === "win32" && !this.hasConfirmedWindowsTreeKill(job)) {
             job.output.push(
               "[dispatch] Shared-checkout root exited, but descendant termination is unconfirmed on Windows; ownership remains blocked pending reconciliation.",
             );
@@ -2786,10 +2867,21 @@ export class DispatchManager {
 
     this.jobs.set(taskId, job);
 
-    // Container creation is async — kick it off and wire up the exec
+    // Treat reconciliation + create as one serialized admission transaction.
+    // A second task must not rescan or classify the first task's live
+    // container while that first admission is still being established.
     const dockerMgr = this.dockerManager!;
-    const startupPromise = this.ensureDockerOwnershipReconciled()
-      .then(() => dockerMgr.createContainer(taskId))
+    const admittedContainer = this.serializeDockerAdmission(async () => {
+      if (this.shutdownInProgress || job.stopRequestedAt) {
+        throw new Error(`Cannot start ${taskId}: dispatch manager shutdown is in progress.`);
+      }
+      await this.ensureDockerOwnershipReconciled();
+      if (this.shutdownInProgress || job.stopRequestedAt) {
+        throw new Error(`Cannot start ${taskId}: dispatch manager shutdown is in progress.`);
+      }
+      return dockerMgr.createContainer(taskId);
+    });
+    const startupPromise = admittedContainer
       .then(async (containerInfo) => {
         job.containerId = containerInfo.containerId;
 
@@ -2859,6 +2951,7 @@ export class DispatchManager {
           job.keyId = dockerKeyId;
         }
 
+        if (process.platform === "win32") this.confirmedWindowsTreeKills.delete(taskId);
         const child = dockerMgr.execAgent(containerInfo.containerId, agentCmd, env);
         job.pid = child.pid ?? 0;
 
@@ -3222,7 +3315,7 @@ export class DispatchManager {
         : Array.from(this.jobs.values()).filter(
             (job) => !job.worktreePath && job.status !== "completed",
           );
-    const durablePause = this.readSharedCheckoutPause();
+    const durablePause = this.ensureSharedCheckoutRecoveryMetadata();
     if (durablePause && !occupants.some((job) => job.taskId === durablePause.taskId)) {
       // A durable `running` marker without its original in-memory child is a
       // crash/restart recovery record, not evidence that the process is live.
@@ -3239,6 +3332,7 @@ export class DispatchManager {
         output: [
           `[dispatch] Restored shared-checkout pause ownership recorded ${durablePause.pausedAt}.`,
         ],
+        sharedCheckoutOwnershipId: durablePause.ownershipId,
       });
     }
     return occupants;
@@ -3258,6 +3352,7 @@ export class DispatchManager {
     return {
       taskId: marker.taskId,
       sessionId: marker.sessionId,
+      ownershipId: marker.ownershipId,
       processId: marker.processId,
       status: marker.status ?? "awaiting_approval",
       reconciliationToken: marker.reconciliationToken,
@@ -3272,6 +3367,7 @@ export class DispatchManager {
   reconcileSharedCheckoutShutdownSurvivor(
     taskId: string,
     sessionId: string,
+    ownershipId: string,
     reconciliationToken: string,
     processTreeConfirmedStopped: boolean,
   ): boolean {
@@ -3283,6 +3379,7 @@ export class DispatchManager {
           !marker ||
           marker.taskId !== taskId ||
           marker.sessionId !== sessionId ||
+          marker.ownershipId !== ownershipId ||
           !marker.reconciliationToken ||
           marker.reconciliationToken !== reconciliationToken ||
           marker.processTreeStatus === "confirmed-stopped"
@@ -3300,7 +3397,9 @@ export class DispatchManager {
           `${JSON.stringify(reconciled, null, 2)}\n`,
           "utf-8",
         );
-        if (process.platform === "win32") this.confirmedWindowsTreeKills.add(taskId);
+        if (process.platform === "win32") {
+          this.confirmedWindowsTreeKills.set(taskId, marker.sessionId);
+        }
         return true;
       });
     } catch {
@@ -3480,6 +3579,10 @@ export class DispatchManager {
     }
   }
 
+  private hasConfirmedWindowsTreeKill(job: DispatchJob): boolean {
+    return this.confirmedWindowsTreeKills.get(job.taskId) === job.sessionId;
+  }
+
   private hasLiveStopProcessGroup(taskId: string): boolean {
     const pending = this.stopEscalationTimers.get(taskId);
     return Boolean(pending?.processGroupId && this.processGroupExists(pending.processGroupId));
@@ -3632,7 +3735,7 @@ export class DispatchManager {
         windowsHide: true,
         timeout: Math.max(1, windowsTimeoutMs),
       });
-      this.confirmedWindowsTreeKills.add(taskId);
+      if (job) this.confirmedWindowsTreeKills.set(taskId, job.sessionId);
     } else if (process.platform !== "win32" && !job?.containerId && child.pid) {
       try {
         process.kill(-child.pid, signal);
@@ -3725,7 +3828,12 @@ export class DispatchManager {
       const lifecycleRecorded = this.processes.get(entry.taskId) !== entry.child;
       if (!entry.child.pid) return lifecycleRecorded;
       if (process.platform === "win32" && !entry.job?.containerId) {
-        return childExited && lifecycleRecorded && this.confirmedWindowsTreeKills.has(entry.taskId);
+        return (
+          childExited &&
+          lifecycleRecorded &&
+          entry.job !== undefined &&
+          this.hasConfirmedWindowsTreeKill(entry.job)
+        );
       }
       if (!usesPosixGroup(entry)) return childExited && lifecycleRecorded;
       try {

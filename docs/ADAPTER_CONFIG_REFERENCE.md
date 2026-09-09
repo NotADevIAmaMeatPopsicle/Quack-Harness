@@ -94,7 +94,7 @@ Configure the base branch, generated branch prefix, commit format, and optional 
 
 ## `logging` and runtime state
 
-Logs, checkpoints, databases, queue state, generated worktrees, and credentials are runtime data. Keep them under ignored `.quack/` paths or an external state directory. Do not commit them.
+Logs, checkpoints, databases, queue state, generated worktrees, and credentials are runtime data. Keep them under ignored `.quack/` paths or an external state directory. Do not commit them. When Docker isolation is enabled, `logging.dir` must remain inside the project and outside `.quack/prep`; Quack mounts that directory read-write while keeping prep storage read-only. Additional Docker volumes must be explicitly read-only, cannot overlap the protected `/workspace` tree, and bind sources must resolve inside the project. Read-only named volumes remain supported.
 
 ## Optional capabilities
 

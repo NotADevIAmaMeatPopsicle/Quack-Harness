@@ -86,6 +86,11 @@ export class FleetController {
    * Pause the fleet — prevent new dispatches while active ones continue.
    */
   pause(reason = "Manual pause"): void {
+    if (this.state === "emergency_stopped") {
+      throw new Error(
+        "Fleet is emergency stopped; complete shutdown recovery with resume before pausing",
+      );
+    }
     this.transitionRevision += 1;
     this.state = "paused";
     this.reason = reason;
@@ -164,12 +169,14 @@ export class FleetController {
   reconcileSharedCheckoutShutdownSurvivor(
     taskId: string,
     sessionId: string,
+    ownershipId: string,
     reconciliationToken: string,
     processTreeConfirmedStopped: boolean,
   ): boolean {
     return this.dispatchManager.reconcileSharedCheckoutShutdownSurvivor(
       taskId,
       sessionId,
+      ownershipId,
       reconciliationToken,
       processTreeConfirmedStopped,
     );

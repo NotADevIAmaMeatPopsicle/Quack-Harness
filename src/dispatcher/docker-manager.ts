@@ -16,7 +16,53 @@ const execFileAsync = promisify(execFile);
 const DOCKER_COMMAND_TIMEOUT_MS = 30_000;
 const DOCKER_CLEANUP_TIMEOUT_MS = 5_000;
 const DOCKER_SETUP_TIMEOUT_MS = 15 * 60_000;
-const UNCERTAIN_CREATE_CONFIRMATION_DELAY_MS = 1_000;
+const UNCERTAIN_CREATE_WINDOW_MS = DOCKER_COMMAND_TIMEOUT_MS;
+const UNCERTAIN_CREATE_PROBE_INTERVAL_MS = 250;
+
+function comparablePath(value: string): string {
+  const resolved = path.resolve(value);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function isSameOrDescendant(candidate: string, root: string): boolean {
+  const relative = path.relative(comparablePath(root), comparablePath(candidate));
+  return (
+    relative === "" ||
+    (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`))
+  );
+}
+
+/**
+ * Resolve symlinks/junctions in the existing portion of a path. The remaining
+ * suffix is safe to append because none of its entries exist yet.
+ */
+function resolveThroughExistingAncestor(value: string): string {
+  let existing = path.resolve(value);
+  const suffix: string[] = [];
+  for (;;) {
+    let entryExists = false;
+    try {
+      fs.lstatSync(existing);
+      entryExists = true;
+    } catch (error: unknown) {
+      const code =
+        typeof error === "object" && error !== null && "code" in error
+          ? String((error as { code?: unknown }).code)
+          : "";
+      if (code !== "ENOENT") throw error;
+      const parent = path.dirname(existing);
+      if (parent === existing) throw error;
+      suffix.unshift(path.basename(existing));
+      existing = parent;
+    }
+    if (entryExists) {
+      // If an existing symlink/junction is broken, fail closed instead of
+      // treating it as an ordinary missing suffix that may later escape.
+      const real = fs.realpathSync.native(existing);
+      return path.resolve(real, ...suffix);
+    }
+  }
+}
 
 export interface DockerContainer {
   containerId: string;
@@ -41,6 +87,7 @@ export interface DockerReconciliationResult extends DockerCleanupResult {
 
 interface DockerInspectRecord {
   Id?: unknown;
+  Name?: unknown;
   Config?: { Image?: unknown; Labels?: Record<string, unknown> | null };
   Mounts?: Array<{ Source?: unknown; Destination?: unknown }>;
   State?: { Running?: unknown };
@@ -54,7 +101,18 @@ interface DockerCreateUncertainty {
   projectFingerprint: string;
   createdAt: string;
   confirmAfter: string;
+  /** Do not treat repeated absence as conclusive until this bounded deadline. */
+  reconcileUntil: string;
   confirmationToken: string;
+}
+
+export interface DockerManagerOptions {
+  /** Resolved host directory matching adapter logging.dir. */
+  logDir?: string;
+  /** Testable bound for a daemon request accepted before monitor loss. */
+  uncertainCreateWindowMs?: number;
+  /** Interval between name-based late-create probes. */
+  uncertainCreateProbeIntervalMs?: number;
 }
 
 export class DockerManager {
@@ -65,11 +123,16 @@ export class DockerManager {
   private unreadableUncertaintyMarkers = new Set<string>();
   private readonly projectFingerprint: string;
   private readonly uncertaintyDir: string;
+  private readonly hostLogDir: string;
+  private readonly containerLogDir: string;
+  private readonly uncertainCreateWindowMs: number;
+  private readonly uncertainCreateProbeIntervalMs: number;
 
   constructor(
     private readonly projectRoot: string,
     private readonly config: DockerIsolationConfig,
     stateRoot?: string,
+    options: DockerManagerOptions = {},
   ) {
     const resolvedRoot = path.resolve(projectRoot).replace(/\\/g, "/");
     this.projectFingerprint = createHash("sha256")
@@ -77,7 +140,117 @@ export class DockerManager {
       .digest("hex");
     this.uncertaintyDir =
       stateRoot ?? path.join(projectRoot, ".quack", "logs", "docker-create-uncertainty");
+    this.hostLogDir = path.resolve(options.logDir ?? path.join(projectRoot, ".quack", "logs"));
+    this.assertSafeLogDir();
+    this.assertSafeConfiguredVolumes();
+    const relativeLogDir = path
+      .relative(path.resolve(projectRoot), this.hostLogDir)
+      .replace(/\\/g, "/");
+    this.containerLogDir = path.posix.resolve("/workspace", relativeLogDir || ".");
+    this.uncertainCreateWindowMs = Math.max(
+      1,
+      options.uncertainCreateWindowMs ?? UNCERTAIN_CREATE_WINDOW_MS,
+    );
+    this.uncertainCreateProbeIntervalMs = Math.max(
+      1,
+      options.uncertainCreateProbeIntervalMs ?? UNCERTAIN_CREATE_PROBE_INTERVAL_MS,
+    );
     this.refreshCreateUncertainty();
+  }
+
+  private assertSafeLogDir(): void {
+    const resolvedRoot = path.resolve(this.projectRoot);
+    const canonicalPrep = path.join(resolvedRoot, ".quack", "prep");
+    const protectedPrep = path.resolve(resolvePrepStorageDirSync(resolvedRoot));
+    if (!isSameOrDescendant(this.hostLogDir, resolvedRoot)) {
+      throw new Error("Docker logging.dir must remain inside the project root");
+    }
+    if (
+      isSameOrDescendant(this.hostLogDir, canonicalPrep) ||
+      isSameOrDescendant(this.hostLogDir, protectedPrep)
+    ) {
+      throw new Error("Docker logging.dir must not overlap the protected .quack/prep tree");
+    }
+
+    const realRoot = resolveThroughExistingAncestor(resolvedRoot);
+    const realLogDir = resolveThroughExistingAncestor(this.hostLogDir);
+    const realCanonicalPrepDir = resolveThroughExistingAncestor(canonicalPrep);
+    const realPrepDir = resolveThroughExistingAncestor(protectedPrep);
+    if (!isSameOrDescendant(realLogDir, realRoot)) {
+      throw new Error("Docker logging.dir resolves outside the project root");
+    }
+    if (
+      isSameOrDescendant(realLogDir, realCanonicalPrepDir) ||
+      isSameOrDescendant(realLogDir, realPrepDir)
+    ) {
+      throw new Error("Docker logging.dir resolves into the protected .quack/prep tree");
+    }
+  }
+
+  private safeConfiguredVolume(volume: string): { destination: string; argument: string } {
+    const fields = volume.split(":");
+    let destinationIndex = -1;
+    for (let index = fields.length - 1; index >= 0; index -= 1) {
+      if (fields[index].startsWith("/")) {
+        destinationIndex = index;
+        break;
+      }
+    }
+    if (destinationIndex < 1) {
+      throw new Error(`Docker volume must include a source and absolute destination: ${volume}`);
+    }
+
+    const source = fields.slice(0, destinationIndex).join(":");
+    const destination = path.posix.normalize(fields[destinationIndex]);
+    const options = fields.slice(destinationIndex + 1).join(":");
+    const optionSet = new Set(options.split(",").filter(Boolean));
+    if (!optionSet.has("ro") || optionSet.has("rw")) {
+      throw new Error(`Docker volume ${volume} must be explicitly read-only (:ro)`);
+    }
+
+    const looksLikeBindSource =
+      path.isAbsolute(source) ||
+      /^[A-Za-z]:[\\/]/.test(source) ||
+      source.startsWith(".") ||
+      source.includes("/") ||
+      source.includes("\\");
+    if (!looksLikeBindSource) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(source)) {
+        throw new Error(`Docker volume has an invalid named source: ${volume}`);
+      }
+      return { destination, argument: `${source}:${destination}:${options}` };
+    }
+
+    const resolvedRoot = path.resolve(this.projectRoot);
+    const resolvedSource = path.isAbsolute(source)
+      ? path.resolve(source)
+      : path.resolve(resolvedRoot, source);
+    if (!isSameOrDescendant(resolvedSource, resolvedRoot)) {
+      throw new Error(`Docker bind source must remain inside the project root: ${source}`);
+    }
+    const realRoot = resolveThroughExistingAncestor(resolvedRoot);
+    const realSource = resolveThroughExistingAncestor(resolvedSource);
+    if (!isSameOrDescendant(realSource, realRoot)) {
+      throw new Error(`Docker bind source resolves outside the project root: ${source}`);
+    }
+    return {
+      destination,
+      argument: `${realSource.replace(/\\/g, "/")}:${destination}:${options}`,
+    };
+  }
+
+  private assertSafeConfiguredVolumes(): void {
+    for (const volume of this.config.volumes ?? []) {
+      const { destination } = this.safeConfiguredVolume(volume);
+      if (
+        isSameOrDescendant(destination, "/workspace") ||
+        isSameOrDescendant("/workspace", destination)
+      ) {
+        throw new Error(
+          `Docker volume destination ${destination} overlaps the protected /workspace tree`,
+        );
+      }
+    }
   }
 
   private uncertaintyPath(containerName: string): string {
@@ -96,14 +269,29 @@ export class DockerManager {
         (parsed as { projectFingerprint?: unknown }).projectFingerprint !==
           this.projectFingerprint ||
         typeof (parsed as { createdAt?: unknown }).createdAt !== "string" ||
+        !Number.isFinite(Date.parse((parsed as { createdAt: string }).createdAt)) ||
         typeof (parsed as { confirmAfter?: unknown }).confirmAfter !== "string" ||
         !Number.isFinite(Date.parse((parsed as { confirmAfter: string }).confirmAfter)) ||
+        ((parsed as { reconcileUntil?: unknown }).reconcileUntil !== undefined &&
+          (typeof (parsed as { reconcileUntil?: unknown }).reconcileUntil !== "string" ||
+            !Number.isFinite(Date.parse((parsed as { reconcileUntil: string }).reconcileUntil)))) ||
         typeof (parsed as { confirmationToken?: unknown }).confirmationToken !== "string" ||
         !(parsed as { confirmationToken: string }).confirmationToken
       ) {
         return undefined;
       }
-      return parsed as DockerCreateUncertainty;
+      const marker = parsed as Omit<DockerCreateUncertainty, "reconcileUntil"> & {
+        reconcileUntil?: string;
+      };
+      return {
+        ...marker,
+        // Markers written by the previous release used only a one-second
+        // confirmAfter value. Upgrade them in memory to the full Docker command
+        // acceptance window instead of trusting one negative daemon lookup.
+        reconcileUntil:
+          marker.reconcileUntil ??
+          new Date(Date.parse(marker.createdAt) + this.uncertainCreateWindowMs).toISOString(),
+      };
     } catch {
       return undefined;
     }
@@ -133,13 +321,15 @@ export class DockerManager {
   }
 
   private persistCreateUncertainty(containerName: string, taskId: string): DockerCreateUncertainty {
+    const now = Date.now();
     const marker: DockerCreateUncertainty = {
       version: 1,
       containerName,
       taskId,
       projectFingerprint: this.projectFingerprint,
-      createdAt: new Date().toISOString(),
-      confirmAfter: new Date(Date.now() + UNCERTAIN_CREATE_CONFIRMATION_DELAY_MS).toISOString(),
+      createdAt: new Date(now).toISOString(),
+      confirmAfter: new Date(now + this.uncertainCreateProbeIntervalMs).toISOString(),
+      reconcileUntil: new Date(now + this.uncertainCreateWindowMs).toISOString(),
       confirmationToken: randomUUID(),
     };
     const markerPath = this.uncertaintyPath(containerName);
@@ -176,27 +366,63 @@ export class DockerManager {
       (name) => `uncertainty:${name}`,
     );
     for (const marker of this.uncertainCreations.values()) {
-      const delayMs = Math.max(0, Date.parse(marker.confirmAfter) - Date.now());
-      if (delayMs > 0) {
-        await new Promise<void>((resolve) => {
-          setTimeout(resolve, delayMs);
-        });
+      let nextProbeAt = Date.parse(marker.confirmAfter);
+      const deadline = Date.parse(marker.reconcileUntil);
+      let resolved = false;
+      while (!resolved) {
+        const delayMs = Math.max(0, nextProbeAt - Date.now());
+        if (delayMs > 0) {
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, delayMs);
+          });
+        }
+
+        const outcome = await this.removeContainerOnce(marker.containerName);
+        if (outcome === "removed") {
+          resolved = this.clearCreateUncertainty(marker);
+          break;
+        }
+        if (outcome === "unconfirmed") break;
+        if (Date.now() >= deadline) {
+          // Repeated name probes covered the entire bounded period in which the
+          // interrupted Docker CLI could still have delivered its create.
+          resolved = this.clearCreateUncertainty(marker);
+          break;
+        }
+        nextProbeAt = Math.min(deadline, Date.now() + this.uncertainCreateProbeIntervalMs);
       }
-      const removed = await this.forceRemoveContainer(marker.containerName);
-      if (!removed) failedTaskIds.push(marker.taskId);
+      if (!resolved) {
+        failedTaskIds.push(marker.taskId);
+      } else {
+        const tracked = this.containers.get(marker.taskId);
+        if (tracked?.containerId === marker.containerName && tracked.status === "stopped") {
+          this.containers.delete(marker.taskId);
+        }
+      }
     }
     return { failedTaskIds, ambiguousContainerIds };
   }
 
+  private normalizeHostPath(value: string): string {
+    const normalized = value
+      .replace(/\\/g, "/")
+      .replace(/^\/host_mnt\/([a-z])\//i, "$1:/")
+      .replace(/\/$/, "");
+    return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+  }
+
+  private hostPathMatchesRoot(source: string, root: string): boolean {
+    const normalizedSource = this.normalizeHostPath(source);
+    if (normalizedSource === this.normalizeHostPath(path.resolve(root))) return true;
+    try {
+      return normalizedSource === this.normalizeHostPath(resolveThroughExistingAncestor(root));
+    } catch {
+      return false;
+    }
+  }
+
   private hostPathMatchesProjectRoot(source: string): boolean {
-    const normalize = (value: string): string => {
-      const normalized = value
-        .replace(/\\/g, "/")
-        .replace(/^\/host_mnt\/([a-z])\//i, "$1:/")
-        .replace(/\/$/, "");
-      return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-    };
-    return normalize(source) === normalize(path.resolve(this.projectRoot));
+    return this.hostPathMatchesRoot(source, this.projectRoot);
   }
 
   /**
@@ -205,7 +431,9 @@ export class DockerManager {
    * project fingerprint are accepted only when their /workspace mount proves
    * ownership; ambiguous records fail closed and are never removed.
    */
-  async reconcileExistingContainers(): Promise<DockerReconciliationResult> {
+  async reconcileExistingContainers(
+    registeredProjectRoots: readonly string[] = [this.projectRoot],
+  ): Promise<DockerReconciliationResult> {
     const uncertainty = await this.reconcileCreateUncertainty();
     if (uncertainty.failedTaskIds.length > 0 || uncertainty.ambiguousContainerIds.length > 0) {
       return {
@@ -228,6 +456,7 @@ export class DockerManager {
       .map((value) => value.trim())
       .filter(Boolean);
     const discoveredTaskIds: string[] = [];
+    const discoveredContainers: DockerContainer[] = [];
     const ambiguousContainerIds: string[] = [];
 
     for (const containerId of containerIds) {
@@ -254,17 +483,24 @@ export class DockerManager {
         continue;
       }
       if (typeof owner === "string" && owner !== this.projectFingerprint) continue;
-      if (
-        owner === undefined &&
-        !record.Mounts?.some(
-          (mount) =>
-            mount.Destination === "/workspace" &&
-            typeof mount.Source === "string" &&
-            this.hostPathMatchesProjectRoot(mount.Source),
-        )
-      ) {
-        ambiguousContainerIds.push(containerId);
-        continue;
+      if (owner === undefined) {
+        const workspaceSource = record.Mounts?.find(
+          (mount) => mount.Destination === "/workspace" && typeof mount.Source === "string",
+        )?.Source;
+        if (typeof workspaceSource !== "string") {
+          ambiguousContainerIds.push(containerId);
+          continue;
+        }
+        if (!this.hostPathMatchesProjectRoot(workspaceSource)) {
+          const belongsToRegisteredPeer = registeredProjectRoots.some(
+            (root) =>
+              !this.hostPathMatchesRoot(root, this.projectRoot) &&
+              this.hostPathMatchesRoot(workspaceSource, root),
+          );
+          if (belongsToRegisteredPeer) continue;
+          ambiguousContainerIds.push(containerId);
+          continue;
+        }
       }
 
       const info: DockerContainer = {
@@ -273,16 +509,26 @@ export class DockerManager {
         taskId,
         image: typeof record.Config?.Image === "string" ? record.Config.Image : this.config.image,
         workDir: "/workspace",
-        logsVolume: "/workspace/.quack/logs",
+        logsVolume: this.containerLogDir,
         startedAt: typeof record.Created === "string" ? record.Created : new Date().toISOString(),
         status: record.State?.Running === true ? "running" : "stopped",
       };
-      if (this.containers.has(taskId)) {
+      const tracked = this.containers.get(taskId);
+      if (tracked && (tracked.status === "creating" || tracked.status === "running")) {
+        const inspectedId = typeof record.Id === "string" ? record.Id : containerId;
+        const inspectedName = typeof record.Name === "string" ? record.Name.replace(/^\//, "") : "";
+        const sameContainer =
+          inspectedId === tracked.containerId ||
+          inspectedId.startsWith(tracked.containerId) ||
+          tracked.containerId.startsWith(inspectedId) ||
+          inspectedName === tracked.containerId;
+        if (sameContainer) continue;
         ambiguousContainerIds.push(containerId);
         continue;
       }
       this.containers.set(taskId, info);
       discoveredTaskIds.push(taskId);
+      discoveredContainers.push(info);
     }
 
     if (ambiguousContainerIds.length > 0) {
@@ -293,8 +539,18 @@ export class DockerManager {
         failedTaskIds: discoveredTaskIds,
       };
     }
-    const cleanup = await this.cleanupAll();
-    return { discoveredTaskIds, ambiguousContainerIds, ...cleanup };
+    const outcomes = await Promise.all(
+      discoveredContainers.map(async (container) => ({
+        taskId: container.taskId,
+        removed: await this.forceRemoveContainer(container.containerId),
+      })),
+    );
+    return {
+      discoveredTaskIds,
+      ambiguousContainerIds,
+      removedTaskIds: outcomes.filter(({ removed }) => removed).map(({ taskId }) => taskId),
+      failedTaskIds: outcomes.filter(({ removed }) => !removed).map(({ taskId }) => taskId),
+    };
   }
 
   private async runDocker(
@@ -337,10 +593,12 @@ export class DockerManager {
 
   /**
    * Create and start a container for a task dispatch.
-   * Mounts project root as read-only, .quack/logs as read-write,
+   * Mounts project root as read-only, the configured logging.dir as read-write,
    * and .quack/prep as read-only. Passes through configured env vars.
    */
   async createContainer(taskId: string): Promise<DockerContainer> {
+    this.assertSafeLogDir();
+    this.assertSafeConfiguredVolumes();
     // Prevent double-create
     const existing = this.containers.get(taskId);
     if (existing && existing.status !== "removed") {
@@ -358,7 +616,7 @@ export class DockerManager {
       taskId,
       image: this.config.image,
       workDir: "/workspace",
-      logsVolume: "/workspace/.quack/logs",
+      logsVolume: this.containerLogDir,
       startedAt: new Date().toISOString(),
       status: "creating",
     };
@@ -482,49 +740,14 @@ export class DockerManager {
    * evidence instead of treating a swallowed CLI error as success.
    */
   async forceRemoveContainer(containerId: string): Promise<boolean> {
-    let removalCommandSucceeded = false;
-    try {
-      await this.runDocker(["rm", "-f", containerId], DOCKER_CLEANUP_TIMEOUT_MS);
-      removalCommandSucceeded = true;
-    } catch (error: unknown) {
-      const errorCode =
-        typeof error === "object" && error !== null && "code" in error
-          ? String((error as { code?: unknown }).code)
-          : "";
-      const errorName = error instanceof Error ? error.name : "";
-      if (errorName === "AbortError" || errorCode === "ABORT_ERR" || errorCode === "ETIMEDOUT") {
-        return false;
-      }
-      const detail =
-        typeof error === "object" && error !== null && "stderr" in error
-          ? String((error as { stderr?: unknown }).stderr)
-          : error instanceof Error
-            ? error.message
-            : String(error);
-      if (!/no such (?:object|container)/i.test(detail)) {
-        try {
-          await this.runDocker(
-            ["inspect", "--type", "container", containerId],
-            DOCKER_CLEANUP_TIMEOUT_MS,
-          );
-          return false;
-        } catch (inspectError: unknown) {
-          const inspectDetail =
-            typeof inspectError === "object" && inspectError !== null && "stderr" in inspectError
-              ? String((inspectError as { stderr?: unknown }).stderr)
-              : inspectError instanceof Error
-                ? inspectError.message
-                : String(inspectError);
-          if (!/no such (?:object|container)/i.test(inspectDetail)) return false;
-        }
-      }
-    }
+    const outcome = await this.removeContainerOnce(containerId);
+    if (outcome === "unconfirmed") return false;
 
     const uncertainty = this.uncertainCreations.get(containerId);
     if (
-      !removalCommandSucceeded &&
+      outcome === "absent" &&
       uncertainty !== undefined &&
-      Date.now() < Date.parse(uncertainty.confirmAfter)
+      Date.now() < Date.parse(uncertainty.reconcileUntil)
     ) {
       return false;
     }
@@ -539,6 +762,49 @@ export class DockerManager {
     }
     if (uncertainty) this.clearCreateUncertainty(uncertainty);
     return true;
+  }
+
+  /** One Docker remove/inspect observation; absence alone is not late-create proof. */
+  private async removeContainerOnce(
+    containerId: string,
+  ): Promise<"removed" | "absent" | "unconfirmed"> {
+    try {
+      await this.runDocker(["rm", "-f", containerId], DOCKER_CLEANUP_TIMEOUT_MS);
+      return "removed";
+    } catch (error: unknown) {
+      const errorCode =
+        typeof error === "object" && error !== null && "code" in error
+          ? String((error as { code?: unknown }).code)
+          : "";
+      const errorName = error instanceof Error ? error.name : "";
+      if (errorName === "AbortError" || errorCode === "ABORT_ERR" || errorCode === "ETIMEDOUT") {
+        return "unconfirmed";
+      }
+      const detail =
+        typeof error === "object" && error !== null && "stderr" in error
+          ? String((error as { stderr?: unknown }).stderr)
+          : error instanceof Error
+            ? error.message
+            : String(error);
+      if (!/no such (?:object|container)/i.test(detail)) {
+        try {
+          await this.runDocker(
+            ["inspect", "--type", "container", containerId],
+            DOCKER_CLEANUP_TIMEOUT_MS,
+          );
+          return "unconfirmed";
+        } catch (inspectError: unknown) {
+          const inspectDetail =
+            typeof inspectError === "object" && inspectError !== null && "stderr" in inspectError
+              ? String((inspectError as { stderr?: unknown }).stderr)
+              : inspectError instanceof Error
+                ? inspectError.message
+                : String(inspectError);
+          if (!/no such (?:object|container)/i.test(inspectDetail)) return "unconfirmed";
+        }
+      }
+      return "absent";
+    }
   }
 
   /**
@@ -648,17 +914,24 @@ export class DockerManager {
     const normalizedRoot = this.projectRoot.replace(/\\/g, "/");
     args.push("-v", `${normalizedRoot}:/workspace:ro`);
 
-    // .quack/logs → read-write (JSONL events stream to host)
-    const logsDir = path.join(this.projectRoot, ".quack", "logs").replace(/\\/g, "/");
-    args.push("-v", `${logsDir}:/workspace/.quack/logs:rw`);
+    // Adapter logging.dir → its equivalent container path (JSONL events stream to host)
+    this.assertSafeLogDir();
+    fs.mkdirSync(this.hostLogDir, { recursive: true });
+    // Resolve the newly created directory as well so a symlink/junction in any
+    // previously missing segment cannot turn this into an arbitrary RW mount.
+    this.assertSafeLogDir();
+    // Pass Docker the resolved target, not a mutable symlink/junction alias.
+    const logsDir = resolveThroughExistingAncestor(this.hostLogDir).replace(/\\/g, "/");
+    args.push("-v", `${logsDir}:${this.containerLogDir}:rw`);
 
     // .quack/prep → read-only
     const prepDir = resolvePrepStorageDirSync(this.projectRoot).replace(/\\/g, "/");
     args.push("-v", `${prepDir}:/workspace/.quack/prep:ro`);
 
     // Additional configured volumes
-    for (const vol of this.config.volumes) {
-      args.push("-v", vol);
+    this.assertSafeConfiguredVolumes();
+    for (const vol of this.config.volumes ?? []) {
+      args.push("-v", this.safeConfiguredVolume(vol).argument);
     }
 
     // Environment variables — passed via --env args (no shell expansion)

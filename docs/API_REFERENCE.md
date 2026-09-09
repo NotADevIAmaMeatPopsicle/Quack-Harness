@@ -83,7 +83,7 @@ curl -s "http://127.0.0.1:3333/api/tasks?projectId=<PROJECT_ID>"
 | `GET`  | `/api/fleet/worktree-shutdown-survivors`                   | List unconfirmed Windows worktree process trees                     |
 | `POST` | `/api/fleet/worktree-shutdown-survivors/:taskId/reconcile` | Acknowledge an independently verified stopped worktree process tree |
 
-Survivor reconciliation is deliberately explicit. Read the current record, independently verify that the entire process tree is gone, then post its exact confirmation token (and session ID for shared-checkout or worktree records) with `processTreeConfirmedStopped: true`. Stale tokens return `409`; the monitor never re-signals a PID or process-group ID recovered from disk. Reconciling a worktree survivor clears only the shutdown evidence and does not delete the preserved worktree.
+Survivor reconciliation is deliberately explicit. Read the current record, independently verify that the entire process tree is gone, then post its exact confirmation token (plus the session ID for shared-checkout or worktree records and the ownership ID for shared-checkout records) with `processTreeConfirmedStopped: true`. Stale tokens or ownership generations return `409`; the monitor never re-signals a PID or process-group ID recovered from disk. Reconciling a worktree survivor clears only the shutdown evidence and does not delete the preserved worktree.
 
 ## Federation
 

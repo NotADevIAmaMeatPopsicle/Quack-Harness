@@ -8107,7 +8107,10 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
       if (adapter.config.isolation?.method === "docker") {
         if (!context.dispatchManager) throw new Error("Dispatch manager is unavailable");
-        await context.dispatchManager.checkDockerAvailability();
+        await context.dispatchManager.checkDockerAvailability([
+          ...registry.listProjects().map((project) => project.rootPath),
+          context.rootPath,
+        ]);
       }
 
       // Register project
@@ -9148,6 +9151,9 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         registry.register(context);
         return { adapter, context };
       });
+      const registeredProjectRoots = initializedProjectContexts.map(
+        ({ context }) => context.rootPath,
+      );
 
       // Reconcile Docker ownership for every registered project before any
       // watcher or scheduler can admit work. A clean active project must not
@@ -9158,7 +9164,8 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
           if (!context.dispatchManager) {
             throw new Error("dispatch manager is unavailable");
           }
-          const version = await context.dispatchManager.checkDockerAvailability();
+          const version =
+            await context.dispatchManager.checkDockerAvailability(registeredProjectRoots);
           console.log(`[${context.name}] Docker isolation enabled (Docker ${version})`);
         } catch (error: unknown) {
           const detail = error instanceof Error ? error.message : String(error);

@@ -178,9 +178,17 @@ describe("DockerManager", () => {
       expect(mockExecFile).toHaveBeenCalledTimes(2);
     });
 
-    test("persists an uncertain create and removes a late container after restart", async () => {
-      mockExecFileError("simulated interrupted docker create");
-      await expect(manager.createContainer("TASK-LATE-CREATE")).rejects.toThrow(
+    test("keeps probing durable uncertainty until a delayed daemon create appears", async () => {
+      const timing = {
+        uncertainCreateWindowMs: 80,
+        uncertainCreateProbeIntervalMs: 5,
+      };
+      const interrupted = new DockerManager("/project/root", defaultConfig(), stateRoot, timing);
+      mockExecFileSequence([
+        { error: "simulated interrupted docker create" },
+        { error: "No such container" },
+      ]);
+      await expect(interrupted.createContainer("TASK-LATE-CREATE")).rejects.toThrow(
         "simulated interrupted docker create",
       );
 
@@ -191,8 +199,12 @@ describe("DockerManager", () => {
       };
 
       jest.clearAllMocks();
-      mockExecFileSequence([{ stdout: "" }, { stdout: "" }]);
-      const restarted = new DockerManager("/project/root", defaultConfig(), stateRoot);
+      mockExecFileSequence([
+        { error: "No such container" },
+        { stdout: marker.containerName },
+        { stdout: "" },
+      ]);
+      const restarted = new DockerManager("/project/root", defaultConfig(), stateRoot, timing);
       await expect(restarted.reconcileExistingContainers()).resolves.toEqual({
         discoveredTaskIds: [],
         ambiguousContainerIds: [],
@@ -203,9 +215,115 @@ describe("DockerManager", () => {
       const calls = mockExecFile.mock.calls as MockCallArgs[];
       expect(calls.map((call) => call[1])).toEqual([
         ["rm", "-f", marker.containerName],
+        ["rm", "-f", marker.containerName],
         ["ps", "-a", "--filter", "label=quack.taskId", "--format", "{{.ID}}"],
       ]);
       expect(fs.readdirSync(stateRoot).filter((name) => name.endsWith(".json"))).toEqual([]);
+    });
+
+    test("releases same-process task tracking after uncertain create reconciliation", async () => {
+      const timing = {
+        uncertainCreateWindowMs: 80,
+        uncertainCreateProbeIntervalMs: 5,
+      };
+      const mgr = new DockerManager("/project/root", defaultConfig(), stateRoot, timing);
+      mockExecFileSequence([
+        { error: "simulated interrupted docker create" },
+        { error: "No such container" },
+        { error: "No such container" },
+        { error: "No such container" },
+        { error: "No such container" },
+        { stdout: "" },
+        { stdout: "" },
+        { stdout: "retry-container\n" },
+        { stdout: "" },
+      ]);
+
+      await expect(mgr.createContainer("TASK-SAME-PROCESS-RETRY")).rejects.toThrow(
+        "simulated interrupted docker create",
+      );
+      await expect(mgr.reconcileExistingContainers()).resolves.toEqual({
+        discoveredTaskIds: [],
+        ambiguousContainerIds: [],
+        removedTaskIds: [],
+        failedTaskIds: [],
+      });
+      expect(mgr.getTrackedContainers()).toEqual([]);
+      await expect(mgr.createContainer("TASK-SAME-PROCESS-RETRY")).resolves.toMatchObject({
+        containerId: "retry-container",
+        status: "running",
+      });
+    });
+
+    test("treats a fingerprint-less container mounted to a registered peer as foreign", async () => {
+      const projectA = path.join(stateRoot, "project-a");
+      const projectB = path.join(stateRoot, "project-b");
+      const peerAware = new DockerManager(projectA, defaultConfig(), path.join(stateRoot, "state"));
+      mockExecFileSequence([
+        { stdout: "peer-container\n" },
+        {
+          stdout: JSON.stringify([
+            {
+              Id: "peer-container",
+              Config: {
+                Image: "node:20-slim",
+                Labels: { "quack.taskId": "TASK-PEER" },
+              },
+              Mounts: [{ Source: projectB, Destination: "/workspace" }],
+              State: { Running: true },
+            },
+          ]),
+        },
+      ]);
+
+      await expect(peerAware.reconcileExistingContainers([projectA, projectB])).resolves.toEqual({
+        discoveredTaskIds: [],
+        ambiguousContainerIds: [],
+        removedTaskIds: [],
+        failedTaskIds: [],
+      });
+      expect(mockExecFile).toHaveBeenCalledTimes(2);
+    });
+
+    test("does not reconcile away a container actively owned by this manager", async () => {
+      mockExecFileSequence([{ stdout: "active-container\n" }, { stdout: "" }]);
+      await manager.createContainer("TASK-ACTIVE");
+      const projectFingerprint = (manager as unknown as { projectFingerprint: string })
+        .projectFingerprint;
+
+      jest.clearAllMocks();
+      mockExecFileSequence([
+        { stdout: "active-container\n" },
+        {
+          stdout: JSON.stringify([
+            {
+              Id: "active-container",
+              Config: {
+                Image: "node:20-slim",
+                Labels: {
+                  "quack.taskId": "TASK-ACTIVE",
+                  "quack.projectFingerprint": projectFingerprint,
+                },
+              },
+              Mounts: [{ Source: "/project/root", Destination: "/workspace" }],
+              State: { Running: true },
+            },
+          ]),
+        },
+      ]);
+
+      await expect(manager.reconcileExistingContainers()).resolves.toEqual({
+        discoveredTaskIds: [],
+        ambiguousContainerIds: [],
+        removedTaskIds: [],
+        failedTaskIds: [],
+      });
+      expect((mockExecFile.mock.calls as MockCallArgs[]).some((call) => call[1][0] === "rm")).toBe(
+        false,
+      );
+      expect(manager.getActiveContainers()).toEqual([
+        expect.objectContaining({ taskId: "TASK-ACTIVE", containerId: "active-container" }),
+      ]);
     });
   });
 
@@ -314,10 +432,13 @@ describe("DockerManager", () => {
     });
 
     test("passes configured volumes", async () => {
+      const projectRoot = path.join(stateRoot, "project");
+      const volumeSource = path.join(projectRoot, "fixtures");
+      fs.mkdirSync(volumeSource, { recursive: true });
       const mgr = new DockerManager(
-        "/project/root",
-        defaultConfig({ volumes: ["/host/data:/container/data:ro"] }),
-        stateRoot,
+        projectRoot,
+        defaultConfig({ volumes: [`${volumeSource}:/container/data:ro`] }),
+        path.join(stateRoot, "uncertainty"),
       );
 
       mockExecFileSequence([{ stdout: "vol123\n" }, { stdout: "" }]);
@@ -325,7 +446,141 @@ describe("DockerManager", () => {
       await mgr.createContainer("TASK-004");
 
       const createArgs = (mockExecFile.mock.calls[0] as MockCallArgs)[1];
-      expect(createArgs).toContain("/host/data:/container/data:ro");
+      expect(createArgs).toContain(
+        `${fs.realpathSync.native(volumeSource).replace(/\\/g, "/")}:/container/data:ro`,
+      );
+    });
+
+    test.each(["cache:/workspace:ro", "cache:/workspace/.quack/prep:ro", "cache:/:ro"])(
+      "rejects a configured volume that shadows protected workspace mounts: %s",
+      (volume) => {
+        expect(
+          () => new DockerManager("/project/root", defaultConfig({ volumes: [volume] }), stateRoot),
+        ).toThrow("overlaps the protected /workspace tree");
+      },
+    );
+
+    test("rejects bind sources outside the real project and writable configured volumes", () => {
+      const projectRoot = path.join(stateRoot, "project");
+      const insideSource = path.join(projectRoot, "fixtures");
+      fs.mkdirSync(insideSource, { recursive: true });
+
+      expect(
+        () =>
+          new DockerManager(
+            projectRoot,
+            defaultConfig({ volumes: [`${path.join(stateRoot, "outside")}:/container/data:ro`] }),
+            path.join(stateRoot, "uncertainty-outside"),
+          ),
+      ).toThrow("bind source must remain inside the project root");
+      expect(
+        () =>
+          new DockerManager(
+            projectRoot,
+            defaultConfig({ volumes: [`${insideSource}:/container/data:rw`] }),
+            path.join(stateRoot, "uncertainty-rw"),
+          ),
+      ).toThrow("must be explicitly read-only");
+    });
+
+    test("rechecks configured bind source identity before Docker create", async () => {
+      const projectRoot = path.join(stateRoot, "project");
+      const outsideDir = path.join(stateRoot, "outside-volume");
+      const linkPath = path.join(projectRoot, "fixture-link");
+      fs.mkdirSync(projectRoot, { recursive: true });
+      fs.mkdirSync(outsideDir, { recursive: true });
+      const mgr = new DockerManager(
+        projectRoot,
+        defaultConfig({ volumes: [`${linkPath}:/container/data:ro`] }),
+        path.join(stateRoot, "uncertainty-volume-link"),
+      );
+      fs.symlinkSync(outsideDir, linkPath, process.platform === "win32" ? "junction" : "dir");
+
+      try {
+        await expect(mgr.createContainer("TASK-VOLUME-ESCAPE")).rejects.toThrow(
+          "resolves outside the project root",
+        );
+        expect(mockExecFile).not.toHaveBeenCalled();
+      } finally {
+        fs.unlinkSync(linkPath);
+      }
+    });
+
+    test("mounts the configured logging directory at its container-relative path", async () => {
+      const projectRoot = path.join(stateRoot, "project");
+      const customLogDir = path.join(projectRoot, ".runtime", "events");
+      const mgr = new DockerManager(
+        projectRoot,
+        defaultConfig(),
+        path.join(stateRoot, "uncertainty"),
+        { logDir: customLogDir },
+      );
+      mockExecFileSequence([{ stdout: "custom-logs\n" }, { stdout: "" }]);
+
+      const container = await mgr.createContainer("TASK-CUSTOM-LOGS");
+      const createArgs = (mockExecFile.mock.calls[0] as MockCallArgs)[1];
+      expect(createArgs).toContain(
+        `${customLogDir.replace(/\\/g, "/")}:/workspace/.runtime/events:rw`,
+      );
+      expect(container.logsVolume).toBe("/workspace/.runtime/events");
+    });
+
+    test("rejects logging directories outside the project or inside protected prep storage", () => {
+      const projectRoot = path.join(stateRoot, "project");
+      fs.mkdirSync(projectRoot, { recursive: true });
+
+      expect(
+        () =>
+          new DockerManager(projectRoot, defaultConfig(), path.join(stateRoot, "uncertainty-a"), {
+            logDir: path.join(stateRoot, "outside-logs"),
+          }),
+      ).toThrow("must remain inside the project root");
+      expect(
+        () =>
+          new DockerManager(projectRoot, defaultConfig(), path.join(stateRoot, "uncertainty-b"), {
+            logDir: path.join(projectRoot, ".quack", "prep", "events"),
+          }),
+      ).toThrow("must not overlap the protected .quack/prep tree");
+    });
+
+    test("rejects logging beneath prep storage selected by a pointer", () => {
+      const projectRoot = path.join(stateRoot, "project");
+      const prepStorage = path.join(projectRoot, "runtime-prep-state");
+      fs.mkdirSync(path.join(projectRoot, ".quack"), { recursive: true });
+      fs.mkdirSync(prepStorage, { recursive: true });
+      fs.writeFileSync(path.join(projectRoot, ".quack", "prep"), "runtime-prep-state\n", "utf-8");
+
+      expect(
+        () =>
+          new DockerManager(projectRoot, defaultConfig(), path.join(stateRoot, "uncertainty-d"), {
+            logDir: path.join(prepStorage, "events"),
+          }),
+      ).toThrow("must not overlap the protected .quack/prep tree");
+    });
+
+    test("rechecks logging directory containment before creating the RW mount", async () => {
+      const projectRoot = path.join(stateRoot, "project");
+      const outsideDir = path.join(stateRoot, "outside");
+      const linkPath = path.join(projectRoot, "runtime-link");
+      const configuredLogDir = path.join(linkPath, "events");
+      fs.mkdirSync(projectRoot, { recursive: true });
+      fs.mkdirSync(outsideDir, { recursive: true });
+      const mgr = new DockerManager(
+        projectRoot,
+        defaultConfig(),
+        path.join(stateRoot, "uncertainty-c"),
+        { logDir: configuredLogDir },
+      );
+      fs.symlinkSync(outsideDir, linkPath, process.platform === "win32" ? "junction" : "dir");
+
+      try {
+        await expect(mgr.createContainer("TASK-LOG-ESCAPE")).rejects.toThrow(
+          "resolves outside the project root",
+        );
+        expect(mockExecFile).not.toHaveBeenCalled();
+      } finally {
+        fs.unlinkSync(linkPath);
+      }
     });
 
     test("does not leak env var values into labels", async () => {

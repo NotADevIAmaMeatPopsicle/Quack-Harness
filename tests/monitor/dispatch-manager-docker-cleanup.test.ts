@@ -151,6 +151,8 @@ describe("DispatchManager docker cleanup integration", () => {
     (mgr as unknown as { dockerManager: typeof dockerManager }).dockerManager = dockerManager;
 
     const job = mgr.start("TASK-DOCKER-START", { skipGate: true });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(dockerManager.createContainer).toHaveBeenCalledTimes(1);
     let shutdownResolved = false;
     const shutdown = mgr
       .shutdownAll({ gracefulTimeoutMs: 500, forceTimeoutMs: 500 })
@@ -261,6 +263,76 @@ describe("DispatchManager docker cleanup integration", () => {
     expect(dockerManager.reconcileExistingContainers).toHaveBeenCalledTimes(2);
   });
 
+  test("serializes concurrent Docker reconciliation and container admission", async () => {
+    let releaseFirstCreate!: () => void;
+    const firstCreate = new Promise<void>((resolve) => {
+      releaseFirstCreate = resolve;
+    });
+    const children = [new FakeChild(), new FakeChild()];
+    const dockerManager = {
+      reconcileExistingContainers: jest.fn().mockResolvedValue({
+        discoveredTaskIds: [],
+        ambiguousContainerIds: [],
+        removedTaskIds: [],
+        failedTaskIds: [],
+      }),
+      createContainer: jest.fn(async (taskId: string) => {
+        if (taskId === "TASK-FIRST") await firstCreate;
+        return {
+          containerId: `${taskId}-container`,
+          taskId,
+          image: "fixture",
+          workDir: "/workspace",
+          logsVolume: "/workspace/.quack/logs",
+          startedAt: new Date().toISOString(),
+          status: "running" as const,
+        };
+      }),
+      execAgent: jest.fn().mockReturnValueOnce(children[0]).mockReturnValueOnce(children[1]),
+      extractResults: jest.fn().mockResolvedValue({ diff: "", log: "", branch: "" }),
+      stopContainer: jest.fn().mockResolvedValue(undefined),
+      forceRemoveContainer: jest.fn().mockResolvedValue(true),
+      getActiveContainers: jest.fn().mockReturnValue([]),
+      getTrackedContainers: jest.fn().mockReturnValue([]),
+      abortPendingCommands: jest.fn(),
+      cleanupAll: jest.fn().mockResolvedValue({ removedTaskIds: [], failedTaskIds: [] }),
+    };
+    const mgr = new DispatchManager("/fake/project", "/fake/bin.js", {
+      method: "docker",
+      docker: {
+        image: "node:20-slim",
+        volumes: [],
+        envPassthrough: [],
+        resourceLimits: { memoryMb: 2048, cpus: 1 },
+        networkMode: "bridge",
+        cleanupPolicy: "remove",
+      },
+    });
+    (mgr as unknown as { dockerManager: typeof dockerManager }).dockerManager = dockerManager;
+
+    mgr.start("TASK-FIRST", { skipGate: true });
+    mgr.start("TASK-SECOND", { skipGate: true });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(dockerManager.reconcileExistingContainers).toHaveBeenCalledTimes(1);
+    expect(dockerManager.createContainer).toHaveBeenCalledTimes(1);
+    expect(dockerManager.createContainer).toHaveBeenCalledWith("TASK-FIRST");
+
+    releaseFirstCreate();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(dockerManager.reconcileExistingContainers).toHaveBeenCalledTimes(2);
+    expect(dockerManager.createContainer.mock.calls.map(([taskId]) => taskId)).toEqual([
+      "TASK-FIRST",
+      "TASK-SECOND",
+    ]);
+
+    children[0].emit("exit", 0, null);
+    children[1].emit("exit", 0, null);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  });
+
   test("stop cancels pending container creation before an agent can spawn", async () => {
     let resolveContainer!: (value: {
       containerId: string;
@@ -311,6 +383,8 @@ describe("DispatchManager docker cleanup integration", () => {
     (mgr as unknown as { dockerManager: typeof dockerManager }).dockerManager = dockerManager;
 
     const job = mgr.start("TASK-DOCKER-STOP", { skipGate: true });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(dockerManager.createContainer).toHaveBeenCalledTimes(1);
     expect(job.pid).toBe(0);
     expect(mgr.stop("TASK-DOCKER-STOP")).toBe(true);
 

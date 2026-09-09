@@ -283,6 +283,7 @@ it("exposes tokened prep and shared-checkout survivor reconciliation", async () 
   const getSharedCheckoutShutdownSurvivor = jest.fn(() => ({
     taskId: "TASK-SHARED",
     sessionId: "shared-session",
+    ownershipId: "shared-owner",
     processId: 456,
     status: "stopped" as const,
     reconciliationToken: "shared-token",
@@ -343,6 +344,7 @@ it("exposes tokened prep and shared-checkout survivor reconciliation", async () 
         await post(server.port, "/api/fleet/shared-checkout-shutdown-survivor/reconcile", {
           taskId: "TASK-SHARED",
           sessionId: "shared-session",
+          ownershipId: "shared-owner",
           reconciliationToken: "shared-token",
           processTreeConfirmedStopped: true,
         })
@@ -351,6 +353,7 @@ it("exposes tokened prep and shared-checkout survivor reconciliation", async () 
     expect(reconcileSharedCheckoutShutdownSurvivor).toHaveBeenCalledWith(
       "TASK-SHARED",
       "shared-session",
+      "shared-owner",
       "shared-token",
       true,
     );

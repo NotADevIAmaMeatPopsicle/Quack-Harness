@@ -266,18 +266,20 @@ export function registerFleetRoutes(app: Express, deps: FleetRouteDeps): void {
       if (
         typeof body?.taskId !== "string" ||
         typeof body.sessionId !== "string" ||
+        typeof body.ownershipId !== "string" ||
         typeof body.reconciliationToken !== "string" ||
         body.processTreeConfirmedStopped !== true
       ) {
         res.status(400).json({
           error:
-            "taskId, sessionId, reconciliationToken, and processTreeConfirmedStopped=true are required",
+            "taskId, sessionId, ownershipId, reconciliationToken, and processTreeConfirmedStopped=true are required",
         });
         return;
       }
       const reconciled = p.fleetController.reconcileSharedCheckoutShutdownSurvivor(
         body.taskId,
         body.sessionId,
+        body.ownershipId,
         body.reconciliationToken,
         true,
       );
