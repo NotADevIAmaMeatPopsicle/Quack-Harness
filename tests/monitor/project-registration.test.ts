@@ -464,10 +464,14 @@ describe("DELETE /api/projects/:id - Dynamic project unregistration", () => {
       // Spy on the services of Project Beta to verify teardown is called
       const betaContext = serverObj.registry!.getProject("project-beta")!;
 
-      const stopWatcherSpy = jest.fn();
+      const originalStopWatcher = betaContext.stopWatcher;
+      const stopWatcherSpy = jest.fn(() => originalStopWatcher?.());
       betaContext.stopWatcher = stopWatcherSpy;
 
-      const stopCheckingSpy = jest.fn();
+      const originalStopChecking = betaContext.progressDetector.stopChecking.bind(
+        betaContext.progressDetector,
+      );
+      const stopCheckingSpy = jest.fn(() => originalStopChecking());
       betaContext.progressDetector.stopChecking = stopCheckingSpy;
 
       // Delete Project Beta

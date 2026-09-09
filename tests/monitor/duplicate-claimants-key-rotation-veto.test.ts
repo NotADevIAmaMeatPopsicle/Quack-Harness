@@ -92,7 +92,9 @@ describe.each(DUPLICATE_FIXTURE_CASES)("key rotation claimant matrix (%s, %s)", 
         `${fixture.root}/.quack/logs`,
         (taskId) => Promise.resolve({ taskId, claimants: fixture.claimants }),
       );
-      const createWorktree = jest.fn(() => `${fixture.root}/.quack/worktrees/TASK-100`);
+      const createWorktree = jest.fn(() =>
+        path.join(fixture.root, ".quack", "worktrees", "TASK-100"),
+      );
       const removeWorktree = jest.fn();
       (manager as unknown as { createWorktree: typeof createWorktree }).createWorktree =
         createWorktree;
@@ -113,7 +115,7 @@ describe.each(DUPLICATE_FIXTURE_CASES)("key rotation claimant matrix (%s, %s)", 
     }
   });
 
-  it("Docker key rotation checks claimants before output, SSE or stop", async () => {
+  it("Docker key rotation checks claimants before retry output and still cleans the container", async () => {
     const fixture = createDuplicateFixture("quack-key-rotation-docker-", kind, order);
     const keys = keyManager();
     try {
@@ -153,7 +155,7 @@ describe.each(DUPLICATE_FIXTURE_CASES)("key rotation claimant matrix (%s, %s)", 
 
       expect(job.output.some((line) => line.includes("Re-dispatching"))).toBe(false);
       expect(events.some((event) => event.stage === "container_stopped")).toBe(false);
-      expect(stopContainer).not.toHaveBeenCalled();
+      expect(stopContainer).toHaveBeenCalledWith("container-1", true);
       expect(job.status).toBe("failed");
     } finally {
       keys.restore();

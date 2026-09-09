@@ -19,7 +19,7 @@ import {
 } from "../helpers/duplicate-claimants-fixture";
 
 function testPort(): number {
-  return 30_000 + Math.floor(Math.random() * 10_000);
+  return 0;
 }
 
 describe.each(DUPLICATE_FIXTURE_CASES)("queue route claimant scan (%s, %s)", (kind, order) => {

@@ -9180,8 +9180,6 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     process.on("uncaughtException", onUncaughtException);
     process.on("unhandledRejection", onUnhandledRejection);
 
-    // Collect stop functions for all project event watchers
-    const projectWatcherStops: Array<() => void> = [];
     const startupValidationTasks: Array<Promise<void>> = [];
 
     // â”€â”€â”€ Multi-project initialization â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -9245,7 +9243,6 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
           }),
         );
         context.stopWatcher = stopProjectWatcher;
-        projectWatcherStops.push(stopProjectWatcher);
 
         // Start progress detector for this project
         context.progressDetector.startChecking();
@@ -10261,8 +10258,10 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
     return new Promise((resolve) => {
       const onListening = () => {
+        const address = server.address();
+        const boundPort = typeof address === "object" && address ? address.port : port;
         resolve({
-          port,
+          port: boundPort,
           stop: async () => {
             shutdownAdmissionClosed = true;
             stopPrepSchedulers();
@@ -10288,17 +10287,11 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
               ccusageChild = null;
             }
             if (ccusageRefreshPromise) {
-              await Promise.race([
-                ccusageRefreshPromise.catch(() => undefined),
-                new Promise<void>((resolveRace) => setTimeout(resolveRace, 1000)),
-              ]);
+              await settleBounded([ccusageRefreshPromise.catch(() => undefined)], 1_000);
             }
             prepScheduler?.stop();
             progressDetector.stopChecking();
-            await Promise.race([
-              Promise.allSettled(startupValidationTasks),
-              new Promise<void>((resolveValidation) => setTimeout(resolveValidation, 1000)),
-            ]);
+            await settleBounded([Promise.allSettled(startupValidationTasks)], 1_000);
             clearInterval(baselineInterval);
             clearInterval(cleanupInterval);
             process.off("uncaughtException", onUncaughtException);
@@ -10331,13 +10324,15 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
             activeHeartbeats.clear();
             await Promise.allSettled([dispatchShutdown, prepShutdown, progressShutdown]);
             stopAuxiliaryWorkers();
-            // Stop multi-project watchers and services
-            for (const stopFn of projectWatcherStops) {
-              stopFn();
-            }
+            // Stop multi-project watchers and services. Resolve event
+            // watchers from the live registry so projects registered after
+            // startup are covered too.
             const registryWatcherCloses: Array<Promise<unknown>> = [];
             if (registry) {
               for (const ctx of registry.listProjects()) {
+                if (ctx.stopWatcher) {
+                  registryWatcherCloses.push(Promise.resolve().then(() => ctx.stopWatcher?.()));
+                }
                 ctx.progressDetector.stopChecking();
                 ctx.prepScheduler?.stop();
                 if (ctx.taskWatcher) {

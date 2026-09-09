@@ -30,9 +30,7 @@ Start with [`adapters/examples/node-typescript/adapter.json`](../adapters/exampl
     "deniedBashPatterns": ["git push*", "git reset --hard*"]
   },
   "verification": {
-    "commands": [
-      { "name": "test", "command": "npm test", "required": true, "timeout": 300000 }
-    ],
+    "commands": [{ "name": "test", "command": "npm test", "required": true, "timeout": 300000 }],
     "conventionChecks": []
   },
   "git": {
@@ -53,26 +51,26 @@ Start with [`adapters/examples/node-typescript/adapter.json`](../adapters/exampl
 
 ## `project`
 
-| Field | Meaning |
-| --- | --- |
-| `name` | Human-readable project name |
-| `root` | Project root, normally `.` |
-| `taskDir` | Directory containing structured task Markdown |
+| Field            | Meaning                                              |
+| ---------------- | ---------------------------------------------------- |
+| `name`           | Human-readable project name                          |
+| `root`           | Project root, normally `.`                           |
+| `taskDir`        | Directory containing structured task Markdown        |
 | `conventionsDir` | Directory containing referenced convention documents |
-| `testPatterns` | Optional source-to-test discovery rules |
+| `testPatterns`   | Optional source-to-test discovery rules              |
 
 Paths are resolved under the target project. Task file references that are absolute or escape the project root are rejected.
 
 ## `agent`
 
-| Field | Meaning |
-| --- | --- |
-| `model` | Primary worker model |
-| `judgeModel` | Model used for criterion review |
-| `enrichModel` | Model used to improve incomplete task specifications |
-| `maxTurns` | Per-run turn limit |
-| `maxBudgetPerTask` | Per-run provider budget in US dollars |
-| `maxRetries` | Maximum implementation retries |
+| Field              | Meaning                                              |
+| ------------------ | ---------------------------------------------------- |
+| `model`            | Primary worker model                                 |
+| `judgeModel`       | Model used for criterion review                      |
+| `enrichModel`      | Model used to improve incomplete task specifications |
+| `maxTurns`         | Per-run turn limit                                   |
+| `maxBudgetPerTask` | Per-run provider budget in US dollars                |
+| `maxRetries`       | Maximum implementation retries                       |
 
 Model availability depends on the installed provider SDK and account.
 
@@ -94,7 +92,14 @@ Configure the base branch, generated branch prefix, commit format, and optional 
 
 ## `logging` and runtime state
 
-Logs, checkpoints, databases, queue state, generated worktrees, and credentials are runtime data. Keep them under ignored `.quack/` paths or an external state directory. Do not commit them. When Docker isolation is enabled, `logging.dir` must remain inside the project and outside `.quack/prep`; Quack mounts that directory read-write while keeping prep storage read-only. Additional Docker volumes must be explicitly read-only, cannot overlap the protected `/workspace` tree, and bind sources must resolve inside the project. Read-only named volumes remain supported.
+Logs, checkpoints, databases, queue state, generated worktrees, and credentials are runtime data. Keep them under ignored `.quack/` paths or an external state directory. Do not commit them.
+
+Docker isolation has a deliberately narrow host-mount contract:
+
+- `logging.dir` must be exactly the project's `.quack/logs` directory. That host-owned tree is never writable by the container. Each dispatch writes to a fresh disposable output leaf inside its task worktree; Quack imports regular, single-link files only after the container has stopped.
+- The task-specific Git worktree is mounted read-write. Quack's runtime, prep cache, and adapter policy files are separate read-only mounts. Git metadata is exposed through a dedicated mount only so the task can create its branch and commits.
+- Additional `volumes` must be explicit project-relative or project-contained bind sources ending in exactly `:ro`. They are remapped to the task worktree, checked for links and aliases, and may be mounted only below the inert `/quack-inputs/` namespace. Named volumes, operating-system/runtime destinations, and option variants such as `:ro,z`, `:Z`, or `:rw` are rejected.
+- `keep_on_failure` and `always_keep` are durable retention policies. A confirmed stopped retained container does not block unrelated work, but the same task remains reserved until an operator explicitly cleans up retained resources.
 
 ## Optional capabilities
 

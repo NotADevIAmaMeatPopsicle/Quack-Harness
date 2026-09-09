@@ -51,7 +51,7 @@ function makeJob(taskId: string): DispatchJob {
 }
 
 function testPort(): number {
-  return 30_000 + Math.floor(Math.random() * 10_000);
+  return 0;
 }
 
 function writeSessionEvidence(logDir: string, includeJudge: boolean): void {

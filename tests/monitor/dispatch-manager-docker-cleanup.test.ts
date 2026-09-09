@@ -30,6 +30,13 @@ class FakeChild extends EventEmitter {
   kill = jest.fn();
 }
 
+class ExitListenerThrowChild extends FakeChild {
+  override on(eventName: string | symbol, listener: (...args: unknown[]) => void): this {
+    if (eventName === "exit") throw new Error("exit listener setup failed");
+    return super.on(eventName, listener);
+  }
+}
+
 const mockSpawn = spawn as jest.MockedFunction<typeof spawn>;
 const mockCleanupWorktreeContainers = cleanupWorktreeContainers as jest.MockedFunction<
   typeof cleanupWorktreeContainers
@@ -502,6 +509,379 @@ describe("DispatchManager docker cleanup integration", () => {
     expect(dockerManager.execAgent).not.toHaveBeenCalled();
     expect(dockerManager.forceRemoveContainer).toHaveBeenCalledWith("created-before-key-failure");
     expect(job.status).toBe("failed");
+  });
+
+  test("removes a created container when docker exec setup throws", async () => {
+    const dockerManager = {
+      reconcileExistingContainers: jest.fn().mockResolvedValue({
+        discoveredTaskIds: [],
+        ambiguousContainerIds: [],
+        removedTaskIds: [],
+        failedTaskIds: [],
+      }),
+      createContainer: jest
+        .fn()
+        .mockResolvedValue(fakeContainer("TASK-EXEC-THROW", "exec-throw-container")),
+      containerPathForHost: jest.fn().mockReturnValue("/quack-runtime/dist/index.js"),
+      execAgent: jest.fn(() => {
+        throw new Error("exec setup failed");
+      }),
+      forceRemoveContainer: jest.fn().mockResolvedValue(true),
+      getActiveContainers: jest.fn().mockReturnValue([]),
+      getTrackedContainers: jest.fn().mockReturnValue([]),
+      abortPendingCommands: jest.fn(),
+      cleanupAll: jest.fn().mockResolvedValue({ removedTaskIds: [], failedTaskIds: [] }),
+    };
+    const mgr = new DispatchManager(projectRoot, "/fake/bin.js", {
+      method: "docker",
+      docker: {
+        image: "node:20-slim",
+        volumes: [],
+        envPassthrough: [],
+        resourceLimits: { memoryMb: 2048, cpus: 1 },
+        networkMode: "bridge",
+        cleanupPolicy: "remove",
+      },
+    });
+    stubWorktrees(mgr);
+    (mgr as unknown as { dockerManager: typeof dockerManager }).dockerManager = dockerManager;
+
+    const job = mgr.start("TASK-EXEC-THROW", { skipGate: true });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(dockerManager.forceRemoveContainer).toHaveBeenCalledWith("exec-throw-container");
+    expect(job.status).toBe("failed");
+    expect(job.output.join("\n")).toContain("exec setup failed");
+  });
+
+  test("removes a created container when lifecycle listener setup throws", async () => {
+    const dockerManager = {
+      reconcileExistingContainers: jest.fn().mockResolvedValue({
+        discoveredTaskIds: [],
+        ambiguousContainerIds: [],
+        removedTaskIds: [],
+        failedTaskIds: [],
+      }),
+      createContainer: jest
+        .fn()
+        .mockResolvedValue(fakeContainer("TASK-LISTENER-THROW", "listener-throw-container")),
+      execAgent: jest.fn().mockReturnValue(new ExitListenerThrowChild()),
+      forceRemoveContainer: jest.fn().mockResolvedValue(true),
+      getActiveContainers: jest.fn().mockReturnValue([]),
+      getTrackedContainers: jest.fn().mockReturnValue([]),
+      abortPendingCommands: jest.fn(),
+      cleanupAll: jest.fn().mockResolvedValue({ removedTaskIds: [], failedTaskIds: [] }),
+    };
+    const mgr = new DispatchManager(projectRoot, "/fake/bin.js", {
+      method: "docker",
+      docker: {
+        image: "node:20-slim",
+        volumes: [],
+        envPassthrough: [],
+        resourceLimits: { memoryMb: 2048, cpus: 1 },
+        networkMode: "bridge",
+        cleanupPolicy: "remove",
+      },
+    });
+    stubWorktrees(mgr);
+    (mgr as unknown as { dockerManager: typeof dockerManager }).dockerManager = dockerManager;
+
+    const job = mgr.start("TASK-LISTENER-THROW", { skipGate: true });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(dockerManager.forceRemoveContainer).toHaveBeenCalledWith("listener-throw-container");
+    expect(job.status).toBe("failed");
+    expect(job.output.join("\n")).toContain("exit listener setup failed");
+    expect(mgr.getActiveJobs()).toEqual([]);
+  });
+
+  test("globally blocks later admission when post-create cleanup is unconfirmed", async () => {
+    const dockerManager = {
+      reconcileExistingContainers: jest
+        .fn()
+        .mockResolvedValueOnce({
+          discoveredTaskIds: [],
+          ambiguousContainerIds: [],
+          removedTaskIds: [],
+          failedTaskIds: [],
+        })
+        .mockResolvedValueOnce({
+          discoveredTaskIds: ["TASK-CLEANUP-SURVIVOR"],
+          ambiguousContainerIds: [],
+          removedTaskIds: [],
+          failedTaskIds: ["TASK-CLEANUP-SURVIVOR"],
+        }),
+      createContainer: jest
+        .fn()
+        .mockResolvedValue(fakeContainer("TASK-CLEANUP-SURVIVOR", "cleanup-survivor")),
+      execAgent: jest.fn(),
+      forceRemoveContainer: jest.fn().mockResolvedValue(false),
+      getActiveContainers: jest.fn().mockReturnValue([]),
+      getTrackedContainers: jest
+        .fn()
+        .mockReturnValue([fakeContainer("TASK-CLEANUP-SURVIVOR", "cleanup-survivor")]),
+      abortPendingCommands: jest.fn(),
+      cleanupAll: jest.fn().mockResolvedValue({ removedTaskIds: [], failedTaskIds: [] }),
+    };
+    const noKeys = { getNextKey: jest.fn().mockReturnValue(undefined) };
+    const mgr = new DispatchManager(
+      projectRoot,
+      "/fake/bin.js",
+      {
+        method: "docker",
+        docker: {
+          image: "node:20-slim",
+          volumes: [],
+          envPassthrough: [],
+          resourceLimits: { memoryMb: 2048, cpus: 1 },
+          networkMode: "bridge",
+          cleanupPolicy: "remove",
+        },
+      },
+      noKeys as never,
+    );
+    stubWorktrees(mgr);
+    (mgr as unknown as { dockerManager: typeof dockerManager }).dockerManager = dockerManager;
+
+    const first = mgr.start("TASK-CLEANUP-SURVIVOR", { skipGate: true });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(first.status).toBe("failed");
+
+    const second = mgr.start("TASK-UNRELATED", { skipGate: true });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(second.status).toBe("failed");
+    expect(second.output.join("\n")).toContain("TASK-CLEANUP-SURVIVOR");
+    expect(dockerManager.createContainer).toHaveBeenCalledTimes(1);
+  });
+
+  test.each(["blueprint-approval", "spec-stale"] as const)(
+    "imports trusted post-exit Docker output before classifying %s",
+    async (artifact) => {
+      const taskId = artifact === "blueprint-approval" ? "TASK-DOCKER-PAUSE" : "TASK-DOCKER-STALE";
+      const container = fakeContainer(taskId, `${taskId.toLowerCase()}-container`);
+      const child = new FakeChild();
+      const dockerManager = {
+        reconcileExistingContainers: jest.fn().mockResolvedValue({
+          discoveredTaskIds: [],
+          ambiguousContainerIds: [],
+          removedTaskIds: [],
+          failedTaskIds: [],
+        }),
+        createContainer: jest.fn().mockResolvedValue(container),
+        execAgent: jest.fn().mockReturnValue(child),
+        extractResults: jest.fn().mockResolvedValue({ diff: "", log: "", branch: "" }),
+        stopContainer: jest.fn().mockResolvedValue({ removed: true, retained: false }),
+        forceRemoveContainer: jest.fn().mockResolvedValue(true),
+        getActiveContainers: jest.fn().mockReturnValue([]),
+        getTrackedContainers: jest.fn().mockReturnValue([]),
+        abortPendingCommands: jest.fn(),
+        cleanupAll: jest.fn().mockResolvedValue({ removedTaskIds: [], failedTaskIds: [] }),
+      };
+      const mgr = new DispatchManager(projectRoot, "/fake/bin.js", {
+        method: "docker",
+        docker: {
+          image: "node:20-slim",
+          volumes: [],
+          envPassthrough: [],
+          resourceLimits: { memoryMb: 2048, cpus: 1 },
+          networkMode: "bridge",
+          cleanupPolicy: "remove",
+        },
+      });
+      stubWorktrees(mgr);
+      (mgr as unknown as { dockerManager: typeof dockerManager }).dockerManager = dockerManager;
+
+      const job = mgr.start(taskId, { skipGate: true });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      const relativeArtifact =
+        artifact === "blueprint-approval"
+          ? path.join("approvals", `${taskId}.json`)
+          : path.join("spec-stale", `${taskId}.json`);
+      const sourceArtifact = path.join(container.runtimeLogDir, relativeArtifact);
+      fs.mkdirSync(path.dirname(sourceArtifact), { recursive: true });
+      fs.writeFileSync(
+        sourceArtifact,
+        JSON.stringify(
+          artifact === "blueprint-approval"
+            ? { taskId, state: "pending", createdAt: job.startedAt }
+            : {
+                taskId,
+                surface: "blueprint resume",
+                verdict: "stale",
+                reason: "the task contract changed",
+                refusedAt: job.startedAt,
+              },
+        ),
+        "utf-8",
+      );
+
+      child.emit("exit", 1, null);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(dockerManager.stopContainer).toHaveBeenCalledWith(container.containerId, true);
+      expect(job.runtimeLogDir).toEqual(
+        expect.stringContaining(path.join("docker-import", taskId)),
+      );
+      expect(fs.readFileSync(path.join(job.runtimeLogDir!, relativeArtifact), "utf-8")).toContain(
+        taskId,
+      );
+      if (artifact === "blueprint-approval") {
+        expect(job.status).toBe("awaiting_approval");
+      } else {
+        expect(job.status).toBe("failed");
+        expect(job.specStale).toEqual(
+          expect.objectContaining({ verdict: "stale", reason: "the task contract changed" }),
+        );
+        expect(job.output.join("\n")).toContain("REFUSED, not crashed");
+      }
+    },
+  );
+
+  test("stops the container before refusing an escaping runtime-output symlink", async () => {
+    const taskId = "TASK-RUNTIME-SYMLINK";
+    const container = fakeContainer(taskId, "runtime-symlink-container");
+    const protectedDir = path.join(projectRoot, "authoritative");
+    const protectedFile = path.join(protectedDir, "authoritative.txt");
+    fs.mkdirSync(protectedDir, { recursive: true });
+    fs.writeFileSync(protectedFile, "unchanged", "utf-8");
+    fs.symlinkSync(
+      process.platform === "win32"
+        ? protectedDir
+        : path.relative(container.runtimeLogDir, protectedDir),
+      path.join(container.runtimeLogDir, "escape"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const child = new FakeChild();
+    const order: string[] = [];
+    const dockerManager = {
+      reconcileExistingContainers: jest.fn().mockResolvedValue({
+        discoveredTaskIds: [],
+        ambiguousContainerIds: [],
+        removedTaskIds: [],
+        failedTaskIds: [],
+      }),
+      createContainer: jest.fn().mockResolvedValue(container),
+      execAgent: jest.fn().mockReturnValue(child),
+      extractResults: jest.fn().mockResolvedValue({ diff: "", log: "", branch: "" }),
+      stopContainer: jest.fn(() => {
+        order.push("stopped");
+        return Promise.resolve({ removed: true, retained: false });
+      }),
+      forceRemoveContainer: jest.fn().mockResolvedValue(true),
+      getActiveContainers: jest.fn().mockReturnValue([]),
+      getTrackedContainers: jest.fn().mockReturnValue([]),
+      abortPendingCommands: jest.fn(),
+      cleanupAll: jest.fn().mockResolvedValue({ removedTaskIds: [], failedTaskIds: [] }),
+    };
+    const mgr = new DispatchManager(projectRoot, "/fake/bin.js", {
+      method: "docker",
+      docker: {
+        image: "node:20-slim",
+        volumes: [],
+        envPassthrough: [],
+        resourceLimits: { memoryMb: 2048, cpus: 1 },
+        networkMode: "bridge",
+        cleanupPolicy: "remove",
+      },
+    });
+    stubWorktrees(mgr);
+    (mgr as unknown as { dockerManager: typeof dockerManager }).dockerManager = dockerManager;
+
+    const job = mgr.start(taskId, { skipGate: true });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    child.emit("exit", 0, null);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(order).toEqual(["stopped"]);
+    expect(job.status).toBe("failed");
+    expect(job.output.join("\n")).toContain("Refused unsafe runtime output");
+    expect(fs.readFileSync(protectedFile, "utf-8")).toBe("unchanged");
+    expect(mockRemoveWorktree).not.toHaveBeenCalledWith(
+      container.worktreePath,
+      taskId,
+      projectRoot,
+      expect.anything(),
+    );
+  });
+
+  test("cleans up after a post-create claimant contest even when lifecycle callbacks throw", async () => {
+    const taskId = "TASK-CONTESTED-RETRY";
+    const child = new FakeChild();
+    const dockerManager = {
+      reconcileExistingContainers: jest.fn().mockResolvedValue({
+        discoveredTaskIds: [],
+        ambiguousContainerIds: [],
+        removedTaskIds: [],
+        failedTaskIds: [],
+      }),
+      createContainer: jest
+        .fn()
+        .mockResolvedValue(fakeContainer(taskId, "contested-retry-container")),
+      execAgent: jest.fn().mockReturnValue(child),
+      extractResults: jest.fn().mockResolvedValue({ diff: "", log: "", branch: "" }),
+      stopContainer: jest.fn().mockResolvedValue({ removed: true, retained: false }),
+      forceRemoveContainer: jest.fn().mockResolvedValue(true),
+      getActiveContainers: jest.fn().mockReturnValue([]),
+      getTrackedContainers: jest.fn().mockReturnValue([]),
+      abortPendingCommands: jest.fn(),
+      cleanupAll: jest.fn().mockResolvedValue({ removedTaskIds: [], failedTaskIds: [] }),
+    };
+    const keyManager = {
+      getNextKey: jest.fn().mockReturnValue({ id: "key-1" }),
+      getKeyValue: jest.fn().mockReturnValue("secret"),
+      markRateLimited: jest.fn(),
+      getCooldownMs: jest.fn().mockReturnValue(60_000),
+      hasAvailableKeys: jest.fn().mockReturnValue(true),
+    };
+    const mgr = new DispatchManager(
+      projectRoot,
+      "/fake/bin.js",
+      {
+        method: "docker",
+        docker: {
+          image: "node:20-slim",
+          volumes: [],
+          envPassthrough: [],
+          resourceLimits: { memoryMb: 2048, cpus: 1 },
+          networkMode: "bridge",
+          cleanupPolicy: "remove",
+        },
+      },
+      keyManager as never,
+      undefined,
+      (candidateTaskId) =>
+        Promise.resolve({
+          taskId: candidateTaskId,
+          claimants: ["docs/tasks/TASK-CONTESTED-RETRY.md", "docs/tasks/duplicate.md"],
+        }),
+    );
+    stubWorktrees(mgr);
+    mgr.setEventCallback(() => {
+      throw new Error("observer failed");
+    });
+    (mgr as unknown as { dockerManager: typeof dockerManager }).dockerManager = dockerManager;
+
+    const job = mgr.start(taskId, { skipGate: true });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    child.stderr.emit("data", Buffer.from("429 rate limit exceeded\n"));
+    child.emit("exit", 1, null);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(dockerManager.stopContainer).toHaveBeenCalledWith("contested-retry-container", true);
+    expect(dockerManager.createContainer).toHaveBeenCalledTimes(1);
+    expect(job.status).toBe("failed");
+    expect(job.output.join("\n")).toContain("claimant");
   });
 
   test("force-removes a rate-limited container before same-task retry", async () => {

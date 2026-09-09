@@ -256,7 +256,10 @@ describe("TASK-073: Monitor Crash Hardening", () => {
       await reader.watch(jest.fn());
 
       expect(chokidar.watch).toHaveBeenCalledWith(
-        expect.stringContaining("events-*.jsonl"),
+        expect.arrayContaining([
+          expect.stringContaining("events-*.jsonl"),
+          expect.stringContaining("docker-import"),
+        ]),
         expect.objectContaining({ ignorePermissionErrors: true }),
       );
     });
@@ -289,7 +292,10 @@ describe("TASK-073: Monitor Crash Hardening", () => {
 
       // Verify the watcher was configured with error resilience options
       expect(chokidar.watch).toHaveBeenCalledWith(
-        expect.stringContaining("events-*.jsonl"),
+        expect.arrayContaining([
+          expect.stringContaining("events-*.jsonl"),
+          expect.stringContaining("docker-import"),
+        ]),
         expect.objectContaining({
           ignorePermissionErrors: true,
           // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment

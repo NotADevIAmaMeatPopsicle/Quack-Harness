@@ -203,13 +203,16 @@ export class DockerManager {
   /** Translate a trusted host runtime entry point to its read-only container mount. */
   containerPathForHost(hostPath: string): string {
     const resolved = resolveThroughExistingAncestor(path.resolve(hostPath));
-    if (isSameOrDescendant(resolved, resolveThroughExistingAncestor(this.projectRoot))) {
-      const relative = path.relative(resolveThroughExistingAncestor(this.projectRoot), resolved);
-      return path.posix.join("/workspace", relative.replace(/\\/g, "/"));
-    }
+    // The runtime root may itself be the managed project. Prefer its dedicated
+    // read-only mount so a self-hosted dispatch never executes Quack from the
+    // task's writable worktree copy.
     if (this.runtimeRoot && isSameOrDescendant(resolved, this.runtimeRoot)) {
       const relative = path.relative(this.runtimeRoot, resolved);
       return path.posix.join("/quack-runtime", relative.replace(/\\/g, "/"));
+    }
+    if (isSameOrDescendant(resolved, resolveThroughExistingAncestor(this.projectRoot))) {
+      const relative = path.relative(resolveThroughExistingAncestor(this.projectRoot), resolved);
+      return path.posix.join("/workspace", relative.replace(/\\/g, "/"));
     }
     throw new Error("Quack runtime entry point is outside trusted Docker runtime mounts");
   }
@@ -238,6 +241,8 @@ export class DockerManager {
     ) {
       throw new Error("Docker logging.dir must not overlap the protected .quack/prep tree");
     }
+
+    this.assertNoPathAliases(resolvedRoot, this.hostLogDir, "Docker logging.dir");
 
     const realRoot = resolveThroughExistingAncestor(resolvedRoot);
     const realLogDir = resolveThroughExistingAncestor(this.hostLogDir);
@@ -276,7 +281,6 @@ export class DockerManager {
     if (options !== "ro") {
       throw new Error(`Docker volume ${volume} must be explicitly read-only (:ro)`);
     }
-
     const looksLikeBindSource =
       path.isAbsolute(source) ||
       /^[A-Za-z]:[\\/]/.test(source) ||
@@ -286,6 +290,18 @@ export class DockerManager {
     if (!looksLikeBindSource) {
       throw new Error(
         `Docker named volume ${source} is not trusted; configure an explicit project-relative read-only bind source instead`,
+      );
+    }
+
+    const inputRelative = path.posix.relative("/quack-inputs", destination);
+    if (
+      !inputRelative ||
+      path.posix.isAbsolute(inputRelative) ||
+      inputRelative === ".." ||
+      inputRelative.startsWith("../")
+    ) {
+      throw new Error(
+        `Docker volume destination ${destination} must be inside the inert /quack-inputs namespace`,
       );
     }
 
@@ -307,7 +323,7 @@ export class DockerManager {
     if (worktreePath && !fs.existsSync(realSource)) {
       throw new Error(`Docker bind source does not exist in the task worktree: ${source}`);
     }
-    if (worktreePath) this.assertReadOnlyBindTreeSafe(realSource, realRoot);
+    if (worktreePath) this.assertReadOnlyBindTreeSafe(mountSource, realRoot);
     return {
       destination,
       argument: `${realSource.replace(/\\/g, "/")}:${destination}:${options}`,
@@ -316,19 +332,10 @@ export class DockerManager {
 
   private assertSafeConfiguredVolumes(worktreePath?: string): void {
     for (const volume of this.config.volumes ?? []) {
-      const { destination } = this.safeConfiguredVolume(volume, worktreePath);
-      if (
-        isSameOrDescendant(destination, "/workspace") ||
-        isSameOrDescendant("/workspace", destination) ||
-        isSameOrDescendant(destination, "/quack-runtime") ||
-        isSameOrDescendant("/quack-runtime", destination) ||
-        isSameOrDescendant(destination, "/quack-git") ||
-        isSameOrDescendant("/quack-git", destination)
-      ) {
-        throw new Error(
-          `Docker volume destination ${destination} overlaps a protected runtime tree`,
-        );
-      }
+      this.safeConfiguredVolume(volume, worktreePath);
+      // safeConfiguredVolume confines every destination to /quack-inputs/*.
+      // Keep parsing all entries here so constructor-time validation remains
+      // side-effect free and create-time validation can repeat the same gate.
     }
   }
 
@@ -362,12 +369,58 @@ export class DockerManager {
     }
   }
 
+  private assertNoPathAliases(root: string, candidate: string, description: string): void {
+    const resolvedRoot = path.resolve(root);
+    const resolvedCandidate = path.resolve(candidate);
+    if (!isSameOrDescendant(resolvedCandidate, resolvedRoot)) {
+      throw new Error(`${description} is outside its trusted root`);
+    }
+    const relative = path.relative(resolvedRoot, resolvedCandidate);
+    let cursor = resolvedRoot;
+    for (const segment of relative.split(path.sep).filter(Boolean)) {
+      cursor = path.join(cursor, segment);
+      let stat: fs.Stats;
+      try {
+        stat = fs.lstatSync(cursor);
+      } catch (error: unknown) {
+        const code =
+          typeof error === "object" && error !== null && "code" in error
+            ? String((error as { code?: unknown }).code)
+            : "";
+        if (code === "ENOENT") return;
+        throw error;
+      }
+      if (stat.isSymbolicLink()) {
+        throw new Error(`${description} contains an untrusted symlink or junction: ${cursor}`);
+      }
+    }
+  }
+
   private resolveWorktreeGitDir(worktreePath: string): {
     hostGitRoot: string;
     containerGitDir: string;
   } {
     const projectGitPath = path.join(this.projectRoot, ".git");
-    const hostGitRoot = fs.realpathSync.native(projectGitPath);
+    const projectGitStat = fs.lstatSync(projectGitPath);
+    let hostGitRoot: string;
+    if (projectGitStat.isDirectory() && !projectGitStat.isSymbolicLink()) {
+      hostGitRoot = fs.realpathSync.native(projectGitPath);
+    } else if (projectGitStat.isFile() && !projectGitStat.isSymbolicLink()) {
+      const projectGitFile = fs.readFileSync(projectGitPath, "utf-8").trim();
+      const projectGitMatch = /^gitdir:\s*(.+)$/i.exec(projectGitFile);
+      if (!projectGitMatch) throw new Error("Project .git file has an invalid worktree target");
+      const projectAdminDir = fs.realpathSync.native(
+        path.resolve(this.projectRoot, projectGitMatch[1].trim()),
+      );
+      const commonDirFile = path.join(projectAdminDir, "commondir");
+      hostGitRoot = fs.realpathSync.native(
+        fs.existsSync(commonDirFile)
+          ? path.resolve(projectAdminDir, fs.readFileSync(commonDirFile, "utf-8").trim())
+          : projectAdminDir,
+      );
+    } else {
+      throw new Error("Project Git metadata has an untrusted identity");
+    }
     const dotGitPath = path.join(worktreePath, ".git");
     const dotGit = fs.readFileSync(dotGitPath, "utf-8").trim();
     const match = /^gitdir:\s*(.+)$/i.exec(dotGit);
@@ -428,6 +481,7 @@ export class DockerManager {
       throw new Error("Docker dispatch log root resolves outside the task worktree");
     }
     fs.mkdirSync(base, { recursive: true });
+    this.assertNoPathAliases(realWorktree, base, "Docker dispatch log root");
     const realBase = resolveThroughExistingAncestor(base);
     if (!isSameOrDescendant(realBase, realWorktree)) {
       throw new Error("Docker dispatch log root resolves outside the task worktree");
@@ -455,6 +509,7 @@ export class DockerManager {
 
   private assertRuntimeLogDirSafe(runtimeLogDir: string, worktreePath: string): string {
     const realWorktree = resolveThroughExistingAncestor(worktreePath);
+    this.assertNoPathAliases(realWorktree, runtimeLogDir, "Docker dispatch log directory");
     const realBase = resolveThroughExistingAncestor(
       path.join(realWorktree, ".quack", "docker-runtime"),
     );
@@ -1233,13 +1288,6 @@ export class DockerManager {
   execAgent(containerId: string, command: string[], env?: Record<string, string>): ChildProcess {
     const args = ["exec"];
 
-    const tracked = Array.from(this.containers.values()).find(
-      (container) => container.containerId === containerId,
-    );
-    if (tracked) {
-      args.push("-e", `GIT_DIR=${tracked.gitDir}`, "-e", "GIT_WORK_TREE=/workspace");
-    }
-
     // Pass environment variables
     if (env) {
       for (const [key, value] of Object.entries(env)) {
@@ -1253,6 +1301,22 @@ export class DockerManager {
       if (value !== undefined) {
         args.push("-e", `${envVar}=${value}`);
       }
+    }
+
+    // Trusted task-isolation values are appended last so repository-owned
+    // passthrough configuration cannot replace them.
+    const tracked = Array.from(this.containers.values()).find(
+      (container) => container.containerId === containerId,
+    );
+    if (tracked) {
+      args.push(
+        "-e",
+        `GIT_DIR=${tracked.gitDir}`,
+        "-e",
+        "GIT_WORK_TREE=/workspace",
+        "-e",
+        `QUACK_DOCKER_RUNTIME_LOG_DIR=${tracked.logsVolume}`,
+      );
     }
 
     args.push(containerId, ...command);

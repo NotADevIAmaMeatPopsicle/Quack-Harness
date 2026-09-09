@@ -293,6 +293,7 @@ it("exposes tokened prep and shared-checkout survivor reconciliation", async () 
     version: 1 as const,
     taskId: "TASK-WORKTREE",
     sessionId: "worktree-session",
+    ownershipId: "worktree-owner",
     worktreePath: "C:\\repo\\.quack\\worktrees\\TASK-WORKTREE",
     processId: 789,
     strategy: "windows-process-tree" as const,
@@ -365,6 +366,7 @@ it("exposes tokened prep and shared-checkout survivor reconciliation", async () 
       (
         await post(server.port, "/api/fleet/worktree-shutdown-survivors/TASK-WORKTREE/reconcile", {
           sessionId: "worktree-session",
+          ownershipId: "worktree-owner",
           reconciliationToken: "worktree-token",
           processTreeConfirmedStopped: true,
         })
@@ -373,6 +375,7 @@ it("exposes tokened prep and shared-checkout survivor reconciliation", async () 
     expect(reconcileWorktreeShutdownSurvivor).toHaveBeenCalledWith(
       "TASK-WORKTREE",
       "worktree-session",
+      "worktree-owner",
       "worktree-token",
       true,
     );

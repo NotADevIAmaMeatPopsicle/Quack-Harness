@@ -667,6 +667,49 @@ describe("ProjectRegistry", () => {
       // They are different instances
       expect(pA.dispatchManager).not.toBe(pB.dispatchManager);
     });
+
+    it("broadcasts each dynamic project root to every existing Docker manager", () => {
+      const registry = new ProjectRegistry();
+      const rootA = path.join(tmpDir, "projectA");
+      const rootB = path.join(tmpDir, "projectB");
+      const adapterA = makeMinimalAdapter("Docker A", rootA);
+      const adapterB = makeMinimalAdapter("Docker B", rootB);
+      const updateA = jest.fn();
+      const updateB = jest.fn();
+      const contextFor = (
+        id: string,
+        rootPath: string,
+        adapter: ProjectAdapter,
+        update: jest.Mock,
+      ) => ({
+        id,
+        name: adapter.config.project.name,
+        rootPath,
+        logDir: path.join(rootPath, ".quack", "logs"),
+        adapter,
+        eventReader: {} as EventReader,
+        dispatchManager: { setDockerRegisteredProjectRoots: update } as never,
+        taskService: null,
+        prepCache: null,
+        prepWorker: null,
+        prepScheduler: null,
+        fleetController: null,
+        costVelocityTracker: {} as never,
+        progressDetector: {} as never,
+        dispatchQueue: null,
+        keyManager: null,
+        db: { close: jest.fn() } as never,
+      });
+
+      registry.register(contextFor("docker-a", rootA, adapterA, updateA));
+      registry.register(contextFor("docker-b", rootB, adapterB, updateB));
+
+      expect(updateA).toHaveBeenLastCalledWith([rootA, rootB]);
+      expect(updateB).toHaveBeenLastCalledWith([rootA, rootB]);
+
+      registry.unregister("docker-b");
+      expect(updateA).toHaveBeenLastCalledWith([rootA]);
+    });
   });
 
   describe("unregister", () => {
