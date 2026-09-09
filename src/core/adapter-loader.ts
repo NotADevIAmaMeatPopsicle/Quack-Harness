@@ -102,16 +102,32 @@ export function computeAdapterBundleMetadata(
 export function applyAdapterWorkerOverlay(config: AdapterConfig): AdapterConfig {
   const effective = cloneConfig(config);
   const overlay = effective.workerOverlay;
-  if (!overlay) return effective;
+  if (overlay) {
+    if (overlay.projectRoot) {
+      effective.project.root = overlay.projectRoot;
+    }
+    if (overlay.taskDir) {
+      effective.project.taskDir = overlay.taskDir;
+    }
+    if (overlay.logDir) {
+      effective.logging.dir = overlay.logDir;
+    }
+  }
 
-  if (overlay.projectRoot) {
-    effective.project.root = overlay.projectRoot;
-  }
-  if (overlay.taskDir) {
-    effective.project.taskDir = overlay.taskDir;
-  }
-  if (overlay.logDir) {
-    effective.logging.dir = overlay.logDir;
+  // The monitor injects this only into the Docker agent process. It keeps
+  // container-writable output inside the disposable task worktree instead of
+  // mounting the authoritative host log/control tree read-write.
+  const dockerRuntimeLogDir = process.env.QUACK_DOCKER_RUNTIME_LOG_DIR;
+  if (dockerRuntimeLogDir) {
+    const normalized = dockerRuntimeLogDir.replace(/\\/g, "/");
+    if (
+      !/^\/workspace\/\.quack\/docker-runtime\/[A-Za-z0-9._-]+-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        normalized,
+      )
+    ) {
+      throw new Error("Invalid QUACK_DOCKER_RUNTIME_LOG_DIR isolation boundary");
+    }
+    effective.logging.dir = normalized;
   }
   return effective;
 }

@@ -22,6 +22,12 @@ import { buildCostSummaryFromSessions, eventSessionToCostSummarySession } from "
 
 function parseJsonlFile<T>(filePath: string): T[] {
   if (!fs.existsSync(filePath)) return [];
+  try {
+    const stat = fs.lstatSync(filePath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) return [];
+  } catch {
+    return [];
+  }
 
   const content = fs.readFileSync(filePath, "utf-8");
   const results: T[] = [];
@@ -50,13 +56,36 @@ export class EventReader {
     this.sessionsFile = path.join(logDir, "sessions.jsonl");
   }
 
+  private runtimeFiles(fileName: string): string[] {
+    const files = [path.join(this.logDir, fileName)];
+    const dockerRoot = path.join(this.logDir, "docker-import");
+    if (!fs.existsSync(dockerRoot)) return files;
+    try {
+      for (const entry of fs.readdirSync(dockerRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+        const candidate = path.join(dockerRoot, entry.name, fileName);
+        try {
+          const stat = fs.lstatSync(candidate);
+          if (stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1) files.push(candidate);
+        } catch {
+          // Missing or unreadable per-dispatch output is ignored.
+        }
+      }
+    } catch {
+      // Keep root logging available when a runtime subtree is unreadable.
+    }
+    return files;
+  }
+
   /**
    * Get all sessions, deduplicated by sessionId.
    * When a session has multiple entries (e.g., "active" then "completed"),
    * the latest entry wins — so completed sessions show cost/duration/outcome.
    */
   getAllSessions(): SessionEntry[] {
-    const raw = parseJsonlFile<SessionEntry>(this.sessionsFile);
+    const raw = this.runtimeFiles("sessions.jsonl").flatMap((file) =>
+      parseJsonlFile<SessionEntry>(file),
+    );
     const map = new Map<string, { entry: SessionEntry; index: number }>();
 
     for (let i = 0; i < raw.length; i++) {
@@ -95,8 +124,9 @@ export class EventReader {
   }
 
   getSessionEvents(sessionId: string): QuackEvent[] {
-    const eventsFile = path.join(this.logDir, `events-${sessionId}.jsonl`);
-    return parseJsonlFile<QuackEvent>(eventsFile);
+    return this.runtimeFiles(`events-${sessionId}.jsonl`).flatMap((file) =>
+      parseJsonlFile<QuackEvent>(file),
+    );
   }
 
   getSessionEventsAfter(sessionId: string, afterTimestamp: string): QuackEvent[] {
@@ -202,14 +232,21 @@ export class EventReader {
 
     const fileSizes = new Map<string, number>();
 
-    const watcher = chokidar.watch(path.join(this.logDir, "events-*.jsonl"), {
-      persistent: true,
-      ignoreInitial: true,
-      awaitWriteFinish: { stabilityThreshold: 100, pollInterval: 50 },
-      usePolling: process.platform === "win32",
-      interval: 500,
-      ignorePermissionErrors: true,
-    });
+    const watcher = chokidar.watch(
+      [
+        path.join(this.logDir, "events-*.jsonl"),
+        path.join(this.logDir, "docker-import", "*", "events-*.jsonl"),
+      ],
+      {
+        persistent: true,
+        ignoreInitial: true,
+        awaitWriteFinish: { stabilityThreshold: 100, pollInterval: 50 },
+        usePolling: process.platform === "win32",
+        interval: 500,
+        ignorePermissionErrors: true,
+        followSymlinks: false,
+      },
+    );
 
     watcher.on("error", (err: unknown) => {
       console.error("[event-reader] chokidar watcher error (non-fatal):", err);
@@ -224,6 +261,8 @@ export class EventReader {
 
     const processNewContent = (filePath: string) => {
       try {
+        const identity = fs.lstatSync(filePath);
+        if (!identity.isFile() || identity.isSymbolicLink() || identity.nlink !== 1) return;
         const stats = fs.statSync(filePath);
         const previousSize = fileSizes.get(filePath) ?? 0;
 

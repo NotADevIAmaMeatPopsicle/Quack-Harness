@@ -318,5 +318,38 @@ describe("loadAdapter", () => {
       expect(effective.workerOverlay?.endpoints?.headnode).toBe("http://headnode:3333");
       expect(effective.workerOverlay?.capabilities?.docker).toBe(true);
     });
+
+    it("routes Docker child output only to a task-scoped disposable worktree leaf", () => {
+      const previous = process.env.QUACK_DOCKER_RUNTIME_LOG_DIR;
+      process.env.QUACK_DOCKER_RUNTIME_LOG_DIR =
+        "/workspace/.quack/docker-runtime/TASK-123-550e8400-e29b-41d4-a716-446655440000";
+      try {
+        const effective = applyAdapterWorkerOverlay(adapter.config);
+        expect(effective.logging.dir).toBe(
+          "/workspace/.quack/docker-runtime/TASK-123-550e8400-e29b-41d4-a716-446655440000",
+        );
+      } finally {
+        if (previous === undefined) delete process.env.QUACK_DOCKER_RUNTIME_LOG_DIR;
+        else process.env.QUACK_DOCKER_RUNTIME_LOG_DIR = previous;
+      }
+    });
+
+    it.each([
+      "/workspace/.quack/logs",
+      "/workspace/.quack/docker-runtime",
+      "/workspace/.quack/docker-runtime/../logs",
+      "/host/output",
+    ])("rejects an unsafe Docker runtime output override: %s", (unsafe) => {
+      const previous = process.env.QUACK_DOCKER_RUNTIME_LOG_DIR;
+      process.env.QUACK_DOCKER_RUNTIME_LOG_DIR = unsafe;
+      try {
+        expect(() => applyAdapterWorkerOverlay(adapter.config)).toThrow(
+          "Invalid QUACK_DOCKER_RUNTIME_LOG_DIR isolation boundary",
+        );
+      } finally {
+        if (previous === undefined) delete process.env.QUACK_DOCKER_RUNTIME_LOG_DIR;
+        else process.env.QUACK_DOCKER_RUNTIME_LOG_DIR = previous;
+      }
+    });
   });
 });

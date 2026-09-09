@@ -71,14 +71,26 @@ function mockExecFileSequence(responses: Array<{ stdout?: string; error?: string
   });
 }
 
+function managedWorktree(projectRoot: string, taskId: string): string {
+  const worktreePath = path.join(projectRoot, ".quack", "worktrees", taskId);
+  const gitDir = path.join(projectRoot, ".git", "worktrees", taskId);
+  fs.mkdirSync(gitDir, { recursive: true });
+  fs.mkdirSync(worktreePath, { recursive: true });
+  fs.writeFileSync(path.join(worktreePath, ".git"), `gitdir: ${gitDir}\n`, "utf-8");
+  return worktreePath;
+}
+
 describe("DockerManager", () => {
   let manager: DockerManager;
   let stateRoot: string;
+  let projectRoot: string;
 
   beforeEach(() => {
     jest.clearAllMocks();
     stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "quack-docker-manager-"));
-    manager = new DockerManager("/project/root", defaultConfig(), stateRoot);
+    projectRoot = path.join(stateRoot, "project");
+    fs.mkdirSync(path.join(projectRoot, ".quack", "logs"), { recursive: true });
+    manager = new DockerManager(projectRoot, defaultConfig(), stateRoot);
   });
 
   afterEach(() => {
@@ -183,14 +195,17 @@ describe("DockerManager", () => {
         uncertainCreateWindowMs: 80,
         uncertainCreateProbeIntervalMs: 5,
       };
-      const interrupted = new DockerManager("/project/root", defaultConfig(), stateRoot, timing);
+      const interrupted = new DockerManager(projectRoot, defaultConfig(), stateRoot, timing);
       mockExecFileSequence([
         { error: "simulated interrupted docker create" },
         { error: "No such container" },
       ]);
-      await expect(interrupted.createContainer("TASK-LATE-CREATE")).rejects.toThrow(
-        "simulated interrupted docker create",
-      );
+      await expect(
+        interrupted.createContainer(
+          "TASK-LATE-CREATE",
+          managedWorktree(projectRoot, "TASK-LATE-CREATE"),
+        ),
+      ).rejects.toThrow("simulated interrupted docker create");
 
       const markerFiles = fs.readdirSync(stateRoot).filter((name) => name.endsWith(".json"));
       expect(markerFiles).toHaveLength(1);
@@ -204,7 +219,7 @@ describe("DockerManager", () => {
         { stdout: marker.containerName },
         { stdout: "" },
       ]);
-      const restarted = new DockerManager("/project/root", defaultConfig(), stateRoot, timing);
+      const restarted = new DockerManager(projectRoot, defaultConfig(), stateRoot, timing);
       await expect(restarted.reconcileExistingContainers()).resolves.toEqual({
         discoveredTaskIds: [],
         ambiguousContainerIds: [],
@@ -221,12 +236,103 @@ describe("DockerManager", () => {
       expect(fs.readdirSync(stateRoot).filter((name) => name.endsWith(".json"))).toEqual([]);
     });
 
+    test("starts the late-create proof window when interruption is observed", async () => {
+      const timing = {
+        uncertainCreateWindowMs: 4_000,
+        uncertainCreateProbeIntervalMs: 250,
+      };
+      const mgr = new DockerManager(projectRoot, defaultConfig(), stateRoot, timing);
+      const beganAt = Date.now();
+      const interruptionObservedAt = beganAt + 5_000;
+      const nowSpy = jest
+        .spyOn(Date, "now")
+        .mockReturnValueOnce(beganAt)
+        .mockReturnValueOnce(interruptionObservedAt)
+        .mockReturnValue(interruptionObservedAt);
+      mockExecFileSequence([
+        { error: "simulated timeout after daemon acceptance delay" },
+        { error: "No such container" },
+      ]);
+      try {
+        await expect(
+          mgr.createContainer(
+            "TASK-OBSERVED-TIMEOUT",
+            managedWorktree(projectRoot, "TASK-OBSERVED-TIMEOUT"),
+          ),
+        ).rejects.toThrow("simulated timeout");
+      } finally {
+        nowSpy.mockRestore();
+      }
+
+      const markerFile = fs.readdirSync(stateRoot).find((name) => name.endsWith(".json"));
+      expect(markerFile).toBeDefined();
+      const marker = JSON.parse(fs.readFileSync(path.join(stateRoot, markerFile!), "utf-8")) as {
+        createdAt: string;
+        interruptedAt: string;
+        reconcileUntil: string;
+      };
+      expect(Date.parse(marker.createdAt)).toBe(beganAt);
+      expect(Date.parse(marker.interruptedAt)).toBe(interruptionObservedAt);
+      expect(Date.parse(marker.reconcileUntil) - Date.parse(marker.interruptedAt)).toBe(4_000);
+    });
+
+    test("uses unique create names so a same-clock loser cannot remove the winner", async () => {
+      const first = new DockerManager(projectRoot, defaultConfig(), stateRoot);
+      const second = new DockerManager(projectRoot, defaultConfig(), stateRoot);
+      const names: string[] = [];
+      const removedNames: string[] = [];
+      let creates = 0;
+      mockExecFile.mockImplementation((...args: unknown[]) => {
+        const dockerArgs = args[1] as string[];
+        const callback = args.at(-1) as ExecFileCallback;
+        if (dockerArgs[0] === "create") {
+          const name = dockerArgs[dockerArgs.indexOf("--name") + 1];
+          names.push(name);
+          creates += 1;
+          if (creates === 1) callback(null, { stdout: "winner-id\n", stderr: "" });
+          else callback(new Error("name conflict"), { stdout: "", stderr: "name conflict" });
+          return;
+        }
+        if (dockerArgs[0] === "start") {
+          callback(null, { stdout: "", stderr: "" });
+          return;
+        }
+        if (dockerArgs[0] === "rm") {
+          removedNames.push(dockerArgs.at(-1)!);
+          const error = Object.assign(new Error("No such container"), {
+            stderr: "No such container",
+          });
+          callback(error, { stdout: "", stderr: "No such container" });
+        }
+      });
+      const nowSpy = jest.spyOn(Date, "now").mockReturnValue(1_789_000_000_000);
+      try {
+        const winner = first.createContainer(
+          "TASK-SAME-CLOCK",
+          managedWorktree(projectRoot, "TASK-SAME-CLOCK"),
+        );
+        const loser = second.createContainer(
+          "TASK-SAME-CLOCK",
+          managedWorktree(projectRoot, "TASK-SAME-CLOCK"),
+        );
+        await expect(winner).resolves.toMatchObject({ containerId: "winner-id" });
+        await expect(loser).rejects.toThrow("name conflict");
+      } finally {
+        nowSpy.mockRestore();
+      }
+
+      expect(names).toHaveLength(2);
+      expect(names[0]).not.toBe(names[1]);
+      expect(removedNames).toEqual([names[1]]);
+      expect(removedNames).not.toContain(names[0]);
+    });
+
     test("releases same-process task tracking after uncertain create reconciliation", async () => {
       const timing = {
         uncertainCreateWindowMs: 80,
         uncertainCreateProbeIntervalMs: 5,
       };
-      const mgr = new DockerManager("/project/root", defaultConfig(), stateRoot, timing);
+      const mgr = new DockerManager(projectRoot, defaultConfig(), stateRoot, timing);
       mockExecFileSequence([
         { error: "simulated interrupted docker create" },
         { error: "No such container" },
@@ -239,9 +345,12 @@ describe("DockerManager", () => {
         { stdout: "" },
       ]);
 
-      await expect(mgr.createContainer("TASK-SAME-PROCESS-RETRY")).rejects.toThrow(
-        "simulated interrupted docker create",
-      );
+      await expect(
+        mgr.createContainer(
+          "TASK-SAME-PROCESS-RETRY",
+          managedWorktree(projectRoot, "TASK-SAME-PROCESS-RETRY"),
+        ),
+      ).rejects.toThrow("simulated interrupted docker create");
       await expect(mgr.reconcileExistingContainers()).resolves.toEqual({
         discoveredTaskIds: [],
         ambiguousContainerIds: [],
@@ -249,7 +358,12 @@ describe("DockerManager", () => {
         failedTaskIds: [],
       });
       expect(mgr.getTrackedContainers()).toEqual([]);
-      await expect(mgr.createContainer("TASK-SAME-PROCESS-RETRY")).resolves.toMatchObject({
+      await expect(
+        mgr.createContainer(
+          "TASK-SAME-PROCESS-RETRY",
+          managedWorktree(projectRoot, "TASK-SAME-PROCESS-RETRY"),
+        ),
+      ).resolves.toMatchObject({
         containerId: "retry-container",
         status: "running",
       });
@@ -287,7 +401,7 @@ describe("DockerManager", () => {
 
     test("does not reconcile away a container actively owned by this manager", async () => {
       mockExecFileSequence([{ stdout: "active-container\n" }, { stdout: "" }]);
-      await manager.createContainer("TASK-ACTIVE");
+      await manager.createContainer("TASK-ACTIVE", managedWorktree(projectRoot, "TASK-ACTIVE"));
       const projectFingerprint = (manager as unknown as { projectFingerprint: string })
         .projectFingerprint;
 
@@ -305,7 +419,12 @@ describe("DockerManager", () => {
                   "quack.projectFingerprint": projectFingerprint,
                 },
               },
-              Mounts: [{ Source: "/project/root", Destination: "/workspace" }],
+              Mounts: [
+                {
+                  Source: managedWorktree(projectRoot, "TASK-ACTIVE"),
+                  Destination: "/workspace",
+                },
+              ],
               State: { Running: true },
             },
           ]),
@@ -338,12 +457,17 @@ describe("DockerManager", () => {
         { stdout: "" }, // docker start
       ]);
 
-      const container = await manager.createContainer("TASK-001");
+      const container = await manager.createContainer(
+        "TASK-001",
+        managedWorktree(projectRoot, "TASK-001"),
+      );
       expect(container.containerId).toBe("abc123container");
       expect(container.taskId).toBe("TASK-001");
       expect(container.image).toBe("node:20-slim");
       expect(container.workDir).toBe("/workspace");
-      expect(container.logsVolume).toBe("/workspace/.quack/logs");
+      expect(container.logsVolume).toMatch(
+        /^\/workspace\/\.quack\/docker-runtime\/TASK-001-[a-f0-9-]+$/,
+      );
       expect(container.status).toBe("running");
 
       // Verify docker create was called with correct volume mounts and limits
@@ -369,7 +493,7 @@ describe("DockerManager", () => {
 
     test("runs preInstallCommand when configured", async () => {
       const mgr = new DockerManager(
-        "/project/root",
+        projectRoot,
         defaultConfig({ preInstallCommand: "npm install" }),
         stateRoot,
       );
@@ -380,7 +504,7 @@ describe("DockerManager", () => {
         { stdout: "" }, // docker exec preInstallCommand
       ]);
 
-      await mgr.createContainer("TASK-002");
+      await mgr.createContainer("TASK-002", managedWorktree(projectRoot, "TASK-002"));
 
       // Third call should be the preInstallCommand
       expect(mockExecFile).toHaveBeenCalledTimes(3);
@@ -393,24 +517,24 @@ describe("DockerManager", () => {
     test("throws on double-create for same task", async () => {
       mockExecFileSequence([{ stdout: "abc123\n" }, { stdout: "" }]);
 
-      await manager.createContainer("TASK-001");
+      await manager.createContainer("TASK-001", managedWorktree(projectRoot, "TASK-001"));
 
-      await expect(manager.createContainer("TASK-001")).rejects.toThrow(
-        "Container cleanup is unresolved for TASK-001",
-      );
+      await expect(
+        manager.createContainer("TASK-001", managedWorktree(projectRoot, "TASK-001")),
+      ).rejects.toThrow("Container cleanup is unresolved for TASK-001");
     });
 
     test("throws when docker create fails", async () => {
       mockExecFileError("no space left on device");
 
-      await expect(manager.createContainer("TASK-001")).rejects.toThrow(
-        "Failed to create container for TASK-001: no space left on device",
-      );
+      await expect(
+        manager.createContainer("TASK-001", managedWorktree(projectRoot, "TASK-001")),
+      ).rejects.toThrow("Failed to create container for TASK-001: no space left on device");
     });
 
     test("includes resource limits in create args", async () => {
       const mgr = new DockerManager(
-        "/project/root",
+        projectRoot,
         defaultConfig({
           resourceLimits: { memoryMb: 8192, cpus: 4, storageMb: 10240 },
         }),
@@ -419,7 +543,7 @@ describe("DockerManager", () => {
 
       mockExecFileSequence([{ stdout: "xyz789\n" }, { stdout: "" }]);
 
-      await mgr.createContainer("TASK-003");
+      await mgr.createContainer("TASK-003", managedWorktree(projectRoot, "TASK-003"));
 
       const createArgs = (mockExecFile.mock.calls[0] as MockCallArgs)[1];
       expect(createArgs).toContain("8192m");
@@ -443,22 +567,36 @@ describe("DockerManager", () => {
 
       mockExecFileSequence([{ stdout: "vol123\n" }, { stdout: "" }]);
 
-      await mgr.createContainer("TASK-004");
+      const taskWorktree = managedWorktree(projectRoot, "TASK-004");
+      fs.mkdirSync(path.join(taskWorktree, "fixtures"), { recursive: true });
+      await mgr.createContainer("TASK-004", taskWorktree);
 
       const createArgs = (mockExecFile.mock.calls[0] as MockCallArgs)[1];
       expect(createArgs).toContain(
-        `${fs.realpathSync.native(volumeSource).replace(/\\/g, "/")}:/container/data:ro`,
+        `${fs.realpathSync.native(path.join(taskWorktree, "fixtures")).replace(/\\/g, "/")}:/container/data:ro`,
       );
     });
 
-    test.each(["cache:/workspace:ro", "cache:/workspace/.quack/prep:ro", "cache:/:ro"])(
+    test.each(["/workspace", "/workspace/.quack/prep", "/"])(
       "rejects a configured volume that shadows protected workspace mounts: %s",
-      (volume) => {
+      (destination) => {
+        const volume = `${path.join(projectRoot, "cache")}:${destination}:ro`;
         expect(
-          () => new DockerManager("/project/root", defaultConfig({ volumes: [volume] }), stateRoot),
-        ).toThrow("overlaps the protected /workspace tree");
+          () => new DockerManager(projectRoot, defaultConfig({ volumes: [volume] }), stateRoot),
+        ).toThrow("overlaps a protected runtime tree");
       },
     );
+
+    test("rejects arbitrary named volumes even when read-only", () => {
+      expect(
+        () =>
+          new DockerManager(
+            projectRoot,
+            defaultConfig({ volumes: ["cache:/container/cache:ro"] }),
+            stateRoot,
+          ),
+      ).toThrow("named volume cache is not trusted");
+    });
 
     test("rejects bind sources outside the real project and writable configured volumes", () => {
       const projectRoot = path.join(stateRoot, "project");
@@ -481,6 +619,16 @@ describe("DockerManager", () => {
             path.join(stateRoot, "uncertainty-rw"),
           ),
       ).toThrow("must be explicitly read-only");
+      for (const option of ["ro,z", "ro,Z", "z", ""]) {
+        expect(
+          () =>
+            new DockerManager(
+              projectRoot,
+              defaultConfig({ volumes: [`${insideSource}:/container/data:${option}`] }),
+              path.join(stateRoot, `uncertainty-${option || "missing"}`),
+            ),
+        ).toThrow("must be explicitly read-only");
+      }
     });
 
     test("rechecks configured bind source identity before Docker create", async () => {
@@ -497,7 +645,10 @@ describe("DockerManager", () => {
       fs.symlinkSync(outsideDir, linkPath, process.platform === "win32" ? "junction" : "dir");
 
       try {
-        await expect(mgr.createContainer("TASK-VOLUME-ESCAPE")).rejects.toThrow(
+        const worktreePath = managedWorktree(projectRoot, "TASK-VOLUME-ESCAPE");
+        const worktreeLink = path.join(worktreePath, "fixture-link");
+        fs.symlinkSync(outsideDir, worktreeLink, process.platform === "win32" ? "junction" : "dir");
+        await expect(mgr.createContainer("TASK-VOLUME-ESCAPE", worktreePath)).rejects.toThrow(
           "resolves outside the project root",
         );
         expect(mockExecFile).not.toHaveBeenCalled();
@@ -506,9 +657,8 @@ describe("DockerManager", () => {
       }
     });
 
-    test("mounts the configured logging directory at its container-relative path", async () => {
-      const projectRoot = path.join(stateRoot, "project");
-      const customLogDir = path.join(projectRoot, ".runtime", "events");
+    test("keeps a fresh task-specific log subtree inside the disposable worktree", async () => {
+      const customLogDir = path.join(projectRoot, ".quack", "logs");
       const mgr = new DockerManager(
         projectRoot,
         defaultConfig(),
@@ -517,30 +667,44 @@ describe("DockerManager", () => {
       );
       mockExecFileSequence([{ stdout: "custom-logs\n" }, { stdout: "" }]);
 
-      const container = await mgr.createContainer("TASK-CUSTOM-LOGS");
-      const createArgs = (mockExecFile.mock.calls[0] as MockCallArgs)[1];
-      expect(createArgs).toContain(
-        `${customLogDir.replace(/\\/g, "/")}:/workspace/.runtime/events:rw`,
+      const container = await mgr.createContainer(
+        "TASK-CUSTOM-LOGS",
+        managedWorktree(projectRoot, "TASK-CUSTOM-LOGS"),
       );
-      expect(container.logsVolume).toBe("/workspace/.runtime/events");
+      const createArgs = (mockExecFile.mock.calls[0] as MockCallArgs)[1];
+      expect(container.runtimeLogDir).toMatch(
+        new RegExp(
+          `${path.join(projectRoot, ".quack", "worktrees", "TASK-CUSTOM-LOGS", ".quack", "docker-runtime").replace(/[\\/]/g, "[\\\\/]")}[\\\\/]TASK-CUSTOM-LOGS-`,
+        ),
+      );
+      expect(container.logsVolume).toMatch(
+        /^\/workspace\/\.quack\/docker-runtime\/TASK-CUSTOM-LOGS-[a-f0-9-]+$/,
+      );
+      expect(createArgs).not.toContain(
+        `${customLogDir.replace(/\\/g, "/")}:/workspace/.quack/logs:rw`,
+      );
     });
 
-    test("rejects logging directories outside the project or inside protected prep storage", () => {
-      const projectRoot = path.join(stateRoot, "project");
-      fs.mkdirSync(projectRoot, { recursive: true });
-
+    test("rejects logging directories outside the dedicated .quack/logs boundary", () => {
       expect(
         () =>
           new DockerManager(projectRoot, defaultConfig(), path.join(stateRoot, "uncertainty-a"), {
             logDir: path.join(stateRoot, "outside-logs"),
           }),
       ).toThrow("must remain inside the project root");
-      expect(
-        () =>
-          new DockerManager(projectRoot, defaultConfig(), path.join(stateRoot, "uncertainty-b"), {
-            logDir: path.join(projectRoot, ".quack", "prep", "events"),
-          }),
-      ).toThrow("must not overlap the protected .quack/prep tree");
+      for (const unsafe of [
+        projectRoot,
+        path.join(projectRoot, ".quack"),
+        path.join(projectRoot, "src"),
+        path.join(projectRoot, ".quack", "prep", "events"),
+      ]) {
+        expect(
+          () =>
+            new DockerManager(projectRoot, defaultConfig(), path.join(stateRoot, "uncertainty-b"), {
+              logDir: unsafe,
+            }),
+        ).toThrow("dedicated .quack/logs runtime directory");
+      }
     });
 
     test("rejects logging beneath prep storage selected by a pointer", () => {
@@ -555,15 +719,13 @@ describe("DockerManager", () => {
           new DockerManager(projectRoot, defaultConfig(), path.join(stateRoot, "uncertainty-d"), {
             logDir: path.join(prepStorage, "events"),
           }),
-      ).toThrow("must not overlap the protected .quack/prep tree");
+      ).toThrow("dedicated .quack/logs runtime directory");
     });
 
     test("rechecks logging directory containment before creating the RW mount", async () => {
       const projectRoot = path.join(stateRoot, "project");
       const outsideDir = path.join(stateRoot, "outside");
-      const linkPath = path.join(projectRoot, "runtime-link");
-      const configuredLogDir = path.join(linkPath, "events");
-      fs.mkdirSync(projectRoot, { recursive: true });
+      const configuredLogDir = path.join(projectRoot, ".quack", "logs");
       fs.mkdirSync(outsideDir, { recursive: true });
       const mgr = new DockerManager(
         projectRoot,
@@ -571,15 +733,20 @@ describe("DockerManager", () => {
         path.join(stateRoot, "uncertainty-c"),
         { logDir: configuredLogDir },
       );
-      fs.symlinkSync(outsideDir, linkPath, process.platform === "win32" ? "junction" : "dir");
+      fs.rmSync(configuredLogDir, { recursive: true, force: true });
+      fs.symlinkSync(
+        outsideDir,
+        configuredLogDir,
+        process.platform === "win32" ? "junction" : "dir",
+      );
 
       try {
-        await expect(mgr.createContainer("TASK-LOG-ESCAPE")).rejects.toThrow(
-          "resolves outside the project root",
-        );
+        await expect(
+          mgr.createContainer("TASK-LOG-ESCAPE", managedWorktree(projectRoot, "TASK-LOG-ESCAPE")),
+        ).rejects.toThrow("resolves outside the project root");
         expect(mockExecFile).not.toHaveBeenCalled();
       } finally {
-        fs.unlinkSync(linkPath);
+        fs.unlinkSync(configuredLogDir);
       }
     });
 
@@ -588,7 +755,7 @@ describe("DockerManager", () => {
 
       mockExecFileSequence([{ stdout: "sec123\n" }, { stdout: "" }]);
 
-      await manager.createContainer("TASK-005");
+      await manager.createContainer("TASK-005", managedWorktree(projectRoot, "TASK-005"));
 
       const createArgs = (mockExecFile.mock.calls[0] as MockCallArgs)[1];
       // Labels should not contain the API key value
@@ -680,7 +847,7 @@ describe("DockerManager", () => {
         { stdout: "" }, // docker rm
       ]);
 
-      await manager.createContainer("TASK-010");
+      await manager.createContainer("TASK-010", managedWorktree(projectRoot, "TASK-010"));
 
       // Now stop it
       await manager.stopContainer("stop123");
@@ -698,7 +865,7 @@ describe("DockerManager", () => {
 
     test("keeps container on failure when policy is keep_on_failure", async () => {
       const mgr = new DockerManager(
-        "/project/root",
+        projectRoot,
         defaultConfig({ cleanupPolicy: "keep_on_failure" }),
         stateRoot,
       );
@@ -709,11 +876,69 @@ describe("DockerManager", () => {
         { stdout: "" }, // docker stop
       ]);
 
-      await mgr.createContainer("TASK-011");
+      await mgr.createContainer("TASK-011", managedWorktree(projectRoot, "TASK-011"));
       await mgr.stopContainer("keep123", true); // failed = true
 
       // Should only have stop, no rm (3 calls: create, start, stop)
       expect(mockExecFile).toHaveBeenCalledTimes(3);
+    });
+
+    test("preserves retained ownership across restart without blocking another task", async () => {
+      const config = defaultConfig({ cleanupPolicy: "keep_on_failure" });
+      const first = new DockerManager(projectRoot, config, stateRoot);
+      const retainedWorktree = managedWorktree(projectRoot, "TASK-RETAINED");
+      mockExecFileSequence([{ stdout: "retained-id\n" }, { stdout: "" }, { stdout: "" }]);
+      const retained = await first.createContainer("TASK-RETAINED", retainedWorktree);
+      await expect(first.stopContainer(retained.containerId, true)).resolves.toEqual({
+        removed: false,
+        retained: true,
+      });
+
+      jest.clearAllMocks();
+      const restarted = new DockerManager(projectRoot, config, stateRoot);
+      const fingerprint = (restarted as unknown as { projectFingerprint: string })
+        .projectFingerprint;
+      mockExecFileSequence([
+        { stdout: "retained-id\n" },
+        {
+          stdout: JSON.stringify([
+            {
+              Id: "retained-id",
+              Name: "/retained-container",
+              Config: {
+                Image: "node:20-slim",
+                Labels: {
+                  "quack.taskId": "TASK-RETAINED",
+                  "quack.projectFingerprint": fingerprint,
+                  "quack.runtimeLogPath": retained.logsVolume,
+                },
+              },
+              Mounts: [{ Source: retainedWorktree, Destination: "/workspace" }],
+              State: { Running: false },
+            },
+          ]),
+        },
+      ]);
+      await expect(restarted.reconcileExistingContainers()).resolves.toEqual({
+        discoveredTaskIds: ["TASK-RETAINED"],
+        ambiguousContainerIds: [],
+        removedTaskIds: [],
+        failedTaskIds: [],
+        retainedTaskIds: ["TASK-RETAINED"],
+      });
+      await expect(restarted.cleanupAll()).resolves.toEqual({
+        removedTaskIds: [],
+        failedTaskIds: [],
+        retainedTaskIds: ["TASK-RETAINED"],
+      });
+
+      jest.clearAllMocks();
+      mockExecFileSequence([{ stdout: "" }]);
+      await expect(restarted.cleanupAll({ includeRetained: true })).resolves.toEqual({
+        removedTaskIds: ["TASK-RETAINED"],
+        failedTaskIds: [],
+      });
+      expect((mockExecFile.mock.calls[0] as MockCallArgs)[1]).toEqual(["rm", "-f", "retained-id"]);
     });
   });
 
@@ -727,7 +952,7 @@ describe("DockerManager", () => {
         { stdout: "" }, // docker rm -f
       ]);
 
-      await manager.createContainer("TASK-012");
+      await manager.createContainer("TASK-012", managedWorktree(projectRoot, "TASK-012"));
       await manager.removeContainer("rm123");
 
       const rmCall = mockExecFile.mock.calls[2] as MockCallArgs;
@@ -820,7 +1045,7 @@ describe("DockerManager", () => {
     test("tracks created containers", async () => {
       mockExecFileSequence([{ stdout: "active123\n" }, { stdout: "" }]);
 
-      await manager.createContainer("TASK-020");
+      await manager.createContainer("TASK-020", managedWorktree(projectRoot, "TASK-020"));
 
       const active = manager.getActiveContainers();
       expect(active).toHaveLength(1);
@@ -847,8 +1072,8 @@ describe("DockerManager", () => {
         { stdout: "" },
       ]);
 
-      await manager.createContainer("TASK-A");
-      await manager.createContainer("TASK-B");
+      await manager.createContainer("TASK-A", managedWorktree(projectRoot, "TASK-A"));
+      await manager.createContainer("TASK-B", managedWorktree(projectRoot, "TASK-B"));
 
       expect(manager.getActiveContainers()).toHaveLength(2);
 
@@ -869,15 +1094,19 @@ describe("DockerManager", () => {
         { stdout: "{}" },
       ]);
 
-      await manager.createContainer("TASK-SURVIVOR");
+      await manager.createContainer("TASK-SURVIVOR", managedWorktree(projectRoot, "TASK-SURVIVOR"));
       const result = await manager.cleanupAll();
 
       expect(result).toEqual({
         removedTaskIds: [],
         failedTaskIds: ["TASK-SURVIVOR"],
       });
-      expect(manager.getActiveContainers()).toEqual([
-        expect.objectContaining({ taskId: "TASK-SURVIVOR", status: "running" }),
+      expect(manager.getTrackedContainers()).toEqual([
+        expect.objectContaining({
+          taskId: "TASK-SURVIVOR",
+          status: "cleanup_pending",
+          cleanupPending: true,
+        }),
       ]);
     });
 
@@ -893,16 +1122,22 @@ describe("DockerManager", () => {
       });
       mockExecFileSequence([{ error: "No such container" }, { error: "No such container" }]);
 
-      await expect(manager.createContainer("TASK-ABORTED-CREATE")).rejects.toThrow(
-        "Failed to create container",
-      );
+      await expect(
+        manager.createContainer(
+          "TASK-ABORTED-CREATE",
+          managedWorktree(projectRoot, "TASK-ABORTED-CREATE"),
+        ),
+      ).rejects.toThrow("Failed to create container");
       expect(await manager.cleanupAll()).toEqual({
         removedTaskIds: [],
         failedTaskIds: ["TASK-ABORTED-CREATE"],
       });
-      await expect(manager.createContainer("TASK-ABORTED-CREATE")).rejects.toThrow(
-        "Container cleanup is unresolved",
-      );
+      await expect(
+        manager.createContainer(
+          "TASK-ABORTED-CREATE",
+          managedWorktree(projectRoot, "TASK-ABORTED-CREATE"),
+        ),
+      ).rejects.toThrow("Container cleanup is unresolved");
     });
 
     test("does not throw when no containers exist", async () => {
@@ -922,9 +1157,9 @@ describe("DockerManager", () => {
     test("createContainer gives clear error when create fails", async () => {
       mockExecFileError("Cannot connect to the Docker daemon");
 
-      await expect(manager.createContainer("TASK-099")).rejects.toThrow(
-        "Failed to create container for TASK-099",
-      );
+      await expect(
+        manager.createContainer("TASK-099", managedWorktree(projectRoot, "TASK-099")),
+      ).rejects.toThrow("Failed to create container for TASK-099");
     });
   });
 
@@ -932,15 +1167,11 @@ describe("DockerManager", () => {
 
   describe("network mode", () => {
     test("uses none network when configured", async () => {
-      const mgr = new DockerManager(
-        "/project/root",
-        defaultConfig({ networkMode: "none" }),
-        stateRoot,
-      );
+      const mgr = new DockerManager(projectRoot, defaultConfig({ networkMode: "none" }), stateRoot);
 
       mockExecFileSequence([{ stdout: "net123\n" }, { stdout: "" }]);
 
-      await mgr.createContainer("TASK-NET");
+      await mgr.createContainer("TASK-NET", managedWorktree(projectRoot, "TASK-NET"));
 
       const createArgs = (mockExecFile.mock.calls[0] as MockCallArgs)[1];
       const netIdx = createArgs.indexOf("--network");

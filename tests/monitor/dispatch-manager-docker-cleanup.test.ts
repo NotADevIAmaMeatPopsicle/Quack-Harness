@@ -1,4 +1,7 @@
 import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 jest.mock("node:child_process", () => ({
   spawn: jest.fn(),
@@ -12,6 +15,7 @@ jest.mock("../../src/dispatcher/docker-cleanup", () => ({
 
 jest.mock("../../src/dispatcher/worktree-lifecycle", () => ({
   removeWorktree: jest.fn(),
+  prepareWorktreeFrontendDeps: jest.fn(),
 }));
 
 import { spawn } from "node:child_process";
@@ -35,42 +39,80 @@ const mockRemoveWorktree = lifecycleRemoveWorktreeMock as jest.MockedFunction<
 >;
 
 describe("DispatchManager docker cleanup integration", () => {
+  let projectRoot: string;
+
   beforeEach(() => {
     jest.clearAllMocks();
+    projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "quack-dispatch-docker-"));
+    fs.mkdirSync(path.join(projectRoot, ".quack", "logs"), { recursive: true });
   });
 
+  afterEach(() => {
+    fs.rmSync(projectRoot, { recursive: true, force: true });
+  });
+
+  function stubWorktrees(mgr: DispatchManager): void {
+    (
+      mgr as unknown as {
+        createWorktree(taskId: string): string;
+      }
+    ).createWorktree = (taskId: string) => {
+      const worktreePath = path.join(projectRoot, ".quack", "worktrees", taskId);
+      fs.mkdirSync(path.join(worktreePath, ".quack", "docker-runtime"), {
+        recursive: true,
+      });
+      return worktreePath;
+    };
+  }
+
+  function fakeContainer(taskId: string, containerId: string) {
+    const worktreePath = path.join(projectRoot, ".quack", "worktrees", taskId);
+    const runtimeLogDir = path.join(worktreePath, ".quack", "docker-runtime", `${taskId}-runtime`);
+    fs.mkdirSync(runtimeLogDir, { recursive: true });
+    return {
+      containerId,
+      containerName: containerId,
+      taskId,
+      image: "fixture",
+      workDir: "/workspace",
+      logsVolume: `/workspace/.quack/docker-runtime/${taskId}-runtime`,
+      worktreePath,
+      runtimeLogDir,
+      gitDir: `/quack-git/worktrees/${taskId}`,
+      startedAt: new Date().toISOString(),
+      status: "running" as const,
+    };
+  }
+
   test("removeWorktree calls docker cleanup by default", () => {
-    const mgr = new DispatchManager("/fake/project", "/fake/bin.js", { method: "worktree" });
+    const mgr = new DispatchManager(projectRoot, "/fake/bin.js", { method: "worktree" });
     const removeWorktree = (mgr as unknown as Record<string, (path: string) => void>)
       .removeWorktree;
-    removeWorktree.call(mgr, "/fake/project/.quack/worktrees/TASK-102");
+    const worktreePath = path.join(projectRoot, ".quack", "worktrees", "TASK-102");
+    removeWorktree.call(mgr, worktreePath);
 
     // Docker cleanup now routes through worktree-lifecycle's removeWorktree
     expect(mockRemoveWorktree).toHaveBeenCalledWith(
-      "/fake/project/.quack/worktrees/TASK-102",
+      worktreePath,
       "TASK-102",
-      "/fake/project",
+      projectRoot,
       true, // dockerCleanup=true by default
     );
     mgr.killAll();
   });
 
   test("removeWorktree skips docker cleanup when isolation.dockerCleanup is false", () => {
-    const mgr = new DispatchManager("/fake/project", "/fake/bin.js", {
+    const mgr = new DispatchManager(projectRoot, "/fake/bin.js", {
       method: "worktree",
       dockerCleanup: false,
     });
     const removeWorktree = (mgr as unknown as Record<string, (path: string) => void>)
       .removeWorktree;
-    removeWorktree.call(mgr, "/fake/project/.quack/worktrees/TASK-102");
+    const worktreePath = path.join(projectRoot, ".quack", "worktrees", "TASK-102");
+    removeWorktree.call(mgr, worktreePath);
 
     // Lifecycle removeWorktree called with dockerCleanup=false
-    expect(mockRemoveWorktree).toHaveBeenCalledWith(
-      "/fake/project/.quack/worktrees/TASK-102",
-      "TASK-102",
-      "/fake/project",
-      false,
-    );
+    expect(mockRemoveWorktree).toHaveBeenCalledWith(worktreePath, "TASK-102", projectRoot, false);
     // The old cleanupWorktreeContainers should not be called directly
     expect(mockCleanupWorktreeContainers).not.toHaveBeenCalled();
     mgr.killAll();
@@ -80,9 +122,9 @@ describe("DispatchManager docker cleanup integration", () => {
     const fakeChild = new FakeChild();
     mockSpawn.mockReturnValue(fakeChild as unknown as ReturnType<typeof spawn>);
 
-    const mgr = new DispatchManager("/fake/project", "/fake/bin.js", { method: "worktree" });
+    const mgr = new DispatchManager(projectRoot, "/fake/bin.js", { method: "worktree" });
     (mgr as unknown as { createWorktree: (taskId: string) => string }).createWorktree = () =>
-      "/fake/project/.quack/worktrees/TASK-102";
+      path.join(projectRoot, ".quack", "worktrees", "TASK-102");
 
     const startWorktree = (
       mgr as unknown as {
@@ -94,31 +136,15 @@ describe("DispatchManager docker cleanup integration", () => {
     fakeChild.emit("exit", 1);
 
     expect(mockCleanupWorktreeContainers).toHaveBeenCalledWith(
-      "/fake/project/.quack/worktrees/TASK-102",
+      path.join(projectRoot, ".quack", "worktrees", "TASK-102"),
       expect.any(Object),
     );
     mgr.killAll();
   });
 
   test("shutdown waits for pending container creation and removes the late container", async () => {
-    let resolveContainer!: (value: {
-      containerId: string;
-      taskId: string;
-      image: string;
-      workDir: string;
-      logsVolume: string;
-      startedAt: string;
-      status: "running";
-    }) => void;
-    const containerCreated = new Promise<{
-      containerId: string;
-      taskId: string;
-      image: string;
-      workDir: string;
-      logsVolume: string;
-      startedAt: string;
-      status: "running";
-    }>((resolve) => {
+    let resolveContainer!: (value: ReturnType<typeof fakeContainer>) => void;
+    const containerCreated = new Promise<ReturnType<typeof fakeContainer>>((resolve) => {
       resolveContainer = resolve;
     });
     const dockerManager = {
@@ -137,7 +163,7 @@ describe("DispatchManager docker cleanup integration", () => {
       abortPendingCommands: jest.fn(),
       cleanupAll: jest.fn().mockResolvedValue({ removedTaskIds: [], failedTaskIds: [] }),
     };
-    const mgr = new DispatchManager("/fake/project", "/fake/bin.js", {
+    const mgr = new DispatchManager(projectRoot, "/fake/bin.js", {
       method: "docker",
       docker: {
         image: "node:20-slim",
@@ -148,6 +174,7 @@ describe("DispatchManager docker cleanup integration", () => {
         cleanupPolicy: "remove",
       },
     });
+    stubWorktrees(mgr);
     (mgr as unknown as { dockerManager: typeof dockerManager }).dockerManager = dockerManager;
 
     const job = mgr.start("TASK-DOCKER-START", { skipGate: true });
@@ -163,15 +190,7 @@ describe("DispatchManager docker cleanup integration", () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(shutdownResolved).toBe(false);
 
-    resolveContainer({
-      containerId: "late-container",
-      taskId: "TASK-DOCKER-START",
-      image: "fixture",
-      workDir: "/workspace",
-      logsVolume: "/workspace/.quack/logs",
-      startedAt: new Date().toISOString(),
-      status: "running",
-    });
+    resolveContainer(fakeContainer("TASK-DOCKER-START", "late-container"));
     const result = await shutdown;
 
     expect(dockerManager.execAgent).not.toHaveBeenCalled();
@@ -198,7 +217,7 @@ describe("DispatchManager docker cleanup integration", () => {
       abortPendingCommands: jest.fn(),
       cleanupAll: jest.fn().mockResolvedValue({ removedTaskIds: [], failedTaskIds: [] }),
     };
-    const mgr = new DispatchManager("/fake/project", "/fake/bin.js", {
+    const mgr = new DispatchManager(projectRoot, "/fake/bin.js", {
       method: "docker",
       docker: {
         image: "node:20-slim",
@@ -209,6 +228,7 @@ describe("DispatchManager docker cleanup integration", () => {
         cleanupPolicy: "remove",
       },
     });
+    stubWorktrees(mgr);
     (mgr as unknown as { dockerManager: typeof dockerManager }).dockerManager = dockerManager;
 
     const job = mgr.start("TASK-NEW", { skipGate: true });
@@ -240,7 +260,7 @@ describe("DispatchManager docker cleanup integration", () => {
           failedTaskIds: ["TASK-LATE"],
         }),
     };
-    const mgr = new DispatchManager("/fake/project", "/fake/bin.js", {
+    const mgr = new DispatchManager(projectRoot, "/fake/bin.js", {
       method: "docker",
       docker: {
         image: "node:20-slim",
@@ -278,15 +298,7 @@ describe("DispatchManager docker cleanup integration", () => {
       }),
       createContainer: jest.fn(async (taskId: string) => {
         if (taskId === "TASK-FIRST") await firstCreate;
-        return {
-          containerId: `${taskId}-container`,
-          taskId,
-          image: "fixture",
-          workDir: "/workspace",
-          logsVolume: "/workspace/.quack/logs",
-          startedAt: new Date().toISOString(),
-          status: "running" as const,
-        };
+        return fakeContainer(taskId, `${taskId}-container`);
       }),
       execAgent: jest.fn().mockReturnValueOnce(children[0]).mockReturnValueOnce(children[1]),
       extractResults: jest.fn().mockResolvedValue({ diff: "", log: "", branch: "" }),
@@ -297,7 +309,7 @@ describe("DispatchManager docker cleanup integration", () => {
       abortPendingCommands: jest.fn(),
       cleanupAll: jest.fn().mockResolvedValue({ removedTaskIds: [], failedTaskIds: [] }),
     };
-    const mgr = new DispatchManager("/fake/project", "/fake/bin.js", {
+    const mgr = new DispatchManager(projectRoot, "/fake/bin.js", {
       method: "docker",
       docker: {
         image: "node:20-slim",
@@ -308,6 +320,7 @@ describe("DispatchManager docker cleanup integration", () => {
         cleanupPolicy: "remove",
       },
     });
+    stubWorktrees(mgr);
     (mgr as unknown as { dockerManager: typeof dockerManager }).dockerManager = dockerManager;
 
     mgr.start("TASK-FIRST", { skipGate: true });
@@ -316,7 +329,10 @@ describe("DispatchManager docker cleanup integration", () => {
 
     expect(dockerManager.reconcileExistingContainers).toHaveBeenCalledTimes(1);
     expect(dockerManager.createContainer).toHaveBeenCalledTimes(1);
-    expect(dockerManager.createContainer).toHaveBeenCalledWith("TASK-FIRST");
+    expect(dockerManager.createContainer).toHaveBeenCalledWith(
+      "TASK-FIRST",
+      path.join(projectRoot, ".quack", "worktrees", "TASK-FIRST"),
+    );
 
     releaseFirstCreate();
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -334,24 +350,8 @@ describe("DispatchManager docker cleanup integration", () => {
   });
 
   test("stop cancels pending container creation before an agent can spawn", async () => {
-    let resolveContainer!: (value: {
-      containerId: string;
-      taskId: string;
-      image: string;
-      workDir: string;
-      logsVolume: string;
-      startedAt: string;
-      status: "running";
-    }) => void;
-    const containerCreated = new Promise<{
-      containerId: string;
-      taskId: string;
-      image: string;
-      workDir: string;
-      logsVolume: string;
-      startedAt: string;
-      status: "running";
-    }>((resolve) => {
+    let resolveContainer!: (value: ReturnType<typeof fakeContainer>) => void;
+    const containerCreated = new Promise<ReturnType<typeof fakeContainer>>((resolve) => {
       resolveContainer = resolve;
     });
     const dockerManager = {
@@ -369,7 +369,7 @@ describe("DispatchManager docker cleanup integration", () => {
       abortPendingCommands: jest.fn(),
       cleanupAll: jest.fn().mockResolvedValue({ removedTaskIds: [], failedTaskIds: [] }),
     };
-    const mgr = new DispatchManager("/fake/project", "/fake/bin.js", {
+    const mgr = new DispatchManager(projectRoot, "/fake/bin.js", {
       method: "docker",
       docker: {
         image: "node:20-slim",
@@ -380,6 +380,7 @@ describe("DispatchManager docker cleanup integration", () => {
         cleanupPolicy: "remove",
       },
     });
+    stubWorktrees(mgr);
     (mgr as unknown as { dockerManager: typeof dockerManager }).dockerManager = dockerManager;
 
     const job = mgr.start("TASK-DOCKER-STOP", { skipGate: true });
@@ -388,15 +389,7 @@ describe("DispatchManager docker cleanup integration", () => {
     expect(job.pid).toBe(0);
     expect(mgr.stop("TASK-DOCKER-STOP")).toBe(true);
 
-    resolveContainer({
-      containerId: "stopped-before-exec",
-      taskId: "TASK-DOCKER-STOP",
-      image: "fixture",
-      workDir: "/workspace",
-      logsVolume: "/workspace/.quack/logs",
-      startedAt: new Date().toISOString(),
-      status: "running",
-    });
+    resolveContainer(fakeContainer("TASK-DOCKER-STOP", "stopped-before-exec"));
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     expect(dockerManager.execAgent).not.toHaveBeenCalled();
@@ -440,7 +433,7 @@ describe("DispatchManager docker cleanup integration", () => {
         failedTaskIds: ["TASK-DOCKER-SURVIVOR"],
       }),
     };
-    const mgr = new DispatchManager("/fake/project", "/fake/bin.js", {
+    const mgr = new DispatchManager(projectRoot, "/fake/bin.js", {
       method: "docker",
       docker: {
         image: "node:20-slim",
@@ -468,15 +461,11 @@ describe("DispatchManager docker cleanup integration", () => {
         removedTaskIds: [],
         failedTaskIds: [],
       }),
-      createContainer: jest.fn().mockResolvedValue({
-        containerId: "created-before-key-failure",
-        taskId: "TASK-DOCKER-STARTUP-FAIL",
-        image: "fixture",
-        workDir: "/workspace",
-        logsVolume: "/workspace/.quack/logs",
-        startedAt: new Date().toISOString(),
-        status: "running" as const,
-      }),
+      createContainer: jest
+        .fn()
+        .mockImplementation(() =>
+          Promise.resolve(fakeContainer("TASK-DOCKER-STARTUP-FAIL", "created-before-key-failure")),
+        ),
       execAgent: jest.fn(),
       forceRemoveContainer: jest.fn().mockResolvedValue(true),
       getActiveContainers: jest.fn().mockReturnValue([]),
@@ -488,7 +477,7 @@ describe("DispatchManager docker cleanup integration", () => {
       getNextKey: jest.fn().mockReturnValue(undefined),
     };
     const mgr = new DispatchManager(
-      "/fake/project",
+      projectRoot,
       "/fake/bin.js",
       {
         method: "docker",
@@ -503,6 +492,7 @@ describe("DispatchManager docker cleanup integration", () => {
       },
       noKeys as never,
     );
+    stubWorktrees(mgr);
     (mgr as unknown as { dockerManager: typeof dockerManager }).dockerManager = dockerManager;
 
     const job = mgr.start("TASK-DOCKER-STARTUP-FAIL", { skipGate: true });
@@ -526,24 +516,12 @@ describe("DispatchManager docker cleanup integration", () => {
       }),
       createContainer: jest
         .fn()
-        .mockResolvedValueOnce({
-          containerId: "rate-limited-container",
-          taskId: "TASK-DOCKER-RETRY",
-          image: "fixture",
-          workDir: "/workspace",
-          logsVolume: "/workspace/.quack/logs",
-          startedAt: new Date().toISOString(),
-          status: "running" as const,
-        })
-        .mockResolvedValueOnce({
-          containerId: "retry-container",
-          taskId: "TASK-DOCKER-RETRY",
-          image: "fixture",
-          workDir: "/workspace",
-          logsVolume: "/workspace/.quack/logs",
-          startedAt: new Date().toISOString(),
-          status: "running" as const,
-        }),
+        .mockImplementationOnce(() =>
+          Promise.resolve(fakeContainer("TASK-DOCKER-RETRY", "rate-limited-container")),
+        )
+        .mockImplementationOnce(() =>
+          Promise.resolve(fakeContainer("TASK-DOCKER-RETRY", "retry-container")),
+        ),
       execAgent: jest.fn().mockReturnValueOnce(firstChild).mockReturnValueOnce(secondChild),
       stopContainer: jest.fn().mockResolvedValue(undefined),
       extractResults: jest.fn().mockResolvedValue({ diff: "", log: "", branch: "" }),
@@ -564,7 +542,7 @@ describe("DispatchManager docker cleanup integration", () => {
       hasAvailableKeys: jest.fn().mockReturnValue(true),
     };
     const mgr = new DispatchManager(
-      "/fake/project",
+      projectRoot,
       "/fake/bin.js",
       {
         method: "docker",
@@ -581,6 +559,7 @@ describe("DispatchManager docker cleanup integration", () => {
       undefined,
       (taskId) => Promise.resolve({ taskId, claimants: [] }),
     );
+    stubWorktrees(mgr);
     (mgr as unknown as { dockerManager: typeof dockerManager }).dockerManager = dockerManager;
 
     mgr.start("TASK-DOCKER-RETRY", { skipGate: true });

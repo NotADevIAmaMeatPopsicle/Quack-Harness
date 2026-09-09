@@ -189,12 +189,14 @@ export class FleetController {
   reconcileWorktreeShutdownSurvivor(
     taskId: string,
     sessionId: string,
+    ownershipId: string,
     reconciliationToken: string,
     processTreeConfirmedStopped: boolean,
   ): boolean {
     return this.dispatchManager.reconcileWorktreeShutdownSurvivor(
       taskId,
       sessionId,
+      ownershipId,
       reconciliationToken,
       processTreeConfirmedStopped,
     );

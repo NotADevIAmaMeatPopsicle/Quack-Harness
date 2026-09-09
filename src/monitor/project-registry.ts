@@ -91,6 +91,16 @@ export class ProjectRegistry {
     }
     this.projects.set(context.id, context);
 
+    const roots = Array.from(this.projects.values(), (project) => project.rootPath);
+    for (const project of this.projects.values()) {
+      const manager = project.dispatchManager as
+        | (DispatchManager & {
+            setDockerRegisteredProjectRoots?: (registeredRoots: readonly string[]) => void;
+          })
+        | null;
+      manager?.setDockerRegisteredProjectRoots?.(roots);
+    }
+
     // Set as active if it's the first project
     if (this.activeProjectId === null) {
       this.activeProjectId = context.id;
@@ -106,6 +116,15 @@ export class ProjectRegistry {
     const context = this.projects.get(id);
     if (!context) return undefined;
     this.projects.delete(id);
+    const roots = Array.from(this.projects.values(), (project) => project.rootPath);
+    for (const project of this.projects.values()) {
+      const manager = project.dispatchManager as
+        | (DispatchManager & {
+            setDockerRegisteredProjectRoots?: (registeredRoots: readonly string[]) => void;
+          })
+        | null;
+      manager?.setDockerRegisteredProjectRoots?.(roots);
+    }
     // Switch active project if we're removing the active one
     if (this.activeProjectId === id) {
       const remaining = [...this.projects.keys()];

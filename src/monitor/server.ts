@@ -1331,12 +1331,62 @@ function resolveTaskRuntimeLogDir(
   taskId: string,
   configuredLogDir?: string,
 ): string {
-  const managedWorktree = dispatchManager?.getJob(taskId)?.worktreePath;
+  const fallback = path.resolve(projectRoot, ".quack", "logs");
+  const configured = configuredLogDir ?? fallback;
+  const safeDockerRuntime = (candidate: string): boolean => {
+    const root = path.resolve(configured, "docker-import");
+    const resolved = path.resolve(candidate);
+    const relative = path.relative(root, resolved);
+    if (!relative || path.isAbsolute(relative) || relative.startsWith(`..${path.sep}`))
+      return false;
+    const pending = [resolved];
+    try {
+      while (pending.length > 0) {
+        const current = pending.pop()!;
+        const stat = fs.lstatSync(current);
+        if (stat.isSymbolicLink()) return false;
+        if (stat.isFile()) {
+          if (stat.nlink !== 1) return false;
+          continue;
+        }
+        if (!stat.isDirectory()) return false;
+        for (const entry of fs.readdirSync(current)) pending.push(path.join(current, entry));
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const job = dispatchManager?.getJob(taskId);
+  if (job?.runtimeLogDir && safeDockerRuntime(job.runtimeLogDir)) return job.runtimeLogDir;
+  // While the Docker child is live (or its output import failed), keep host
+  // control writes in the authoritative monitor tree. Never return the
+  // container-writable worktree subtree to approval/checkpoint writers.
+  if (job?.containerId) return configured;
+  const managedWorktree = job?.worktreePath;
   const conventionalWorktree = path.join(projectRoot, ".quack", "worktrees", taskId);
   const runtimeRoot =
     managedWorktree ?? (fs.existsSync(conventionalWorktree) ? conventionalWorktree : projectRoot);
-  const fallback = path.resolve(projectRoot, ".quack", "logs");
-  const configured = configuredLogDir ?? fallback;
+  const dockerRuntimeRoot = path.join(configured, "docker-import");
+  if (!job?.runtimeLogDir && fs.existsSync(dockerRuntimeRoot)) {
+    try {
+      const candidates = fs
+        .readdirSync(dockerRuntimeRoot, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && entry.name.startsWith(`${taskId}-`))
+        .map((entry) => path.join(dockerRuntimeRoot, entry.name))
+        .filter((candidate) => safeDockerRuntime(candidate))
+        .filter(
+          (candidate) =>
+            fs.existsSync(path.join(candidate, "approvals", `${taskId}.json`)) ||
+            fs.existsSync(path.join(candidate, "approvals", `${taskId}-judge.json`)) ||
+            fs.existsSync(path.join(candidate, `checkpoint-${taskId}.json`)),
+        )
+        .sort((left, right) => fs.statSync(right).mtimeMs - fs.statSync(left).mtimeMs);
+      if (candidates[0]) return candidates[0];
+    } catch {
+      // Fall through to the established configured/worktree lookup.
+    }
+  }
   if (runtimeRoot === projectRoot) return configured;
   const rel = path.relative(projectRoot, configured);
   if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
@@ -8105,16 +8155,18 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         });
       });
 
-      if (adapter.config.isolation?.method === "docker") {
-        if (!context.dispatchManager) throw new Error("Dispatch manager is unavailable");
-        await context.dispatchManager.checkDockerAvailability([
-          ...registry.listProjects().map((project) => project.rootPath),
-          context.rootPath,
-        ]);
-      }
-
-      // Register project
       registry.register(context);
+      try {
+        if (adapter.config.isolation?.method === "docker") {
+          if (!context.dispatchManager) throw new Error("Dispatch manager is unavailable");
+          await context.dispatchManager.checkDockerAvailability(
+            registry.listProjects().map((project) => project.rootPath),
+          );
+        }
+      } catch (error) {
+        registry.unregister(context.id);
+        throw error;
+      }
 
       // Start event watcher
       const stopProjectWatcher = await context.eventReader.watch(

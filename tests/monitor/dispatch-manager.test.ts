@@ -138,7 +138,7 @@ describe("DispatchManager", () => {
 
   test("bounded shutdown confirms a real child exit and preserves its worktree", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shutdown-"));
-    const worktreePath = path.join(tmpDir, "worktree");
+    const worktreePath = path.join(tmpDir, ".quack", "worktrees", "TASK-SHUTDOWN");
     const readyPath = path.join(tmpDir, "child-ready");
     const scriptPath = path.join(tmpDir, "signal-resistant-child.cjs");
     fs.mkdirSync(worktreePath, { recursive: true });
@@ -1284,7 +1284,8 @@ describe("DispatchManager", () => {
         const marker = JSON.parse(
           fs.readFileSync(path.join(logDir, "shared-checkout-pause.json"), "utf-8"),
         ) as { sessionId: string; ownershipId: string; processTreeStatus: string };
-        expect(resumed.sessionId).toBe(oldJob.sessionId);
+        expect(resumed.sessionId).not.toBe(oldJob.sessionId);
+        expect(resumed.sessionId).toMatch(/^quack-TASK-WIN-ABA-[a-f0-9-]+$/);
         expect(marker.ownershipId).not.toBe(oldOwnershipId);
         expect(marker.processTreeStatus).toBe("unconfirmed");
         expect(internals.confirmedWindowsTreeKills.has(oldJob.taskId)).toBe(false);
@@ -1304,6 +1305,8 @@ describe("DispatchManager", () => {
       const scriptPath = path.join(tmpDir, "quick-exit.cjs");
       fs.writeFileSync(scriptPath, "setTimeout(() => process.exit(0), 25);\n", "utf-8");
       const mgr = new DispatchManager(tmpDir, scriptPath);
+      const worktreePath = path.join(tmpDir, ".quack", "worktrees", "TASK-WIN-SESSION");
+      fs.mkdirSync(worktreePath, { recursive: true });
       const internals = mgr as unknown as {
         startWorktree(taskId: string): DispatchJob;
         createWorktree(taskId: string): string;
@@ -1311,13 +1314,13 @@ describe("DispatchManager", () => {
         removeWorktree(worktreePath: string): void;
         confirmedWindowsTreeKills: Map<string, string>;
       };
-      internals.createWorktree = () => tmpDir;
+      internals.createWorktree = () => worktreePath;
       internals.ensureWorktreeAdapterFreshness = () => undefined;
       internals.removeWorktree = jest.fn();
       internals.confirmedWindowsTreeKills.set("TASK-WIN-SESSION", "old-session");
       try {
         const job = internals.startWorktree("TASK-WIN-SESSION");
-        expect(job.worktreePath).toBe(tmpDir);
+        expect(job.worktreePath).toBe(worktreePath);
         expect(internals.confirmedWindowsTreeKills.has("TASK-WIN-SESSION")).toBe(false);
         await waitForCondition(() => job.status !== "running", "isolated Windows fixture exit");
       } finally {
@@ -1510,7 +1513,8 @@ describe("DispatchManager", () => {
           mgr.reconcileWorktreeShutdownSurvivor(
             survivor.taskId,
             survivor.sessionId,
-            "stale-token",
+            "stale-ownership",
+            survivor.reconciliationToken!,
             true,
           ),
         ).toBe(false);
@@ -1518,6 +1522,7 @@ describe("DispatchManager", () => {
           mgr.reconcileWorktreeShutdownSurvivor(
             survivor.taskId,
             survivor.sessionId,
+            survivor.ownershipId!,
             survivor.reconciliationToken!,
             false,
           ),
@@ -1526,6 +1531,7 @@ describe("DispatchManager", () => {
           mgr.reconcileWorktreeShutdownSurvivor(
             survivor.taskId,
             survivor.sessionId,
+            survivor.ownershipId!,
             survivor.reconciliationToken!,
             true,
           ),
@@ -1681,7 +1687,7 @@ describe("DispatchManager", () => {
 
     test("does not refresh projectRoot while another task owns the shared checkout", async () => {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-refresh-"));
-      const isolatedDir = path.join(tmpDir, "isolated-task");
+      const isolatedDir = path.join(tmpDir, ".quack", "worktrees", "TASK-ISOLATED");
       const scriptPath = path.join(tmpDir, "concurrent-children.cjs");
       const isolatedReady = path.join(tmpDir, "isolated-ready");
       const sharedReady = path.join(tmpDir, "shared-ready");
@@ -1748,6 +1754,14 @@ describe("DispatchManager", () => {
         await waitForFile(isolatedReady);
         const shared = mgr.start("TASK-SHARED", { skipGate: true });
         await waitForFile(sharedReady);
+        if (process.platform === "win32") {
+          (
+            mgr as unknown as { confirmedWindowsTreeKills: Map<string, string> }
+          ).confirmedWindowsTreeKills.set(isolated.taskId, isolated.sessionId);
+        }
+        // This test targets the shared-checkout refresh interlock, not the
+        // platform-specific tree attestation exercised by dedicated tests.
+        (mgr as unknown as { clearWorktreeSurvivor(): boolean }).clearWorktreeSurvivor = () => true;
         fs.writeFileSync(releaseIsolated, "release", "utf-8");
         await waitForCondition(() => isolated.status === "completed", "isolated completion");
 

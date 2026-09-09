@@ -313,18 +313,20 @@ export function registerFleetRoutes(app: Express, deps: FleetRouteDeps): void {
       const body = req.body as Record<string, unknown> | undefined;
       if (
         typeof body?.sessionId !== "string" ||
+        typeof body.ownershipId !== "string" ||
         typeof body.reconciliationToken !== "string" ||
         body.processTreeConfirmedStopped !== true
       ) {
         res.status(400).json({
           error:
-            "sessionId, reconciliationToken, and processTreeConfirmedStopped=true are required",
+            "sessionId, ownershipId, reconciliationToken, and processTreeConfirmedStopped=true are required",
         });
         return;
       }
       const reconciled = p.fleetController.reconcileWorktreeShutdownSurvivor(
         req.params.taskId as string,
         body.sessionId,
+        body.ownershipId,
         body.reconciliationToken,
         true,
       );
@@ -384,6 +386,28 @@ export function registerFleetRoutes(app: Express, deps: FleetRouteDeps): void {
       return;
     }
     res.json(p.dispatchManager.getActiveContainers());
+  });
+
+  app.post("/api/fleet/containers/cleanup", async (req: Request, res: Response) => {
+    const p = resolveProject(req);
+    if (!p.dispatchManager) {
+      res.status(500).json({ error: "Dispatch manager not available" });
+      return;
+    }
+    try {
+      const result = await p.dispatchManager.cleanupAllContainers();
+      if (result.failedTaskIds.length > 0) {
+        res.status(409).json({
+          error: "Some Docker containers could not be confirmed removed",
+          ...result,
+        });
+        return;
+      }
+      res.json({ ok: true, ...result });
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : String(error);
+      res.status(409).json({ error: detail });
+    }
   });
 
   // ─── Cost Velocity endpoints ─────────────────────────────────
