@@ -27,9 +27,9 @@
 Repository visibility, anonymous rendering, and security-reporting settings are
 rechecked whenever release or repository settings change.
 
-The fresh-clone validation on 2026-09-06 passed 5,114 tests in 348 suites, with
-9 intentionally skipped tests. Both root and frontend dependency audits
-reported zero known vulnerabilities.
+The fresh-clone validation on 2026-09-10 passed 5,258 tests in 356 suites, with
+10 tests in 2 suites intentionally skipped. Both root and frontend dependency
+audits reported zero known vulnerabilities.
 
 ## Known limitations
 

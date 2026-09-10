@@ -943,7 +943,7 @@ function buildManifest(
     if (sanitized.credentialsRemoved) {
       pushUniqueManualStep(
         manualSteps,
-        "Configure a git credential helper before running the bootstrap command (TASK-903): run `gh auth login` (preferred) or configure Git Credential Manager (Windows) / `git config --global credential.helper store` (Linux). The bootstrap will then clone the private repo via the helper instead of needing a PAT in the URL. The legacy migration script `scripts/admin/migrate-credentials.{sh,ps1}` can move existing PAT-in-URL clones onto the helper without re-cloning.",
+        "Configure a git credential helper with secure storage before running the bootstrap command (TASK-903): run `gh auth login` (preferred) or use an operating-system-backed helper such as Git Credential Manager. The bootstrap will then clone the repository through the helper instead of embedding a PAT in the URL. For an existing clone whose remote URL contains credentials, replace it with the credential-free HTTPS URL and rotate the exposed token before reuse.",
       );
     }
     return {
