@@ -271,6 +271,43 @@ describe("DockerRuntimeBridge", () => {
     ).toMatch(/duplicate Docker session_start/i);
   });
 
+  test("rechecks the event stream size after opening it before allocating", () => {
+    const fixture = createFixture();
+    roots.push(fixture.root);
+    writeSessionStart(fixture.sourceDir, fixture.sessionId);
+    const eventPath = path.join(fixture.sourceDir, `events-${fixture.sessionId}.jsonl`);
+    const maxEventFileBytes = 16 * 1024 * 1024;
+    fs.truncateSync(eventPath, maxEventFileBytes + 1);
+
+    // Simulate growth in the lstat-to-open race window: the path check sees a
+    // file at the limit while fstat on the opened descriptor sees the larger
+    // authoritative size.
+    const mutableFs = jest.requireActual<typeof import("node:fs")>("node:fs");
+    const realLstatSync = mutableFs.lstatSync;
+    const lstatSpy = jest.spyOn(mutableFs, "lstatSync").mockImplementation(((
+      target: fs.PathLike,
+    ) => {
+      const stat = realLstatSync(target);
+      if (path.resolve(String(target)) === path.resolve(eventPath)) {
+        stat.size = maxEventFileBytes;
+      }
+      return stat;
+    }) as typeof fs.lstatSync);
+
+    try {
+      expect(fixture.bridge.pollOnce()).toBe(0);
+      expect(() => fixture.bridge.sealAndImport()).toThrow(/event stream exceeds the size limit/i);
+      expect(
+        fs.readFileSync(
+          path.join(fixture.bridge.archiveDir, "runtime-import-rejections.jsonl"),
+          "utf-8",
+        ),
+      ).toMatch(/event stream exceeds the size limit/i);
+    } finally {
+      lstatSpy.mockRestore();
+    }
+  });
+
   test("rejects malformed approval artifacts atomically", () => {
     const fixture = createFixture();
     roots.push(fixture.root);

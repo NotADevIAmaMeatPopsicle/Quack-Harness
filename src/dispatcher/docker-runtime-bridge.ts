@@ -1696,6 +1696,9 @@ export class DockerRuntimeBridge {
     let chunk: Buffer;
     try {
       const opened = fs.fstatSync(fd);
+      if (opened.size > MAX_EVENT_FILE_BYTES) {
+        throw new Error(`Docker event stream exceeds the size limit: ${fileName}`);
+      }
       if (
         !opened.isFile() ||
         opened.nlink !== 1 ||

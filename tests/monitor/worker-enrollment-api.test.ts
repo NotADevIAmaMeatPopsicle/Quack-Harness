@@ -392,6 +392,7 @@ describe("worker enrollment API", () => {
         expect.stringContaining("Configure a git credential helper"),
       ]),
     );
+    expect(createdBody.manifestPreview.manualSteps.join("\n")).not.toContain("TASK-903");
     expect(createdBody.progressEvents).toEqual([]);
     expect(createdBody.capabilityResults).toEqual([]);
 

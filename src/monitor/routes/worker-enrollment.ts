@@ -943,7 +943,7 @@ function buildManifest(
     if (sanitized.credentialsRemoved) {
       pushUniqueManualStep(
         manualSteps,
-        "Configure a git credential helper with secure storage before running the bootstrap command (TASK-903): run `gh auth login` (preferred) or use an operating-system-backed helper such as Git Credential Manager. The bootstrap will then clone the repository through the helper instead of embedding a PAT in the URL. For an existing clone whose remote URL contains credentials, replace it with the credential-free HTTPS URL and rotate the exposed token before reuse.",
+        "Configure a git credential helper with secure storage before running the bootstrap command: run `gh auth login` (preferred) or use an operating-system-backed helper such as Git Credential Manager. The bootstrap will then clone the repository through the helper instead of embedding a PAT in the URL. For an existing clone whose remote URL contains credentials, replace it with the credential-free HTTPS URL and rotate the exposed token before reuse.",
       );
     }
     return {
