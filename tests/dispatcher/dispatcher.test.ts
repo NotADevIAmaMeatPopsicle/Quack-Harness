@@ -3488,6 +3488,66 @@ describe("dispatchTask", () => {
       expect(mergeEvent!.payload.parentTaskId).toBe("TASK-040");
       expect(mergeEvent!.payload.featureBranch).toBe("quack/TASK-040");
     }, 15000);
+
+    test("Docker host-promotion mode never publishes or merges from the untrusted child", async () => {
+      const adapter = makeAdapter({
+        projectRoot: tmpDir,
+        config: {
+          ...makeAdapter().config,
+          git: {
+            ...makeAdapter().config.git,
+            autoPush: true,
+            autoCreatePr: true,
+            autoMerge: true,
+            autoMergeTarget: "main",
+          },
+        },
+      });
+      mockRunReadinessGate.mockResolvedValue({ outcome: "pass", task: {} as ParsedTask });
+      mockAssembleContext.mockResolvedValue(makeContext());
+      mockRunAgent.mockResolvedValue(makeAgentResult("TASK-042"));
+      mockRunJudge.mockResolvedValue(makeJudgeResult());
+      mockGitResults = {
+        "checkout -b": { stdout: "Switched to branch" },
+        "diff main": { stdout: "diff content" },
+        "rev-parse --verify quack/TASK-040": { error: true, stderr: "unknown revision" },
+        "branch quack/TASK-040 main": { stdout: "" },
+        "push -u origin": { error: true, stderr: "child has no remote" },
+        "fetch origin main": { error: true, stderr: "child has no authoritative remote" },
+      };
+
+      const previousPromotion = process.env.QUACK_DOCKER_HOST_PROMOTION;
+      const previousParent = process.env.QUACK_DOCKER_PARENT_TASK_ID;
+      const previousShared = process.env.QUACK_DOCKER_SHARED_BRANCH;
+      const previousAdmitted = process.env.QUACK_DOCKER_ADMITTED_BRANCH;
+      process.env.QUACK_DOCKER_HOST_PROMOTION = "1";
+      process.env.QUACK_DOCKER_PARENT_TASK_ID = "TASK-040";
+      process.env.QUACK_DOCKER_SHARED_BRANCH = "quack/TASK-040";
+      process.env.QUACK_DOCKER_ADMITTED_BRANCH = "quack/TASK-040";
+      try {
+        const result = await dispatchTask("TASK-042", adapter, {
+          skipGate: true,
+        });
+        if (result.outcome !== "approved") {
+          throw new Error(
+            `Docker host-promotion fixture failed: ${result.error ?? result.outcome}`,
+          );
+        }
+        expect(result.outcome).toBe("approved");
+        expect(result.prUrl).toBeUndefined();
+        expect(result.autoMerged).toBeUndefined();
+        expect(result.error).toBeUndefined();
+      } finally {
+        if (previousPromotion === undefined) delete process.env.QUACK_DOCKER_HOST_PROMOTION;
+        else process.env.QUACK_DOCKER_HOST_PROMOTION = previousPromotion;
+        if (previousParent === undefined) delete process.env.QUACK_DOCKER_PARENT_TASK_ID;
+        else process.env.QUACK_DOCKER_PARENT_TASK_ID = previousParent;
+        if (previousShared === undefined) delete process.env.QUACK_DOCKER_SHARED_BRANCH;
+        else process.env.QUACK_DOCKER_SHARED_BRANCH = previousShared;
+        if (previousAdmitted === undefined) delete process.env.QUACK_DOCKER_ADMITTED_BRANCH;
+        else process.env.QUACK_DOCKER_ADMITTED_BRANCH = previousAdmitted;
+      }
+    }, 15000);
   });
 
   // ─── TASK-076: Fix 2 — content validation: abort on zero commits ──

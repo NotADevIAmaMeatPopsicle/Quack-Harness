@@ -2,14 +2,14 @@
 // Creates pull requests via the `gh` CLI tool. Generates a PR with the
 // task spec, verification results, and judge verdict as context.
 
-import { exec } from "node:child_process";
+import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 import type { ProjectAdapter } from "../core/adapter-loader.js";
 import type { JudgeResult, VerificationResult } from "../core/types.js";
 import { getSyncMap } from "../integrations/github/sync-map.js";
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // ─── Constants ──────────────────────────────────────────────────────
 
@@ -32,6 +32,8 @@ export interface PrCreateInput {
   title: string;
   body: string;
   baseBranch: string;
+  /** Explicit source branch for host-side/Docker publication. */
+  headBranch?: string;
 }
 
 // ─── PR body builder ────────────────────────────────────────────────
@@ -143,23 +145,26 @@ export async function createPullRequest(
 ): Promise<PrCreateResult> {
   const cwd = adapter.projectRoot;
 
-  // Escape the title and body for shell safety
-  const escapedTitle = input.title.replace(/"/g, '\\"');
-  const escapedBody = input.body.replace(/"/g, '\\"');
-
-  const command = [
-    "gh pr create",
-    `--title "${escapedTitle}"`,
-    `--body "${escapedBody}"`,
-    `--base ${input.baseBranch}`,
-  ].join(" ");
-
   try {
-    const { stdout, stderr } = await execAsync(command, {
-      cwd,
-      timeout: GH_TIMEOUT_MS,
-      maxBuffer: MAX_BUFFER,
-    });
+    const { stdout, stderr } = await execFileAsync(
+      "gh",
+      [
+        "pr",
+        "create",
+        "--title",
+        input.title,
+        "--body",
+        input.body,
+        "--base",
+        input.baseBranch,
+        ...(input.headBranch ? ["--head", input.headBranch] : []),
+      ],
+      {
+        cwd,
+        timeout: GH_TIMEOUT_MS,
+        maxBuffer: MAX_BUFFER,
+      },
+    );
 
     // gh pr create outputs the PR URL on stdout
     const prUrl = stdout.trim();
@@ -179,6 +184,46 @@ export async function createPullRequest(
     };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
+    // A remote may accept `gh pr create` and lose the response, or the host
+    // may crash before its publication journal is advanced. Recover only an
+    // unambiguous PR for the exact host-validated head/base pair.
+    if (input.headBranch) {
+      try {
+        const { stdout } = await execFileAsync(
+          "gh",
+          [
+            "pr",
+            "list",
+            "--head",
+            input.headBranch,
+            "--base",
+            input.baseBranch,
+            "--state",
+            "all",
+            "--limit",
+            "2",
+            "--json",
+            "url",
+          ],
+          { cwd, timeout: GH_TIMEOUT_MS, maxBuffer: MAX_BUFFER },
+        );
+        const parsed = JSON.parse(stdout) as unknown;
+        if (
+          Array.isArray(parsed) &&
+          parsed.length === 1 &&
+          typeof parsed[0] === "object" &&
+          parsed[0] !== null &&
+          "url" in parsed[0] &&
+          typeof (parsed[0] as { url?: unknown }).url === "string" &&
+          (parsed[0] as { url: string }).url.startsWith("http")
+        ) {
+          return { success: true, prUrl: (parsed[0] as { url: string }).url };
+        }
+      } catch {
+        // Preserve the original create failure below. Ambiguous or failed
+        // lookups are never treated as successful publication.
+      }
+    }
     return {
       success: false,
       error: `Failed to create PR: ${message}`,

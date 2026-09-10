@@ -1357,6 +1357,13 @@ function resolveTaskRuntimeLogDir(
       return false;
     }
   };
+  const exactDockerPause = dispatchManager?.getDockerPausedRuntimeDir(taskId);
+  if (exactDockerPause) {
+    if (!safeDockerRuntime(exactDockerPause)) {
+      throw new Error(`Docker pause archive for ${taskId} failed the trusted-path check`);
+    }
+    return exactDockerPause;
+  }
   const job = dispatchManager?.getJob(taskId);
   if (job?.runtimeLogDir && safeDockerRuntime(job.runtimeLogDir)) return job.runtimeLogDir;
   // While the Docker child is live (or its output import failed), keep host
@@ -1367,26 +1374,6 @@ function resolveTaskRuntimeLogDir(
   const conventionalWorktree = path.join(projectRoot, ".quack", "worktrees", taskId);
   const runtimeRoot =
     managedWorktree ?? (fs.existsSync(conventionalWorktree) ? conventionalWorktree : projectRoot);
-  const dockerRuntimeRoot = path.join(configured, "docker-import");
-  if (!job?.runtimeLogDir && fs.existsSync(dockerRuntimeRoot)) {
-    try {
-      const candidates = fs
-        .readdirSync(dockerRuntimeRoot, { withFileTypes: true })
-        .filter((entry) => entry.isDirectory() && entry.name.startsWith(`${taskId}-`))
-        .map((entry) => path.join(dockerRuntimeRoot, entry.name))
-        .filter((candidate) => safeDockerRuntime(candidate))
-        .filter(
-          (candidate) =>
-            fs.existsSync(path.join(candidate, "approvals", `${taskId}.json`)) ||
-            fs.existsSync(path.join(candidate, "approvals", `${taskId}-judge.json`)) ||
-            fs.existsSync(path.join(candidate, `checkpoint-${taskId}.json`)),
-        )
-        .sort((left, right) => fs.statSync(right).mtimeMs - fs.statSync(left).mtimeMs);
-      if (candidates[0]) return candidates[0];
-    } catch {
-      // Fall through to the established configured/worktree lookup.
-    }
-  }
   if (runtimeRoot === projectRoot) return configured;
   const rel = path.relative(projectRoot, configured);
   if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
@@ -5415,6 +5402,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         taskId,
         {
           resume: true,
+          dockerResumeStateDir: logDir,
           provenance: startProvenance(req),
           duplicateClaimantCheck: claimantCheck,
         },
@@ -5723,6 +5711,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         taskId,
         {
           resume: true,
+          dockerResumeStateDir: logDir,
           provenance: startProvenance(req),
           duplicateClaimantCheck: claimantCheck,
         },
@@ -5796,6 +5785,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
             judgeFeedback: feedback,
             reuseWorktree: true,
             ...(resuming ? { resume: true } : {}),
+            ...(resuming ? { dockerResumeStateDir: logDir } : {}),
             provenance: startProvenance(req),
             duplicateClaimantCheck: claimantCheck,
           }
@@ -7020,6 +7010,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       : feedback;
     const effectiveExecutionMode = taskExecutionMode ?? adapterExecutionMode;
     let resuming = false;
+    let resumeRuntimeLogDir: string | undefined;
 
     if (effectiveExecutionMode === "loop" && p.projectRoot) {
       const runtimeLogDir = resolveTaskRuntimeLogDir(
@@ -7028,6 +7019,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         taskId,
         p.logDir,
       );
+      resumeRuntimeLogDir = runtimeLogDir;
       const { loadJudgeApproval, deleteJudgeApproval } =
         await import("../dispatcher/judge-approval.js");
       const approval = await loadJudgeApproval(taskId, runtimeLogDir);
@@ -7069,6 +7061,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
           skipGate: true,
           reuseWorktree: true,
           ...(resuming ? { resume: true } : {}),
+          ...(resuming && resumeRuntimeLogDir ? { dockerResumeStateDir: resumeRuntimeLogDir } : {}),
           maxBudget,
           maxTurns,
           federatedJobId,
@@ -7322,12 +7315,18 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     }
 
     const taskId = req.params.id as string;
+    const taskRuntimeLogDir = resolveTaskRuntimeLogDir(
+      p.projectRoot,
+      p.dispatchManager,
+      taskId,
+      resolvedLogDir,
+    );
     const body = req.body as Record<string, unknown> | undefined;
     const sessionId = typeof body?.sessionId === "string" ? body.sessionId : undefined;
 
     // Check for existing checkpoint
     const { CheckpointManager } = await import("../dispatcher/checkpoint-manager.js");
-    const checkpointMgr = new CheckpointManager(resolvedLogDir);
+    const checkpointMgr = new CheckpointManager(taskRuntimeLogDir);
     const checkpoint = await checkpointMgr.load(taskId);
 
     if (!checkpoint && !sessionId) {
@@ -7366,6 +7365,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         {
           skipGate: true,
           resume: true,
+          dockerResumeStateDir: taskRuntimeLogDir,
           provenance: startProvenance(req),
           duplicateClaimantCheck: claimantCheck,
         },

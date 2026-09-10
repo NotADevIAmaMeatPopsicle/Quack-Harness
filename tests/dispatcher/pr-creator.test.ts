@@ -4,7 +4,7 @@ import { promisify } from "node:util";
 import type { ProjectAdapter } from "../../src/core/adapter-loader";
 import type { AdapterConfig } from "../../src/core/types";
 
-// ─── Mock child_process.exec ──────────────────────────────────────────
+// ─── Mock child_process.execFile ──────────────────────────────────────
 
 type MockExecResult = {
   stdout?: string;
@@ -28,9 +28,11 @@ jest.mock("node:child_process", () => {
   const actual = jest.requireActual<typeof import("node:child_process")>("node:child_process");
 
   const customPromisified = (
-    command: string,
+    file: string,
+    args: readonly string[],
     _options: Record<string, unknown>,
   ): Promise<{ stdout: string; stderr: string }> => {
+    const command = [file, ...args].join(" ");
     const matchedResult = findGitResult(command);
     if (!matchedResult) {
       return Promise.resolve({ stdout: "", stderr: "" });
@@ -53,12 +55,12 @@ jest.mock("node:child_process", () => {
     });
   };
 
-  const mockExec = jest.fn();
-  (mockExec as unknown as Record<symbol, unknown>)[promisify.custom] = customPromisified;
+  const mockExecFile = jest.fn();
+  (mockExecFile as unknown as Record<symbol, unknown>)[promisify.custom] = customPromisified;
 
   return {
     ...actual,
-    exec: mockExec,
+    execFile: mockExecFile,
   };
 });
 
@@ -298,6 +300,31 @@ describe("pr-creator", () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toContain("Failed to create PR");
+    });
+
+    test("recovers the one exact existing head/base PR after an ambiguous create failure", async () => {
+      mockGitResults = {
+        "gh pr create": {
+          error: true,
+          stderr: "request completed but response was lost",
+        },
+        "gh pr list": {
+          stdout: JSON.stringify([{ url: "https://github.com/org/repo/pull/42" }]),
+        },
+      };
+
+      const result = await createPullRequest(
+        {
+          taskId: "TASK-042",
+          title: "[TASK-042] Test Task",
+          body: "Test body",
+          baseBranch: "main",
+          headBranch: "quack/TASK-042",
+        },
+        makeAdapter(),
+      );
+
+      expect(result).toEqual({ success: true, prUrl: "https://github.com/org/repo/pull/42" });
     });
   });
 });

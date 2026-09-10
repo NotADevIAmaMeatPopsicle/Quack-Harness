@@ -7,6 +7,11 @@ jest.mock("node:child_process", () => ({
   spawn: jest.fn(),
   execSync: jest.fn(),
   execFile: jest.fn(),
+  execFileSync: jest.fn((_file: string, args: string[]) => {
+    if (args.includes("--show-object-format")) return "sha1\n";
+    if (args.includes("rev-parse")) return `${"a".repeat(40)}\n`;
+    return "";
+  }),
 }));
 
 jest.mock("../../src/dispatcher/docker-cleanup", () => ({
@@ -303,10 +308,12 @@ describe("DispatchManager docker cleanup integration", () => {
         removedTaskIds: [],
         failedTaskIds: [],
       }),
-      createContainer: jest.fn(async (taskId: string) => {
-        if (taskId === "TASK-FIRST") await firstCreate;
-        return fakeContainer(taskId, `${taskId}-container`);
-      }),
+      createContainer: jest.fn(
+        async (taskId: string, _worktreePath: string, _options: Record<string, unknown>) => {
+          if (taskId === "TASK-FIRST") await firstCreate;
+          return fakeContainer(taskId, `${taskId}-container`);
+        },
+      ),
       execAgent: jest.fn().mockReturnValueOnce(children[0]).mockReturnValueOnce(children[1]),
       extractResults: jest.fn().mockResolvedValue({ diff: "", log: "", branch: "" }),
       stopContainer: jest.fn().mockResolvedValue(undefined),
@@ -339,7 +346,15 @@ describe("DispatchManager docker cleanup integration", () => {
     expect(dockerManager.createContainer).toHaveBeenCalledWith(
       "TASK-FIRST",
       path.join(projectRoot, ".quack", "worktrees", "TASK-FIRST"),
+      expect.objectContaining({
+        authoritativeBranch: "quack/TASK-FIRST",
+        authoritativeHead: "a".repeat(40),
+      }),
     );
+    const firstCreateOptions = dockerManager.createContainer.mock.calls[0]?.[2] as
+      | Record<string, unknown>
+      | undefined;
+    expect(String(firstCreateOptions?.eventSessionId)).toMatch(/^quack-TASK-FIRST-/);
 
     releaseFirstCreate();
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -675,6 +690,13 @@ describe("DispatchManager docker cleanup integration", () => {
         createContainer: jest.fn().mockResolvedValue(container),
         execAgent: jest.fn().mockReturnValue(child),
         extractResults: jest.fn().mockResolvedValue({ diff: "", log: "", branch: "" }),
+        sealPrivateGitForResume: jest.fn((_container: unknown, ownershipId: string) => ({
+          authoritativeRef: `refs/heads/quack/${taskId}`,
+          baseHead: "a".repeat(40),
+          candidateHead: "b".repeat(40),
+          sealedRef: `refs/quack/docker-resume/${taskId}/${ownershipId}`,
+        })),
+        releaseSealedResumeRef: jest.fn().mockReturnValue(true),
         stopContainer: jest.fn().mockResolvedValue({ removed: true, retained: false }),
         forceRemoveContainer: jest.fn().mockResolvedValue(true),
         getActiveContainers: jest.fn().mockReturnValue([]),
@@ -706,11 +728,57 @@ describe("DispatchManager docker cleanup integration", () => {
           : path.join("spec-stale", `${taskId}.json`);
       const sourceArtifact = path.join(container.runtimeLogDir, relativeArtifact);
       fs.mkdirSync(path.dirname(sourceArtifact), { recursive: true });
+      fs.appendFileSync(
+        path.join(container.runtimeLogDir, `events-${job.sessionId}.jsonl`),
+        `${JSON.stringify({
+          sessionId: job.sessionId,
+          taskId,
+          project: path.basename(projectRoot),
+          timestamp: new Date().toISOString(),
+          stage: "session_start",
+          payload: {
+            model: "fixture",
+            maxTurns: 10,
+            maxBudget: 1,
+            taskId,
+            federated: false,
+            provenance: { channel: "api-direct", principal: "unattributed-local-start" },
+          },
+        })}\n`,
+        "utf-8",
+      );
+      if (artifact === "blueprint-approval") {
+        fs.writeFileSync(
+          path.join(container.runtimeLogDir, `checkpoint-${taskId}.json`),
+          JSON.stringify({
+            taskId,
+            sessionId: job.sessionId,
+            completedStages: ["gate", "blueprint"],
+            totalCostUsd: 0,
+            retriesUsed: 0,
+            updatedAt: job.startedAt,
+            startedAt: job.startedAt,
+          }),
+          "utf-8",
+        );
+      }
       fs.writeFileSync(
         sourceArtifact,
         JSON.stringify(
           artifact === "blueprint-approval"
-            ? { taskId, state: "pending", createdAt: job.startedAt }
+            ? {
+                taskId,
+                state: "pending",
+                blueprint: {
+                  taskId,
+                  fileAnalyses: [],
+                  codeExamples: [],
+                  verificationPatterns: [],
+                  antiPatterns: [],
+                  preconditions: [],
+                },
+                createdAt: job.startedAt,
+              }
             : {
                 taskId,
                 surface: "blueprint resume",

@@ -104,6 +104,44 @@ import { orchestrateJudgment } from "../judgment/judgment-orchestrator.js";
 import { buildJudgeIntentRequest } from "../judgment/intent-request.js";
 import { createIntentJudgmentRunner } from "../judgment/runner/intent-judgment-runner.js";
 
+function resolveDispatchEventSessionId(taskId: string): string {
+  const assigned = process.env.QUACK_DOCKER_EVENT_SESSION_ID;
+  if (!assigned) return generateSessionId(taskId);
+  const prefix = `quack-${taskId}-`;
+  const ownership = assigned.startsWith(prefix) ? assigned.slice(prefix.length) : "";
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(ownership)
+  ) {
+    throw new Error("Invalid host-assigned Docker event session identity");
+  }
+  return assigned;
+}
+
+function resolveDockerAdmittedBranch(taskId: string, expectedBranch: string): string {
+  const admitted = process.env.QUACK_DOCKER_ADMITTED_BRANCH;
+  const forbidden = new Set(["~", "^", ":", "?", "*", "[", "]", "\\"]);
+  if (
+    !admitted ||
+    admitted !== expectedBranch ||
+    admitted.startsWith("-") ||
+    admitted.startsWith("/") ||
+    admitted.endsWith("/") ||
+    admitted.endsWith(".") ||
+    admitted.endsWith(".lock") ||
+    admitted.includes("..") ||
+    admitted.includes("@{") ||
+    Array.from(admitted).some((character) => {
+      const code = character.charCodeAt(0);
+      return code <= 0x20 || code === 0x7f || forbidden.has(character);
+    })
+  ) {
+    throw new Error(
+      `Invalid host-admitted Docker branch for ${taskId}: received ${JSON.stringify(admitted)}, expected ${JSON.stringify(expectedBranch)}`,
+    );
+  }
+  return admitted;
+}
+
 // ─── Options ────────────────────────────────────────────────────────
 
 export interface DispatchOptions {
@@ -198,6 +236,16 @@ export async function dispatchTask(
   adapter: ProjectAdapter,
   options?: DispatchOptions,
 ): Promise<DispatchResult> {
+  const dockerHostPromotion = process.env.QUACK_DOCKER_HOST_PROMOTION === "1";
+  if (dockerHostPromotion) {
+    const parentTaskId = process.env.QUACK_DOCKER_PARENT_TASK_ID;
+    const sharedBranchName = process.env.QUACK_DOCKER_SHARED_BRANCH;
+    options = {
+      ...(options ?? {}),
+      ...(parentTaskId ? { parentTaskId } : {}),
+      ...(sharedBranchName ? { sharedBranchName } : {}),
+    };
+  }
   const taskDir = path.resolve(adapter.projectRoot, adapter.config.project.taskDir);
   const claimants = await listDuplicateClaimants(taskDir, taskId);
   if (claimants.length > 1) {
@@ -218,7 +266,7 @@ export async function dispatchTask(
   const baseWriter: IEventWriter = options?.disableEvents
     ? createNoOpWriter()
     : new EventWriter({
-        sessionId: generateSessionId(taskId),
+        sessionId: resolveDispatchEventSessionId(taskId),
         taskId,
         project: adapter.config.project.name,
         logDir,
@@ -1436,8 +1484,22 @@ export async function dispatchTask(
         reason: "completed in previous checkpoint",
       });
     }
+    // Docker receives one host-admitted private ref and no authoritative Git
+    // metadata. Do not run ordinary checkout/fetch/delete logic in that child.
+    if (dockerHostPromotion) {
+      const expectedBranch = options?.sharedBranchName ?? buildBranchName(taskId, adapter);
+      branchName = resolveDockerAdmittedBranch(taskId, expectedBranch);
+      if (!completedStages.has("branch")) {
+        await checkpointMgr.markStageComplete(taskId, "branch", { branchName });
+      }
+      events.emit("stage_skipped", {
+        taskId,
+        stage: "branch",
+        reason: "using host-admitted Docker private branch",
+      });
+    }
     // Use shared branch if provided (for subtasks sharing a worktree)
-    if (options?.sharedBranchName) {
+    else if (options?.sharedBranchName) {
       branchName = options.sharedBranchName;
       // Ensure we're on the shared branch and have the latest commits
       // from prior subtasks. This is critical for context continuity:
@@ -3322,7 +3384,7 @@ export async function dispatchTask(
       }
 
       // Sync dispatch completion to GitHub if configured
-      if (adapter.config.integrations?.github?.reportBack) {
+      if (!dockerHostPromotion && adapter.config.integrations?.github?.reportBack) {
         await syncDispatchComplete(taskId, "approved", undefined, adapter.config).catch((err) => {
           // Non-fatal: log but don't block
           console.error(`GitHub sync failed: ${err}`);
@@ -3373,7 +3435,7 @@ export async function dispatchTask(
           strategy: adapter.config.git.autoMergeStrategy ?? "squash",
           mergeCommitSha: result.mergeCommitSha,
         });
-      } else if (adapter.config.git.autoMerge && branchName) {
+      } else if (!dockerHostPromotion && adapter.config.git.autoMerge && branchName) {
         // autoMerge was enabled but merge didn't succeed
         events.emit("auto_merge_failed", {
           taskId,
@@ -4034,6 +4096,23 @@ async function handleApproval(
 ): Promise<DispatchResult> {
   // Determine diff base for content validation
   const diffBase = dispatchBaseBranch ?? featureBranch ?? adapter.config.git.baseBranch;
+
+  // Docker runs use an isolated private gitdir with no authoritative refs,
+  // remotes, config, or hooks. Publishing from that untrusted process would
+  // either fail or require restoring the authority boundary this isolation is
+  // designed to enforce. A successful child therefore stops at a committed,
+  // judged result; the monitor promotes it with an exact old-ref CAS and then
+  // performs configured push/PR/merge actions from the trusted host.
+  if (process.env.QUACK_DOCKER_HOST_PROMOTION === "1") {
+    return {
+      taskId,
+      outcome: "approved",
+      branchName,
+      agentResult,
+      judgeResult,
+      retriesUsed,
+    };
+  }
 
   // Push branch (skip if autoPush is disabled in adapter config)
   if (branchName && adapter.config.git.autoPush !== false) {

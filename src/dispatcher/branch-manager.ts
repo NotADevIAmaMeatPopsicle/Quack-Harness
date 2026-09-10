@@ -851,6 +851,7 @@ export async function mergeBranchToTarget(
   prUrl?: string,
   targetBranchOverride?: string,
   events?: IEventWriter,
+  sourceBranchOverride?: string,
 ): Promise<MergeResult> {
   const cwd = adapter.projectRoot;
   const targetBranch =
@@ -876,7 +877,7 @@ export async function mergeBranchToTarget(
   }
 
   // Fallback: local merge for when there's no PR (autoCreatePr: false)
-  const branchName = buildBranchName(taskId, adapter);
+  const branchName = sourceBranchOverride ?? buildBranchName(taskId, adapter);
 
   // Pattern 36 fix: when dispatching in a worktree, the cwd is the worktree
   // path which can't checkout the target branch (it's checked out in the main
@@ -1093,6 +1094,11 @@ export async function updateTaskFileStatus(
     // and rewriting it, even inside this private worktree.
     const filePath = resolvedSpec.filePath;
     let content = resolvedSpec.content;
+    if (/(\*\*Status:\*\*\s*)COMPLETE\b/.test(content)) {
+      // Idempotent recovery: the remote update may have succeeded before the
+      // Docker publication journal recorded it.
+      return { success: true };
+    }
     const statusRegex = /(\*\*Status:\*\*\s*)(BACKLOG|READY|IN_PROGRESS|VERIFYING)/;
     if (!statusRegex.test(content)) {
       return {

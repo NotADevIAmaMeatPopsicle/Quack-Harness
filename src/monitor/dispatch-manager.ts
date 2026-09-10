@@ -40,6 +40,20 @@ import {
   type DockerContainer,
   type DockerStopResult,
 } from "../dispatcher/docker-manager.js";
+import {
+  DockerRuntimeBridge,
+  inspectValidatedDockerPendingArchive,
+  inspectValidatedDockerResumeArchive,
+  isValidatedDockerResumeArchive,
+  type DockerPausedRuntimeBinding,
+  type DockerResumeSourceBinding,
+} from "../dispatcher/docker-runtime-bridge.js";
+import {
+  clearDockerPublicationRecovery,
+  findDockerPublicationRecovery,
+  readDockerPublicationRecovery,
+  type DockerPublicationJournal,
+} from "../dispatcher/docker-publication-recovery.js";
 import { appendDispatchChildExit } from "./child-exit-log.js";
 import { cleanupWorktreeContainers } from "../dispatcher/docker-cleanup.js";
 import {
@@ -97,6 +111,8 @@ export interface DispatchJob {
   worktreeOwnershipId?: string;
   /** Docker-only trusted host archive imported after the agent exits. */
   runtimeLogDir?: string;
+  /** Durable host-publication journal retained until every required step completes. */
+  publicationRecoveryPath?: string;
   federatedJobId?: string;
   federatedHostId?: string;
   federatedHostAlias?: string;
@@ -173,6 +189,19 @@ interface DurableSharedCheckoutPause {
 interface SharedCheckoutBaseline {
   originalBranch?: string;
   originalStatus?: string;
+}
+
+interface DockerPausedRunPointer {
+  version: 1;
+  taskId: string;
+  archiveName: string;
+  dispatchSessionId: string;
+  ownershipId: string;
+  approvedGate: "blueprint" | "judge";
+  provenance: JobProvenance;
+  parentTaskId?: string;
+  sharedBranchName?: string;
+  recordedAt: string;
 }
 
 const SHARED_CHECKOUT_PAUSE_VERSION = 1;
@@ -253,6 +282,8 @@ export interface StartOptions {
   provenance?: JobProvenance;
   /** Prebuilt async claimant result for the synchronous start seam. */
   duplicateClaimantCheck?: DuplicateClaimantCheck;
+  /** Exact monitor-owned Docker runtime archive to seed for this resume. */
+  dockerResumeStateDir?: string;
 }
 
 export type DispatchEventCallback = (
@@ -376,6 +407,25 @@ function allowedPrefixForBranch(
   return allowedPrefixes.find((prefix) => branch.startsWith(prefix));
 }
 
+function isSafeDockerBranchName(value: string): boolean {
+  const forbidden = new Set(["~", "^", ":", "?", "*", "[", "]", "\\"]);
+  return (
+    value.length > 0 &&
+    value.length <= 500 &&
+    !value.startsWith("-") &&
+    !value.startsWith("/") &&
+    !value.endsWith("/") &&
+    !value.endsWith(".") &&
+    !value.endsWith(".lock") &&
+    !value.includes("..") &&
+    !value.includes("@{") &&
+    !Array.from(value).some((character) => {
+      const code = character.charCodeAt(0);
+      return code <= 0x20 || code === 0x7f || forbidden.has(character);
+    })
+  );
+}
+
 export class DispatchManager {
   private jobs = new Map<string, DispatchJob>();
   private processes = new Map<string, ChildProcess>();
@@ -409,6 +459,10 @@ export class DispatchManager {
 
   /** Where the durable event jsonl files live (QPI-043 exit facts). */
   private readonly logDir: string;
+  /** Trusted adapter identity used to reject container-chosen event projects. */
+  private readonly projectName: string;
+  /** Trusted task branch prefix used to pre-admit a private Docker ref. */
+  private readonly branchPrefix: string;
 
   constructor(
     private readonly projectRoot: string,
@@ -419,6 +473,21 @@ export class DispatchManager {
     private readonly claimantResolver?: (taskId: string) => Promise<DuplicateClaimantCheck>,
   ) {
     this.logDir = logDir ?? path.join(projectRoot, ".quack", "logs");
+    this.projectName = path.basename(path.resolve(projectRoot));
+    this.branchPrefix = "quack/";
+    try {
+      const raw = JSON.parse(
+        fs.readFileSync(path.join(projectRoot, ".quack", "adapter.json"), "utf-8"),
+      ) as unknown;
+      const parsed = AdapterConfigSchema.safeParse(raw);
+      if (parsed.success) {
+        this.projectName = parsed.data.project.name;
+        this.branchPrefix = parsed.data.git.branchPrefix;
+      }
+    } catch {
+      // A missing/invalid adapter will be rejected by the child loader. The
+      // basename remains a deterministic host-known identity for diagnostics.
+    }
     if (isolationConfig?.method === "docker" && isolationConfig.docker) {
       this.dockerManager = new DockerManager(
         projectRoot,
@@ -588,6 +657,26 @@ export class DispatchManager {
         fs.writeFileSync(temporaryPath, `${JSON.stringify(updated, null, 2)}\n`, "utf-8");
         fs.renameSync(temporaryPath, markerPath);
         return true;
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  private hasExactWorktreeOwnership(job: DispatchJob): boolean {
+    if (!job.worktreePath || !job.worktreeOwnershipId) return false;
+    try {
+      return this.withWorktreeMarkerLock(job.taskId, () => {
+        const marker = this.parseWorktreeSurvivor(this.worktreeSurvivorPath(job.taskId));
+        return Boolean(
+          marker &&
+          marker.taskId === job.taskId &&
+          marker.sessionId === job.sessionId &&
+          marker.ownershipId === job.worktreeOwnershipId &&
+          marker.worktreePath === job.worktreePath &&
+          marker.strategy === "docker-container" &&
+          marker.state === "stopping",
+        );
       });
     } catch {
       return false;
@@ -1327,6 +1416,57 @@ export class DispatchManager {
       { kind: "hermes", root: path.join(this.projectRoot, ".hermes-worktrees") },
       { kind: "claude", root: path.join(this.projectRoot, ".claude", "worktrees") },
     ];
+  }
+
+  private prepareDockerAdmittedBranch(
+    taskId: string,
+    worktreePath: string,
+    options?: StartOptions,
+  ): { branch: string; head: string } {
+    if (Boolean(options?.parentTaskId) !== Boolean(options?.sharedBranchName)) {
+      throw new Error(
+        `Docker decomposition for ${taskId} requires paired parentTaskId and sharedBranchName before worktree mutation`,
+      );
+    }
+    if (
+      options?.parentTaskId &&
+      options.sharedBranchName !== `${this.branchPrefix}${options.parentTaskId}`
+    ) {
+      throw new Error(
+        `Docker decomposition for ${taskId} requires the host-derived parent branch ${this.branchPrefix}${options.parentTaskId}`,
+      );
+    }
+    const branch = options?.sharedBranchName ?? `${this.branchPrefix}${taskId}`;
+    if (!isSafeDockerBranchName(branch)) {
+      throw new Error(`Docker dispatch ${taskId} received an unsafe admitted branch name`);
+    }
+    const fullRef = `refs/heads/${branch}`;
+    const git = (cwd: string, args: string[]): string =>
+      execFileSync("git", args, {
+        cwd,
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 15_000,
+      }).trim();
+
+    if (options?.resume || options?.reuseWorktree) {
+      const head = git(this.projectRoot, ["rev-parse", "--verify", fullRef]);
+      return { branch, head };
+    }
+
+    if (options?.sharedBranchName) {
+      const head = git(this.projectRoot, ["rev-parse", "--verify", fullRef]);
+      // Keep the linked worktree detached: only the host-owned ref is
+      // authoritative, while the container receives a same-named private ref.
+      git(worktreePath, ["reset", "--hard", head]);
+      return { branch, head };
+    }
+
+    const head = git(worktreePath, ["rev-parse", "HEAD"]);
+    const objectFormat = git(this.projectRoot, ["rev-parse", "--show-object-format"]);
+    const zero = "0".repeat(objectFormat === "sha256" ? 64 : 40);
+    git(this.projectRoot, ["update-ref", fullRef, head, zero]);
+    return { branch, head };
   }
 
   private readBranchCleanupPolicy(): ResolvedWorktreeCleanupPolicy {
@@ -2144,26 +2284,202 @@ export class DispatchManager {
     );
   }
 
+  private dockerPausePointerPath(taskId: string): string {
+    return path.join(
+      this.logDir,
+      "docker-pauses",
+      `${taskId.replace(/[^A-Za-z0-9._-]/g, "_")}.json`,
+    );
+  }
+
+  private withDockerPausePointerLock<T>(taskId: string, operation: () => T): T {
+    const pointerPath = this.dockerPausePointerPath(taskId);
+    const lockPath = `${pointerPath}.lock`;
+    fs.mkdirSync(path.dirname(pointerPath), { recursive: true });
+    try {
+      fs.writeFileSync(
+        lockPath,
+        `${JSON.stringify({ version: 1, pid: process.pid, acquiredAt: new Date().toISOString() })}\n`,
+        { encoding: "utf-8", flag: "wx" },
+      );
+    } catch (error: unknown) {
+      const code =
+        typeof error === "object" && error !== null && "code" in error
+          ? String((error as { code?: unknown }).code)
+          : "";
+      if (code === "EEXIST") {
+        throw new Error(`Docker pause ownership for ${taskId} is locked or unreconciled`);
+      }
+      throw error;
+    }
+    try {
+      return operation();
+    } finally {
+      try {
+        fs.rmSync(lockPath);
+      } catch {
+        // A retained lock deliberately keeps resume fail-closed.
+      }
+    }
+  }
+
+  private readDockerPausePointer(taskId: string): DockerPausedRunPointer | undefined {
+    const pointerPath = this.dockerPausePointerPath(taskId);
+    try {
+      const parsed = JSON.parse(fs.readFileSync(pointerPath, "utf-8")) as unknown;
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        (parsed as { version?: unknown }).version !== 1 ||
+        (parsed as { taskId?: unknown }).taskId !== taskId ||
+        typeof (parsed as { archiveName?: unknown }).archiveName !== "string" ||
+        path.basename((parsed as { archiveName: string }).archiveName) !==
+          (parsed as { archiveName: string }).archiveName ||
+        typeof (parsed as { dispatchSessionId?: unknown }).dispatchSessionId !== "string" ||
+        typeof (parsed as { ownershipId?: unknown }).ownershipId !== "string" ||
+        !["blueprint", "judge"].includes(
+          String((parsed as { approvedGate?: unknown }).approvedGate),
+        ) ||
+        typeof (parsed as { provenance?: unknown }).provenance !== "object" ||
+        (parsed as { provenance?: unknown }).provenance === null ||
+        Boolean((parsed as { parentTaskId?: unknown }).parentTaskId) !==
+          Boolean((parsed as { sharedBranchName?: unknown }).sharedBranchName) ||
+        ((parsed as { parentTaskId?: unknown }).parentTaskId !== undefined &&
+          typeof (parsed as { parentTaskId?: unknown }).parentTaskId !== "string") ||
+        ((parsed as { sharedBranchName?: unknown }).sharedBranchName !== undefined &&
+          (typeof (parsed as { sharedBranchName?: unknown }).sharedBranchName !== "string" ||
+            !isSafeDockerBranchName(
+              String((parsed as { sharedBranchName?: unknown }).sharedBranchName),
+            ))) ||
+        typeof (parsed as { recordedAt?: unknown }).recordedAt !== "string" ||
+        !Number.isFinite(Date.parse((parsed as { recordedAt: string }).recordedAt))
+      ) {
+        throw new Error("invalid pointer schema");
+      }
+      return parsed as DockerPausedRunPointer;
+    } catch (error: unknown) {
+      const code =
+        typeof error === "object" && error !== null && "code" in error
+          ? String((error as { code?: unknown }).code)
+          : "";
+      if (code === "ENOENT") return undefined;
+      throw new Error(
+        `Docker pause ownership for ${taskId} is unreadable; explicit reconciliation is required`,
+      );
+    }
+  }
+
+  private dockerBindingMatchesPointer(
+    pointer: DockerPausedRunPointer,
+    binding: DockerResumeSourceBinding,
+  ): boolean {
+    return (
+      pointer.archiveName === binding.archiveName &&
+      pointer.dispatchSessionId === binding.dispatchSessionId &&
+      pointer.ownershipId === binding.ownershipId &&
+      pointer.approvedGate === binding.approvedGate &&
+      pointer.parentTaskId === binding.parentTaskId &&
+      pointer.sharedBranchName === binding.sharedBranchName
+    );
+  }
+
+  private writeDockerPausePointer(
+    job: DispatchJob,
+    binding: DockerPausedRuntimeBinding,
+    resumedFrom?: DockerResumeSourceBinding,
+  ): void {
+    if (
+      job.sessionId !== binding.dispatchSessionId ||
+      job.worktreeOwnershipId !== binding.ownershipId ||
+      JSON.stringify(
+        job.provenance ?? {
+          channel: "api-direct",
+          principal: "unattributed-local-start",
+        },
+      ) !== JSON.stringify(binding.provenance)
+    ) {
+      throw new Error(
+        `Docker pause archive does not match the active host ownership for ${job.taskId}`,
+      );
+    }
+    this.withDockerPausePointerLock(job.taskId, () => {
+      const existing = this.readDockerPausePointer(job.taskId);
+      if (
+        existing &&
+        !this.dockerBindingMatchesPointer(existing, binding) &&
+        (!resumedFrom || !this.dockerBindingMatchesPointer(existing, resumedFrom))
+      ) {
+        throw new Error(`Docker pause ownership changed before ${job.taskId} could be recorded`);
+      }
+      const pointer: DockerPausedRunPointer = {
+        version: 1,
+        taskId: job.taskId,
+        archiveName: binding.archiveName,
+        dispatchSessionId: binding.dispatchSessionId,
+        ownershipId: binding.ownershipId,
+        approvedGate: binding.approvedGate,
+        provenance: binding.provenance,
+        ...(binding.parentTaskId ? { parentTaskId: binding.parentTaskId } : {}),
+        ...(binding.sharedBranchName ? { sharedBranchName: binding.sharedBranchName } : {}),
+        recordedAt: new Date().toISOString(),
+      };
+      const pointerPath = this.dockerPausePointerPath(job.taskId);
+      const temporary = `${pointerPath}.${randomUUID()}.tmp`;
+      fs.writeFileSync(temporary, `${JSON.stringify(pointer, null, 2)}\n`, "utf-8");
+      fs.renameSync(temporary, pointerPath);
+    });
+  }
+
+  private clearDockerPausePointer(taskId: string, expected: DockerResumeSourceBinding): boolean {
+    try {
+      return this.withDockerPausePointerLock(taskId, () => {
+        const pointer = this.readDockerPausePointer(taskId);
+        if (!pointer || !this.dockerBindingMatchesPointer(pointer, expected)) return false;
+        fs.rmSync(this.dockerPausePointerPath(taskId));
+        return !fs.existsSync(this.dockerPausePointerPath(taskId));
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  private inspectDockerPausePointer(
+    taskId: string,
+  ):
+    | { logDir: string; binding: DockerPausedRuntimeBinding | DockerResumeSourceBinding }
+    | undefined {
+    const pointer = this.readDockerPausePointer(taskId);
+    if (!pointer) return undefined;
+    const candidate = path.join(this.logDir, "docker-import", pointer.archiveName);
+    if (!this.isSafeDockerRuntimeLogTree(candidate)) {
+      throw new Error(`Docker pause archive for ${taskId} is outside the trusted import tree`);
+    }
+    let binding: DockerPausedRuntimeBinding | DockerResumeSourceBinding;
+    try {
+      binding = inspectValidatedDockerPendingArchive(candidate, taskId);
+    } catch {
+      binding = inspectValidatedDockerResumeArchive(candidate, taskId);
+    }
+    if (!this.dockerBindingMatchesPointer(pointer, binding)) {
+      throw new Error(`Docker pause pointer for ${taskId} does not match its sealed archive`);
+    }
+    return { logDir: candidate, binding };
+  }
+
+  /** Exact monitor-owned runtime archive for approval/read/resume routes. */
+  getDockerPausedRuntimeDir(taskId: string): string | undefined {
+    // In-memory runtimeLogDir may belong to a later failed publication or
+    // retry attempt. Only the CAS-protected pause pointer identifies the
+    // operator-approved archive that is eligible for control writes/resume.
+    return this.inspectDockerPausePointer(taskId)?.logDir;
+  }
+
   private resolvePausedRuntime(taskId: string): {
     logDir: string;
     paused: NonNullable<ReturnType<typeof resolvePausedRunState>>;
   } | null {
-    const candidates = [this.logDir];
-    const dockerRuntimeRoot = path.join(this.logDir, "docker-import");
-    if (fs.existsSync(dockerRuntimeRoot)) {
-      try {
-        candidates.push(
-          ...fs
-            .readdirSync(dockerRuntimeRoot, { withFileTypes: true })
-            .filter((entry) => entry.isDirectory() && entry.name.startsWith(`${taskId}-`))
-            .map((entry) => path.join(dockerRuntimeRoot, entry.name))
-            .sort((left, right) => fs.statSync(right).mtimeMs - fs.statSync(left).mtimeMs),
-        );
-      } catch {
-        // An unreadable runtime root cannot prove a pause; Docker ownership
-        // reconciliation remains the independent admission barrier.
-      }
-    }
+    const exactDockerRuntime = this.inspectDockerPausePointer(taskId)?.logDir;
+    const candidates = [...(exactDockerRuntime ? [exactDockerRuntime] : []), this.logDir];
     for (const runtimeLogDir of candidates) {
       if (runtimeLogDir !== this.logDir && !this.isSafeDockerRuntimeLogTree(runtimeLogDir)) {
         continue;
@@ -2172,6 +2488,152 @@ export class DispatchManager {
       if (paused) return { logDir: runtimeLogDir, paused };
     }
     return null;
+  }
+
+  private resolveDockerResumeRuntime(taskId: string): string | undefined {
+    const selected = this.inspectDockerPausePointer(taskId);
+    if (!selected) return undefined;
+    if (!isValidatedDockerResumeArchive(selected.logDir, taskId)) {
+      throw new Error(`Docker pause for ${taskId} has not received a valid operator decision`);
+    }
+    return selected.logDir;
+  }
+
+  private dockerPublicationRecoveryRoot(): string {
+    return path.join(this.logDir, "docker-publications");
+  }
+
+  private assertPublicationSourceOwnership(journal: DockerPublicationJournal): void {
+    if (!journal.sourceResume) return;
+    const pointer = this.readDockerPausePointer(journal.taskId);
+    if (pointer && !this.dockerBindingMatchesPointer(pointer, journal.sourceResume)) {
+      throw new Error(
+        `Docker publication recovery for ${journal.taskId} no longer owns its exact approval pause`,
+      );
+    }
+  }
+
+  private finalizeDockerPublicationRecovery(
+    job: DispatchJob,
+    recoveryPath: string,
+    journal: DockerPublicationJournal,
+  ): void {
+    this.assertPublicationSourceOwnership(journal);
+    const pointer = journal.sourceResume ? this.readDockerPausePointer(job.taskId) : undefined;
+    if (
+      journal.sourceResume &&
+      pointer &&
+      !this.clearDockerPausePointer(job.taskId, journal.sourceResume)
+    ) {
+      throw new Error("Published Docker result could not release its exact approval pointer");
+    }
+    if (journal.sourceResume && !this.dockerManager?.releaseSealedResumeRef(journal.sourceResume)) {
+      throw new Error("Published Docker result could not release its sealed approval ref");
+    }
+    if (!this.dockerManager?.releaseSealedPublicationRef(journal.gitState)) {
+      throw new Error("Published Docker result could not release its sealed publication ref");
+    }
+    if (!journal.preserveWorktree) {
+      if (
+        fs.existsSync(this.worktreeSurvivorPath(job.taskId)) &&
+        !this.clearWorktreeSurvivor(job, true)
+      ) {
+        throw new Error("Published Docker result could not release its exact worktree ownership");
+      }
+      if (fs.existsSync(journal.worktreePath)) {
+        this.removeWorktree(journal.worktreePath);
+        if (fs.existsSync(journal.worktreePath)) {
+          throw new Error("Published Docker result worktree could not be removed safely");
+        }
+      }
+    } else {
+      job.output.push(
+        "[docker-publish] Worktree retained with the intentionally retained container; explicit cleanup is required.",
+      );
+    }
+    if (!clearDockerPublicationRecovery(recoveryPath, journal.publicationId)) {
+      throw new Error("Completed Docker publication journal could not be cleared");
+    }
+    delete job.publicationRecoveryPath;
+  }
+
+  private startDockerPublicationRecovery(
+    taskId: string,
+    recoveryPath: string,
+    journal: DockerPublicationJournal,
+    options?: StartOptions,
+  ): DispatchJob {
+    if (journal.taskId !== taskId) {
+      throw new Error("Docker publication recovery belongs to a different task");
+    }
+    this.assertPublicationSourceOwnership(journal);
+    if (
+      options?.dockerResumeStateDir &&
+      journal.sourceResume &&
+      path.basename(options.dockerResumeStateDir) !== journal.sourceResume.archiveName
+    ) {
+      throw new Error("Docker publication retry does not match the selected approval archive");
+    }
+    const job: DispatchJob = {
+      taskId,
+      sessionId: journal.worktreeSessionId,
+      pid: 0,
+      startedAt: new Date().toISOString(),
+      status: "running",
+      output: ["[docker-publish] Resuming exact host publication recovery."],
+      worktreePath: journal.worktreePath,
+      worktreeOwnershipId: journal.worktreeOwnershipId,
+      publicationRecoveryPath: recoveryPath,
+      provenance: options?.provenance,
+    };
+    this.jobs.set(taskId, job);
+    void (async () => {
+      try {
+        const { resumeDockerPromotedResult } =
+          await import("../dispatcher/docker-host-publication.js");
+        const publication = await resumeDockerPromotedResult(this.projectRoot, recoveryPath);
+        if (publication.prUrl) job.output.push(`[docker-publish] PR ${publication.prUrl}`);
+        if (publication.autoMerged) {
+          job.output.push(
+            `[docker-publish] auto-merged${publication.mergeCommitSha ? ` ${publication.mergeCommitSha}` : ""}`,
+          );
+        }
+        job.output.push(...publication.warnings.map((warning) => `[docker-publish] ${warning}`));
+        const completed = readDockerPublicationRecovery(recoveryPath);
+        this.finalizeDockerPublicationRecovery(job, recoveryPath, completed);
+        job.status = "completed";
+        job.exitCode = 0;
+      } catch (error: unknown) {
+        job.status = "failed";
+        job.exitCode = 1;
+        job.output.push(
+          `[docker-publish] ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      this.jobs.set(taskId, job);
+    })();
+    return job;
+  }
+
+  private assertDockerResumeSelection(
+    taskId: string,
+    selectedDir: string,
+  ): DockerResumeSourceBinding {
+    const selected = this.inspectDockerPausePointer(taskId);
+    if (!selected) {
+      throw new Error(
+        `Cannot resume Docker dispatch ${taskId}: no exact paused-run ownership exists.`,
+      );
+    }
+    if (
+      path.resolve(selected.logDir) !== path.resolve(selectedDir) ||
+      !isValidatedDockerResumeArchive(selected.logDir, taskId)
+    ) {
+      throw new Error(
+        `Cannot resume Docker dispatch ${taskId}: the selected archive is not the exact approved paused run.`,
+      );
+    }
+    return inspectValidatedDockerResumeArchive(selected.logDir, taskId);
   }
 
   private isSafeDockerRuntimeLogTree(runtimeLogDir: string, worktreePath?: string): boolean {
@@ -2608,6 +3070,12 @@ export class DispatchManager {
     // is gone. Only the explicit override proceeds.
     const pausedRuntime = this.resolvePausedRuntime(taskId);
     const paused = pausedRuntime?.paused;
+    const pausedDockerBinding =
+      pausedRuntime &&
+      this.isSafeDockerRuntimeLogTree(pausedRuntime.logDir) &&
+      path.resolve(pausedRuntime.logDir) !== path.resolve(this.logDir)
+        ? inspectValidatedDockerPendingArchive(pausedRuntime.logDir, taskId)
+        : undefined;
     if (paused && !options?.overridePausedRun) {
       throw new PausedRunRefusalError(taskId, paused);
     }
@@ -2692,12 +3160,63 @@ export class DispatchManager {
             .filter(Boolean)
             .join(", "),
       );
+      if (pausedDockerBinding && !this.clearDockerPausePointer(taskId, pausedDockerBinding)) {
+        throw new Error(
+          `Docker pause for ${taskId} was archived, but its exact ownership pointer could not be released`,
+        );
+      }
+      if (pausedDockerBinding && !this.dockerManager?.releaseSealedResumeRef(pausedDockerBinding)) {
+        console.warn(
+          `[dispatch] ${taskId}: archived pause retained its hidden Docker recovery ref`,
+        );
+      }
+    }
+
+    const publicationRecovery =
+      this.isolationConfig?.method === "docker"
+        ? findDockerPublicationRecovery(this.dockerPublicationRecoveryRoot(), taskId)
+        : undefined;
+    if (publicationRecovery) {
+      if (options?.resume !== true) {
+        throw new Error(
+          `Task ${taskId} has an incomplete Docker host publication. Resume it before starting a new run.`,
+        );
+      }
+      return this.startDockerPublicationRecovery(
+        taskId,
+        publicationRecovery.path,
+        publicationRecovery.journal,
+        options,
+      );
     }
 
     // TASK-1323: no dispatch proceeds without provenance. Callers stamp
     // the real channel; this fallback only marks a path that forgot.
+    const selectedDockerRuntime =
+      options?.resume && this.isolationConfig?.method === "docker"
+        ? (options.dockerResumeStateDir ?? this.resolveDockerResumeRuntime(taskId))
+        : undefined;
+    const selectedDockerBinding = selectedDockerRuntime
+      ? this.assertDockerResumeSelection(taskId, selectedDockerRuntime)
+      : undefined;
+    if (
+      selectedDockerBinding &&
+      ((options?.parentTaskId !== undefined &&
+        options.parentTaskId !== selectedDockerBinding.parentTaskId) ||
+        (options?.sharedBranchName !== undefined &&
+          options.sharedBranchName !== selectedDockerBinding.sharedBranchName))
+    ) {
+      throw new Error(`Cannot resume Docker dispatch ${taskId}: decomposition identity changed.`);
+    }
     const effectiveOptions: StartOptions = {
       ...(options ?? {}),
+      ...(selectedDockerRuntime ? { dockerResumeStateDir: selectedDockerRuntime } : {}),
+      ...(selectedDockerBinding?.parentTaskId
+        ? { parentTaskId: selectedDockerBinding.parentTaskId }
+        : {}),
+      ...(selectedDockerBinding?.sharedBranchName
+        ? { sharedBranchName: selectedDockerBinding.sharedBranchName }
+        : {}),
       provenance: options?.provenance ?? {
         channel: "api-direct",
         principal: "unattributed-local-start",
@@ -2979,6 +3498,11 @@ export class DispatchManager {
           // This capability is injected only for a Docker child. Never let an
           // inherited parent value redirect ordinary worktree control files.
           QUACK_DOCKER_RUNTIME_LOG_DIR: undefined,
+          QUACK_DOCKER_EVENT_SESSION_ID: undefined,
+          QUACK_DOCKER_HOST_PROMOTION: undefined,
+          QUACK_DOCKER_ADMITTED_BRANCH: undefined,
+          QUACK_DOCKER_PARENT_TASK_ID: undefined,
+          QUACK_DOCKER_SHARED_BRANCH: undefined,
           // Clear ANTHROPIC_API_KEY unless the key manager explicitly set one.
           // When absent, the SDK CLI uses the Max subscription's OAuth auth
           // instead of a potentially depleted API key from the parent env.
@@ -3368,8 +3892,13 @@ export class DispatchManager {
   private async finalizeDockerContainer(
     job: DispatchJob,
     container: DockerContainer,
-    options: { failed: boolean; force: boolean },
+    options: { failed: boolean; force: boolean; deferWorktreeRelease?: boolean },
   ): Promise<DockerStopResult> {
+    if (job.worktreePath && !this.updateWorktreeOwnership(job, "stopping", job.pid)) {
+      job.output.push(
+        `[docker-cleanup] Worktree ownership changed before container shutdown; promotion is blocked.`,
+      );
+    }
     let result: DockerStopResult = { removed: false, retained: false };
     try {
       if (options.force) {
@@ -3390,7 +3919,7 @@ export class DispatchManager {
     }
 
     if (result.removed) {
-      if (!this.clearWorktreeSurvivor(job, true)) {
+      if (!options.deferWorktreeRelease && !this.clearWorktreeSurvivor(job, true)) {
         job.output.push(
           `[docker-cleanup] Container ${container.containerId} was removed, but its worktree ownership marker could not be cleared.`,
         );
@@ -3409,6 +3938,31 @@ export class DispatchManager {
   }
 
   private startDocker(taskId: string, options?: StartOptions): DispatchJob {
+    if (Boolean(options?.parentTaskId) !== Boolean(options?.sharedBranchName)) {
+      throw new Error(
+        `Docker decomposition for ${taskId} requires paired parentTaskId and sharedBranchName before admission`,
+      );
+    }
+    if (
+      options?.parentTaskId &&
+      options.sharedBranchName !== `${this.branchPrefix}${options.parentTaskId}`
+    ) {
+      throw new Error(
+        `Docker decomposition for ${taskId} requires the host-derived parent branch ${this.branchPrefix}${options.parentTaskId}`,
+      );
+    }
+    const requestedBranch = options?.sharedBranchName ?? `${this.branchPrefix}${taskId}`;
+    if (!isSafeDockerBranchName(requestedBranch)) {
+      throw new Error(`Docker dispatch ${taskId} received an unsafe admitted branch name`);
+    }
+    if (options?.resume && !options.dockerResumeStateDir) {
+      throw new Error(
+        `Cannot resume Docker dispatch ${taskId}: no exact validated runtime archive was selected.`,
+      );
+    }
+    if (options?.resume && options.dockerResumeStateDir) {
+      this.assertDockerResumeSelection(taskId, options.dockerResumeStateDir);
+    }
     const sessionId = `quack-${taskId}-${randomUUID()}`;
     const expectedWorktreePath = path.join(this.projectRoot, ".quack", "worktrees", taskId);
     const worktreeOwnership = this.acquireWorktreeOwnership(
@@ -3418,6 +3972,7 @@ export class DispatchManager {
     );
     this.pendingWorktreeOwnerships.set(taskId, worktreeOwnership);
     let worktreePath: string | undefined;
+    let admittedBranch: { branch: string; head: string };
     try {
       const shouldReuse = options?.reuseWorktree || options?.resume;
       if (shouldReuse && fs.existsSync(expectedWorktreePath)) {
@@ -3435,6 +3990,7 @@ export class DispatchManager {
           `Docker dispatch ${taskId} requires a task-specific worktree; shared-checkout fallback is disabled`,
         );
       }
+      admittedBranch = this.prepareDockerAdmittedBranch(taskId, worktreePath, options);
     } catch (error) {
       this.clearWorktreeSurvivor(
         {
@@ -3476,6 +4032,7 @@ export class DispatchManager {
     // container while that first admission is still being established.
     const dockerMgr = this.dockerManager!;
     let createdContainer: DockerContainer | undefined;
+    let runtimeBridge: DockerRuntimeBridge | undefined;
     const admittedContainer = this.serializeDockerAdmission(async () => {
       if (this.shutdownInProgress || job.stopRequestedAt) {
         throw new Error(`Cannot start ${taskId}: dispatch manager shutdown is in progress.`);
@@ -3484,7 +4041,14 @@ export class DispatchManager {
       if (this.shutdownInProgress || job.stopRequestedAt) {
         throw new Error(`Cannot start ${taskId}: dispatch manager shutdown is in progress.`);
       }
-      return dockerMgr.createContainer(taskId, worktreePath);
+      return dockerMgr.createContainer(taskId, worktreePath, {
+        eventSessionId: sessionId,
+        authoritativeBranch: admittedBranch.branch,
+        authoritativeHead: admittedBranch.head,
+        ...(options?.parentTaskId ? { parentTaskId: options.parentTaskId } : {}),
+        ...(options?.sharedBranchName ? { sharedBranchName: options.sharedBranchName } : {}),
+        ...(options?.dockerResumeStateDir ? { resumeStateDir: options.dockerResumeStateDir } : {}),
+      });
     });
     const startupPromise = admittedContainer
       .then(async (containerInfo) => {
@@ -3497,6 +4061,25 @@ export class DispatchManager {
         }
         this.pendingWorktreeOwnerships.delete(taskId);
 
+        runtimeBridge = new DockerRuntimeBridge({
+          sourceDir: containerInfo.runtimeLogDir,
+          archiveRoot: path.join(this.logDir, "docker-import"),
+          taskId,
+          dispatchSessionId: sessionId,
+          ownershipId: worktreeOwnership.ownershipId!,
+          startedAt: job.startedAt,
+          provenance: options?.provenance ?? {
+            channel: "api-direct",
+            principal: "unattributed-local-start",
+          },
+          expectedProject: this.projectName,
+          ...(options?.parentTaskId ? { parentTaskId: options.parentTaskId } : {}),
+          ...(options?.sharedBranchName ? { sharedBranchName: options.sharedBranchName } : {}),
+          ...(containerInfo.resumeSource ? { resumeSource: containerInfo.resumeSource } : {}),
+        });
+        job.runtimeLogDir = runtimeBridge.archiveDir;
+        runtimeBridge.start();
+
         // Container creation is asynchronous. A shutdown can begin after
         // startDocker() returns but before the exec child exists; never spawn a
         // late child after the shutdown snapshot has already been taken.
@@ -3506,10 +4089,14 @@ export class DispatchManager {
           const cleanup = await this.finalizeDockerContainer(job, containerInfo, {
             failed: true,
             force: true,
+            deferWorktreeRelease: true,
           });
           if (!cleanup.removed) {
             throw new Error(`Container ${containerInfo.containerId} survived stop cleanup`);
           }
+          runtimeBridge.sealAndImport();
+          runtimeBridge.emitTrustedTerminal({ outcome: "stopped" });
+          this.clearWorktreeSurvivor(job, true);
           return;
         }
 
@@ -3582,7 +4169,11 @@ export class DispatchManager {
 
         let cleanupPromise: Promise<DockerStopResult> | undefined;
         const cleanupOnce = (failed: boolean, force: boolean): Promise<DockerStopResult> => {
-          cleanupPromise ??= this.finalizeDockerContainer(job, containerInfo, { failed, force });
+          cleanupPromise ??= this.finalizeDockerContainer(job, containerInfo, {
+            failed,
+            force,
+            deferWorktreeRelease: true,
+          });
           return cleanupPromise;
         };
 
@@ -3663,14 +4254,6 @@ export class DispatchManager {
                 },
                 job,
               );
-              const results = await dockerMgr
-                .extractResults(containerInfo.containerId)
-                .catch(() => ({ diff: "", log: "", branch: "" }));
-              if (results.diff) {
-                job.output.push(
-                  `[docker-results] branch=${results.branch}, diff=${results.diff.length} bytes`,
-                );
-              }
             } catch (error: unknown) {
               const detail = error instanceof Error ? error.message : String(error);
               job.status = "failed";
@@ -3683,20 +4266,122 @@ export class DispatchManager {
                 try {
                   // A docker-exec child may leave background descendants. Read
                   // its bind tree only after container stop/removal proves no
-                  // untrusted process can race no-follow imports.
-                  job.runtimeLogDir = this.archiveDockerRuntimeLogs(
-                    job,
-                    containerInfo.runtimeLogDir,
-                  );
-                  if (
+                  // untrusted process can race the validating bridge.
+                  job.runtimeLogDir = runtimeBridge!.sealAndImport();
+                  const approvalPending =
                     !stopRequested &&
                     code !== 0 &&
                     !signal &&
-                    this.isApprovalPending(taskId, job.startedAt, job.runtimeLogDir)
-                  ) {
+                    this.isApprovalPending(taskId, job.startedAt, job.runtimeLogDir);
+                  if (approvalPending) {
+                    const gitState = dockerMgr.sealPrivateGitForResume(
+                      containerInfo,
+                      worktreeOwnership.ownershipId!,
+                    );
+                    runtimeBridge!.recordGitResumeState(gitState);
+                    const pending = inspectValidatedDockerPendingArchive(job.runtimeLogDir, taskId);
+                    this.writeDockerPausePointer(job, pending, containerInfo.resumeSource);
+                    if (
+                      containerInfo.resumeSource &&
+                      !dockerMgr.releaseSealedResumeRef(containerInfo.resumeSource)
+                    ) {
+                      job.output.push(
+                        "[docker-resume] Prior sealed Git ref was retained for explicit recovery.",
+                      );
+                    }
                     job.status = "awaiting_approval";
                   }
                   this.classifySpecStaleExit(job, taskId, code, signal ?? null, job.runtimeLogDir);
+                  if (!this.hasExactWorktreeOwnership(job)) {
+                    job.status = "failed";
+                    retry = false;
+                    job.output.push(
+                      "[docker-output] Refused unsafe runtime output: Docker result promotion refused because worktree ownership changed",
+                    );
+                  } else {
+                    const results = await dockerMgr.extractResults(containerInfo);
+                    if (results.diff) {
+                      job.output.push(
+                        `[docker-results] branch=${results.branch}, diff=${results.diff.length} bytes`,
+                      );
+                    }
+                    if (job.status === "completed" && !retry) {
+                      if (
+                        containerInfo.resumeSource?.approvedDiffHash &&
+                        createHash("sha256").update(results.diff, "utf-8").digest("hex") !==
+                          containerInfo.resumeSource.approvedDiffHash
+                      ) {
+                        job.status = "failed";
+                        retry = false;
+                        job.output.push(
+                          "[docker-output] Refused unsafe runtime output: resumed Git result differs from the exact judge-approved diff",
+                        );
+                      }
+                    }
+                    if (job.status === "completed" && !retry) {
+                      const gitState = dockerMgr.sealPrivateGitForPublication(
+                        containerInfo,
+                        worktreeOwnership.ownershipId!,
+                      );
+                      job.publicationRecoveryPath = path.join(
+                        this.dockerPublicationRecoveryRoot(),
+                        `${taskId.replace(/[^A-Za-z0-9._-]/g, "_")}-${worktreeOwnership.ownershipId!}.json`,
+                      );
+                      const { publishDockerPromotedResult } =
+                        await import("../dispatcher/docker-host-publication.js");
+                      const publication = await publishDockerPromotedResult(
+                        taskId,
+                        this.projectRoot,
+                        results.branch,
+                        {
+                          ...(options?.sharedBranchName
+                            ? {
+                                parentTaskId: options.parentTaskId,
+                                sharedBranchName: options.sharedBranchName,
+                              }
+                            : {}),
+                          recovery: {
+                            rootDir: this.dockerPublicationRecoveryRoot(),
+                            publicationId: worktreeOwnership.ownershipId!,
+                            gitState,
+                            worktreePath,
+                            worktreeSessionId: sessionId,
+                            worktreeOwnershipId: worktreeOwnership.ownershipId!,
+                            preserveWorktree: cleanup.retained,
+                            ...(containerInfo.resumeSource
+                              ? { sourceResume: containerInfo.resumeSource }
+                              : {}),
+                          },
+                        },
+                      );
+                      job.publicationRecoveryPath = publication.recoveryPath;
+                      if (publication.prUrl) {
+                        job.output.push(`[docker-publish] PR ${publication.prUrl}`);
+                      }
+                      if (publication.autoMerged) {
+                        job.output.push(
+                          `[docker-publish] auto-merged${publication.mergeCommitSha ? ` ${publication.mergeCommitSha}` : ""}`,
+                        );
+                      }
+                      job.output.push(
+                        ...publication.warnings.map((warning) => `[docker-publish] ${warning}`),
+                      );
+                      if (!publication.recoveryPath) {
+                        job.status = "failed";
+                        retry = false;
+                        job.output.push(
+                          "[docker-output] Refused unsafe runtime output: Docker publication completed without durable recovery identity",
+                        );
+                      } else {
+                        const completed = readDockerPublicationRecovery(publication.recoveryPath);
+                        this.finalizeDockerPublicationRecovery(
+                          job,
+                          publication.recoveryPath,
+                          completed,
+                        );
+                      }
+                    }
+                  }
                 } catch (error: unknown) {
                   const detail = error instanceof Error ? error.message : String(error);
                   job.status = "failed";
@@ -3706,9 +4391,36 @@ export class DispatchManager {
               } else {
                 job.status = "failed";
                 retry = false;
+                runtimeBridge?.abort(
+                  `Container ${containerInfo.containerId} cleanup was not confirmed`,
+                );
               }
               this.captureGitMetadata(job, worktreePath);
-              if (cleanup.removed && job.status === "completed" && !retry && worktreePath) {
+              if (cleanup.removed && !job.publicationRecoveryPath) {
+                this.clearWorktreeSurvivor(job, true);
+              }
+              runtimeBridge?.emitTrustedTerminal({
+                outcome:
+                  job.status === "completed"
+                    ? "approved"
+                    : job.status === "awaiting_approval"
+                      ? "awaiting_approval"
+                      : job.specStale
+                        ? "spec_changed"
+                        : stopRequested
+                          ? "stopped"
+                          : "error",
+                ...(job.status === "failed"
+                  ? { error: job.output.at(-1) ?? "Docker dispatch failed" }
+                  : {}),
+              });
+              if (
+                cleanup.removed &&
+                job.status === "completed" &&
+                !retry &&
+                worktreePath &&
+                fs.existsSync(worktreePath)
+              ) {
                 this.removeWorktree(worktreePath);
               } else if (worktreePath) {
                 job.output.push(
@@ -3757,7 +4469,27 @@ export class DispatchManager {
             );
             job.status = this.shutdownInProgress || job.stopRequestedAt ? "stopped" : "failed";
             const cleanup = await cleanupOnce(true, true);
-            if (cleanup.removed) this.processes.delete(taskId);
+            if (cleanup.removed || cleanup.retained) {
+              try {
+                job.runtimeLogDir = runtimeBridge!.sealAndImport();
+              } catch (error: unknown) {
+                job.output.push(
+                  `[docker-output] Refused unsafe runtime output: ${error instanceof Error ? error.message : String(error)}`,
+                );
+              }
+              runtimeBridge?.emitTrustedTerminal({
+                outcome: job.status === "stopped" ? "stopped" : "error",
+                error: err.message,
+              });
+            } else {
+              runtimeBridge?.abort(
+                `Container ${containerInfo.containerId} cleanup was not confirmed`,
+              );
+            }
+            if (cleanup.removed) {
+              this.processes.delete(taskId);
+              this.clearWorktreeSurvivor(job, true);
+            }
           })();
         });
       })
@@ -3778,8 +4510,25 @@ export class DispatchManager {
             const cleanup = await this.finalizeDockerContainer(job, ownedContainer, {
               failed: true,
               force: true,
+              deferWorktreeRelease: true,
             });
-            if (cleanup.removed) this.processes.delete(taskId);
+            if (cleanup.removed || cleanup.retained) {
+              try {
+                job.runtimeLogDir = runtimeBridge?.sealAndImport() ?? job.runtimeLogDir;
+              } catch (error: unknown) {
+                job.output.push(
+                  `[docker-output] Refused unsafe runtime output: ${error instanceof Error ? error.message : String(error)}`,
+                );
+              }
+            } else {
+              runtimeBridge?.abort(
+                `Container ${ownedContainer.containerId} cleanup was not confirmed`,
+              );
+            }
+            if (cleanup.removed) {
+              this.processes.delete(taskId);
+              this.clearWorktreeSurvivor(job, true);
+            }
           } else {
             this.clearWorktreeSurvivor(job, true);
           }

@@ -4,13 +4,20 @@
 // Provides the same spawn interface as the worktree path so the
 // dispatch manager can branch between isolation methods transparently.
 
-import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { promisify } from "node:util";
+import { inflateSync } from "node:zlib";
 import type { DockerIsolationConfig } from "../core/types.js";
 import { resolvePrepStorageDirSync } from "../core/prep-storage.js";
+import {
+  inspectValidatedDockerResumeArchive,
+  seedDockerResumeState,
+  type DockerResumeGitBinding,
+  type DockerResumeSourceBinding,
+} from "./docker-runtime-bridge.js";
 
 const execFileAsync = promisify(execFile);
 const DOCKER_COMMAND_TIMEOUT_MS = 30_000;
@@ -30,6 +37,89 @@ function isSameOrDescendant(candidate: string, root: string): boolean {
     relative === "" ||
     (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`))
   );
+}
+
+function isSafeGitRef(value: string): boolean {
+  const forbidden = new Set(["~", "^", ":", "?", "*", "[", "]", "\\"]);
+  return (
+    value.length <= 500 &&
+    !value.includes("..") &&
+    !value.includes("\\") &&
+    !value.includes("@{") &&
+    !value.endsWith("/") &&
+    !value.endsWith(".") &&
+    !value.endsWith(".lock") &&
+    !Array.from(value).some((character) => {
+      const code = character.charCodeAt(0);
+      return code <= 0x20 || code === 0x7f || forbidden.has(character);
+    })
+  );
+}
+
+function readTrustedTextFile(filePath: string, maxBytes: number): string {
+  const before = fs.lstatSync(filePath);
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > maxBytes) {
+    throw new Error(`Git metadata has an untrusted identity: ${path.basename(filePath)}`);
+  }
+  const fd = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = fs.fstatSync(fd);
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1 ||
+      opened.size !== before.size ||
+      (before.ino !== 0 && opened.ino !== before.ino) ||
+      (before.dev !== 0 && opened.dev !== before.dev)
+    ) {
+      throw new Error(`Git metadata changed identity: ${path.basename(filePath)}`);
+    }
+    const value = fs.readFileSync(fd, "utf-8");
+    const after = fs.fstatSync(fd);
+    if (
+      after.size !== opened.size ||
+      after.nlink !== 1 ||
+      (opened.ino !== 0 && after.ino !== opened.ino) ||
+      (opened.dev !== 0 && after.dev !== opened.dev)
+    ) {
+      throw new Error(`Git metadata changed while reading: ${path.basename(filePath)}`);
+    }
+    return value;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function readTrustedBinaryFile(filePath: string, maxBytes: number): Buffer {
+  const before = fs.lstatSync(filePath);
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > maxBytes) {
+    throw new Error(`Git object has an untrusted identity: ${path.basename(filePath)}`);
+  }
+  const fd = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = fs.fstatSync(fd);
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1 ||
+      opened.size !== before.size ||
+      (before.ino !== 0 && opened.ino !== before.ino) ||
+      (before.dev !== 0 && opened.dev !== before.dev)
+    ) {
+      throw new Error(`Git object changed identity: ${path.basename(filePath)}`);
+    }
+    const value = fs.readFileSync(fd);
+    const after = fs.fstatSync(fd);
+    if (
+      after.size !== opened.size ||
+      after.nlink !== 1 ||
+      (opened.ino !== 0 && after.ino !== opened.ino) ||
+      (opened.dev !== 0 && after.dev !== opened.dev)
+    ) {
+      throw new Error(`Git object changed while reading: ${path.basename(filePath)}`);
+    }
+    return value;
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 /**
@@ -75,8 +165,25 @@ export interface DockerContainer {
   worktreePath: string;
   /** Fresh per-dispatch output directory inside the disposable worktree. */
   runtimeLogDir: string;
-  /** Task-specific gitdir exposed through the dedicated metadata mount. */
+  /** Container-private gitdir inside the disposable task worktree. */
   gitDir: string;
+  /** Host path for the container-private gitdir. Never authoritative. */
+  privateGitDir?: string;
+  /** Read-only authoritative object store used only as a Git alternate. */
+  gitObjectsDir?: string;
+  /** Read-only .git overlay hiding the authoritative worktree pointer. */
+  dotGitOverlay?: string;
+  /** Exact authoritative ref/head captured before the untrusted run. */
+  authoritativeRef?: string;
+  authoritativeHead?: string;
+  /** Exact authoritative linked-worktree admin directory hidden from Docker. */
+  authoritativeWorktreeGitDir?: string;
+  /** Host-assigned event identity; repository configuration cannot replace it. */
+  eventSessionId?: string;
+  /** Exact sealed archive lineage used to seed this execution attempt. */
+  resumeSource?: DockerResumeSourceBinding;
+  parentTaskId?: string;
+  sharedBranchName?: string;
   startedAt: string;
   status: "creating" | "running" | "stopped" | "cleanup_pending" | "removed";
   /** A cleanup attempt did not prove absence; admission must reconcile it. */
@@ -134,6 +241,17 @@ interface DockerRetentionMarker {
   retainedAt: string;
   stopConfirmed: boolean;
   confirmationToken: string;
+}
+
+interface PrivateGitLayout {
+  hostGitRoot: string;
+  hostObjectsDir: string;
+  hostPrivateGitDir: string;
+  containerGitDir: string;
+  dotGitOverlay: string;
+  authoritativeRef: string;
+  authoritativeHead: string;
+  authoritativeWorktreeGitDir: string;
 }
 
 export interface DockerStopResult {
@@ -339,6 +457,36 @@ export class DockerManager {
     }
   }
 
+  private projectGitOutput(args: string[]): string {
+    return String(
+      execFileSync("git", args, {
+        cwd: this.projectRoot,
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 10_000,
+      }),
+    ).trim();
+  }
+
+  private readSafeCoreGitConfig(
+    key: "core.autocrlf" | "core.eol" | "core.safecrlf",
+    allowed: readonly string[],
+  ): string | undefined {
+    try {
+      const value = this.projectGitOutput(["config", "--get", key]).toLowerCase();
+      return allowed.includes(value) ? value : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private assertSealedResumeRef(binding: DockerResumeSourceBinding): void {
+    const current = this.projectGitOutput(["rev-parse", "--verify", binding.gitState.sealedRef]);
+    if (current !== binding.gitState.candidateHead) {
+      throw new Error("Docker sealed recovery ref changed before resume");
+    }
+  }
+
   private assertReadOnlyBindTreeSafe(source: string, root: string): void {
     const pending = [source];
     let entries = 0;
@@ -396,10 +544,40 @@ export class DockerManager {
     }
   }
 
-  private resolveWorktreeGitDir(worktreePath: string): {
-    hostGitRoot: string;
-    containerGitDir: string;
-  } {
+  private resolveLooseRef(hostGitRoot: string, refName: string): string {
+    if (!refName.startsWith("refs/heads/") || !isSafeGitRef(refName)) {
+      throw new Error("Docker dispatch worktree HEAD is not a safe local branch ref");
+    }
+    const loosePath = path.join(hostGitRoot, ...refName.split("/"));
+    if (fs.existsSync(loosePath)) {
+      const stat = fs.lstatSync(loosePath);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+        throw new Error("Docker dispatch branch ref has an untrusted identity");
+      }
+      const value = fs.readFileSync(loosePath, "utf-8").trim();
+      if (/^[a-f0-9]{40,64}$/i.test(value)) return value;
+    }
+    const packedRefs = path.join(hostGitRoot, "packed-refs");
+    if (fs.existsSync(packedRefs)) {
+      const stat = fs.lstatSync(packedRefs);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+        throw new Error("Docker dispatch packed refs have an untrusted identity");
+      }
+      for (const line of fs.readFileSync(packedRefs, "utf-8").split(/\r?\n/)) {
+        const match = /^([a-f0-9]{40,64})\s+(.+)$/.exec(line);
+        if (match?.[2] === refName) return match[1];
+      }
+    }
+    throw new Error(`Docker dispatch could not resolve authoritative branch ${refName}`);
+  }
+
+  private preparePrivateGit(
+    worktreePath: string,
+    token: string,
+    authoritativeRefOverride?: string,
+    authoritativeHeadOverride?: string,
+    privateHeadOverride?: string,
+  ): PrivateGitLayout {
     const projectGitPath = path.join(this.projectRoot, ".git");
     const projectGitStat = fs.lstatSync(projectGitPath);
     let hostGitRoot: string;
@@ -432,10 +610,140 @@ export class DockerManager {
     if (!isSameOrDescendant(worktreeGitDir, worktreeAdminRoot)) {
       throw new Error("Docker worktree git metadata resolves outside the authoritative repository");
     }
-    const relativeGitDir = path.relative(hostGitRoot, worktreeGitDir).replace(/\\/g, "/");
+    let authoritativeRef: string;
+    let authoritativeHead: string;
+    if (authoritativeRefOverride) {
+      const normalized = authoritativeRefOverride.startsWith("refs/heads/")
+        ? authoritativeRefOverride
+        : `refs/heads/${authoritativeRefOverride}`;
+      if (!isSafeGitRef(normalized) || !normalized.startsWith("refs/heads/")) {
+        throw new Error("Docker dispatch received an invalid admitted task branch");
+      }
+      authoritativeRef = normalized;
+      authoritativeHead = this.resolveLooseRef(hostGitRoot, authoritativeRef);
+      if (
+        authoritativeHeadOverride &&
+        authoritativeHead.toLowerCase() !== authoritativeHeadOverride.toLowerCase()
+      ) {
+        throw new Error("Docker admitted task branch changed before private Git setup");
+      }
+    } else {
+      const headPath = path.join(worktreeGitDir, "HEAD");
+      const headStat = fs.lstatSync(headPath);
+      if (!headStat.isFile() || headStat.isSymbolicLink() || headStat.nlink !== 1) {
+        throw new Error("Docker worktree HEAD has an untrusted identity");
+      }
+      const headValue = fs.readFileSync(headPath, "utf-8").trim();
+      const symbolic = /^ref:\s*(refs\/heads\/.+)$/.exec(headValue);
+      authoritativeRef = symbolic?.[1] ?? "HEAD";
+      authoritativeHead = symbolic ? this.resolveLooseRef(hostGitRoot, symbolic[1]) : headValue;
+    }
+    if (!/^[a-f0-9]{40,64}$/i.test(authoritativeHead)) {
+      throw new Error("Docker worktree HEAD does not resolve to a commit object");
+    }
+    const privateHead = privateHeadOverride ?? authoritativeHead;
+    if (
+      !/^[a-f0-9]{40,64}$/i.test(privateHead) ||
+      privateHead.length !== authoritativeHead.length
+    ) {
+      throw new Error("Docker resume private Git head is invalid");
+    }
+
+    const safeToken = token.replace(/[^A-Za-z0-9._-]/g, "_");
+    // Preserve only Git's inert line-ending normalization knobs. A Windows
+    // checkout made with core.autocrlf=true otherwise appears wholly dirty to
+    // the Linux container's private repository, while copying the host config
+    // itself would re-expose aliases, hooks, remotes, and credential helpers.
+    const autoCrlf = this.readSafeCoreGitConfig("core.autocrlf", ["true", "false", "input"]);
+    const coreEol = this.readSafeCoreGitConfig("core.eol", ["native", "lf", "crlf"]);
+    const safeCrlf = this.readSafeCoreGitConfig("core.safecrlf", ["true", "false", "warn"]);
+    const privateRoot = path.join(worktreePath, ".quack", "docker-git");
+    fs.mkdirSync(privateRoot, { recursive: true });
+    this.assertNoPathAliases(worktreePath, privateRoot, "Docker private Git root");
+    const hostPrivateGitDir = path.join(privateRoot, safeToken);
+    fs.mkdirSync(path.join(hostPrivateGitDir, "objects", "info"), { recursive: true });
+    fs.mkdirSync(path.join(hostPrivateGitDir, "objects", "pack"), { recursive: true });
+    fs.mkdirSync(path.join(hostPrivateGitDir, "refs", "heads"), { recursive: true });
+    fs.mkdirSync(path.join(hostPrivateGitDir, "info"), { recursive: true });
+    fs.writeFileSync(
+      path.join(hostPrivateGitDir, "config"),
+      [
+        "[core]",
+        "\trepositoryformatversion = 0",
+        "\tfilemode = false",
+        "\tbare = false",
+        "\tlogallrefupdates = true",
+        ...(autoCrlf ? [`\tautocrlf = ${autoCrlf}`] : []),
+        ...(coreEol ? [`\teol = ${coreEol}`] : []),
+        ...(safeCrlf ? [`\tsafecrlf = ${safeCrlf}`] : []),
+        "[gc]",
+        "\tauto = 0",
+        "[safe]",
+        "\tdirectory = /workspace",
+        "[user]",
+        "\tname = Quack Docker Worker",
+        "\temail = quack-docker@localhost.invalid",
+        "",
+      ].join("\n"),
+      { encoding: "utf-8", flag: "wx" },
+    );
+    const privateRef =
+      authoritativeRef === "HEAD" ? `refs/heads/quack-private/${safeToken}` : authoritativeRef;
+    const privateRefPath = path.join(hostPrivateGitDir, ...privateRef.split("/"));
+    fs.mkdirSync(path.dirname(privateRefPath), { recursive: true });
+    fs.writeFileSync(path.join(hostPrivateGitDir, "HEAD"), `ref: ${privateRef}\n`, {
+      encoding: "utf-8",
+      flag: "wx",
+    });
+    fs.writeFileSync(privateRefPath, `${privateHead}\n`, {
+      encoding: "utf-8",
+      flag: "wx",
+    });
+    fs.writeFileSync(
+      path.join(hostPrivateGitDir, "objects", "info", "alternates"),
+      "/quack-git-objects\n",
+      { encoding: "utf-8", flag: "wx" },
+    );
+    fs.writeFileSync(
+      path.join(hostPrivateGitDir, "info", "exclude"),
+      ".quack/docker-git/\n.quack/docker-runtime/\n",
+      { encoding: "utf-8", flag: "wx" },
+    );
+
+    const hostObjectsDir = fs.realpathSync.native(path.join(hostGitRoot, "objects"));
+    const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
+    execFileSync(
+      "git",
+      ["--git-dir", hostPrivateGitDir, "--work-tree", worktreePath, "read-tree", privateHead],
+      {
+        cwd: worktreePath,
+        stdio: "ignore",
+        env: {
+          ...process.env,
+          GIT_ALTERNATE_OBJECT_DIRECTORIES: hostObjectsDir,
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_CONFIG_GLOBAL: nullDevice,
+        },
+      },
+    );
+
+    const containerGitDir = path.posix.join("/workspace/.quack/docker-git", safeToken);
+    const overlayRoot = path.join(this.uncertaintyDir, "git-overlays");
+    fs.mkdirSync(overlayRoot, { recursive: true });
+    const dotGitOverlay = path.join(overlayRoot, `${safeToken}.git`);
+    fs.writeFileSync(dotGitOverlay, `gitdir: ${containerGitDir}\n`, {
+      encoding: "utf-8",
+      flag: "wx",
+    });
     return {
       hostGitRoot,
-      containerGitDir: path.posix.join("/quack-git", relativeGitDir),
+      hostObjectsDir,
+      hostPrivateGitDir,
+      containerGitDir,
+      dotGitOverlay,
+      authoritativeRef,
+      authoritativeHead,
+      authoritativeWorktreeGitDir: worktreeGitDir,
     };
   }
 
@@ -1170,8 +1478,24 @@ export class DockerManager {
    * Mounts only a task worktree read-write. Git metadata is mounted separately
    * so commits work, while authoritative policy/prep files stay read-only.
    */
-  async createContainer(taskId: string, worktreePath: string): Promise<DockerContainer> {
+  async createContainer(
+    taskId: string,
+    worktreePath: string,
+    options: {
+      resumeStateDir?: string;
+      eventSessionId?: string;
+      authoritativeBranch?: string;
+      authoritativeHead?: string;
+      parentTaskId?: string;
+      sharedBranchName?: string;
+    } = {},
+  ): Promise<DockerContainer> {
     this.assertSafeLogDir();
+    if (Boolean(options.parentTaskId) !== Boolean(options.sharedBranchName)) {
+      throw new Error(
+        `Docker decomposition for ${taskId} requires paired parentTaskId and sharedBranchName`,
+      );
+    }
     const expectedWorktree = path.resolve(this.projectRoot, ".quack", "worktrees", taskId);
     const resolvedWorktree = path.resolve(worktreePath);
     if (comparablePath(resolvedWorktree) !== comparablePath(expectedWorktree)) {
@@ -1187,7 +1511,6 @@ export class DockerManager {
       throw new Error(`Docker dispatch ${taskId} worktree identity could not be verified`);
     }
     this.assertSafeConfiguredVolumes(realWorktree);
-    const gitMount = this.resolveWorktreeGitDir(realWorktree);
     // Prevent double-create
     const existing = this.containers.get(taskId);
     if (existing && existing.status !== "removed") {
@@ -1195,9 +1518,47 @@ export class DockerManager {
         `Container cleanup is unresolved for ${taskId} (${existing.containerId}, ${existing.status})`,
       );
     }
-
     const containerName = `quack-${taskId}-${randomUUID()}`;
+    const inspectedResumeSource = options.resumeStateDir
+      ? inspectValidatedDockerResumeArchive(options.resumeStateDir, taskId)
+      : undefined;
+    const resumeSource: DockerResumeSourceBinding | undefined = inspectedResumeSource
+      ? {
+          archiveName: inspectedResumeSource.archiveName,
+          dispatchSessionId: inspectedResumeSource.dispatchSessionId,
+          eventSessionId: inspectedResumeSource.eventSessionId,
+          ownershipId: inspectedResumeSource.ownershipId,
+          approvedGate: inspectedResumeSource.approvedGate,
+          gitState: inspectedResumeSource.gitState,
+          ...(inspectedResumeSource.approvedDiffHash
+            ? { approvedDiffHash: inspectedResumeSource.approvedDiffHash }
+            : {}),
+          ...(inspectedResumeSource.parentTaskId
+            ? { parentTaskId: inspectedResumeSource.parentTaskId }
+            : {}),
+          ...(inspectedResumeSource.sharedBranchName
+            ? { sharedBranchName: inspectedResumeSource.sharedBranchName }
+            : {}),
+        }
+      : undefined;
+    if (
+      resumeSource &&
+      (resumeSource.gitState.authoritativeRef !== `refs/heads/${options.authoritativeBranch}` ||
+        resumeSource.gitState.baseHead.toLowerCase() !== options.authoritativeHead?.toLowerCase() ||
+        resumeSource.parentTaskId !== options.parentTaskId ||
+        resumeSource.sharedBranchName !== options.sharedBranchName)
+    ) {
+      throw new Error(`Docker resume archive for ${taskId} does not match the admitted Git ref`);
+    }
+    if (resumeSource) this.assertSealedResumeRef(resumeSource);
     const runtimeLog = this.createRuntimeLogDir(taskId, realWorktree);
+    const gitMount = this.preparePrivateGit(
+      realWorktree,
+      containerName,
+      options.authoritativeBranch,
+      options.authoritativeHead,
+      resumeSource?.gitState.candidateHead,
+    );
     const runtimeLogDir = runtimeLog.hostPath;
     const info: DockerContainer = {
       // Docker commands accept the unique name as well as the eventual ID,
@@ -1212,9 +1573,30 @@ export class DockerManager {
       worktreePath: realWorktree,
       runtimeLogDir,
       gitDir: gitMount.containerGitDir,
+      privateGitDir: gitMount.hostPrivateGitDir,
+      gitObjectsDir: gitMount.hostObjectsDir,
+      dotGitOverlay: gitMount.dotGitOverlay,
+      authoritativeRef: gitMount.authoritativeRef,
+      authoritativeHead: gitMount.authoritativeHead,
+      authoritativeWorktreeGitDir: gitMount.authoritativeWorktreeGitDir,
+      ...(options.eventSessionId ? { eventSessionId: options.eventSessionId } : {}),
+      ...(options.parentTaskId ? { parentTaskId: options.parentTaskId } : {}),
+      ...(options.sharedBranchName ? { sharedBranchName: options.sharedBranchName } : {}),
       startedAt: new Date().toISOString(),
       status: "creating",
     };
+    if (resumeSource) info.resumeSource = resumeSource;
+    if (resumeSource) {
+      const dirty = this.gitOutput(
+        gitMount.hostPrivateGitDir,
+        realWorktree,
+        ["status", "--porcelain", "--untracked-files=all"],
+        gitMount.hostObjectsDir,
+      );
+      if (dirty) {
+        throw new Error(`Docker resume worktree for ${taskId} no longer matches its sealed commit`);
+      }
+    }
     this.containers.set(taskId, info);
     let uncertainty: DockerCreateUncertainty;
     try {
@@ -1236,10 +1618,25 @@ export class DockerManager {
         realWorktree,
         runtimeLogDir,
         runtimeLog.containerPath,
-        gitMount.hostGitRoot,
+        gitMount.hostObjectsDir,
         gitMount.containerGitDir,
+        gitMount.dotGitOverlay,
         containerName,
       );
+      if (options.resumeStateDir) {
+        if (!options.eventSessionId) {
+          throw new Error(`Docker resume for ${taskId} has no host-assigned event session`);
+        }
+        const seeded = seedDockerResumeState(
+          options.resumeStateDir,
+          runtimeLogDir,
+          taskId,
+          options.eventSessionId,
+        );
+        if (JSON.stringify(seeded) !== JSON.stringify(info.resumeSource)) {
+          throw new Error(`Docker resume archive for ${taskId} changed during container setup`);
+        }
+      }
       const { stdout } = await this.runDocker(createArgs);
       const containerId = stdout.trim() || containerName;
       info.containerId = containerId;
@@ -1315,7 +1712,34 @@ export class DockerManager {
         "-e",
         "GIT_WORK_TREE=/workspace",
         "-e",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES=/quack-git-objects",
+        "-e",
+        "GIT_CONFIG_NOSYSTEM=1",
+        "-e",
+        "GIT_CONFIG_GLOBAL=/dev/null",
+        "-e",
+        "GIT_TERMINAL_PROMPT=0",
+        "-e",
+        "GIT_OPTIONAL_LOCKS=0",
+        "-e",
         `QUACK_DOCKER_RUNTIME_LOG_DIR=${tracked.logsVolume}`,
+        ...(tracked.eventSessionId
+          ? ["-e", `QUACK_DOCKER_EVENT_SESSION_ID=${tracked.eventSessionId}`]
+          : []),
+        ...(tracked.authoritativeRef?.startsWith("refs/heads/")
+          ? [
+              "-e",
+              `QUACK_DOCKER_ADMITTED_BRANCH=${tracked.authoritativeRef.slice("refs/heads/".length)}`,
+            ]
+          : []),
+        ...(tracked.parentTaskId
+          ? ["-e", `QUACK_DOCKER_PARENT_TASK_ID=${tracked.parentTaskId}`]
+          : []),
+        ...(tracked.sharedBranchName
+          ? ["-e", `QUACK_DOCKER_SHARED_BRANCH=${tracked.sharedBranchName}`]
+          : []),
+        "-e",
+        "QUACK_DOCKER_HOST_PROMOTION=1",
       );
     }
 
@@ -1481,35 +1905,534 @@ export class DockerManager {
     }
   }
 
-  /**
-   * Extract git results from a container (diff + recent log + current branch).
-   */
-  async extractResults(
-    containerId: string,
-  ): Promise<{ diff: string; log: string; branch: string }> {
-    const tracked = Array.from(this.containers.values()).find(
-      (container) => container.containerId === containerId,
-    );
-    const execPrefix = tracked
-      ? ["exec", "-e", `GIT_DIR=${tracked.gitDir}`, "-e", "GIT_WORK_TREE=/workspace", containerId]
-      : ["exec", containerId];
-    const [diffResult, logResult, branchResult] = await Promise.all([
-      this.runDocker([...execPrefix, "git", "diff", "HEAD"]).catch(() => ({
-        stdout: "",
-      })),
-      this.runDocker([...execPrefix, "git", "log", "--oneline", "-10"]).catch(() => ({
-        stdout: "",
-      })),
-      this.runDocker([...execPrefix, "git", "rev-parse", "--abbrev-ref", "HEAD"]).catch(() => ({
-        stdout: "",
-      })),
-    ]);
+  private gitOutput(
+    gitDir: string,
+    worktreePath: string,
+    args: string[],
+    alternates?: string,
+  ): string {
+    const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
+    return String(
+      execFileSync(
+        "git",
+        [
+          "-c",
+          `core.hooksPath=${nullDevice}`,
+          "-c",
+          "core.fsmonitor=false",
+          "-c",
+          "core.untrackedCache=false",
+          `--git-dir=${gitDir}`,
+          `--work-tree=${worktreePath}`,
+          ...args,
+        ],
+        {
+          cwd: worktreePath,
+          encoding: "utf-8",
+          env: {
+            ...process.env,
+            GIT_ALTERNATE_OBJECT_DIRECTORIES: alternates ?? "",
+            GIT_CONFIG_NOSYSTEM: "1",
+            GIT_CONFIG_GLOBAL: nullDevice,
+            GIT_EXTERNAL_DIFF: "",
+            GIT_PAGER: "cat",
+          },
+        },
+      ),
+    ).trim();
+  }
 
+  private readPrivateHead(container: DockerContainer): string {
+    if (!container.privateGitDir || !container.authoritativeRef) {
+      throw new Error("Docker result metadata is incomplete");
+    }
+    this.assertNoPathAliases(
+      container.worktreePath,
+      container.privateGitDir,
+      "Docker private Git directory",
+    );
+    const headPath = path.join(container.privateGitDir, "HEAD");
+    const head = readTrustedTextFile(headPath, 1_024).trim();
+    const expected = `ref: ${container.authoritativeRef}`;
+    if (head !== expected) {
+      throw new Error("Docker private Git HEAD moved away from the admitted task branch");
+    }
+    const refPath = path.join(container.privateGitDir, ...container.authoritativeRef.split("/"));
+    this.assertNoPathAliases(container.privateGitDir, refPath, "Docker private Git branch ref");
+    const candidate = readTrustedTextFile(refPath, 1_024).trim();
+    if (!/^[a-f0-9]{40,64}$/i.test(candidate)) {
+      throw new Error("Docker private Git result is not a valid commit id");
+    }
+    return candidate;
+  }
+
+  private validateAndCopyPrivateObjects(container: DockerContainer): void {
+    if (!container.privateGitDir || !container.gitObjectsDir) {
+      throw new Error("Docker result object metadata is incomplete");
+    }
+    const privateObjects = path.join(container.privateGitDir, "objects");
+    this.assertNoPathAliases(
+      container.privateGitDir,
+      privateObjects,
+      "Docker private Git object store",
+    );
+    const sourceRoot = fs.realpathSync.native(privateObjects);
+    const targetRoot = fs.realpathSync.native(container.gitObjectsDir);
+    let files = 0;
+    let bytes = 0;
+    for (const prefixEntry of fs.readdirSync(sourceRoot, { withFileTypes: true })) {
+      if (!prefixEntry.isDirectory() || prefixEntry.isSymbolicLink()) {
+        throw new Error(`Docker private Git object entry is not allowlisted: ${prefixEntry.name}`);
+      }
+      if (prefixEntry.name === "info") {
+        const infoPath = path.join(sourceRoot, "info");
+        this.assertNoPathAliases(sourceRoot, infoPath, "Docker private Git object info");
+        const entries = fs.readdirSync(infoPath);
+        if (entries.some((entry) => entry !== "alternates")) {
+          throw new Error("Docker private Git object info contains an untrusted entry");
+        }
+        continue;
+      }
+      if (prefixEntry.name === "pack") {
+        const packPath = path.join(sourceRoot, "pack");
+        this.assertNoPathAliases(sourceRoot, packPath, "Docker private Git pack directory");
+        if (fs.readdirSync(packPath).length > 0) {
+          throw new Error("Docker private Git packed objects are not accepted for promotion");
+        }
+        continue;
+      }
+      if (!/^[a-f0-9]{2}$/i.test(prefixEntry.name)) {
+        throw new Error(`Docker private Git object entry is not allowlisted: ${prefixEntry.name}`);
+      }
+      const prefixPath = path.join(sourceRoot, prefixEntry.name);
+      for (const objectEntry of fs.readdirSync(prefixPath, { withFileTypes: true })) {
+        if (
+          !objectEntry.isFile() ||
+          objectEntry.isSymbolicLink() ||
+          !/^[a-f0-9]{38,62}$/i.test(objectEntry.name)
+        ) {
+          throw new Error("Docker private Git contains an invalid loose object path");
+        }
+        const source = path.join(prefixPath, objectEntry.name);
+        const stat = fs.lstatSync(source);
+        files += 1;
+        bytes += stat.size;
+        if (stat.nlink !== 1 || files > 100_000 || bytes > 512 * 1024 * 1024) {
+          throw new Error("Docker private Git object import exceeds its safety boundary");
+        }
+        const compressed = Buffer.from(readTrustedBinaryFile(source, 128 * 1024 * 1024));
+        const inflated = inflateSync(compressed, { maxOutputLength: 128 * 1024 * 1024 });
+        const nul = inflated.indexOf(0);
+        if (nul <= 0) throw new Error("Docker private Git contains a malformed object");
+        const header = inflated.subarray(0, nul).toString("ascii");
+        const headerMatch = /^(blob|tree|commit|tag) ([0-9]+)$/.exec(header);
+        if (!headerMatch || Number(headerMatch[2]) !== inflated.length - nul - 1) {
+          throw new Error("Docker private Git contains a malformed object header");
+        }
+        const objectId = `${prefixEntry.name}${objectEntry.name}`.toLowerCase();
+        const algorithm = objectId.length === 64 ? "sha256" : "sha1";
+        if (createHash(algorithm).update(inflated).digest("hex") !== objectId) {
+          throw new Error("Docker private Git object content does not match its object id");
+        }
+        const destinationDir = path.join(targetRoot, prefixEntry.name.toLowerCase());
+        const destination = path.join(destinationDir, objectEntry.name.toLowerCase());
+        fs.mkdirSync(destinationDir, { recursive: true });
+        if (!fs.existsSync(destination)) {
+          try {
+            fs.writeFileSync(destination, compressed, { flag: "wx" });
+          } catch (error: unknown) {
+            const code =
+              typeof error === "object" && error !== null && "code" in error
+                ? String((error as { code?: unknown }).code)
+                : "";
+            if (code !== "EEXIST") throw error;
+          }
+        }
+      }
+    }
+  }
+
+  private assertPrivateGitTreeSafe(privateGitDir: string): void {
+    this.assertNoPathAliases(privateGitDir, privateGitDir, "Docker private Git directory");
+    const rootStat = fs.lstatSync(privateGitDir);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+      throw new Error("Docker private Git directory has an untrusted identity");
+    }
+    const pending = [privateGitDir];
+    let entries = 0;
+    while (pending.length > 0) {
+      const current = pending.pop()!;
+      for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+        entries += 1;
+        if (entries > 200_000) {
+          throw new Error("Docker private Git directory exceeds the safe validation limit");
+        }
+        const candidate = path.join(current, entry.name);
+        const stat = fs.lstatSync(candidate);
+        if (entry.isSymbolicLink() || stat.isSymbolicLink()) {
+          throw new Error(`Docker private Git contains an untrusted symlink: ${entry.name}`);
+        }
+        if (entry.isDirectory() && stat.isDirectory()) {
+          pending.push(candidate);
+        } else if (!entry.isFile() || !stat.isFile() || stat.nlink !== 1) {
+          throw new Error(`Docker private Git contains an untrusted entry: ${entry.name}`);
+        }
+      }
+    }
+  }
+
+  private preparePrivateGitForInspection(container: DockerContainer): {
+    candidateHead: string;
+    privateObjects: string;
+  } {
+    if (!container.privateGitDir || !container.gitObjectsDir) {
+      throw new Error("Docker result object metadata is incomplete");
+    }
+    this.assertPrivateGitTreeSafe(container.privateGitDir);
+    const privateConfig = path.join(container.privateGitDir, "config");
+    const autoCrlf = this.readSafeCoreGitConfig("core.autocrlf", ["true", "false", "input"]);
+    const coreEol = this.readSafeCoreGitConfig("core.eol", ["native", "lf", "crlf"]);
+    const safeCrlf = this.readSafeCoreGitConfig("core.safecrlf", ["true", "false", "warn"]);
+    fs.rmSync(privateConfig, { force: true });
+    fs.writeFileSync(
+      privateConfig,
+      [
+        "[core]",
+        "\trepositoryformatversion = 0",
+        "\tfilemode = false",
+        "\tbare = false",
+        ...(autoCrlf ? [`\tautocrlf = ${autoCrlf}`] : []),
+        ...(coreEol ? [`\teol = ${coreEol}`] : []),
+        ...(safeCrlf ? [`\tsafecrlf = ${safeCrlf}`] : []),
+        "[gc]",
+        "\tauto = 0",
+        "",
+      ].join("\n"),
+      { encoding: "utf-8", flag: "wx" },
+    );
+    fs.rmSync(path.join(container.privateGitDir, "objects", "info", "alternates"), {
+      force: true,
+    });
     return {
-      diff: diffResult.stdout,
-      log: logResult.stdout,
-      branch: branchResult.stdout.trim(),
+      candidateHead: this.readPrivateHead(container),
+      privateObjects: path.join(container.privateGitDir, "objects"),
     };
+  }
+
+  private assertAuthoritativeRefUnchanged(container: DockerContainer): void {
+    if (
+      !container.authoritativeWorktreeGitDir ||
+      !container.authoritativeHead ||
+      !container.authoritativeRef
+    ) {
+      throw new Error("Docker result metadata is incomplete");
+    }
+    const currentHead = this.gitOutput(
+      container.authoritativeWorktreeGitDir,
+      container.worktreePath,
+      ["rev-parse", container.authoritativeRef],
+    );
+    if (currentHead !== container.authoritativeHead) {
+      throw new Error("Authoritative task branch changed during Docker dispatch");
+    }
+  }
+
+  private assertPrivateWorktreeClean(
+    container: DockerContainer,
+    candidateHead: string,
+    purpose: "resume" | "pause" | "publication",
+  ): void {
+    if (!container.privateGitDir || !container.gitObjectsDir || !container.authoritativeHead) {
+      throw new Error("Docker result metadata is incomplete");
+    }
+    // Policy names stay protected even when the file did not exist when the
+    // container was created. Otherwise an untrusted run could create a new
+    // verifier/conventions file and smuggle executable policy into the branch
+    // that the trusted host later publishes.
+    const protectedFiles = [
+      ".quack/adapter.json",
+      ".quack/conventions.md",
+      ".quack/judge-criteria.md",
+      ".quack/verify.js",
+    ];
+    for (const relativePath of protectedFiles) {
+      const committedChange = this.gitOutput(
+        container.privateGitDir,
+        container.worktreePath,
+        [
+          "diff",
+          "--name-only",
+          "--no-ext-diff",
+          container.authoritativeHead,
+          candidateHead,
+          "--",
+          relativePath,
+        ],
+        container.gitObjectsDir,
+      );
+      if (committedChange) {
+        throw new Error(`Docker ${purpose} changed protected policy ${relativePath}`);
+      }
+    }
+
+    const porcelain = this.gitOutput(
+      container.privateGitDir,
+      container.worktreePath,
+      ["status", "--porcelain", "--untracked-files=all"],
+      container.gitObjectsDir,
+    );
+    const unsafe = porcelain
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .filter((line) => {
+        // gitOutput trims the complete command output, which removes the
+        // leading status-space from the first unstaged-only porcelain row.
+        const pathOffset = line.length > 2 && line[2] === " " ? 3 : 2;
+        const relativePath = line.slice(pathOffset).replace(/\\/g, "/");
+        // These paths are overlaid read-only from host-owned sources while
+        // Docker runs. Linux may refresh the private index against the
+        // overlay's LF representation while the Windows worktree retains
+        // CRLF. Their candidate blobs were compared above, so such working
+        // tree-only differences cannot enter the promoted commit.
+        return (
+          !protectedFiles.includes(relativePath) &&
+          relativePath !== ".quack/prep" &&
+          !relativePath.startsWith(".quack/prep/")
+        );
+      });
+    if (unsafe.length > 0) {
+      throw new Error(
+        `Docker ${purpose} has uncommitted files and cannot be accepted safely: ${unsafe
+          .slice(0, 20)
+          .join("\n")}`,
+      );
+    }
+  }
+
+  /**
+   * Preserve one stopped private result for an approval resume without
+   * publishing it. Objects are content-address verified, then a host-created
+   * hidden ref prevents GC until the exact paused-run pointer is consumed.
+   */
+  sealPrivateGitForResume(container: DockerContainer, ownershipId: string): DockerResumeGitBinding {
+    if (
+      container.status === "creating" ||
+      container.status === "running" ||
+      !container.privateGitDir ||
+      !container.gitObjectsDir ||
+      !container.authoritativeHead ||
+      !container.authoritativeRef ||
+      !container.authoritativeWorktreeGitDir
+    ) {
+      throw new Error("Docker private Git cannot be sealed before container exit is confirmed");
+    }
+    if (!/^[0-9a-f-]{36}$/i.test(ownershipId)) {
+      throw new Error("Docker private Git resume ownership is invalid");
+    }
+    const { candidateHead, privateObjects } = this.preparePrivateGitForInspection(container);
+    this.assertPrivateWorktreeClean(container, candidateHead, "pause");
+    this.assertAuthoritativeRefUnchanged(container);
+    this.gitOutput(
+      container.authoritativeWorktreeGitDir,
+      container.worktreePath,
+      ["merge-base", "--is-ancestor", container.authoritativeHead, candidateHead],
+      privateObjects,
+    );
+    this.validateAndCopyPrivateObjects(container);
+    const safeTask = container.taskId.replace(/[^A-Za-z0-9._-]/g, "_");
+    const sealedRef = `refs/quack/docker-resume/${safeTask}/${ownershipId}`;
+    const zero = "0".repeat(candidateHead.length);
+    this.gitOutput(container.authoritativeWorktreeGitDir, container.worktreePath, [
+      "update-ref",
+      sealedRef,
+      candidateHead,
+      zero,
+    ]);
+    return {
+      authoritativeRef: container.authoritativeRef,
+      baseHead: container.authoritativeHead,
+      candidateHead,
+      sealedRef,
+    };
+  }
+
+  /**
+   * Copy and pin a completed container's candidate commit before any host-side
+   * publication effect. The publication ref is durable recovery evidence: it
+   * survives a push/PR/merge failure and is released only after every required
+   * publication step is confirmed.
+   */
+  sealPrivateGitForPublication(
+    container: DockerContainer,
+    ownershipId: string,
+  ): DockerResumeGitBinding {
+    if (
+      container.status === "creating" ||
+      container.status === "running" ||
+      !container.privateGitDir ||
+      !container.gitObjectsDir ||
+      !container.authoritativeHead ||
+      !container.authoritativeRef ||
+      !container.authoritativeWorktreeGitDir
+    ) {
+      throw new Error("Docker private Git cannot be sealed before container exit is confirmed");
+    }
+    if (!/^[0-9a-f-]{36}$/i.test(ownershipId)) {
+      throw new Error("Docker publication ownership is invalid");
+    }
+    const { candidateHead, privateObjects } = this.preparePrivateGitForInspection(container);
+    this.assertPrivateWorktreeClean(container, candidateHead, "publication");
+    if (candidateHead === container.authoritativeHead) {
+      throw new Error("Docker result has no committed change to publish");
+    }
+    this.assertAuthoritativeRefUnchanged(container);
+    this.gitOutput(
+      container.authoritativeWorktreeGitDir,
+      container.worktreePath,
+      ["merge-base", "--is-ancestor", container.authoritativeHead, candidateHead],
+      privateObjects,
+    );
+    this.validateAndCopyPrivateObjects(container);
+    const safeTask = container.taskId.replace(/[^A-Za-z0-9._-]/g, "_");
+    const sealedRef = `refs/quack/docker-publication/${safeTask}/${ownershipId}`;
+    const zero = "0".repeat(candidateHead.length);
+    this.gitOutput(container.authoritativeWorktreeGitDir, container.worktreePath, [
+      "update-ref",
+      sealedRef,
+      candidateHead,
+      zero,
+    ]);
+    return {
+      authoritativeRef: container.authoritativeRef,
+      baseHead: container.authoritativeHead,
+      candidateHead,
+      sealedRef,
+    };
+  }
+
+  releaseSealedResumeRef(binding: DockerResumeSourceBinding): boolean {
+    return this.releaseSealedGitRef(binding.gitState);
+  }
+
+  releaseSealedPublicationRef(binding: DockerResumeGitBinding): boolean {
+    return this.releaseSealedGitRef(binding);
+  }
+
+  private releaseSealedGitRef(binding: DockerResumeGitBinding): boolean {
+    try {
+      let current: string;
+      try {
+        current = this.projectGitOutput(["show-ref", "--verify", "--hash", binding.sealedRef]);
+      } catch (error: unknown) {
+        const status =
+          typeof error === "object" && error !== null && "status" in error
+            ? Number((error as { status?: unknown }).status)
+            : undefined;
+        // git show-ref returns 1 when the exact ref is absent. Absence is the
+        // desired idempotent cleanup state; other failures stay fail-closed.
+        return status === 1;
+      }
+      if (current !== binding.candidateHead) return false;
+      this.projectGitOutput(["update-ref", "-d", binding.sealedRef, binding.candidateHead]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Inspect a stopped container's private repository. When `promote` is true,
+   * verified content-addressed objects are copied and the one admitted task
+   * ref is advanced with Git's old-value compare-and-swap. No container can
+   * write authoritative refs, config, hooks, indexes, or worktree metadata.
+   */
+  extractResults(
+    containerOrId: string | DockerContainer,
+    options: { promote?: boolean } = {},
+  ): Promise<{ diff: string; log: string; branch: string }> {
+    const tracked =
+      typeof containerOrId === "string"
+        ? Array.from(this.containers.values()).find(
+            (container) => container.containerId === containerOrId,
+          )
+        : containerOrId;
+    if (
+      !tracked?.privateGitDir ||
+      !tracked.gitObjectsDir ||
+      !tracked.authoritativeHead ||
+      !tracked.authoritativeRef ||
+      !tracked.authoritativeWorktreeGitDir
+    ) {
+      throw new Error("Docker result extraction requires tracked private Git metadata");
+    }
+    if (tracked.status === "creating" || tracked.status === "running") {
+      throw new Error("Docker results cannot be trusted until the container is stopped");
+    }
+    const expectedWorktree = path.resolve(this.projectRoot, ".quack", "worktrees", tracked.taskId);
+    if (
+      comparablePath(fs.realpathSync.native(tracked.worktreePath)) !==
+      comparablePath(fs.realpathSync.native(expectedWorktree))
+    ) {
+      throw new Error("Docker result worktree identity changed before extraction");
+    }
+    const dotGit = readTrustedTextFile(path.join(tracked.worktreePath, ".git"), 4_096).trim();
+    const match = /^gitdir:\s*(.+)$/i.exec(dotGit);
+    if (
+      !match ||
+      comparablePath(
+        fs.realpathSync.native(path.resolve(tracked.worktreePath, match[1].trim())),
+      ) !== comparablePath(tracked.authoritativeWorktreeGitDir)
+    ) {
+      throw new Error("Docker result worktree no longer points to its admitted Git metadata");
+    }
+
+    // Replace container-controlled config with a fixed non-executable one and
+    // remove its alternate pointer before invoking host Git on the private dir.
+    const { candidateHead, privateObjects } = this.preparePrivateGitForInspection(tracked);
+    const branch =
+      tracked.authoritativeRef === "HEAD"
+        ? "HEAD"
+        : tracked.authoritativeRef.slice("refs/heads/".length);
+    const diff = this.gitOutput(
+      tracked.privateGitDir,
+      tracked.worktreePath,
+      ["diff", "--no-ext-diff", tracked.authoritativeHead, candidateHead],
+      tracked.gitObjectsDir,
+    );
+    const log = this.gitOutput(
+      tracked.privateGitDir,
+      tracked.worktreePath,
+      ["log", "--oneline", "-10", candidateHead],
+      tracked.gitObjectsDir,
+    );
+
+    if (options.promote) {
+      this.assertPrivateWorktreeClean(tracked, candidateHead, "publication");
+      if (candidateHead === tracked.authoritativeHead) {
+        throw new Error("Docker result has no committed change to promote");
+      }
+      this.assertAuthoritativeRefUnchanged(tracked);
+      this.gitOutput(
+        tracked.authoritativeWorktreeGitDir,
+        tracked.worktreePath,
+        ["merge-base", "--is-ancestor", tracked.authoritativeHead, candidateHead],
+        privateObjects,
+      );
+      this.validateAndCopyPrivateObjects(tracked);
+      this.gitOutput(tracked.authoritativeWorktreeGitDir, tracked.worktreePath, [
+        "update-ref",
+        tracked.authoritativeRef,
+        candidateHead,
+        tracked.authoritativeHead,
+      ]);
+      this.gitOutput(tracked.authoritativeWorktreeGitDir, tracked.worktreePath, [
+        "reset",
+        "--mixed",
+        candidateHead,
+      ]);
+    }
+
+    return Promise.resolve({ diff, log, branch });
   }
 
   /**
@@ -1602,8 +2525,9 @@ export class DockerManager {
     worktreePath: string,
     runtimeLogDir: string,
     containerRuntimeLogDir: string,
-    hostGitRoot: string,
+    hostGitObjectsDir: string,
     containerGitDir: string,
+    dotGitOverlay: string,
     containerName?: string,
   ): string[] {
     const args = ["create"];
@@ -1626,7 +2550,12 @@ export class DockerManager {
     // authoritative checkout is never mounted into the container.
     const normalizedWorktree = resolveThroughExistingAncestor(worktreePath).replace(/\\/g, "/");
     args.push("-v", `${normalizedWorktree}:/workspace:rw`);
-    args.push("-v", `${hostGitRoot.replace(/\\/g, "/")}:/quack-git:rw`);
+    // Git writes go only to the disposable private gitdir inside the task
+    // worktree. The authoritative repository contributes immutable objects,
+    // never refs/config/hooks/worktree administration. Overlay .git so the
+    // child cannot damage the host worktree's real gitdir pointer.
+    args.push("-v", `${hostGitObjectsDir.replace(/\\/g, "/")}:/quack-git-objects:ro`);
+    args.push("-v", `${dotGitOverlay.replace(/\\/g, "/")}:/workspace/.git:ro`);
 
     if (this.runtimeRoot) {
       args.push("-v", `${this.runtimeRoot.replace(/\\/g, "/")}:/quack-runtime:ro`);

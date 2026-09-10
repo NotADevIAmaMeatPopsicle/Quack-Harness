@@ -12,10 +12,12 @@ type ExecFileCallback = (err: Error | null, result: { stdout: string; stderr: st
 // Mock child_process
 jest.mock("node:child_process", () => ({
   execFile: jest.fn(),
+  execFileSync: jest.fn(() => ""),
   spawn: jest.fn(),
 }));
 
 const mockExecFile = childProcess.execFile as unknown as jest.Mock;
+const mockExecFileSync = childProcess.execFileSync as unknown as jest.Mock;
 const mockSpawn = childProcess.spawn as unknown as jest.Mock;
 
 function defaultConfig(overrides?: Partial<DockerIsolationConfig>): DockerIsolationConfig {
@@ -74,7 +76,13 @@ function mockExecFileSequence(responses: Array<{ stdout?: string; error?: string
 function managedWorktree(projectRoot: string, taskId: string): string {
   const worktreePath = path.join(projectRoot, ".quack", "worktrees", taskId);
   const gitDir = path.join(projectRoot, ".git", "worktrees", taskId);
+  const refName = `refs/heads/quack/${taskId}`;
+  const baseSha = "1111111111111111111111111111111111111111";
   fs.mkdirSync(gitDir, { recursive: true });
+  fs.mkdirSync(path.join(projectRoot, ".git", "objects"), { recursive: true });
+  fs.mkdirSync(path.join(projectRoot, ".git", "refs", "heads", "quack"), { recursive: true });
+  fs.writeFileSync(path.join(gitDir, "HEAD"), `ref: ${refName}\n`, "utf-8");
+  fs.writeFileSync(path.join(projectRoot, ".git", ...refName.split("/")), `${baseSha}\n`, "utf-8");
   fs.mkdirSync(worktreePath, { recursive: true });
   fs.writeFileSync(path.join(worktreePath, ".git"), `gitdir: ${gitDir}\n`, "utf-8");
   return worktreePath;
@@ -498,8 +506,10 @@ describe("DockerManager", () => {
       expect(createArgs).toContain("/workspace");
       expect(createArgs).toContain("node:20-slim");
       expect(createArgs).toContain(
-        `${fs.realpathSync.native(path.join(projectRoot, ".git")).replace(/\\/g, "/")}:/quack-git:rw`,
+        `${fs.realpathSync.native(path.join(projectRoot, ".git", "objects")).replace(/\\/g, "/")}:/quack-git-objects:ro`,
       );
+      expect(createArgs.some((arg) => arg.endsWith(":/workspace/.git:ro"))).toBe(true);
+      expect(createArgs.some((arg) => arg.includes(":/quack-git:rw"))).toBe(false);
       expect(createArgs).toContain(
         `${fs.realpathSync.native(path.join(projectRoot, ".quack", "adapter.json")).replace(/\\/g, "/")}:/workspace/.quack/adapter.json:ro`,
       );
@@ -1187,28 +1197,55 @@ describe("DockerManager", () => {
   // ─── extractResults ─────────────────────────────────────────
 
   describe("extractResults", () => {
-    test("returns git diff, log, and branch from container", async () => {
-      mockExecFileSequence([
-        { stdout: "diff --git a/foo.ts b/foo.ts\n+new line\n" },
-        { stdout: "abc1234 Add new feature\ndef5678 Fix bug\n" },
-        { stdout: "quack/TASK-001-feature\n" },
-      ]);
+    test("returns git diff, log, and admitted branch from stopped private metadata", async () => {
+      mockExecFileSequence([{ stdout: "result123\n" }, { stdout: "" }]);
+      const container = await manager.createContainer(
+        "TASK-RESULT",
+        managedWorktree(projectRoot, "TASK-RESULT"),
+      );
+      container.status = "stopped";
+      mockExecFileSync.mockImplementation((_file: string, args: string[]) => {
+        if (args.includes("diff")) return "diff --git a/foo.ts b/foo.ts\n+new line\n";
+        if (args.includes("log")) return "abc1234 Add new feature\ndef5678 Fix bug\n";
+        return "";
+      });
 
-      const results = await manager.extractResults("result123");
+      const results = await manager.extractResults(container);
 
       expect(results.diff).toContain("diff --git");
       expect(results.log).toContain("abc1234");
-      expect(results.branch).toBe("quack/TASK-001-feature");
+      expect(results.branch).toBe("quack/TASK-RESULT");
     });
 
-    test("returns empty strings on git failures", async () => {
-      mockExecFileError("git not found");
+    test("refuses extraction without tracked private metadata", () => {
+      expect(() => manager.extractResults("nogit123")).toThrow(
+        "requires tracked private Git metadata",
+      );
+    });
 
-      const results = await manager.extractResults("nogit123");
+    test("refuses publication that creates a previously absent protected policy file", async () => {
+      mockExecFileSequence([{ stdout: "policy123\n" }, { stdout: "" }]);
+      const container = await manager.createContainer(
+        "TASK-POLICY",
+        managedWorktree(projectRoot, "TASK-POLICY"),
+      );
+      container.status = "stopped";
+      const candidate = "2".repeat(40);
+      fs.writeFileSync(
+        path.join(container.privateGitDir!, ...container.authoritativeRef!.split("/")),
+        `${candidate}\n`,
+        "utf-8",
+      );
+      mockExecFileSync.mockImplementation((_file: string, args: string[]) => {
+        if (args.includes("diff") && args.at(-1) === ".quack/verify.js") {
+          return ".quack/verify.js\n";
+        }
+        return "";
+      });
 
-      expect(results.diff).toBe("");
-      expect(results.log).toBe("");
-      expect(results.branch).toBe("");
+      expect(() =>
+        manager.sealPrivateGitForPublication(container, "11111111-1111-4111-8111-111111111111"),
+      ).toThrow("changed protected policy .quack/verify.js");
     });
   });
 

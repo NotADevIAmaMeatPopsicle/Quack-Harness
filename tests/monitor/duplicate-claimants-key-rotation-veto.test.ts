@@ -9,7 +9,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { PassThrough } from "node:stream";
 
-import type { ChildProcess } from "node:child_process";
+import { execFileSync, type ChildProcess } from "node:child_process";
 
 import { KeyManager } from "../../src/dispatcher/key-manager";
 import { DispatchManager } from "../../src/monitor/dispatch-manager";
@@ -78,6 +78,17 @@ async function rateLimit(child: FakeChild): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
+function initializeGitFixture(root: string): void {
+  const git = (args: string[]): void => {
+    execFileSync("git", args, { cwd: root, stdio: "ignore" });
+  };
+  git(["init"]);
+  git(["config", "user.email", "fixture@example.invalid"]);
+  git(["config", "user.name", "Fixture"]);
+  git(["add", "."]);
+  git(["commit", "-m", "fixture"]);
+}
+
 describe.each(DUPLICATE_FIXTURE_CASES)("key rotation claimant matrix (%s, %s)", (kind, order) => {
   it("worktree key rotation checks claimants before output or removal", async () => {
     const fixture = createDuplicateFixture("quack-key-rotation-worktree-", kind, order);
@@ -119,6 +130,7 @@ describe.each(DUPLICATE_FIXTURE_CASES)("key rotation claimant matrix (%s, %s)", 
     const fixture = createDuplicateFixture("quack-key-rotation-docker-", kind, order);
     const keys = keyManager();
     try {
+      initializeGitFixture(fixture.root);
       const Manager = DispatchManager as unknown as ManagerConstructor;
       const manager = new Manager(
         fixture.root,
@@ -137,9 +149,28 @@ describe.each(DUPLICATE_FIXTURE_CASES)("key rotation claimant matrix (%s, %s)", 
           removedTaskIds: [],
           failedTaskIds: [],
         }),
-        createContainer: jest
-          .fn()
-          .mockResolvedValue({ containerId: "container-1", image: "fixture" }),
+        createContainer: jest.fn((requestedTaskId: string, worktreePath: string) => {
+          const runtimeLogDir = path.join(
+            worktreePath,
+            ".quack",
+            "docker-runtime",
+            "fixture-runtime",
+          );
+          fs.mkdirSync(runtimeLogDir, { recursive: true });
+          return Promise.resolve({
+            containerId: "container-1",
+            containerName: "container-1",
+            taskId: requestedTaskId,
+            image: "fixture",
+            workDir: "/workspace",
+            logsVolume: "/workspace/.quack/docker-runtime/fixture-runtime",
+            worktreePath,
+            runtimeLogDir,
+            gitDir: "/quack-git",
+            startedAt: new Date().toISOString(),
+            status: "running" as const,
+          });
+        }),
         execAgent: jest.fn(() => child as unknown as ChildProcess),
         stopContainer,
       };
@@ -150,7 +181,14 @@ describe.each(DUPLICATE_FIXTURE_CASES)("key rotation claimant matrix (%s, %s)", 
       });
 
       const job = manager.start("TASK-100", { skipGate: true });
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      for (
+        let attempt = 0;
+        attempt < 100 && dockerManager.execAgent.mock.calls.length === 0;
+        attempt++
+      ) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      }
+      expect(dockerManager.execAgent).toHaveBeenCalledTimes(1);
       await rateLimit(child);
 
       expect(job.output.some((line) => line.includes("Re-dispatching"))).toBe(false);
