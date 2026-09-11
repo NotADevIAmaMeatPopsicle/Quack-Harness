@@ -321,12 +321,21 @@ describe("API-key project object scope", () => {
   it("filters admin-run listing and conceals cross-project run details from a scoped key", async () => {
     const alphaRun = makeAdminRun("alpha-run", "alpha", alphaRoot);
     const betaRun = makeAdminRun("beta-run", "beta", betaRoot);
-    jest.spyOn(AdminRunManager.prototype, "listRuns").mockResolvedValue([alphaRun, betaRun]);
+    const emptyProjectRun = makeAdminRun("empty-project-run", "", betaRoot);
+    jest
+      .spyOn(AdminRunManager.prototype, "listRuns")
+      .mockResolvedValue([alphaRun, betaRun, emptyProjectRun]);
     jest
       .spyOn(AdminRunManager.prototype, "getRun")
       .mockImplementation((runId) =>
         Promise.resolve(
-          runId === alphaRun.runId ? alphaRun : runId === betaRun.runId ? betaRun : undefined,
+          runId === alphaRun.runId
+            ? alphaRun
+            : runId === betaRun.runId
+              ? betaRun
+              : runId === emptyProjectRun.runId
+                ? emptyProjectRun
+                : undefined,
         ),
       );
     const stopSpy = jest.spyOn(AdminRunManager.prototype, "stopRun").mockReturnValue(true);
@@ -343,6 +352,12 @@ describe("API-key project object scope", () => {
     const foreignStop = await request(port, "POST", "/API/Admin/Runs/beta-run/Stop/", {
       apiKey: "alpha-secret",
     });
+    const emptyProjectDetail = await request(port, "GET", "/api/admin/runs/empty-project-run", {
+      apiKey: "alpha-secret",
+    });
+    const emptyProjectStop = await request(port, "POST", "/api/admin/runs/empty-project-run/stop", {
+      apiKey: "alpha-secret",
+    });
     const ownStop = await request(port, "POST", "/api/admin/runs/alpha-run/stop", {
       apiKey: "alpha-secret",
     });
@@ -355,6 +370,13 @@ describe("API-key project object scope", () => {
     expect(foreignDetail.body).toEqual({ error: "Admin run not found" });
     expect(foreignStop.status).toBe(404);
     expect(foreignStop.body).toEqual({ ok: false, error: "Admin run not running or not found" });
+    expect(emptyProjectDetail.status).toBe(404);
+    expect(emptyProjectDetail.body).toEqual({ error: "Admin run not found" });
+    expect(emptyProjectStop.status).toBe(404);
+    expect(emptyProjectStop.body).toEqual({
+      ok: false,
+      error: "Admin run not running or not found",
+    });
     expect(ownStop.status).toBe(200);
     expect(stopSpy).toHaveBeenCalledTimes(1);
     expect(stopSpy).toHaveBeenCalledWith("alpha-run");
@@ -363,12 +385,21 @@ describe("API-key project object scope", () => {
   it("preserves process-wide admin-run access for wildcard keys and sessions", async () => {
     const alphaRun = makeAdminRun("alpha-run", "alpha", alphaRoot);
     const betaRun = makeAdminRun("beta-run", "beta", betaRoot);
-    jest.spyOn(AdminRunManager.prototype, "listRuns").mockResolvedValue([alphaRun, betaRun]);
+    const emptyProjectRun = makeAdminRun("empty-project-run", "", betaRoot);
+    jest
+      .spyOn(AdminRunManager.prototype, "listRuns")
+      .mockResolvedValue([alphaRun, betaRun, emptyProjectRun]);
     jest
       .spyOn(AdminRunManager.prototype, "getRun")
       .mockImplementation((runId) =>
         Promise.resolve(
-          runId === alphaRun.runId ? alphaRun : runId === betaRun.runId ? betaRun : undefined,
+          runId === alphaRun.runId
+            ? alphaRun
+            : runId === betaRun.runId
+              ? betaRun
+              : runId === emptyProjectRun.runId
+                ? emptyProjectRun
+                : undefined,
         ),
       );
     const stopSpy = jest.spyOn(AdminRunManager.prototype, "stopRun").mockReturnValue(true);
@@ -376,10 +407,10 @@ describe("API-key project object scope", () => {
     const wildcardList = await request(port, "GET", "/api/admin/runs", {
       apiKey: "fleet-secret",
     });
-    const wildcardDetail = await request(port, "GET", "/api/admin/runs/beta-run", {
+    const wildcardDetail = await request(port, "GET", "/api/admin/runs/empty-project-run", {
       apiKey: "fleet-secret",
     });
-    const wildcardStop = await request(port, "POST", "/api/admin/runs/beta-run/stop", {
+    const wildcardStop = await request(port, "POST", "/api/admin/runs/empty-project-run/stop", {
       apiKey: "fleet-secret",
     });
 
@@ -391,21 +422,21 @@ describe("API-key project object scope", () => {
     const sessionList = await request(port, "GET", "/api/admin/runs", {
       cookie: sessionCookie,
     });
-    const sessionDetail = await request(port, "GET", "/api/admin/runs/beta-run", {
+    const sessionDetail = await request(port, "GET", "/api/admin/runs/empty-project-run", {
       cookie: sessionCookie,
     });
-    const sessionStop = await request(port, "POST", "/api/admin/runs/alpha-run/stop", {
+    const sessionStop = await request(port, "POST", "/api/admin/runs/empty-project-run/stop", {
       cookie: sessionCookie,
     });
 
     expect(wildcardList.status).toBe(200);
-    expect(wildcardList.body).toEqual({ runs: [alphaRun, betaRun] });
+    expect(wildcardList.body).toEqual({ runs: [alphaRun, betaRun, emptyProjectRun] });
     expect(wildcardDetail.status).toBe(200);
     expect(wildcardStop.status).toBe(200);
     expect(sessionList.status).toBe(200);
-    expect(sessionList.body).toEqual({ runs: [alphaRun, betaRun] });
+    expect(sessionList.body).toEqual({ runs: [alphaRun, betaRun, emptyProjectRun] });
     expect(sessionDetail.status).toBe(200);
     expect(sessionStop.status).toBe(200);
-    expect(stopSpy.mock.calls).toEqual([["beta-run"], ["alpha-run"]]);
+    expect(stopSpy.mock.calls).toEqual([["empty-project-run"], ["empty-project-run"]]);
   });
 });

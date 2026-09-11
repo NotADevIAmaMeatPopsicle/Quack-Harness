@@ -2834,7 +2834,14 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
   function apiKeyCanAccessAdminRun(req: Request, projectId: string): boolean {
     const principal = (req as AuthenticatedRequest).apiPrincipal;
-    return !principal || authService.isApiKeyAllowedForProject(principal, projectId);
+    if (!principal) return true;
+
+    // An empty stored project ID is still an object identity, not an absent
+    // request constraint. Fail closed for narrowly scoped keys while retaining
+    // the explicitly process-wide authority of wildcard keys.
+    if (!projectId) return principal.projectScopes.includes("*");
+
+    return authService.isApiKeyAllowedForProject(principal, projectId);
   }
 
   app.get("/api/admin/runs", async (req: Request, res: Response) => {
