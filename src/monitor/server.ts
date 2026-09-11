@@ -1975,6 +1975,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
   interface ResolvedProject {
     projectId: string;
     projectRoot: string | undefined;
+    adapter: ProjectAdapter | null;
     taskDir: string | undefined;
     logDir: string | undefined;
     adapterPath: string | undefined;
@@ -2033,6 +2034,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     return {
       projectId: ctx.id,
       projectRoot: ctx.rootPath,
+      adapter: ctx.adapter,
       taskDir: ctx.adapter.config.project.taskDir,
       logDir: ctx.logDir,
       adapterPath: path.resolve(ctx.rootPath, ".quack", "adapter.json"),
@@ -2229,6 +2231,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     return {
       projectId: legacyProjectId,
       projectRoot: projectRoot ?? undefined,
+      adapter: null,
       taskDir: taskDir ?? undefined,
       logDir: logDir ?? undefined,
       adapterPath: adapterPath ?? undefined,
@@ -2354,6 +2357,11 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       const isGlobalOperation =
         globalPaths.has(normalizedPath) ||
         globalPrefixes.some((prefix) => normalizedPath.startsWith(prefix));
+      const isAdminRunObjectOperation =
+        (req.method === "GET" &&
+          (normalizedPath === "/api/admin/runs" ||
+            /^\/api\/admin\/runs\/[^/]+$/u.test(normalizedPath))) ||
+        (req.method === "POST" && /^\/api\/admin\/runs\/[^/]+\/stop$/u.test(normalizedPath));
 
       // Global APIs aggregate or mutate state across projects. They cannot be
       // safely represented by one project scope, so only an explicitly
@@ -2367,7 +2375,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         return;
       }
 
-      if (!isUnscopedRead && !isGlobalOperation) {
+      if (!isUnscopedRead && !isGlobalOperation && !isAdminRunObjectOperation) {
         const effectiveProjectId =
           resolution.projectId ?? registry?.getActiveProjectId() ?? legacyProjectId;
         if (!effectiveProjectId) {
@@ -2824,23 +2832,34 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
   const adminRunReadScopes = ["admin:read", "admin:write", "federation:write"];
 
-  app.get("/api/admin/runs", async (_req: Request, res: Response) => {
-    if (!requireServiceScopeAnyWhenConfigured(_req, res, adminRunReadScopes)) return;
-    res.json({ runs: await adminRuns.listRuns() });
+  function apiKeyCanAccessAdminRun(req: Request, projectId: string): boolean {
+    const principal = (req as AuthenticatedRequest).apiPrincipal;
+    return !principal || authService.isApiKeyAllowedForProject(principal, projectId);
+  }
+
+  app.get("/api/admin/runs", async (req: Request, res: Response) => {
+    if (!requireServiceScopeAnyWhenConfigured(req, res, adminRunReadScopes)) return;
+    const runs = await adminRuns.listRuns();
+    res.json({ runs: runs.filter((run) => apiKeyCanAccessAdminRun(req, run.projectId)) });
   });
 
   app.get("/api/admin/runs/:runId", async (req: Request, res: Response) => {
     if (!requireServiceScopeAnyWhenConfigured(req, res, adminRunReadScopes)) return;
     const run = await adminRuns.getRun(req.params.runId as string);
-    if (!run) {
+    if (!run || !apiKeyCanAccessAdminRun(req, run.projectId)) {
       res.status(404).json({ error: "Admin run not found" });
       return;
     }
     res.json(run);
   });
 
-  app.post("/api/admin/runs/:runId/stop", (req: Request, res: Response) => {
+  app.post("/api/admin/runs/:runId/stop", async (req: Request, res: Response) => {
     if (!requireServiceScopeWhenConfigured(req, res, "admin:write")) return;
+    const run = await adminRuns.getRun(req.params.runId as string);
+    if (!run || !apiKeyCanAccessAdminRun(req, run.projectId)) {
+      res.status(404).json({ ok: false, error: "Admin run not running or not found" });
+      return;
+    }
     const stopped = adminRuns.stopRun(req.params.runId as string);
     if (!stopped) {
       res.status(404).json({ ok: false, error: "Admin run not running or not found" });
@@ -8372,8 +8391,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         autoDispatch?: boolean;
       };
 
-      const activeProject = registry?.getActiveProject();
-      const adapter = activeProject?.adapter;
+      const adapter = resolveProject(req).adapter;
       if (!adapter) {
         res.status(400).json({ error: "No active project" });
         return;
@@ -8404,8 +8422,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         allBacklog?: boolean;
       };
 
-      const activeProject = registry?.getActiveProject();
-      const adapter = activeProject?.adapter;
+      const adapter = resolveProject(req).adapter;
       if (!adapter) {
         res.status(400).json({ error: "No active project" });
         return;
@@ -8484,8 +8501,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     try {
       const { status: showStatus } = req.body as { status?: boolean };
 
-      const activeProject = registry?.getActiveProject();
-      const adapter = activeProject?.adapter;
+      const adapter = resolveProject(req).adapter;
       if (!adapter) {
         res.status(400).json({ error: "No active project" });
         return;
@@ -8508,10 +8524,9 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     }
   });
 
-  app.get("/api/github/sync-status", async (_req: Request, res: Response) => {
+  app.get("/api/github/sync-status", async (req: Request, res: Response) => {
     try {
-      const activeProject = registry?.getActiveProject();
-      const adapter = activeProject?.adapter;
+      const adapter = resolveProject(req).adapter;
       if (!adapter) {
         res.json({ success: true, status: { totalEntries: 0, entries: [] } });
         return;

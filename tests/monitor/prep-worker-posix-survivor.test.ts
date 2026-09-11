@@ -72,4 +72,77 @@ describe("PrepWorker POSIX survivor reconciliation", () => {
     ).toBe(true);
     expect(restarted.resumeAfterShutdown()).toBe(true);
   });
+
+  it("does not send SIGKILL after the tracked root exits during SIGTERM", async () => {
+    const child = new FakeChild();
+    const taskId = "TASK-PREP-ROOT-EXIT";
+    const spawnProcess = jest.fn(
+      (_command: string, _args: readonly string[], _options: SpawnOptions) =>
+        child as unknown as ChildProcess,
+    );
+    const killProcess = jest.fn((pid: number, signal?: string | number) => {
+      if (pid === -child.pid && signal === "SIGTERM") {
+        child.exitCode = 0;
+        child.emit("exit", 0);
+      }
+      // A descendant (or a recycled process group) still occupies the PGID.
+      return true;
+    }) as unknown as typeof process.kill;
+    const worker = new PrepWorker(projectRoot, "fixture.js", {
+      platform: "linux",
+      spawnProcess: spawnProcess as unknown as typeof import("node:child_process").spawn,
+      killProcess,
+    });
+    worker.start(taskId);
+
+    const shutdown = await worker.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 0 });
+
+    expect(killProcess).toHaveBeenCalledWith(-child.pid, "SIGTERM");
+    expect(killProcess).not.toHaveBeenCalledWith(-child.pid, "SIGKILL");
+    expect(shutdown.timedOut).toContain(taskId);
+    expect(worker.getShutdownSurvivors()).toEqual([
+      expect.objectContaining({
+        taskId,
+        pid: child.pid,
+        strategy: "posix-process-group",
+      }),
+    ]);
+    expect(worker.canResumeAfterShutdown()).toBe(false);
+  });
+
+  it("never re-signals an unbound process group on repeated same-process shutdown", async () => {
+    const child = new FakeChild();
+    const taskId = "TASK-PREP-REPEATED-SHUTDOWN";
+    const spawnProcess = jest.fn(
+      (_command: string, _args: readonly string[], _options: SpawnOptions) =>
+        child as unknown as ChildProcess,
+    );
+    const killProcessMock = jest.fn((pid: number, signal?: string | number) => {
+      if (pid === -child.pid && signal === "SIGTERM") {
+        child.exitCode = 0;
+        child.emit("exit", 0);
+      }
+      return true;
+    });
+    const killProcess = killProcessMock as unknown as typeof process.kill;
+    const worker = new PrepWorker(projectRoot, "fixture.js", {
+      platform: "linux",
+      spawnProcess: spawnProcess as unknown as typeof import("node:child_process").spawn,
+      killProcess,
+    });
+    worker.start(taskId);
+
+    const first = await worker.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 0 });
+    expect(first.timedOut).toContain(taskId);
+    killProcessMock.mockClear();
+    child.kill.mockClear();
+
+    const repeated = await worker.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 0 });
+
+    expect(repeated.requested).toContain(taskId);
+    expect(repeated.timedOut).toContain(taskId);
+    expect(killProcessMock).not.toHaveBeenCalled();
+    expect(child.kill).not.toHaveBeenCalled();
+    expect(worker.canResumeAfterShutdown()).toBe(false);
+  });
 });

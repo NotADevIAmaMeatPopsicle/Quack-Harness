@@ -210,20 +210,8 @@ export class PrepWorker {
     }
   }
 
-  private clearExitedOwnedProcessGroups(): void {
-    for (const [taskId, processGroupId] of this.unconfirmedProcessGroups) {
-      if (this.processGroupExists(processGroupId)) continue;
-      this.unconfirmedProcessGroups.delete(taskId);
-      const marker = this.shutdownSurvivors.get(taskId);
-      if (marker?.strategy === "posix-process-group" && marker.pid === processGroupId) {
-        this.clearShutdownSurvivor(marker);
-      }
-    }
-  }
-
   /** Durable records that require an operator to confirm the process tree is gone. */
   getShutdownSurvivors(): PrepShutdownSurvivor[] {
-    this.clearExitedOwnedProcessGroups();
     this.refreshShutdownSurvivors();
     return Array.from(this.shutdownSurvivors.values(), (marker) => ({ ...marker }));
   }
@@ -239,8 +227,6 @@ export class PrepWorker {
     processTreeConfirmedStopped: boolean,
   ): boolean {
     if (!processTreeConfirmedStopped || this.processes.has(taskId)) return false;
-    const locallyOwnedGroup = this.unconfirmedProcessGroups.get(taskId);
-    if (locallyOwnedGroup && this.processGroupExists(locallyOwnedGroup)) return false;
     this.refreshShutdownSurvivors();
     const marker = this.shutdownSurvivors.get(taskId);
     if (!marker || marker.confirmationToken !== confirmationToken) return false;
@@ -261,7 +247,9 @@ export class PrepWorker {
       if (!current || current.confirmationToken !== confirmationToken) return false;
       fs.rmSync(markerPath);
       this.refreshShutdownSurvivors();
-      return !this.shutdownSurvivors.has(taskId);
+      const cleared = !this.shutdownSurvivors.has(taskId);
+      if (cleared) this.unconfirmedProcessGroups.delete(taskId);
+      return cleared;
     } catch {
       return false;
     } finally {
@@ -281,7 +269,6 @@ export class PrepWorker {
     if (this.shutdownInProgress) {
       throw new Error("Prep worker is shutting down; resume the fleet before starting new prep");
     }
-    this.clearExitedOwnedProcessGroups();
     this.refreshShutdownSurvivors();
     if (this.shutdownSurvivors.size > 0 || this.unreadableSurvivorMarkers.size > 0) {
       throw new Error(
@@ -361,6 +348,7 @@ export class PrepWorker {
         if (
           marker?.strategy === "posix-process-group" &&
           marker.pid === child.pid &&
+          !this.unconfirmedProcessGroups.has(taskId) &&
           !this.processGroupExists(child.pid)
         ) {
           this.clearShutdownSurvivor(marker);
@@ -393,9 +381,6 @@ export class PrepWorker {
     if (!child) return false;
 
     this.stopRequestedTasks.add(taskId);
-    if ((this.runtime.platform ?? process.platform) !== "win32" && child.pid) {
-      this.unconfirmedProcessGroups.set(taskId, child.pid);
-    }
     try {
       this.signalProcessTree(taskId, child, "SIGTERM", 1_000);
     } catch {
@@ -453,6 +438,26 @@ export class PrepWorker {
     }
   }
 
+  /**
+   * A POSIX process-group ID is trustworthy only while its original root
+   * ChildProcess identity is still live and tracked for this task.
+   */
+  private isPosixRootIdentityLive(taskId: string, child: ChildProcess): boolean {
+    return (
+      this.processes.get(taskId) === child && child.exitCode == null && child.signalCode == null
+    );
+  }
+
+  /**
+   * Once the root identity is gone, retain tokened evidence for explicit
+   * reconciliation. The numeric PGID must never be probed or signalled again.
+   */
+  private retainUnconfirmedProcessGroup(taskId: string, child: ChildProcess): void {
+    if (!child.pid) return;
+    this.unconfirmedProcessGroups.set(taskId, child.pid);
+    this.recordShutdownAttempt(taskId, child, "posix-process-group");
+  }
+
   private signalProcessTree(
     taskId: string,
     child: ChildProcess,
@@ -484,6 +489,17 @@ export class PrepWorker {
     }
 
     if ((this.runtime.platform ?? process.platform) !== "win32" && child.pid) {
+      if (this.unconfirmedProcessGroups.has(taskId)) {
+        throw new Error(
+          `Refusing to re-signal unconfirmed process group for ${taskId}; its numeric ID may have been recycled`,
+        );
+      }
+      if (!this.isPosixRootIdentityLive(taskId, child)) {
+        this.retainUnconfirmedProcessGroup(taskId, child);
+        throw new Error(
+          `Refusing to signal process group for ${taskId} after its root identity was lost`,
+        );
+      }
       this.recordShutdownAttempt(taskId, child, "posix-process-group");
       try {
         (this.runtime.killProcess ?? process.kill)(-child.pid, signal);
@@ -523,11 +539,8 @@ export class PrepWorker {
     );
     const escalated: string[] = [];
 
-    for (const { taskId, child } of tracked) {
+    for (const { taskId } of tracked) {
       this.stopRequestedTasks.add(taskId);
-      if ((this.runtime.platform ?? process.platform) !== "win32" && child.pid) {
-        this.unconfirmedProcessGroups.set(taskId, child.pid);
-      }
     }
 
     const trackedHasExited = ({ taskId, child }: (typeof tracked)[number]): boolean => {
@@ -536,6 +549,7 @@ export class PrepWorker {
       if ((this.runtime.platform ?? process.platform) === "win32") {
         return lifecycleRecorded && this.confirmedWindowsTreeKills.has(taskId);
       }
+      if (this.unconfirmedProcessGroups.has(taskId)) return false;
       return lifecycleRecorded && !this.processGroupExists(child.pid);
     };
     const waitForTracked = async (
@@ -550,21 +564,6 @@ export class PrepWorker {
       }
       return remaining;
     };
-    const waitForGroups = async (
-      entries: typeof pendingGroups,
-      timeoutMs: number,
-    ): Promise<typeof pendingGroups> => {
-      const deadline = Date.now() + timeoutMs;
-      let remaining = entries.filter(({ processGroupId }) =>
-        this.processGroupExists(processGroupId),
-      );
-      while (remaining.length > 0 && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, Math.min(25, deadline - Date.now())));
-        remaining = entries.filter(({ processGroupId }) => this.processGroupExists(processGroupId));
-      }
-      return remaining;
-    };
-
     let remaining = tracked;
     if ((this.runtime.platform ?? process.platform) === "win32") {
       for (const entry of remaining) {
@@ -596,16 +595,10 @@ export class PrepWorker {
 
     remaining = await waitForTracked(remaining, forceTimeoutMs);
 
-    for (const entry of pendingGroups) {
-      if (!this.processGroupExists(entry.processGroupId)) continue;
-      if (!escalated.includes(entry.taskId)) escalated.push(entry.taskId);
-      try {
-        (this.runtime.killProcess ?? process.kill)(-entry.processGroupId, "SIGKILL");
-      } catch {
-        // A concurrent exit is distinguished by the evidence check below.
-      }
-    }
-    const remainingGroups = await waitForGroups(pendingGroups, forceTimeoutMs);
+    // These groups have already lost the ChildProcess identity that made their
+    // numeric IDs trustworthy. Preserve them as unresolved evidence without
+    // probing or signalling a number that the OS may have recycled.
+    const remainingGroups = pendingGroups;
 
     // Clear only evidence tied to a process handle/group owned by this worker
     // and now proven absent. Durable records restored after restart are never
@@ -615,12 +608,6 @@ export class PrepWorker {
       const marker = this.shutdownSurvivors.get(taskId);
       if (marker) this.clearShutdownSurvivor(marker);
     }
-    for (const { taskId, processGroupId } of pendingGroups) {
-      if (this.processGroupExists(processGroupId)) continue;
-      const marker = this.shutdownSurvivors.get(taskId);
-      if (marker?.pid === processGroupId) this.clearShutdownSurvivor(marker);
-    }
-
     this.refreshShutdownSurvivors();
     const remainingDurableSurvivors = Array.from(this.shutdownSurvivors.values());
     const remainingUnreadableSurvivors = Array.from(
@@ -671,7 +658,6 @@ export class PrepWorker {
   }
 
   canResumeAfterShutdown(): boolean {
-    this.clearExitedOwnedProcessGroups();
     this.refreshShutdownSurvivors();
     return (
       this.shutdownPromise === null &&
@@ -698,9 +684,6 @@ export class PrepWorker {
     this.shutdownInProgress = true;
     for (const [taskId, child] of this.processes) {
       this.stopRequestedTasks.add(taskId);
-      if ((this.runtime.platform ?? process.platform) !== "win32" && child.pid) {
-        this.unconfirmedProcessGroups.set(taskId, child.pid);
-      }
       try {
         this.signalProcessTree(taskId, child, "SIGKILL", 1_000);
       } catch {
