@@ -1,10 +1,11 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 
 import type { ProjectAdapter } from "../../src/core/adapter-loader";
 import type { AdapterConfig } from "../../src/core/types";
 
-// ─── Mock child_process.exec ──────────────────────────────────────────
+// ─── Mock child_process.execFile ──────────────────────────────────────
 
 type MockExecResult = {
   stdout?: string;
@@ -15,6 +16,16 @@ type MockExecResult = {
 
 let mockGitResults: Record<string, MockExecResult | MockExecResult[]> = {};
 let mockExecutedCommands: string[] = [];
+const ORIGIN_PUSH_URL = "git@github.com:org/repo.git";
+const ORIGIN_IDENTITY = {
+  pushUrl: ORIGIN_PUSH_URL,
+  pushUrlHash: createHash("sha256").update(ORIGIN_PUSH_URL).digest("hex"),
+  github: {
+    selector: "github.com/org/repo",
+    host: "github.com",
+    nameWithOwner: "org/repo",
+  },
+};
 
 function findGitResult(command: string): MockExecResult | undefined {
   for (const [pattern, resultOrQueue] of Object.entries(mockGitResults)) {
@@ -33,12 +44,20 @@ jest.mock("node:child_process", () => {
   const actual = jest.requireActual<typeof import("node:child_process")>("node:child_process");
 
   const customPromisified = (
-    command: string,
+    file: string,
+    args: readonly string[],
     _options: Record<string, unknown>,
   ): Promise<{ stdout: string; stderr: string }> => {
+    const normalizedArgs = args.map((arg) =>
+      /^quack-bound-[0-9a-f-]+$/iu.test(arg) ? "origin" : arg,
+    );
+    const command = [file, ...normalizedArgs].join(" ");
     mockExecutedCommands.push(command);
     const matchedResult = findGitResult(command);
     if (!matchedResult) {
+      if (command === "git remote get-url --push --all origin") {
+        return Promise.resolve({ stdout: `${ORIGIN_PUSH_URL}\n`, stderr: "" });
+      }
       return Promise.resolve({ stdout: "", stderr: "" });
     }
 
@@ -59,12 +78,12 @@ jest.mock("node:child_process", () => {
     });
   };
 
-  const mockExec = jest.fn();
-  (mockExec as unknown as Record<symbol, unknown>)[promisify.custom] = customPromisified;
+  const mockExecFile = jest.fn();
+  (mockExecFile as unknown as Record<symbol, unknown>)[promisify.custom] = customPromisified;
 
   return {
     ...actual,
-    exec: mockExec,
+    execFile: mockExecFile,
   };
 });
 
@@ -78,6 +97,8 @@ const {
   createBranch,
   createFeatureBranch,
   pushBranch,
+  pushExactBranch,
+  resolveExactBranchHead,
   cleanupBranch,
   getBranchDiff,
   getBranchCommitCount,
@@ -149,6 +170,23 @@ function makeAdapter(overrides: Partial<ProjectAdapter> = {}): ProjectAdapter {
     },
     ...overrides,
   };
+}
+
+const MERGE_HEAD = "a".repeat(40);
+const MERGE_COMMIT = "b".repeat(40);
+const TARGET_HEAD = "c".repeat(40);
+
+function boundPullRequest(state: "OPEN" | "MERGED"): string {
+  return JSON.stringify({
+    url: "https://github.com/org/repo/pull/42",
+    state,
+    baseRefName: "main",
+    headRefName: "quack/TASK-042",
+    headRefOid: MERGE_HEAD,
+    headRepository: { nameWithOwner: "org/repo" },
+    headRepositoryOwner: { login: "org" },
+    mergeCommit: state === "MERGED" ? { oid: MERGE_COMMIT } : null,
+  });
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
@@ -313,6 +351,67 @@ describe("branch-manager", () => {
 
       expect(result.success).toBe(true);
       expect(result.branchName).toBe("quack/TASK-042");
+    });
+
+    describe("exact branch publication", () => {
+      test("pushes the sealed object ID and confirms the same remote head", async () => {
+        const branch = "quack/TASK-042";
+        const branchRef = `refs/heads/${branch}`;
+        mockGitResults = {
+          [`rev-parse --verify ${branchRef}^{commit}`]: { stdout: `${MERGE_HEAD}\n` },
+          [`push origin ${MERGE_HEAD}:${branchRef}`]: { stdout: "pushed" },
+          [`ls-remote --heads origin ${branchRef}`]: {
+            stdout: `${MERGE_HEAD}\t${branchRef}\n`,
+          },
+        };
+
+        const sealed = await resolveExactBranchHead(branch, makeAdapter());
+        expect(sealed).toEqual({ success: true, branchName: branch, headCommitSha: MERGE_HEAD });
+        await expect(pushExactBranch(branch, MERGE_HEAD, makeAdapter())).resolves.toEqual({
+          success: true,
+          branchName: branch,
+        });
+        expect(mockExecutedCommands).toContain(`git push origin ${MERGE_HEAD}:${branchRef}`);
+      });
+
+      test("branch advancement after judgment is refused before any push", async () => {
+        const branch = "quack/TASK-042";
+        const branchRef = `refs/heads/${branch}`;
+        mockGitResults = {
+          [`rev-parse --verify ${branchRef}^{commit}`]: { stdout: `${MERGE_COMMIT}\n` },
+        };
+
+        await expect(pushExactBranch(branch, MERGE_HEAD, makeAdapter())).resolves.toEqual({
+          success: false,
+          branchName: branch,
+          error: `Refusing to push ${branch}: branch advanced after judgment`,
+        });
+        expect(mockExecutedCommands.some((command) => command.startsWith("git push"))).toBe(false);
+      });
+
+      test("fails closed when origin changes between the exact push and confirmation", async () => {
+        const branch = "quack/TASK-042";
+        const branchRef = `refs/heads/${branch}`;
+        mockGitResults = {
+          [`rev-parse --verify ${branchRef}^{commit}`]: { stdout: `${MERGE_HEAD}\n` },
+          "git remote get-url --push --all origin": [
+            { stdout: `${ORIGIN_PUSH_URL}\n` },
+            { stdout: "git@github.com:attacker/redirect.git\n" },
+          ],
+          [`push origin ${MERGE_HEAD}:${branchRef}`]: { stdout: "pushed" },
+        };
+
+        const result = await pushExactBranch(branch, MERGE_HEAD, makeAdapter(), ORIGIN_PUSH_URL);
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain("Git origin changed");
+        expect(
+          mockExecutedCommands.filter((command) => command.startsWith("git push")),
+        ).toHaveLength(1);
+        expect(mockExecutedCommands.some((command) => command.startsWith("git ls-remote"))).toBe(
+          false,
+        );
+      });
     });
 
     test("should return failure on push error", async () => {
@@ -670,9 +769,18 @@ describe("branch-manager", () => {
   describe("mergeBranchToTarget", () => {
     test("should use gh pr merge when prUrl is provided", async () => {
       mockGitResults = {
-        "gh pr merge https://github.com/org/repo/pull/42 --squash --delete-branch": {
-          stdout: "Merged",
+        "git rev-parse --verify quack/TASK-042": { stdout: MERGE_HEAD },
+        "gh repo view": {
+          stdout: JSON.stringify({ nameWithOwner: "org/repo", url: "https://github.com/org/repo" }),
         },
+        "gh pr view": [
+          { stdout: boundPullRequest("OPEN") },
+          { stdout: boundPullRequest("MERGED") },
+        ],
+        [`gh pr merge https://github.com/org/repo/pull/42 --repo github.com/org/repo --squash --match-head-commit ${MERGE_HEAD}`]:
+          {
+            stdout: "Merged",
+          },
       };
 
       const adapter = makeAdapter();
@@ -686,10 +794,20 @@ describe("branch-manager", () => {
       );
 
       expect(result.success).toBe(true);
+      const prCommands = mockExecutedCommands.filter((command) => command.startsWith("gh pr "));
+      expect(prCommands.every((command) => command.includes("--repo github.com/org/repo"))).toBe(
+        true,
+      );
+      expect(prCommands.some((command) => command.includes("--delete-branch"))).toBe(false);
     });
 
     test("should return failure when gh pr merge fails", async () => {
       mockGitResults = {
+        "git rev-parse --verify quack/TASK-042": { stdout: MERGE_HEAD },
+        "gh repo view": {
+          stdout: JSON.stringify({ nameWithOwner: "org/repo", url: "https://github.com/org/repo" }),
+        },
+        "gh pr view": { stdout: boundPullRequest("OPEN") },
         "gh pr merge": {
           error: true,
           stderr: "merge conflict",
@@ -711,9 +829,18 @@ describe("branch-manager", () => {
 
     test("should use merge strategy flag from config", async () => {
       mockGitResults = {
-        "gh pr merge https://github.com/org/repo/pull/42 --merge --delete-branch": {
-          stdout: "Merged",
+        "git rev-parse --verify quack/TASK-042": { stdout: MERGE_HEAD },
+        "gh repo view": {
+          stdout: JSON.stringify({ nameWithOwner: "org/repo", url: "https://github.com/org/repo" }),
         },
+        "gh pr view": [
+          { stdout: boundPullRequest("OPEN") },
+          { stdout: boundPullRequest("MERGED") },
+        ],
+        [`gh pr merge https://github.com/org/repo/pull/42 --repo github.com/org/repo --merge --match-head-commit ${MERGE_HEAD}`]:
+          {
+            stdout: "Merged",
+          },
       };
 
       const adapter = makeAdapter();
@@ -727,6 +854,267 @@ describe("branch-manager", () => {
       );
 
       expect(result.success).toBe(true);
+    });
+
+    test("refuses shell metacharacters in a target branch before executing a command", async () => {
+      const result = await mergeBranchToTarget("TASK-042", makeAdapter(), undefined, "main&whoami");
+
+      expect(result).toEqual({ success: false, error: "Unsafe Git branch name" });
+      expect(mockExecutedCommands).toEqual([]);
+    });
+
+    test("refuses a PR whose head commit is not the exact merge candidate", async () => {
+      mockGitResults = {
+        "git rev-parse --verify quack/TASK-042": { stdout: MERGE_HEAD },
+        "gh repo view": {
+          stdout: JSON.stringify({ nameWithOwner: "org/repo", url: "https://github.com/org/repo" }),
+        },
+        "gh pr view": {
+          stdout: JSON.stringify({
+            ...JSON.parse(boundPullRequest("OPEN")),
+            headRefOid: "f".repeat(40),
+          }),
+        },
+      };
+
+      const result = await mergeBranchToTarget(
+        "TASK-042",
+        makeAdapter(),
+        "https://github.com/org/repo/pull/42",
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("sealed repository/base/head binding");
+      expect(mockExecutedCommands.some((command) => command.startsWith("gh pr merge"))).toBe(false);
+    });
+
+    test.each([
+      ["squash", `git merge --squash ${MERGE_HEAD}`],
+      ["merge", `git merge --no-ff ${MERGE_HEAD}`],
+      ["rebase", "git rebase origin/main"],
+    ] as const)(
+      "merges the immutable sealed candidate for a local %s even if the source branch can move",
+      async (strategy, expectedCommand) => {
+        const preparedRef = "refs/quack/docker-publication-prepared/TASK-042/test";
+        mockGitResults = {
+          "git rev-parse --verify refs/heads/quack/TASK-042^{commit}": {
+            stdout: `${MERGE_HEAD}\n`,
+          },
+          "git fetch origin main:refs/remotes/origin/main": { stdout: "" },
+          "git worktree add --detach": { stdout: "Preparing worktree" },
+          [`git merge-base --is-ancestor ${MERGE_HEAD} ${TARGET_HEAD}`]: {
+            error: true,
+            code: 1,
+          },
+          [`git cherry ${TARGET_HEAD} ${MERGE_HEAD}`]: { stdout: `+ ${MERGE_HEAD}\n` },
+          [`git merge-base origin/main ${MERGE_HEAD}`]: { stdout: "base123\n" },
+          "git rev-parse origin/main": { stdout: "base123\n" },
+          [expectedCommand]: { stdout: "candidate integrated" },
+          "git diff --cached --quiet": { error: true, code: 1 },
+          "git diff --cached --name-status": { stdout: "M\tsrc/example.ts\n" },
+          "git commit -m": { stdout: "created squash commit" },
+          "git push origin HEAD:main": { stdout: "Pushed" },
+          "git rev-parse HEAD": [
+            { stdout: `${TARGET_HEAD}\n` },
+            ...(strategy === "rebase" ? [{ stdout: `${MERGE_COMMIT}\n` }] : []),
+            { stdout: `${MERGE_COMMIT}\n` },
+          ],
+          "git ls-remote --heads origin refs/heads/main": [
+            { stdout: `${TARGET_HEAD}\trefs/heads/main\n` },
+            { stdout: `${MERGE_COMMIT}\trefs/heads/main\n` },
+          ],
+          [`git rev-parse --verify ${preparedRef}^{commit}`]: { stdout: `${MERGE_COMMIT}\n` },
+          [`git merge-base --is-ancestor ${TARGET_HEAD} ${MERGE_COMMIT}`]: { stdout: "" },
+          [`git push --force-with-lease=refs/heads/main:${TARGET_HEAD} origin ${MERGE_COMMIT}:refs/heads/main`]:
+            { stdout: "Pushed" },
+          "git worktree remove": { stdout: "" },
+        };
+        const adapter = makeAdapter();
+        adapter.config.git.autoMergeStrategy = strategy;
+
+        const result = await mergeBranchToTarget(
+          "TASK-042",
+          adapter,
+          undefined,
+          "main",
+          undefined,
+          "quack/TASK-042",
+          MERGE_HEAD,
+          { preparedRef, onPrepared: jest.fn() },
+          ORIGIN_IDENTITY,
+        );
+
+        expect(result).toEqual({ success: true, mergeCommitSha: MERGE_COMMIT });
+        expect(mockExecutedCommands.some((command) => command.startsWith(expectedCommand))).toBe(
+          true,
+        );
+        if (strategy === "rebase") {
+          expect(
+            mockExecutedCommands.some(
+              (command) =>
+                command.startsWith("git checkout -b quack-internal/merge-candidate-") &&
+                command.endsWith(` ${MERGE_HEAD}`),
+            ),
+          ).toBe(true);
+          expect(mockExecutedCommands).not.toContain(`git rebase origin/main ${MERGE_HEAD}`);
+        }
+        expect(
+          mockExecutedCommands.filter((command) =>
+            command.includes("refs/heads/quack/TASK-042^{commit}"),
+          ),
+        ).toHaveLength(1);
+        expect(
+          mockExecutedCommands.some(
+            (command) =>
+              /git (?:merge|rebase) /u.test(command) &&
+              !command.startsWith("git merge-base") &&
+              command.includes("quack/TASK-042"),
+          ),
+        ).toBe(false);
+      },
+    );
+
+    test("refuses a local merge when the source branch moved before exact binding", async () => {
+      const movedHead = "f".repeat(40);
+      mockGitResults = {
+        "git rev-parse --verify refs/heads/quack/TASK-042^{commit}": {
+          stdout: `${movedHead}\n`,
+        },
+      };
+
+      const result = await mergeBranchToTarget(
+        "TASK-042",
+        makeAdapter(),
+        undefined,
+        "main",
+        undefined,
+        "quack/TASK-042",
+        MERGE_HEAD,
+        undefined,
+        ORIGIN_IDENTITY,
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("no longer points to the sealed candidate");
+      expect(mockExecutedCommands.some((command) => command.startsWith("git fetch"))).toBe(false);
+      expect(mockExecutedCommands.some((command) => command.includes("worktree add"))).toBe(false);
+    });
+
+    test("refuses a no-PR merge when origin changes after the candidate is bound", async () => {
+      mockGitResults = {
+        "git remote get-url --push --all origin": [
+          { stdout: `${ORIGIN_PUSH_URL}\n` },
+          { stdout: "git@github.com:attacker/redirect.git\n" },
+        ],
+        "git rev-parse --verify refs/heads/quack/TASK-042^{commit}": {
+          stdout: `${MERGE_HEAD}\n`,
+        },
+      };
+
+      const result = await mergeBranchToTarget(
+        "TASK-042",
+        makeAdapter(),
+        undefined,
+        "main",
+        undefined,
+        "quack/TASK-042",
+        MERGE_HEAD,
+        undefined,
+        ORIGIN_IDENTITY,
+      );
+
+      expect(result).toEqual({
+        success: false,
+        error: "Git origin changed before target publication",
+      });
+      expect(mockExecutedCommands.some((command) => command.startsWith("git fetch"))).toBe(false);
+    });
+
+    test("refuses no-effect completion when the remote target moved after the local proof", async () => {
+      const movedTarget = "e".repeat(40);
+      const preparedRef = "refs/quack/docker-publication-prepared/TASK-042/test";
+      mockGitResults = {
+        "git rev-parse --verify refs/heads/quack/TASK-042^{commit}": {
+          stdout: `${MERGE_HEAD}\n`,
+        },
+        "git fetch origin main:refs/remotes/origin/main": { stdout: "" },
+        "git worktree add --detach": { stdout: "Preparing worktree" },
+        "git rev-parse HEAD": { stdout: `${TARGET_HEAD}\n` },
+        [`git merge-base --is-ancestor ${MERGE_HEAD} ${TARGET_HEAD}`]: { stdout: "" },
+        "git ls-remote --heads origin refs/heads/main": {
+          stdout: `${movedTarget}\trefs/heads/main\n`,
+        },
+        [`git merge-base --is-ancestor ${TARGET_HEAD} ${movedTarget}`]: {
+          error: true,
+          code: 1,
+        },
+        "git worktree remove": { stdout: "" },
+      };
+
+      const result = await mergeBranchToTarget(
+        "TASK-042",
+        makeAdapter(),
+        undefined,
+        "main",
+        undefined,
+        "quack/TASK-042",
+        MERGE_HEAD,
+        { preparedRef, onPrepared: jest.fn() },
+        ORIGIN_IDENTITY,
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("remote target moved");
+      expect(
+        mockExecutedCommands.some(
+          (command) => command.includes("update-ref -d") && command.includes(preparedRef),
+        ),
+      ).toBe(false);
+    });
+
+    test("rechecks the bound origin before completing a no-effect rebase", async () => {
+      const preparedRef = "refs/quack/docker-publication-prepared/TASK-042/test";
+      mockGitResults = {
+        "git remote get-url --push --all origin": [
+          { stdout: `${ORIGIN_PUSH_URL}\n` },
+          { stdout: `${ORIGIN_PUSH_URL}\n` },
+          { stdout: "git@github.com:attacker/redirect.git\n" },
+        ],
+        "git rev-parse --verify refs/heads/quack/TASK-042^{commit}": {
+          stdout: `${MERGE_HEAD}\n`,
+        },
+        "git fetch origin main:refs/remotes/origin/main": { stdout: "" },
+        "git worktree add --detach": { stdout: "Preparing worktree" },
+        "git rev-parse HEAD": { stdout: `${TARGET_HEAD}\n` },
+        [`git merge-base --is-ancestor ${MERGE_HEAD} ${TARGET_HEAD}`]: {
+          error: true,
+          code: 1,
+        },
+        [`git merge --squash ${MERGE_HEAD}`]: { stdout: "candidate probed" },
+        "git diff --cached --quiet": { stdout: "" },
+        "git reset --hard HEAD": { stdout: "" },
+        "git worktree remove": { stdout: "" },
+      };
+      const adapter = makeAdapter();
+      adapter.config.git.autoMergeStrategy = "rebase";
+
+      const result = await mergeBranchToTarget(
+        "TASK-042",
+        adapter,
+        undefined,
+        "main",
+        undefined,
+        "quack/TASK-042",
+        MERGE_HEAD,
+        { preparedRef, onPrepared: jest.fn() },
+        ORIGIN_IDENTITY,
+      );
+
+      expect(result).toEqual({
+        success: false,
+        error: "Git origin changed after publication was bound",
+      });
+      expect(mockExecutedCommands).not.toContain("git ls-remote --heads origin refs/heads/main");
     });
 
     test("should fall back to local squash merge when no prUrl", async () => {
@@ -1233,6 +1621,178 @@ describe("branch-manager", () => {
 
       expect(result.deleted).toBe(true);
       expect(result.remoteDeleted).toBe(true);
+    });
+
+    test("uses exact local and remote leases when cleaning a sealed candidate", async () => {
+      const adapter = makeAdapter();
+      const twoDaysAgo = Math.floor(Date.now() / 1000) - 2 * 86400;
+      const branchRef = "refs/heads/quack/TASK-100";
+      mockGitResults = {
+        [`rev-parse --verify ${branchRef}`]: { stdout: `${MERGE_HEAD}\n` },
+        [`log -1 --format=%ct ${MERGE_HEAD}`]: { stdout: `${twoDaysAgo}\n` },
+        [`log -1 --format=%B ${MERGE_HEAD}`]: { stdout: "[TASK-100] fix something\n" },
+        [`merge-base --is-ancestor ${MERGE_HEAD} origin/main`]: { stdout: "" },
+        [`update-ref -d ${branchRef} ${MERGE_HEAD}`]: { stdout: "" },
+        [`push --force-with-lease=${branchRef}:${MERGE_HEAD} origin :${branchRef}`]: {
+          stdout: "",
+        },
+      };
+
+      const result = await deleteAfterMerge("quack/TASK-100", adapter, {
+        expectedHeadCommit: MERGE_HEAD,
+      });
+
+      expect(result).toEqual({ deleted: true, localDeleted: true, remoteDeleted: true });
+      expect(mockExecutedCommands).toContain(`git update-ref -d ${branchRef} ${MERGE_HEAD}`);
+      expect(mockExecutedCommands).toContain(
+        `git push --force-with-lease=${branchRef}:${MERGE_HEAD} origin :${branchRef}`,
+      );
+      expect(mockExecutedCommands.some((command) => command.includes("branch -d"))).toBe(false);
+    });
+
+    test("refuses cleanup when origin changes before remote merge proof", async () => {
+      const twoDaysAgo = Math.floor(Date.now() / 1000) - 2 * 86400;
+      const branchRef = "refs/heads/quack/TASK-100";
+      mockGitResults = {
+        "git remote get-url --push --all origin": [
+          { stdout: `${ORIGIN_PUSH_URL}\n` },
+          { stdout: "git@github.com:attacker/redirect.git\n" },
+        ],
+        [`rev-parse --verify ${branchRef}`]: { stdout: `${MERGE_HEAD}\n` },
+        [`log -1 --format=%ct ${MERGE_HEAD}`]: { stdout: `${twoDaysAgo}\n` },
+        [`log -1 --format=%B ${MERGE_HEAD}`]: { stdout: "[TASK-100] fix\n" },
+      };
+
+      const result = await deleteAfterMerge("quack/TASK-100", makeAdapter(), {
+        expectedHeadCommit: MERGE_HEAD,
+        expectedMergedCommit: MERGE_COMMIT,
+        expectedOriginPushUrl: ORIGIN_PUSH_URL,
+      });
+
+      expect(result).toEqual({ deleted: false, reason: "origin-mismatch" });
+      expect(mockExecutedCommands.some((command) => command.includes("update-ref -d"))).toBe(false);
+      expect(mockExecutedCommands.some((command) => command.startsWith("git fetch"))).toBe(false);
+    });
+
+    test("treats a failed leased delete as success when the exact remote ref is already absent", async () => {
+      const twoDaysAgo = Math.floor(Date.now() / 1000) - 2 * 86400;
+      const branchRef = "refs/heads/quack/TASK-100";
+      mockGitResults = {
+        [`rev-parse --verify ${branchRef}`]: { stdout: `${MERGE_HEAD}\n` },
+        [`log -1 --format=%ct ${MERGE_HEAD}`]: { stdout: `${twoDaysAgo}\n` },
+        [`log -1 --format=%B ${MERGE_HEAD}`]: { stdout: "[TASK-100] fix something\n" },
+        [`merge-base --is-ancestor ${MERGE_HEAD} origin/main`]: { stdout: "" },
+        [`update-ref -d ${branchRef} ${MERGE_HEAD}`]: { stdout: "" },
+        [`push --force-with-lease=${branchRef}:${MERGE_HEAD} origin :${branchRef}`]: {
+          error: true,
+          stderr: "! [rejected] (delete) -> quack/TASK-100 (stale info)",
+        },
+        [`ls-remote --heads origin ${branchRef}`]: { stdout: "" },
+      };
+
+      const result = await deleteAfterMerge("quack/TASK-100", makeAdapter(), {
+        expectedHeadCommit: MERGE_HEAD,
+      });
+
+      expect(result).toEqual({ deleted: true, localDeleted: true, remoteDeleted: true });
+      expect(mockExecutedCommands).toContain(`git ls-remote --heads origin ${branchRef}`);
+    });
+
+    test("refuses cleanup when a failed leased delete reveals a replacement remote head", async () => {
+      const twoDaysAgo = Math.floor(Date.now() / 1000) - 2 * 86400;
+      const branchRef = "refs/heads/quack/TASK-100";
+      mockGitResults = {
+        [`rev-parse --verify ${branchRef}`]: { stdout: `${MERGE_HEAD}\n` },
+        [`log -1 --format=%ct ${MERGE_HEAD}`]: { stdout: `${twoDaysAgo}\n` },
+        [`log -1 --format=%B ${MERGE_HEAD}`]: { stdout: "[TASK-100] fix something\n" },
+        [`merge-base --is-ancestor ${MERGE_HEAD} origin/main`]: { stdout: "" },
+        [`update-ref -d ${branchRef} ${MERGE_HEAD}`]: { stdout: "" },
+        [`push --force-with-lease=${branchRef}:${MERGE_HEAD} origin :${branchRef}`]: {
+          error: true,
+          stderr: "! [rejected] (delete) -> quack/TASK-100 (stale info)",
+        },
+        [`ls-remote --heads origin ${branchRef}`]: {
+          stdout: `${MERGE_COMMIT}\t${branchRef}\n`,
+        },
+      };
+
+      const result = await deleteAfterMerge("quack/TASK-100", makeAdapter(), {
+        expectedHeadCommit: MERGE_HEAD,
+      });
+
+      expect(result).toEqual({
+        deleted: false,
+        reason: "head-mismatch",
+        localDeleted: true,
+        remoteDeleted: false,
+      });
+    });
+
+    test("reports cleanup retryable when a failed leased delete leaves the same remote head", async () => {
+      const twoDaysAgo = Math.floor(Date.now() / 1000) - 2 * 86400;
+      const branchRef = "refs/heads/quack/TASK-100";
+      mockGitResults = {
+        [`rev-parse --verify ${branchRef}`]: { stdout: `${MERGE_HEAD}\n` },
+        [`log -1 --format=%ct ${MERGE_HEAD}`]: { stdout: `${twoDaysAgo}\n` },
+        [`log -1 --format=%B ${MERGE_HEAD}`]: { stdout: "[TASK-100] fix something\n" },
+        [`merge-base --is-ancestor ${MERGE_HEAD} origin/main`]: { stdout: "" },
+        [`update-ref -d ${branchRef} ${MERGE_HEAD}`]: { stdout: "" },
+        [`push --force-with-lease=${branchRef}:${MERGE_HEAD} origin :${branchRef}`]: {
+          error: true,
+          stderr: "remote unavailable",
+        },
+        [`ls-remote --heads origin ${branchRef}`]: {
+          stdout: `${MERGE_HEAD}\t${branchRef}\n`,
+        },
+      };
+
+      const result = await deleteAfterMerge("quack/TASK-100", makeAdapter(), {
+        expectedHeadCommit: MERGE_HEAD,
+      });
+
+      expect(result).toEqual({
+        deleted: false,
+        reason: "delete-failed",
+        localDeleted: true,
+        remoteDeleted: false,
+      });
+    });
+
+    test("branch advancement before cleanup preserves the replacement branch", async () => {
+      const branchRef = "refs/heads/quack/TASK-100";
+      mockGitResults = {
+        [`rev-parse --verify ${branchRef}`]: { stdout: `${MERGE_COMMIT}\n` },
+      };
+
+      const result = await deleteAfterMerge("quack/TASK-100", makeAdapter(), {
+        expectedHeadCommit: MERGE_HEAD,
+      });
+
+      expect(result).toEqual({ deleted: false, reason: "head-mismatch" });
+      expect(mockExecutedCommands.some((command) => command.includes("update-ref -d"))).toBe(false);
+      expect(mockExecutedCommands.some((command) => command.startsWith("git push"))).toBe(false);
+    });
+
+    test("fails closed when the branch moves between validation and leased deletion", async () => {
+      const twoDaysAgo = Math.floor(Date.now() / 1000) - 2 * 86400;
+      const branchRef = "refs/heads/quack/TASK-100";
+      mockGitResults = {
+        [`rev-parse --verify ${branchRef}`]: { stdout: `${MERGE_HEAD}\n` },
+        [`log -1 --format=%ct ${MERGE_HEAD}`]: { stdout: `${twoDaysAgo}\n` },
+        [`log -1 --format=%B ${MERGE_HEAD}`]: { stdout: "[TASK-100] fix something\n" },
+        [`merge-base --is-ancestor ${MERGE_HEAD} origin/main`]: { stdout: "" },
+        [`update-ref -d ${branchRef} ${MERGE_HEAD}`]: {
+          error: true,
+          stderr: "cannot lock ref: is at a different object",
+        },
+      };
+
+      const result = await deleteAfterMerge("quack/TASK-100", makeAdapter(), {
+        expectedHeadCommit: MERGE_HEAD,
+      });
+
+      expect(result).toEqual({ deleted: false, reason: "delete-failed", localDeleted: false });
+      expect(mockExecutedCommands.some((command) => command.startsWith("git push"))).toBe(false);
     });
 
     test("non-quack branch is rejected immediately", async () => {

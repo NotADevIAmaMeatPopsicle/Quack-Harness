@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import type { DockerIsolationConfig } from "../../src/core/types";
 import {
   clearDockerPublicationRecovery,
+  initializeDockerPublicationRecovery,
   publishDockerPromotedResult,
 } from "../../src/dispatcher/docker-host-publication";
 import { DockerManager } from "../../src/dispatcher/docker-manager";
@@ -160,22 +161,30 @@ describeWithDocker("DockerManager real Docker isolation", () => {
       ).toBe("authoritative");
 
       const publicationId = randomUUID();
-      const gitState = manager.sealPrivateGitForPublication(container, publicationId);
+      const gitState = manager.preparePrivateGitForPublication(container, publicationId);
+      const publicationOptions = {
+        recovery: {
+          rootDir: path.join(stateRoot, "publication"),
+          publicationId,
+          gitState,
+          worktreePath,
+          worktreeSessionId: `quack-${taskId}-${randomUUID()}`,
+          worktreeOwnershipId: publicationId,
+          preserveWorktree: false,
+        },
+      };
+      await initializeDockerPublicationRecovery(
+        taskId,
+        projectRoot,
+        "quack/TASK-DOCKER-E2E",
+        publicationOptions,
+      );
+      manager.sealPreparedPublicationRef(gitState);
       const publication = await publishDockerPromotedResult(
         taskId,
         projectRoot,
         "quack/TASK-DOCKER-E2E",
-        {
-          recovery: {
-            rootDir: path.join(stateRoot, "publication"),
-            publicationId,
-            gitState,
-            worktreePath,
-            worktreeSessionId: `quack-${taskId}-${randomUUID()}`,
-            worktreeOwnershipId: publicationId,
-            preserveWorktree: false,
-          },
-        },
+        publicationOptions,
       );
       expect(publication.autoMerged).toBe(true);
       expect(

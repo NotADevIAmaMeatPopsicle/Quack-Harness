@@ -9,6 +9,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { createMonitorServer } from "../../src/monitor/server";
+import { hashPassword } from "../../src/monitor/auth";
 import type { ProjectAdapter } from "../../src/core/adapter-loader";
 import type { AdapterConfig } from "../../src/core/types";
 
@@ -128,10 +129,13 @@ function makeAdapters(roots: string[]): ProjectAdapter[] {
   });
 }
 
-async function httpGet(url: string): Promise<{ status: number; body: string }> {
+async function httpGet(
+  url: string,
+  headers?: Record<string, string>,
+): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     http
-      .get(url, (res) => {
+      .get(url, { headers }, (res) => {
         let body = "";
         res.on("data", (chunk) => (body += chunk));
         res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
@@ -169,6 +173,31 @@ async function httpPost(
     );
     req.on("error", reject);
     if (postData) req.write(postData);
+    req.end();
+  });
+}
+
+async function httpDelete(
+  url: string,
+  headers?: Record<string, string>,
+): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(url);
+    const req = http.request(
+      {
+        hostname: urlObj.hostname,
+        port: urlObj.port,
+        path: `${urlObj.pathname}${urlObj.search}`,
+        method: "DELETE",
+        headers,
+      },
+      (res) => {
+        let body = "";
+        res.on("data", (chunk) => (body += chunk));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+      },
+    );
+    req.on("error", reject);
     req.end();
   });
 }
@@ -433,5 +462,179 @@ describe("project scope write guard (TASK-1301) — single-project registry", ()
       docsImpact: "none",
     });
     expect(resp.status).toBe(201);
+  });
+});
+
+describe("API key effective-project authorization — multi-project fleet routes", () => {
+  let tempRoot: string;
+  let rootAlpha: string;
+  let rootBeta: string;
+  let port: number;
+  let stop: (() => Promise<void>) | null = null;
+
+  beforeEach(async () => {
+    tempRoot = makeTempDir();
+    rootAlpha = path.join(tempRoot, "alpha");
+    rootBeta = path.join(tempRoot, "beta");
+    setupProjectDirectory(rootAlpha, "alpha");
+    setupProjectDirectory(rootBeta, "beta");
+
+    const authDir = path.join(tempRoot, "auth-root", ".quack");
+    fs.mkdirSync(authDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(authDir, "auth.json"),
+      JSON.stringify({
+        users: [{ username: "admin", passwordHash: "not-used", role: "admin" }],
+        apiKeys: [
+          {
+            id: "alpha-key",
+            name: "Alpha machine",
+            keyHash: await hashPassword("alpha-secret"),
+            role: "admin",
+            projectScopes: ["alpha"],
+          },
+          {
+            id: "fleet-key",
+            name: "Fleet machine",
+            keyHash: await hashPassword("fleet-secret"),
+            role: "admin",
+            projectScopes: ["*"],
+          },
+        ],
+        sessionSecret: "test-secret",
+        sessionTtlMs: 60_000,
+      }),
+      "utf-8",
+    );
+
+    port = 43000 + Math.floor(Math.random() * 2000);
+    const server = createMonitorServer({
+      port,
+      quackRoot: path.join(tempRoot, "auth-root"),
+      // Registration order deliberately makes beta the mutable active project.
+      projectAdapters: makeAdapters([rootBeta, rootAlpha]),
+    });
+    const started = await server.start();
+    stop = started.stop;
+  });
+
+  afterEach(async () => {
+    if (stop) {
+      await stop();
+      stop = null;
+    }
+    await cleanupDir(tempRoot);
+  });
+
+  it.each(["/API/FlEeT/StAtUs", "/API/TaSkS/TASK-999/HeAlTh", "/api/tasks"])(
+    "checks an omitted selector against the active project on route %s",
+    async (routePath) => {
+      const response = await httpGet(`http://localhost:${port}${routePath}`, {
+        "x-api-key": "alpha-secret",
+      });
+
+      expect(response.status).toBe(403);
+      expect(JSON.parse(response.body)).toMatchObject({
+        code: "API_KEY_SCOPE_MISMATCH",
+        projectId: "beta",
+      });
+    },
+  );
+
+  it("accepts the scoped key only for its explicitly selected alpha project", async () => {
+    const allowed = await httpGet(`http://localhost:${port}/ApI/FlEeT/StAtUs?project=alpha`, {
+      "x-api-key": "alpha-secret",
+    });
+    expect(allowed.status).toBe(200);
+
+    const denied = await httpGet(`http://localhost:${port}/api/fleet/status?project=beta`, {
+      "x-api-key": "alpha-secret",
+    });
+    expect(denied.status).toBe(403);
+    expect(JSON.parse(denied.body)).toMatchObject({ code: "API_KEY_SCOPE_MISMATCH" });
+  });
+
+  it("blocks an explicitly cross-project task mutation before dispatch", async () => {
+    const response = await httpPost(
+      `http://localhost:${port}/api/tasks/TASK-777/start?project=beta`,
+      { localSmokeOnly: true },
+      { "x-api-key": "alpha-secret" },
+    );
+
+    expect(response.status).toBe(403);
+    expect(JSON.parse(response.body)).toMatchObject({
+      code: "API_KEY_SCOPE_MISMATCH",
+      projectId: "beta",
+    });
+  });
+
+  it("preserves active-project fallback for an explicitly wildcard-scoped key", async () => {
+    const response = await httpGet(`http://localhost:${port}/api/fleet/status`, {
+      "x-api-key": "fleet-secret",
+    });
+    expect(response.status).toBe(200);
+  });
+
+  it.each([
+    ["/api/tasks/create", { task: { title: "must not land" } }],
+    ["/api/testing/run", {}],
+    ["/api/intake/apply", {}],
+  ])("blocks active-project mutation %s when the key lacks that scope", async (routePath, body) => {
+    const response = await httpPost(`http://localhost:${port}${routePath}`, body, {
+      "x-api-key": "alpha-secret",
+    });
+
+    expect(response.status).toBe(403);
+    expect(JSON.parse(response.body)).toMatchObject({
+      code: "API_KEY_SCOPE_MISMATCH",
+      projectId: "beta",
+    });
+  });
+
+  it("allows an omitted selector only when the active project is in key scope", async () => {
+    const selectAlpha = await httpPost(
+      `http://localhost:${port}/api/projects/active`,
+      { projectId: "alpha" },
+      { "x-api-key": "fleet-secret" },
+    );
+    expect(selectAlpha.status).toBe(200);
+
+    const response = await httpGet(`http://localhost:${port}/api/tasks`, {
+      "x-api-key": "alpha-secret",
+    });
+    expect(response.status).toBe(200);
+  });
+
+  it("requires wildcard scope to create a project registry entry", async () => {
+    const response = await httpPost(
+      `http://localhost:${port}/api/projects`,
+      { path: rootAlpha },
+      { "x-api-key": "alpha-secret" },
+    );
+
+    expect(response.status).toBe(403);
+    expect(JSON.parse(response.body)).toMatchObject({
+      code: "API_KEY_GLOBAL_SCOPE_REQUIRED",
+    });
+  });
+
+  it("requires wildcard scope for project deletion and leaves the target registered", async () => {
+    const response = await httpDelete(`http://localhost:${port}/api/projects/beta`, {
+      "x-api-key": "alpha-secret",
+    });
+
+    expect(response.status).toBe(403);
+    expect(JSON.parse(response.body)).toMatchObject({
+      code: "API_KEY_GLOBAL_SCOPE_REQUIRED",
+    });
+    expect((await httpGet(`http://localhost:${port}/api/projects/beta`)).status).toBe(200);
+  });
+
+  it("never exposes fleet survivor reconciliation tokens anonymously", async () => {
+    const response = await httpGet(
+      `http://localhost:${port}/api/fleet/worktree-shutdown-survivors`,
+    );
+    expect(response.status).toBe(401);
+    expect(response.body).not.toContain("reconciliationToken");
   });
 });

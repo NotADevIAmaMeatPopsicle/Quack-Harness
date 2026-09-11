@@ -25,6 +25,12 @@ const DOCKER_CLEANUP_TIMEOUT_MS = 5_000;
 const DOCKER_SETUP_TIMEOUT_MS = 15 * 60_000;
 const UNCERTAIN_CREATE_WINDOW_MS = DOCKER_COMMAND_TIMEOUT_MS;
 const UNCERTAIN_CREATE_PROBE_INTERVAL_MS = 250;
+const MAX_PRIVATE_GIT_OBJECT_FILES = 100_000;
+const MAX_PRIVATE_GIT_COMPRESSED_BYTES = 512 * 1024 * 1024;
+const MAX_PRIVATE_GIT_OBJECT_BYTES = 128 * 1024 * 1024;
+const MAX_PRIVATE_GIT_INFLATED_BYTES = 512 * 1024 * 1024;
+const MAX_PRIVATE_GIT_REV_LIST_BYTES = 8 * 1024 * 1024;
+const PRIVATE_GIT_COMMAND_TIMEOUT_MS = 60_000;
 
 function comparablePath(value: string): string {
   const resolved = path.resolve(value);
@@ -212,6 +218,12 @@ interface DockerInspectRecord {
   Mounts?: Array<{ Source?: unknown; Destination?: unknown }>;
   State?: { Running?: unknown };
   Created?: unknown;
+}
+
+interface ValidatedPrivateGitObject {
+  objectId: string;
+  source: string;
+  compressedDigest: string;
 }
 
 interface DockerCreateUncertainty {
@@ -1929,11 +1941,14 @@ export class DockerManager {
         {
           cwd: worktreePath,
           encoding: "utf-8",
+          maxBuffer: MAX_PRIVATE_GIT_REV_LIST_BYTES,
+          timeout: PRIVATE_GIT_COMMAND_TIMEOUT_MS,
           env: {
             ...process.env,
             GIT_ALTERNATE_OBJECT_DIRECTORIES: alternates ?? "",
             GIT_CONFIG_NOSYSTEM: "1",
             GIT_CONFIG_GLOBAL: nullDevice,
+            GIT_NO_REPLACE_OBJECTS: "1",
             GIT_EXTERNAL_DIFF: "",
             GIT_PAGER: "cat",
           },
@@ -1966,8 +1981,10 @@ export class DockerManager {
     return candidate;
   }
 
-  private validateAndCopyPrivateObjects(container: DockerContainer): void {
-    if (!container.privateGitDir || !container.gitObjectsDir) {
+  private validatePrivateObjectsForInspection(
+    container: DockerContainer,
+  ): Map<string, ValidatedPrivateGitObject> {
+    if (!container.privateGitDir) {
       throw new Error("Docker result object metadata is incomplete");
     }
     const privateObjects = path.join(container.privateGitDir, "objects");
@@ -1977,9 +1994,10 @@ export class DockerManager {
       "Docker private Git object store",
     );
     const sourceRoot = fs.realpathSync.native(privateObjects);
-    const targetRoot = fs.realpathSync.native(container.gitObjectsDir);
+    const validated = new Map<string, ValidatedPrivateGitObject>();
     let files = 0;
     let bytes = 0;
+    let inflatedBytes = 0;
     for (const prefixEntry of fs.readdirSync(sourceRoot, { withFileTypes: true })) {
       if (!prefixEntry.isDirectory() || prefixEntry.isSymbolicLink()) {
         throw new Error(`Docker private Git object entry is not allowlisted: ${prefixEntry.name}`);
@@ -2013,15 +2031,24 @@ export class DockerManager {
         ) {
           throw new Error("Docker private Git contains an invalid loose object path");
         }
+        const objectId = `${prefixEntry.name}${objectEntry.name}`.toLowerCase();
         const source = path.join(prefixPath, objectEntry.name);
         const stat = fs.lstatSync(source);
         files += 1;
         bytes += stat.size;
-        if (stat.nlink !== 1 || files > 100_000 || bytes > 512 * 1024 * 1024) {
+        if (
+          stat.nlink !== 1 ||
+          files > MAX_PRIVATE_GIT_OBJECT_FILES ||
+          bytes > MAX_PRIVATE_GIT_COMPRESSED_BYTES
+        ) {
           throw new Error("Docker private Git object import exceeds its safety boundary");
         }
-        const compressed = Buffer.from(readTrustedBinaryFile(source, 128 * 1024 * 1024));
-        const inflated = inflateSync(compressed, { maxOutputLength: 128 * 1024 * 1024 });
+        const compressed = Buffer.from(readTrustedBinaryFile(source, MAX_PRIVATE_GIT_OBJECT_BYTES));
+        const inflated = inflateSync(compressed, { maxOutputLength: MAX_PRIVATE_GIT_OBJECT_BYTES });
+        inflatedBytes += inflated.length;
+        if (inflatedBytes > MAX_PRIVATE_GIT_INFLATED_BYTES) {
+          throw new Error("Docker private Git decompression exceeds its aggregate safety boundary");
+        }
         const nul = inflated.indexOf(0);
         if (nul <= 0) throw new Error("Docker private Git contains a malformed object");
         const header = inflated.subarray(0, nul).toString("ascii");
@@ -2029,24 +2056,80 @@ export class DockerManager {
         if (!headerMatch || Number(headerMatch[2]) !== inflated.length - nul - 1) {
           throw new Error("Docker private Git contains a malformed object header");
         }
-        const objectId = `${prefixEntry.name}${objectEntry.name}`.toLowerCase();
         const algorithm = objectId.length === 64 ? "sha256" : "sha1";
         if (createHash(algorithm).update(inflated).digest("hex") !== objectId) {
           throw new Error("Docker private Git object content does not match its object id");
         }
-        const destinationDir = path.join(targetRoot, prefixEntry.name.toLowerCase());
-        const destination = path.join(destinationDir, objectEntry.name.toLowerCase());
-        fs.mkdirSync(destinationDir, { recursive: true });
-        if (!fs.existsSync(destination)) {
-          try {
-            fs.writeFileSync(destination, compressed, { flag: "wx" });
-          } catch (error: unknown) {
-            const code =
-              typeof error === "object" && error !== null && "code" in error
-                ? String((error as { code?: unknown }).code)
-                : "";
-            if (code !== "EEXIST") throw error;
-          }
+        if (validated.has(objectId)) {
+          throw new Error("Docker private Git contains duplicate loose-object identities");
+        }
+        validated.set(objectId, {
+          objectId,
+          source,
+          compressedDigest: createHash("sha256").update(compressed).digest("hex"),
+        });
+      }
+    }
+    return validated;
+  }
+
+  private copyReachablePrivateObjects(
+    container: DockerContainer,
+    candidateHead: string,
+    validated: ReadonlyMap<string, ValidatedPrivateGitObject>,
+  ): void {
+    if (!container.privateGitDir || !container.gitObjectsDir || !container.authoritativeHead) {
+      throw new Error("Docker result object metadata is incomplete");
+    }
+    const reachableOutput = this.gitOutput(
+      container.privateGitDir,
+      container.worktreePath,
+      [
+        "rev-list",
+        "--objects",
+        "--no-object-names",
+        candidateHead,
+        "--not",
+        container.authoritativeHead,
+      ],
+      container.gitObjectsDir,
+    );
+    const reachableObjects = new Set(
+      reachableOutput
+        .split(/\r?\n/u)
+        .map((value) => value.trim().toLowerCase())
+        .filter(Boolean),
+    );
+    if (
+      reachableObjects.size > MAX_PRIVATE_GIT_OBJECT_FILES ||
+      [...reachableObjects].some((value) => !/^[a-f0-9]{40,64}$/u.test(value))
+    ) {
+      throw new Error("Docker private Git reachable object set exceeds its safety boundary");
+    }
+    const targetRoot = fs.realpathSync.native(container.gitObjectsDir);
+    for (const object of validated.values()) {
+      // A normal commit can leave objects from an amend/reset behind. They
+      // are not part of the sealed candidate graph, so never import them into
+      // the authoritative repository.
+      if (!reachableObjects.has(object.objectId)) continue;
+      const compressed = Buffer.from(
+        readTrustedBinaryFile(object.source, MAX_PRIVATE_GIT_OBJECT_BYTES),
+      );
+      if (createHash("sha256").update(compressed).digest("hex") !== object.compressedDigest) {
+        throw new Error("Docker private Git object changed after bounded validation");
+      }
+      const destinationDir = path.join(targetRoot, object.objectId.slice(0, 2));
+      const destination = path.join(destinationDir, object.objectId.slice(2));
+      fs.mkdirSync(destinationDir, { recursive: true });
+      if (!fs.existsSync(destination)) {
+        try {
+          fs.writeFileSync(destination, compressed, { flag: "wx" });
+        } catch (error: unknown) {
+          const code =
+            typeof error === "object" && error !== null && "code" in error
+              ? String((error as { code?: unknown }).code)
+              : "";
+          if (code !== "EEXIST") throw error;
         }
       }
     }
@@ -2068,6 +2151,20 @@ export class DockerManager {
           throw new Error("Docker private Git directory exceeds the safe validation limit");
         }
         const candidate = path.join(current, entry.name);
+        const relative = path.relative(privateGitDir, candidate).replace(/\\/gu, "/").toLowerCase();
+        if (
+          relative === "commondir" ||
+          relative === "gitdir" ||
+          relative === "packed-refs" ||
+          relative === "shallow" ||
+          relative === "shallow.lock" ||
+          relative === "info/grafts" ||
+          relative === "info/grafts.lock" ||
+          relative === "refs/replace" ||
+          relative.startsWith("refs/replace/")
+        ) {
+          throw new Error(`Docker private Git contains graph-rewriting metadata: ${relative}`);
+        }
         const stat = fs.lstatSync(candidate);
         if (entry.isSymbolicLink() || stat.isSymbolicLink()) {
           throw new Error(`Docker private Git contains an untrusted symlink: ${entry.name}`);
@@ -2230,6 +2327,9 @@ export class DockerManager {
       throw new Error("Docker private Git resume ownership is invalid");
     }
     const { candidateHead, privateObjects } = this.preparePrivateGitForInspection(container);
+    // Complete the bounded, in-process object validation before any Git
+    // subprocess is allowed to parse container-authored objects.
+    const validatedObjects = this.validatePrivateObjectsForInspection(container);
     this.assertPrivateWorktreeClean(container, candidateHead, "pause");
     this.assertAuthoritativeRefUnchanged(container);
     this.gitOutput(
@@ -2238,7 +2338,7 @@ export class DockerManager {
       ["merge-base", "--is-ancestor", container.authoritativeHead, candidateHead],
       privateObjects,
     );
-    this.validateAndCopyPrivateObjects(container);
+    this.copyReachablePrivateObjects(container, candidateHead, validatedObjects);
     const safeTask = container.taskId.replace(/[^A-Za-z0-9._-]/g, "_");
     const sealedRef = `refs/quack/docker-resume/${safeTask}/${ownershipId}`;
     const zero = "0".repeat(candidateHead.length);
@@ -2257,12 +2357,12 @@ export class DockerManager {
   }
 
   /**
-   * Copy and pin a completed container's candidate commit before any host-side
-   * publication effect. The publication ref is durable recovery evidence: it
-   * survives a push/PR/merge failure and is released only after every required
-   * publication step is confirmed.
+   * Validate and copy a completed container's candidate commit before host
+   * publication. This deliberately does not create the sealed ref: callers
+   * persist the complete publication journal first, closing the ref-before-
+   * journal crash window.
    */
-  sealPrivateGitForPublication(
+  preparePrivateGitForPublication(
     container: DockerContainer,
     ownershipId: string,
   ): DockerResumeGitBinding {
@@ -2281,6 +2381,9 @@ export class DockerManager {
       throw new Error("Docker publication ownership is invalid");
     }
     const { candidateHead, privateObjects } = this.preparePrivateGitForInspection(container);
+    // Complete the bounded, in-process object validation before any Git
+    // subprocess is allowed to parse container-authored objects.
+    const validatedObjects = this.validatePrivateObjectsForInspection(container);
     this.assertPrivateWorktreeClean(container, candidateHead, "publication");
     if (candidateHead === container.authoritativeHead) {
       throw new Error("Docker result has no committed change to publish");
@@ -2292,22 +2395,33 @@ export class DockerManager {
       ["merge-base", "--is-ancestor", container.authoritativeHead, candidateHead],
       privateObjects,
     );
-    this.validateAndCopyPrivateObjects(container);
+    this.copyReachablePrivateObjects(container, candidateHead, validatedObjects);
     const safeTask = container.taskId.replace(/[^A-Za-z0-9._-]/g, "_");
     const sealedRef = `refs/quack/docker-publication/${safeTask}/${ownershipId}`;
-    const zero = "0".repeat(candidateHead.length);
-    this.gitOutput(container.authoritativeWorktreeGitDir, container.worktreePath, [
-      "update-ref",
-      sealedRef,
-      candidateHead,
-      zero,
-    ]);
     return {
       authoritativeRef: container.authoritativeRef,
       baseHead: container.authoritativeHead,
       candidateHead,
       sealedRef,
     };
+  }
+
+  sealPreparedPublicationRef(binding: DockerResumeGitBinding): DockerResumeGitBinding {
+    const candidate = this.projectGitOutput([
+      "rev-parse",
+      "--verify",
+      `${binding.candidateHead}^{commit}`,
+    ]);
+    if (candidate.toLowerCase() !== binding.candidateHead.toLowerCase()) {
+      throw new Error("Prepared Docker publication candidate is not an exact commit");
+    }
+    this.projectGitOutput([
+      "update-ref",
+      binding.sealedRef,
+      binding.candidateHead,
+      "0".repeat(binding.candidateHead.length),
+    ]);
+    return binding;
   }
 
   releaseSealedResumeRef(binding: DockerResumeSourceBinding): boolean {
@@ -2389,6 +2503,7 @@ export class DockerManager {
     // Replace container-controlled config with a fixed non-executable one and
     // remove its alternate pointer before invoking host Git on the private dir.
     const { candidateHead, privateObjects } = this.preparePrivateGitForInspection(tracked);
+    const validatedObjects = this.validatePrivateObjectsForInspection(tracked);
     const branch =
       tracked.authoritativeRef === "HEAD"
         ? "HEAD"
@@ -2418,7 +2533,7 @@ export class DockerManager {
         ["merge-base", "--is-ancestor", tracked.authoritativeHead, candidateHead],
         privateObjects,
       );
-      this.validateAndCopyPrivateObjects(tracked);
+      this.copyReachablePrivateObjects(tracked, candidateHead, validatedObjects);
       this.gitOutput(tracked.authoritativeWorktreeGitDir, tracked.worktreePath, [
         "update-ref",
         tracked.authoritativeRef,

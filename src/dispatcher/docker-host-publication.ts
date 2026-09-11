@@ -4,19 +4,40 @@
 // either confirmed or remains retryable from an exact sealed Git ref.
 
 import { execFile } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { isDeepStrictEqual, promisify } from "node:util";
 import { loadAdapter, type ProjectAdapter } from "../core/adapter-loader.js";
 import { resolveTaskFile } from "../core/task-file-resolver.js";
 import { resolveTargetBranch } from "./branch-resolver.js";
+import { BOUND_GIT_REMOTE, runBoundGitCommand } from "./bound-git-command.js";
 import {
   buildBranchName,
   deleteAfterMerge,
   mergeBranchToTarget,
+  type PreparedTargetMerge,
   updateTaskFileStatus,
 } from "./branch-manager.js";
 import type { DockerResumeGitBinding, DockerResumeSourceBinding } from "./docker-runtime-bridge.js";
+import {
+  findDockerPublicationRecovery as findDurableDockerPublicationRecovery,
+  reconcileDockerPublicationRecoveryArtifacts,
+} from "./docker-publication-recovery.js";
+import {
+  ensureDirectoryDurably,
+  removeFileDurably,
+  trustedWindowsPowerShellPath,
+  writeJsonAtomicDurable,
+} from "./durable-json-file.js";
+import {
+  isGitOriginBinding,
+  persistentOriginRepositoryBinding,
+  resolveBoundOriginRepository,
+  resolveBoundOriginGitHubRepository,
+  resolveOriginRepository,
+  type GitOriginBinding,
+} from "./github-repository.js";
 import { createPullRequest } from "./pr-creator.js";
 
 export interface DockerHostPublicationRecoveryInput {
@@ -51,6 +72,7 @@ interface PublicationProgress {
   pushedAt?: string;
   pullRequestAt?: string;
   prUrl?: string;
+  preparedMerge?: PreparedTargetMerge & { preparedAt: string };
   mergedAt?: string;
   mergeCommitSha?: string;
   statusAt?: string;
@@ -68,6 +90,7 @@ export interface DockerPublicationJournal {
   targetBranch: string;
   parentTaskId?: string;
   sharedBranchName?: string;
+  repository?: GitOriginBinding;
   gitState: DockerResumeGitBinding;
   worktreePath: string;
   worktreeSessionId: string;
@@ -77,6 +100,8 @@ export interface DockerPublicationJournal {
   requirements: PublicationRequirements;
   progress: PublicationProgress;
   state: "pending" | "complete";
+  generation?: number;
+  previousDigest?: string;
   createdAt: string;
   updatedAt: string;
   lastError?: { step: DockerPublicationStep; detail: string; at: string };
@@ -119,7 +144,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isSafeBranchName(value: string): boolean {
-  const forbidden = new Set(["~", "^", ":", "?", "*", "[", "]", "\\"]);
+  const forbidden = new Set([
+    "~",
+    "^",
+    ":",
+    "?",
+    "*",
+    "[",
+    "]",
+    "\\",
+    ";",
+    "&",
+    "|",
+    "<",
+    ">",
+    "`",
+    "$",
+    "!",
+    "'",
+    '"',
+    "(",
+    ")",
+    "{",
+    "}",
+  ]);
   return (
     value.length > 0 &&
     value.length <= 500 &&
@@ -156,33 +204,21 @@ function publicationPath(rootDir: string, taskId: string, publicationId: string)
   return path.join(rootDir, `${safeTaskId(taskId)}-${publicationId}.json`);
 }
 
-function writeJsonAtomic(filePath: string, value: unknown, exclusive = false): void {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  if (exclusive) {
-    const fd = fs.openSync(
-      filePath,
-      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY,
-    );
-    try {
-      fs.writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`, "utf-8");
-      fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-    return;
-  }
-  const temporary = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  const fd = fs.openSync(
-    temporary,
-    fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY,
+function preparedPublicationRef(sealedRef: string): string {
+  return sealedRef.replace(
+    "refs/quack/docker-publication/",
+    "refs/quack/docker-publication-prepared/",
   );
-  try {
-    fs.writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`, "utf-8");
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-  fs.renameSync(temporary, filePath);
+}
+
+function errorCode(error: unknown): string {
+  return typeof error === "object" && error !== null && "code" in error
+    ? String((error as { code?: unknown }).code)
+    : "";
+}
+
+function writeJsonAtomic(filePath: string, value: unknown, exclusive = false): void {
+  writeJsonAtomicDurable(filePath, value, exclusive);
 }
 
 function validateGitState(value: unknown): value is DockerResumeGitBinding {
@@ -246,6 +282,7 @@ function validateProgress(value: unknown): value is PublicationProgress {
         "pushedAt",
         "pullRequestAt",
         "prUrl",
+        "preparedMerge",
         "mergedAt",
         "mergeCommitSha",
         "statusAt",
@@ -276,10 +313,43 @@ function validateProgress(value: unknown): value is PublicationProgress {
   return (
     (value.prUrl === undefined ||
       (typeof value.prUrl === "string" && /^https?:\/\//i.test(value.prUrl))) &&
+    (value.preparedMerge === undefined || validatePreparedMerge(value.preparedMerge)) &&
     (value.mergeCommitSha === undefined ||
       (typeof value.mergeCommitSha === "string" && HASH_PATTERN.test(value.mergeCommitSha))) &&
     (value.cleanupOutcome === undefined ||
       (typeof value.cleanupOutcome === "string" && value.cleanupOutcome.length <= 1_000))
+  );
+}
+
+function validatePreparedMerge(
+  value: unknown,
+): value is PreparedTargetMerge & { preparedAt: string } {
+  return (
+    isRecord(value) &&
+    Object.keys(value).length === 6 &&
+    Object.keys(value).every((key) =>
+      [
+        "strategy",
+        "candidateHead",
+        "targetHead",
+        "resultHead",
+        "preparedRef",
+        "preparedAt",
+      ].includes(key),
+    ) &&
+    ["merge", "rebase", "squash"].includes(String(value.strategy)) &&
+    typeof value.candidateHead === "string" &&
+    HASH_PATTERN.test(value.candidateHead) &&
+    typeof value.targetHead === "string" &&
+    HASH_PATTERN.test(value.targetHead) &&
+    typeof value.resultHead === "string" &&
+    HASH_PATTERN.test(value.resultHead) &&
+    isSafeRef(value.preparedRef, "refs/quack/docker-publication-prepared/") &&
+    value.candidateHead.length === value.targetHead.length &&
+    value.candidateHead.length === value.resultHead.length &&
+    value.targetHead !== value.resultHead &&
+    typeof value.preparedAt === "string" &&
+    Number.isFinite(Date.parse(value.preparedAt))
   );
 }
 
@@ -299,6 +369,7 @@ function validateLastError(value: unknown): boolean {
 }
 
 function readJournal(filePath: string): DockerPublicationJournal {
+  reconcileDockerPublicationRecoveryArtifacts(filePath);
   const before = fs.lstatSync(filePath);
   if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > 256_000) {
     throw new Error("Docker publication recovery has an untrusted file identity");
@@ -338,6 +409,11 @@ function readJournal(filePath: string): DockerPublicationJournal {
     !validateBooleanRecord(parsed.requirements) ||
     !validateProgress(parsed.progress) ||
     !["pending", "complete"].includes(String(parsed.state)) ||
+    (parsed.generation !== undefined &&
+      (!Number.isSafeInteger(parsed.generation) || Number(parsed.generation) < 0)) ||
+    (parsed.previousDigest !== undefined &&
+      (typeof parsed.previousDigest !== "string" ||
+        !/^[a-f0-9]{64}$/iu.test(parsed.previousDigest))) ||
     typeof parsed.createdAt !== "string" ||
     !Number.isFinite(Date.parse(parsed.createdAt)) ||
     typeof parsed.updatedAt !== "string" ||
@@ -353,6 +429,8 @@ function readJournal(filePath: string): DockerPublicationJournal {
     throw new Error("Docker publication recovery has an invalid schema");
   }
   const journal = parsed as unknown as DockerPublicationJournal;
+  const requiresRemote = Object.values(journal.requirements).some(Boolean);
+  const generation = journal.generation ?? 0;
   const requiredProgress: Array<[boolean, keyof PublicationProgress]> = [
     [true, "promotedAt"],
     [journal.requirements.push, "pushedAt"],
@@ -363,6 +441,12 @@ function readJournal(filePath: string): DockerPublicationJournal {
   ];
   if (
     journal.publicationId !== journal.worktreeOwnershipId ||
+    Boolean(journal.repository) !== requiresRemote ||
+    (journal.repository !== undefined && !isGitOriginBinding(journal.repository)) ||
+    (journal.requirements.pullRequest && !journal.repository?.github) ||
+    (generation === 0
+      ? journal.previousDigest !== undefined
+      : journal.previousDigest === undefined) ||
     journal.gitState.authoritativeRef !== `refs/heads/${journal.branch}` ||
     (journal.state === "complete" &&
       requiredProgress.some(
@@ -372,9 +456,22 @@ function readJournal(filePath: string): DockerPublicationJournal {
     (journal.progress.pullRequestAt !== undefined &&
       journal.requirements.push &&
       journal.progress.pushedAt === undefined) ||
+    (journal.progress.preparedMerge !== undefined &&
+      (!journal.requirements.merge ||
+        journal.requirements.pullRequest ||
+        journal.progress.promotedAt === undefined ||
+        journal.progress.preparedMerge.candidateHead.toLowerCase() !==
+          journal.gitState.candidateHead.toLowerCase() ||
+        journal.progress.preparedMerge.preparedRef !==
+          preparedPublicationRef(journal.gitState.sealedRef))) ||
     (journal.progress.mergedAt !== undefined &&
       journal.requirements.pullRequest &&
       journal.progress.pullRequestAt === undefined) ||
+    (journal.progress.mergeCommitSha !== undefined && journal.progress.mergedAt === undefined) ||
+    (journal.progress.preparedMerge !== undefined &&
+      journal.progress.mergedAt !== undefined &&
+      journal.progress.mergeCommitSha?.toLowerCase() !==
+        journal.progress.preparedMerge.resultHead.toLowerCase()) ||
     (journal.progress.statusAt !== undefined && journal.progress.mergedAt === undefined) ||
     (journal.progress.cleanupAt !== undefined && journal.progress.mergedAt === undefined)
   ) {
@@ -394,34 +491,14 @@ export function findDockerPublicationRecovery(
   rootDir: string,
   taskId: string,
 ): { path: string; journal: DockerPublicationJournal } | undefined {
-  const root = path.resolve(rootDir);
-  if (!fs.existsSync(root)) return undefined;
-  const rootStat = fs.lstatSync(root);
-  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
-    throw new Error("Docker publication recovery root is not a trusted directory");
-  }
-  const prefix = `${safeTaskId(taskId)}-`;
-  const matches = fs
-    .readdirSync(root)
-    .filter((name) => name.startsWith(prefix) && name.endsWith(".json"))
-    .map((name) => {
-      const filePath = path.join(root, name);
-      return { path: filePath, journal: readJournal(filePath) };
-    })
-    .filter(({ journal }) => journal.taskId === taskId);
-  if (matches.length > 1) {
-    throw new Error(
-      `Multiple Docker publication recoveries exist for ${taskId}; reconcile explicitly`,
-    );
-  }
-  return matches[0];
+  return findDurableDockerPublicationRecovery(rootDir, taskId);
 }
 
 export function clearDockerPublicationRecovery(filePath: string, publicationId: string): boolean {
   try {
     const journal = readJournal(filePath);
     if (journal.publicationId !== publicationId || journal.state !== "complete") return false;
-    fs.rmSync(filePath);
+    removeFileDurably(filePath);
     return !fs.existsSync(filePath);
   } catch {
     return false;
@@ -437,6 +514,18 @@ async function runGit(projectRoot: string, args: readonly string[]): Promise<str
   return stdout.trim();
 }
 
+async function runBoundGit(
+  projectRoot: string,
+  args: readonly string[],
+  pushUrl: string,
+): Promise<string> {
+  const result = await runBoundGitCommand(args, projectRoot, pushUrl);
+  if (result.exitCode !== 0) {
+    throw new Error(`Bound Git command failed: ${result.stderr || "Unknown Git command failure"}`);
+  }
+  return result.stdout.trim();
+}
+
 async function readRef(projectRoot: string, ref: string): Promise<string> {
   const value = await runGit(projectRoot, ["rev-parse", "--verify", ref]);
   if (!HASH_PATTERN.test(value)) throw new Error(`Git ref ${ref} did not resolve to a commit`);
@@ -445,7 +534,7 @@ async function readRef(projectRoot: string, ref: string): Promise<string> {
 
 async function readOptionalRef(projectRoot: string, ref: string): Promise<string | undefined> {
   try {
-    const value = await runGit(projectRoot, ["show-ref", "--verify", "--hash", ref]);
+    const value = await runGit(projectRoot, ["rev-parse", "--verify", "--quiet", ref]);
     if (!HASH_PATTERN.test(value)) {
       throw new Error(`Git ref ${ref} returned an invalid commit id`);
     }
@@ -460,13 +549,17 @@ async function readOptionalRef(projectRoot: string, ref: string): Promise<string
   }
 }
 
-async function remoteBranchHead(projectRoot: string, branch: string): Promise<string | undefined> {
-  const output = await runGit(projectRoot, [
-    "ls-remote",
-    "--heads",
-    "origin",
-    `refs/heads/${branch}`,
-  ]);
+async function remoteBranchHead(
+  projectRoot: string,
+  branch: string,
+  repository: GitOriginBinding,
+): Promise<string | undefined> {
+  const current = await resolveBoundOriginRepository(projectRoot, repository);
+  const output = await runBoundGit(
+    projectRoot,
+    ["ls-remote", "--heads", BOUND_GIT_REMOTE, `refs/heads/${branch}`],
+    current.pushUrl,
+  );
   const match = /^([a-f0-9]{40,64})\s+refs\/heads\/(.+)$/i.exec(output);
   return match?.[2] === branch ? match[1] : undefined;
 }
@@ -475,67 +568,60 @@ async function pushExactBranch(
   branch: string,
   candidateHead: string,
   projectRoot: string,
+  repository: GitOriginBinding,
 ): Promise<void> {
-  const existing = await remoteBranchHead(projectRoot, branch);
+  const existing = await remoteBranchHead(projectRoot, branch, repository);
   if (existing === candidateHead) return;
-  await runGit(projectRoot, ["push", "-u", "origin", `${candidateHead}:refs/heads/${branch}`]);
-  const confirmed = await remoteBranchHead(projectRoot, branch);
+  const current = await resolveBoundOriginRepository(projectRoot, repository);
+  await runBoundGit(
+    projectRoot,
+    ["push", BOUND_GIT_REMOTE, `${candidateHead}:refs/heads/${branch}`],
+    current.pushUrl,
+  );
+  const confirmed = await remoteBranchHead(projectRoot, branch, repository);
   if (confirmed !== candidateHead) {
     throw new Error(`remote branch ${branch} was not confirmed at ${candidateHead}`);
   }
 }
 
-async function finishPartiallyDeletedBranch(
-  journal: DockerPublicationJournal,
-  recoveryPath: string,
-): Promise<boolean> {
-  const localHead = journal.progress.cleanupLocalAt
-    ? undefined
-    : await readOptionalRef(journal.projectRoot, journal.gitState.authoritativeRef);
-  if (localHead !== undefined) return false;
-
-  const remoteHead = await remoteBranchHead(journal.projectRoot, journal.branch);
-  if (remoteHead !== undefined && remoteHead !== journal.gitState.candidateHead) {
-    throw new Error(
-      `remote branch ${journal.branch} changed after its local cleanup; refusing deletion`,
-    );
+async function releasePreparedMergeRef(
+  projectRoot: string,
+  prepared: NonNullable<PublicationProgress["preparedMerge"]>,
+): Promise<void> {
+  const current = await readOptionalRef(projectRoot, prepared.preparedRef);
+  if (current === undefined) return;
+  if (current.toLowerCase() !== prepared.resultHead.toLowerCase()) {
+    throw new Error(`prepared publication ref ${prepared.preparedRef} changed before release`);
   }
-  if (remoteHead !== undefined) {
-    await runGit(journal.projectRoot, ["push", "origin", "--delete", journal.branch]);
-    if ((await remoteBranchHead(journal.projectRoot, journal.branch)) !== undefined) {
-      throw new Error(`remote branch ${journal.branch} deletion was not confirmed`);
-    }
+  await runGit(projectRoot, ["update-ref", "-d", prepared.preparedRef, prepared.resultHead]);
+  if ((await readOptionalRef(projectRoot, prepared.preparedRef)) !== undefined) {
+    throw new Error(`prepared publication ref ${prepared.preparedRef} was not released`);
   }
-  recordProgress(recoveryPath, journal, {
-    cleanupLocalAt: journal.progress.cleanupLocalAt ?? new Date().toISOString(),
-    cleanupAt: new Date().toISOString(),
-    cleanupOutcome: "deleted",
-  });
-  return true;
 }
 
-async function inspectMergedPullRequest(
-  projectRoot: string,
-  prUrl: string,
-): Promise<{ merged: boolean; mergeCommitSha?: string }> {
-  try {
-    const { stdout } = await execFileAsync(
-      "gh",
-      ["pr", "view", prUrl, "--json", "state,mergeCommit"],
-      { cwd: projectRoot, timeout: GIT_TIMEOUT_MS, maxBuffer: 1024 * 1024 },
-    );
-    const parsed = JSON.parse(stdout) as unknown;
-    if (!isRecord(parsed) || parsed.state !== "MERGED") return { merged: false };
-    const mergeCommit = parsed.mergeCommit;
-    const oid =
-      isRecord(mergeCommit) &&
-      typeof mergeCommit.oid === "string" &&
-      HASH_PATTERN.test(mergeCommit.oid)
-        ? mergeCommit.oid
-        : undefined;
-    return { merged: true, ...(oid ? { mergeCommitSha: oid } : {}) };
-  } catch {
-    return { merged: false };
+async function restoreMissingLocalCandidateForCleanup(
+  journal: DockerPublicationJournal,
+): Promise<void> {
+  const current = await readOptionalRef(journal.projectRoot, journal.gitState.authoritativeRef);
+  if (current !== undefined) {
+    if (current.toLowerCase() !== journal.gitState.candidateHead.toLowerCase()) {
+      throw new Error(`local branch ${journal.branch} changed before cleanup retry`);
+    }
+    return;
+  }
+  const sealedHead = await readRef(journal.projectRoot, journal.gitState.sealedRef);
+  if (sealedHead.toLowerCase() !== journal.gitState.candidateHead.toLowerCase()) {
+    throw new Error(`sealed candidate for ${journal.branch} changed before cleanup retry`);
+  }
+  await runGit(journal.projectRoot, [
+    "update-ref",
+    journal.gitState.authoritativeRef,
+    journal.gitState.candidateHead,
+    "0".repeat(journal.gitState.candidateHead.length),
+  ]);
+  const restored = await readOptionalRef(journal.projectRoot, journal.gitState.authoritativeRef);
+  if (restored?.toLowerCase() !== journal.gitState.candidateHead.toLowerCase()) {
+    throw new Error(`local branch ${journal.branch} was not restored for cleanup validation`);
   }
 }
 
@@ -581,15 +667,80 @@ function sameRequirements(left: PublicationRequirements, right: PublicationRequi
   );
 }
 
+function hasRemoteRequirements(requirements: PublicationRequirements): boolean {
+  return Object.values(requirements).some(Boolean);
+}
+
+async function resolvePublicationRepositoryBinding(
+  projectRoot: string,
+  requirements: PublicationRequirements,
+): Promise<GitOriginBinding | undefined> {
+  if (!hasRemoteRequirements(requirements)) return undefined;
+  const origin = await resolveOriginRepository(projectRoot);
+  if (requirements.pullRequest && !origin.github) {
+    throw new Error("Pull-request publication requires a GitHub origin");
+  }
+  return persistentOriginRepositoryBinding(origin);
+}
+
 function recordProgress(
   recoveryPath: string,
   journal: DockerPublicationJournal,
   patch: Partial<PublicationProgress>,
 ): void {
-  journal.progress = { ...journal.progress, ...patch };
-  journal.updatedAt = new Date().toISOString();
+  const next: DockerPublicationJournal = {
+    ...journal,
+    progress: { ...journal.progress, ...patch },
+    updatedAt: new Date().toISOString(),
+  };
+  delete next.lastError;
+  Object.assign(journal, persistJournalUpdate(recoveryPath, journal, next));
   delete journal.lastError;
-  writeJsonAtomic(recoveryPath, journal);
+}
+
+function journalDigest(content: Buffer): string {
+  return createHash("sha256").update(content).digest("hex");
+}
+
+function persistJournalUpdate(
+  recoveryPath: string,
+  current: DockerPublicationJournal,
+  next: DockerPublicationJournal,
+): DockerPublicationJournal {
+  const persisted = readJournal(recoveryPath);
+  if (
+    !isDeepStrictEqual(persisted, current) ||
+    (persisted.generation ?? 0) !== (current.generation ?? 0)
+  ) {
+    throw new Error("Docker publication recovery changed before its journal update");
+  }
+  const previousBytes = readTrustedArtifact(recoveryPath, 256_000);
+  const advanced: DockerPublicationJournal = {
+    ...next,
+    generation: (persisted.generation ?? 0) + 1,
+    previousDigest: journalDigest(previousBytes),
+  };
+  try {
+    writeJsonAtomic(recoveryPath, advanced);
+  } catch (error: unknown) {
+    // A rename/move can become visible before its final durability barrier
+    // reports failure. Reconcile and compare the exact next generation. On
+    // Windows, repeat the native write-through replacement because merely
+    // flushing the visible file cannot establish namespace durability.
+    try {
+      let recovered = readJournal(recoveryPath);
+      if (!isDeepStrictEqual(recovered, advanced)) throw error;
+      if (process.platform === "win32") {
+        writeJsonAtomic(recoveryPath, recovered);
+        recovered = readJournal(recoveryPath);
+        if (!isDeepStrictEqual(recovered, advanced)) throw error;
+      }
+      return recovered;
+    } catch {
+      throw error;
+    }
+  }
+  return advanced;
 }
 
 function recordFailure(
@@ -600,10 +751,13 @@ function recordFailure(
 ): DockerPublicationIncompleteError {
   const detail = error instanceof Error ? error.message : String(error);
   if (recoveryPath && journal) {
-    journal.lastError = { step, detail, at: new Date().toISOString() };
-    journal.updatedAt = new Date().toISOString();
+    const failed: DockerPublicationJournal = {
+      ...journal,
+      lastError: { step, detail, at: new Date().toISOString() },
+      updatedAt: new Date().toISOString(),
+    };
     try {
-      writeJsonAtomic(recoveryPath, journal);
+      Object.assign(journal, persistJournalUpdate(recoveryPath, journal, failed));
     } catch {
       return new DockerPublicationIncompleteError(
         step,
@@ -615,37 +769,366 @@ function recordFailure(
   return new DockerPublicationIncompleteError(step, recoveryPath, detail);
 }
 
-async function withRecoveryLock<T>(recoveryPath: string, operation: () => Promise<T>): Promise<T> {
-  const lockPath = `${recoveryPath}.lock`;
-  let fd: number | undefined;
+function isProcessAlive(pid: number): boolean {
   try {
-    fd = fs.openSync(lockPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY);
-    fs.writeFileSync(fd, `${JSON.stringify({ pid: process.pid, at: new Date().toISOString() })}\n`);
-    fs.fsyncSync(fd);
+    process.kill(pid, 0);
+    return true;
   } catch (error: unknown) {
     const code =
       typeof error === "object" && error !== null && "code" in error
         ? String((error as { code?: unknown }).code)
         : "";
-    if (code === "EEXIST") {
-      throw new DockerPublicationIncompleteError(
-        "validation",
-        recoveryPath,
-        "another publisher owns the durable recovery lock",
+    return code !== "ESRCH";
+  }
+}
+
+export interface RecoveryLockIdentity {
+  projectRoot: string;
+  publicationId: string;
+  gitState: Pick<DockerResumeGitBinding, "sealedRef">;
+}
+
+interface RecoveryLockOwner {
+  version: 1;
+  publicationId: string;
+  pid: number;
+  processStartedAt: string;
+  processIncarnation: string;
+  acquiredAt: string;
+  nonce: string;
+}
+
+interface RecoveryLockLease {
+  lockRef: string;
+  objectId: string;
+  attemptKey: string;
+  localAttemptId: string;
+}
+
+const activeRecoveryLockAttempts = new Map<string, string>();
+const retainedInactiveRecoveryLocks = new Map<string, string>();
+
+function recoveryLockAttemptKey(projectRoot: string, lockRef: string): string {
+  const canonicalRoot = fs.realpathSync.native(projectRoot);
+  return `${process.platform === "win32" ? canonicalRoot.toLowerCase() : canonicalRoot}\0${lockRef}`;
+}
+
+function recoveryLockRef(sealedRef: string): string {
+  return sealedRef.replace("refs/quack/docker-publication/", "refs/quack/docker-publication-lock/");
+}
+
+function validateRecoveryLockOwner(
+  value: unknown,
+  publicationId: string,
+): value is RecoveryLockOwner {
+  return (
+    isRecord(value) &&
+    Object.keys(value).length === 7 &&
+    value.version === 1 &&
+    value.publicationId === publicationId &&
+    Number.isSafeInteger(value.pid) &&
+    Number(value.pid) > 0 &&
+    typeof value.processStartedAt === "string" &&
+    Number.isFinite(Date.parse(value.processStartedAt)) &&
+    typeof value.processIncarnation === "string" &&
+    value.processIncarnation.length > 0 &&
+    value.processIncarnation.length <= 512 &&
+    typeof value.acquiredAt === "string" &&
+    Number.isFinite(Date.parse(value.acquiredAt)) &&
+    isUuid(value.nonce)
+  );
+}
+
+async function readProcessIncarnation(pid: number): Promise<string | undefined> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  if (process.platform === "linux") {
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf-8");
+      const fields = stat
+        .slice(stat.lastIndexOf(")") + 2)
+        .trim()
+        .split(/\s+/u);
+      const startTicks = fields[19];
+      const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf-8").trim();
+      return startTicks && bootId ? `linux:${bootId}:${startTicks}` : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  if (process.platform === "win32") {
+    try {
+      const { stdout } = await execFileAsync(
+        trustedWindowsPowerShellPath(),
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          `[Console]::Out.Write((Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks)`,
+        ],
+        { timeout: 5_000, maxBuffer: 16_384 },
       );
+      const ticks = stdout.trim();
+      return /^\d+$/u.test(ticks) ? `win32:${ticks}` : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  if (process.platform === "darwin" || process.platform === "freebsd") {
+    try {
+      const { stdout } = await execFileAsync("ps", ["-o", "lstart=", "-p", String(pid)], {
+        timeout: 5_000,
+        maxBuffer: 16_384,
+      });
+      const started = stdout.trim();
+      return started ? `${process.platform}:${started}` : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+async function createRecoveryLockObject(
+  recoveryPath: string,
+  identity: RecoveryLockIdentity,
+): Promise<{ objectId: string; owner: RecoveryLockOwner }> {
+  const now = new Date().toISOString();
+  const processIncarnation = await readProcessIncarnation(process.pid);
+  if (!processIncarnation) {
+    throw new Error("Could not establish the publisher process incarnation");
+  }
+  const owner: RecoveryLockOwner = {
+    version: 1,
+    publicationId: identity.publicationId,
+    pid: process.pid,
+    processStartedAt: new Date(Date.now() - process.uptime() * 1_000).toISOString(),
+    processIncarnation,
+    acquiredAt: now,
+    nonce: randomUUID(),
+  };
+  const temporary = `${recoveryPath}.${process.pid}.${owner.nonce}.lock-owner`;
+  try {
+    writeJsonAtomic(temporary, owner, true);
+    const objectId = await runGit(identity.projectRoot, ["hash-object", "-w", "--", temporary]);
+    if (!HASH_PATTERN.test(objectId)) {
+      throw new Error("Git returned an invalid recovery lock object id");
+    }
+    return { objectId: objectId.toLowerCase(), owner };
+  } finally {
+    try {
+      fs.rmSync(temporary);
+    } catch {
+      // Git object creation errors remain the primary failure.
+    }
+  }
+}
+
+async function readRecoveryLockOwner(
+  identity: RecoveryLockIdentity,
+  objectId: string,
+): Promise<RecoveryLockOwner> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(
+      await runGit(identity.projectRoot, ["cat-file", "blob", objectId]),
+    ) as unknown;
+  } catch (error: unknown) {
+    throw new Error(
+      `durable recovery lock ${objectId} is unreadable: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (!validateRecoveryLockOwner(parsed, identity.publicationId)) {
+    throw new Error(`durable recovery lock ${objectId} has invalid ownership metadata`);
+  }
+  return parsed;
+}
+
+async function acquireRecoveryLock(
+  recoveryPath: string,
+  identity: RecoveryLockIdentity,
+): Promise<RecoveryLockLease> {
+  const lockRef = recoveryLockRef(identity.gitState.sealedRef);
+  const attemptKey = recoveryLockAttemptKey(identity.projectRoot, lockRef);
+  const localAttemptId = randomUUID();
+  if (activeRecoveryLockAttempts.has(attemptKey)) {
+    throw new DockerPublicationIncompleteError(
+      "validation",
+      recoveryPath,
+      "another publisher owns the durable recovery lock",
+    );
+  }
+  activeRecoveryLockAttempts.set(attemptKey, localAttemptId);
+  try {
+    const { objectId } = await createRecoveryLockObject(recoveryPath, identity);
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const observed = await readOptionalRef(identity.projectRoot, lockRef);
+      if (observed !== undefined) {
+        const owner = await readRecoveryLockOwner(identity, observed);
+        if (isProcessAlive(owner.pid)) {
+          const liveIncarnation = await readProcessIncarnation(owner.pid);
+          if (!liveIncarnation) {
+            throw new DockerPublicationIncompleteError(
+              "validation",
+              recoveryPath,
+              "another publisher owns the durable recovery lock",
+            );
+          }
+          // The same OS process incarnation is live. Only this module's own
+          // retained, inactive token may be replaced; the map guard above
+          // excludes a concurrently active invocation in this process.
+          if (
+            liveIncarnation === owner.processIncarnation &&
+            (owner.pid !== process.pid ||
+              retainedInactiveRecoveryLocks.get(attemptKey) !== observed)
+          ) {
+            throw new DockerPublicationIncompleteError(
+              "validation",
+              recoveryPath,
+              "another publisher owns the durable recovery lock",
+            );
+          }
+          // A live PID with a different incarnation is PID reuse, not the
+          // recorded owner, so its stale token remains eligible for exact CAS.
+        }
+      }
+      const expected = observed ?? "0".repeat(objectId.length);
+      try {
+        await runGit(identity.projectRoot, ["update-ref", lockRef, objectId, expected]);
+      } catch (error: unknown) {
+        // The exact CAS may have succeeded before its wrapper reported a
+        // timeout/error. Read back the ref before retrying: our unique object
+        // proves ownership, while any other token remains untouched.
+        try {
+          const installed = await readOptionalRef(identity.projectRoot, lockRef);
+          if (installed === objectId) {
+            retainedInactiveRecoveryLocks.delete(attemptKey);
+            return { lockRef, objectId, attemptKey, localAttemptId };
+          }
+        } catch (readbackError: unknown) {
+          // Preserve the exact possible token so a later same-process retry
+          // can reclaim it after transient readback failure.
+          retainedInactiveRecoveryLocks.set(attemptKey, objectId);
+          throw new DockerPublicationIncompleteError(
+            "validation",
+            recoveryPath,
+            `could not confirm durable recovery lock acquisition: ${readbackError instanceof Error ? readbackError.message : String(readbackError)}; update reported ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        // Another contender won or the ref is still absent. Re-evaluate its
+        // exact state at the top of the loop.
+        continue;
+      }
+      let confirmed: string | undefined;
+      try {
+        confirmed = await readOptionalRef(identity.projectRoot, lockRef);
+      } catch (error: unknown) {
+        retainedInactiveRecoveryLocks.set(attemptKey, objectId);
+        throw new DockerPublicationIncompleteError(
+          "validation",
+          recoveryPath,
+          `could not confirm durable recovery lock acquisition: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      if (confirmed === objectId) {
+        retainedInactiveRecoveryLocks.delete(attemptKey);
+        return { lockRef, objectId, attemptKey, localAttemptId };
+      }
+    }
+    throw new DockerPublicationIncompleteError(
+      "validation",
+      recoveryPath,
+      "could not acquire the durable recovery lock after concurrent ownership changes",
+    );
+  } catch (error: unknown) {
+    if (activeRecoveryLockAttempts.get(attemptKey) === localAttemptId) {
+      activeRecoveryLockAttempts.delete(attemptKey);
     }
     throw error;
   }
+}
+
+async function releaseRecoveryLock(
+  recoveryPath: string,
+  identity: RecoveryLockIdentity,
+  lock: RecoveryLockLease,
+): Promise<void> {
+  let deleteError: unknown;
   try {
-    return await operation();
+    await runGit(identity.projectRoot, ["update-ref", "-d", lock.lockRef, lock.objectId]);
+  } catch (error: unknown) {
+    deleteError = error;
+  }
+  let retained: string | undefined;
+  try {
+    retained = await readOptionalRef(identity.projectRoot, lock.lockRef);
+  } catch (error: unknown) {
+    throw new DockerPublicationIncompleteError(
+      "validation",
+      recoveryPath,
+      `could not verify durable recovery lock release: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (retained === undefined) return;
+  // A different exact token means our compare-and-swap lease is gone and a
+  // later contender has already acquired the ref. Never touch that token.
+  if (retained !== lock.objectId) return;
+  const detail = deleteError instanceof Error ? `: ${deleteError.message}` : "";
+  throw new DockerPublicationIncompleteError(
+    "validation",
+    recoveryPath,
+    `durable recovery lock release was not confirmed${detail}`,
+  );
+}
+
+/** @internal Exported for deterministic real-Git lock-race verification. */
+export async function withDockerPublicationRecoveryLock<T>(
+  recoveryPath: string,
+  identity: RecoveryLockIdentity,
+  operation: () => Promise<T>,
+): Promise<T> {
+  let lock: RecoveryLockLease;
+  try {
+    lock = await acquireRecoveryLock(recoveryPath, identity);
+  } catch (error: unknown) {
+    if (error instanceof DockerPublicationIncompleteError) throw error;
+    throw new DockerPublicationIncompleteError(
+      "validation",
+      recoveryPath,
+      `could not acquire the durable recovery lock: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  let outcome: { success: true; value: T } | { success: false; error: unknown };
+  try {
+    outcome = { success: true, value: await operation() };
+  } catch (error: unknown) {
+    outcome = { success: false, error };
+  }
+  let releaseFailure: { error: unknown } | undefined;
+  try {
+    await releaseRecoveryLock(recoveryPath, identity, lock);
+    if (retainedInactiveRecoveryLocks.get(lock.attemptKey) === lock.objectId) {
+      retainedInactiveRecoveryLocks.delete(lock.attemptKey);
+    }
+  } catch (error: unknown) {
+    // This invocation is ending. Record its exact token as inactive so a
+    // later call in this same process can reclaim it without treating every
+    // same-PID token as stale.
+    retainedInactiveRecoveryLocks.set(lock.attemptKey, lock.objectId);
+    releaseFailure = { error };
   } finally {
-    if (fd !== undefined) fs.closeSync(fd);
-    try {
-      fs.rmSync(lockPath);
-    } catch {
-      // A retained lock fails closed after an abnormal filesystem error.
+    if (activeRecoveryLockAttempts.get(lock.attemptKey) === lock.localAttemptId) {
+      activeRecoveryLockAttempts.delete(lock.attemptKey);
     }
   }
+  if (releaseFailure) {
+    if (releaseFailure.error instanceof Error) throw releaseFailure.error;
+    throw new Error(String(releaseFailure.error));
+  }
+  if (!outcome.success) {
+    if (outcome.error instanceof Error) throw outcome.error;
+    throw new Error(String(outcome.error));
+  }
+  return outcome.value;
 }
 
 async function resolvePublicationContext(
@@ -708,16 +1191,10 @@ async function resolvePublicationContext(
   };
 }
 
-function createOrReadJournal(
+function resolveRecoveryJournalPath(
   taskId: string,
-  projectRoot: string,
-  branch: string,
-  targetBranch: string,
-  requirements: PublicationRequirements,
-  options: DockerHostPublicationOptions,
-): { recoveryPath?: string; journal?: DockerPublicationJournal } {
-  if (!options.recovery) return {};
-  const recovery = options.recovery;
+  recovery: DockerHostPublicationRecoveryInput,
+): string {
   if (!isUuid(recovery.publicationId) || !validateGitState(recovery.gitState)) {
     throw new Error("Docker publication recovery identity is invalid");
   }
@@ -727,34 +1204,160 @@ function createOrReadJournal(
     );
   }
   const rootDir = path.resolve(recovery.rootDir);
-  fs.mkdirSync(rootDir, { recursive: true });
+  ensureDirectoryDurably(rootDir);
   const rootStat = fs.lstatSync(rootDir);
   if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
     throw new Error("Docker publication recovery root is not a trusted directory");
   }
-  const recoveryPath = publicationPath(rootDir, taskId, recovery.publicationId);
-  if (fs.existsSync(recoveryPath)) {
-    const existing = readJournal(recoveryPath);
-    if (
-      existing.taskId !== taskId ||
-      existing.publicationId !== recovery.publicationId ||
-      existing.projectRoot !== fs.realpathSync.native(projectRoot) ||
-      existing.branch !== branch ||
-      existing.targetBranch !== targetBranch ||
-      existing.worktreePath !== fs.realpathSync.native(recovery.worktreePath) ||
-      existing.worktreeSessionId !== recovery.worktreeSessionId ||
-      existing.worktreeOwnershipId !== recovery.worktreeOwnershipId ||
-      existing.preserveWorktree !== recovery.preserveWorktree ||
-      existing.parentTaskId !== options.parentTaskId ||
-      existing.sharedBranchName !== options.sharedBranchName ||
-      !isDeepStrictEqual(existing.gitState, recovery.gitState) ||
-      !isDeepStrictEqual(existing.sourceResume, recovery.sourceResume) ||
-      !sameRequirements(existing.requirements, requirements)
-    ) {
-      throw new Error("Docker publication recovery already exists with different ownership");
-    }
-    return { recoveryPath, journal: existing };
+  return publicationPath(rootDir, taskId, recovery.publicationId);
+}
+
+function readTrustedArtifact(filePath: string, maxBytes: number): Buffer {
+  const before = fs.lstatSync(filePath);
+  if (
+    !before.isFile() ||
+    before.isSymbolicLink() ||
+    before.nlink !== 1 ||
+    before.size < 0 ||
+    before.size > maxBytes
+  ) {
+    throw new Error("Docker publication recovery has an untrusted initial artifact");
   }
+  const fd = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = fs.fstatSync(fd);
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1 ||
+      opened.size !== before.size ||
+      (before.ino !== 0 && opened.ino !== before.ino) ||
+      (before.dev !== 0 && opened.dev !== before.dev)
+    ) {
+      throw new Error("Docker publication recovery initial artifact changed identity");
+    }
+    return fs.readFileSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function initialJournalBytes(journal: DockerPublicationJournal): Buffer {
+  return Buffer.from(`${JSON.stringify(journal, null, 2)}\n`, "utf-8");
+}
+
+const ISO_TIMESTAMP_SHAPE = "0000-00-00T00:00:00.000Z";
+
+function isCanonicalTimestampPrefix(value: string): boolean {
+  if (value.length > ISO_TIMESTAMP_SHAPE.length) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    const expected = ISO_TIMESTAMP_SHAPE[index];
+    const observed = value[index];
+    if (expected === "0" ? !/\d/u.test(observed) : observed !== expected) return false;
+  }
+  return true;
+}
+
+/**
+ * Initial journal timestamps are generated per attempt. Match a strict prefix
+ * against the stable ownership payload, then bind both timestamp fields to the
+ * same canonical value before allowing removal of a crash-truncated artifact.
+ */
+function matchesInitialJournalPrefix(
+  observed: Buffer,
+  expectedJournal: DockerPublicationJournal,
+  allowComplete: boolean,
+): boolean {
+  const expected = initialJournalBytes(expectedJournal);
+  const marker = `"createdAt": "${expectedJournal.createdAt}"`;
+  const markerOffset = expected.indexOf(Buffer.from(marker, "utf-8"));
+  if (markerOffset < 0) return false;
+  const timestampOffset = markerOffset + `"createdAt": "`.length;
+  // Refuse to remove a partial artifact until its complete immutable
+  // ownership payload is present. A shorter prefix could belong to an
+  // unrelated writer that happened to claim the same filename.
+  if (observed.length < timestampOffset) return false;
+  if (observed.length === timestampOffset)
+    return observed.equals(expected.subarray(0, observed.length));
+  if (!observed.subarray(0, timestampOffset).equals(expected.subarray(0, timestampOffset))) {
+    return false;
+  }
+
+  const timestampAvailable = Math.min(
+    ISO_TIMESTAMP_SHAPE.length,
+    observed.length - timestampOffset,
+  );
+  const timestampPrefix = observed
+    .subarray(timestampOffset, timestampOffset + timestampAvailable)
+    .toString("utf-8");
+  if (!isCanonicalTimestampPrefix(timestampPrefix)) return false;
+  if (timestampAvailable < ISO_TIMESTAMP_SHAPE.length) return true;
+
+  let timestamp: string;
+  try {
+    timestamp = new Date(timestampPrefix).toISOString();
+  } catch {
+    return false;
+  }
+  if (timestamp !== timestampPrefix) return false;
+  const matchingJournal: DockerPublicationJournal = {
+    ...expectedJournal,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  const matchingBytes = initialJournalBytes(matchingJournal);
+  return (
+    (allowComplete
+      ? observed.length <= matchingBytes.length
+      : observed.length < matchingBytes.length) &&
+    observed.equals(matchingBytes.subarray(0, observed.length))
+  );
+}
+
+function removeTruncatedInitialArtifact(
+  filePath: string,
+  expectedJournal: DockerPublicationJournal,
+): boolean {
+  const observed = readTrustedArtifact(filePath, initialJournalBytes(expectedJournal).length);
+  if (!matchesInitialJournalPrefix(observed, expectedJournal, false)) return false;
+  removeFileDurably(filePath);
+  return true;
+}
+
+function journalMatchesCreation(
+  existing: DockerPublicationJournal,
+  expected: DockerPublicationJournal,
+): boolean {
+  return (
+    existing.taskId === expected.taskId &&
+    existing.publicationId === expected.publicationId &&
+    existing.projectRoot === expected.projectRoot &&
+    existing.branch === expected.branch &&
+    existing.targetBranch === expected.targetBranch &&
+    existing.worktreePath === expected.worktreePath &&
+    existing.worktreeSessionId === expected.worktreeSessionId &&
+    existing.worktreeOwnershipId === expected.worktreeOwnershipId &&
+    existing.preserveWorktree === expected.preserveWorktree &&
+    existing.parentTaskId === expected.parentTaskId &&
+    existing.sharedBranchName === expected.sharedBranchName &&
+    isDeepStrictEqual(existing.repository, expected.repository) &&
+    isDeepStrictEqual(existing.gitState, expected.gitState) &&
+    isDeepStrictEqual(existing.sourceResume, expected.sourceResume) &&
+    sameRequirements(existing.requirements, expected.requirements)
+  );
+}
+
+function createOrReadJournal(
+  taskId: string,
+  projectRoot: string,
+  branch: string,
+  targetBranch: string,
+  requirements: PublicationRequirements,
+  repository: GitOriginBinding | undefined,
+  options: DockerHostPublicationOptions,
+): { recoveryPath?: string; journal?: DockerPublicationJournal } {
+  if (!options.recovery) return {};
+  const recovery = options.recovery;
+  const recoveryPath = resolveRecoveryJournalPath(taskId, recovery);
   const now = new Date().toISOString();
   const journal: DockerPublicationJournal = {
     version: 1,
@@ -765,6 +1368,7 @@ function createOrReadJournal(
     targetBranch,
     ...(options.parentTaskId ? { parentTaskId: options.parentTaskId } : {}),
     ...(options.sharedBranchName ? { sharedBranchName: options.sharedBranchName } : {}),
+    ...(repository ? { repository } : {}),
     gitState: recovery.gitState,
     worktreePath: fs.realpathSync.native(recovery.worktreePath),
     worktreeSessionId: recovery.worktreeSessionId,
@@ -774,11 +1378,106 @@ function createOrReadJournal(
     requirements,
     progress: {},
     state: "pending",
+    generation: 0,
     createdAt: now,
     updatedAt: now,
   };
-  writeJsonAtomic(recoveryPath, journal, true);
+  if (!fs.existsSync(recoveryPath)) {
+    const discovered = findDurableDockerPublicationRecovery(path.dirname(recoveryPath), taskId);
+    if (discovered) {
+      if (
+        path.resolve(discovered.path) !== path.resolve(recoveryPath) ||
+        !journalMatchesCreation(discovered.journal, journal)
+      ) {
+        throw new Error("Docker publication recovery already exists with different ownership");
+      }
+      return { recoveryPath, journal: discovered.journal };
+    }
+  }
+  if (fs.existsSync(recoveryPath)) {
+    let existing: DockerPublicationJournal | undefined;
+    try {
+      existing = readJournal(recoveryPath);
+    } catch (error: unknown) {
+      if (!removeTruncatedInitialArtifact(recoveryPath, journal)) throw error;
+    }
+    if (existing) {
+      if (!journalMatchesCreation(existing, journal)) {
+        throw new Error("Docker publication recovery already exists with different ownership");
+      }
+      return { recoveryPath, journal: existing };
+    }
+  }
+  try {
+    writeJsonAtomic(recoveryPath, journal, true);
+  } catch (error: unknown) {
+    if (errorCode(error) !== "EEXIST") throw error;
+    const existing = readJournal(recoveryPath);
+    if (!journalMatchesCreation(existing, journal)) {
+      throw new Error("Docker publication recovery already exists with different ownership");
+    }
+    return { recoveryPath, journal: existing };
+  }
   return { recoveryPath, journal };
+}
+
+export async function initializeDockerPublicationRecovery(
+  taskId: string,
+  projectRoot: string,
+  promotedBranch: string,
+  options: DockerHostPublicationOptions,
+): Promise<string> {
+  if (!options.recovery) {
+    throw new Error("durable recovery ownership is required before journal initialization");
+  }
+  const context = await resolvePublicationContext(taskId, projectRoot, promotedBranch, options);
+  const repository = await resolvePublicationRepositoryBinding(projectRoot, context.requirements);
+  const created = createOrReadJournal(
+    taskId,
+    projectRoot,
+    promotedBranch,
+    context.targetBranch,
+    context.requirements,
+    repository,
+    options,
+  );
+  if (!created.recoveryPath || !created.journal) {
+    throw new Error("durable Docker publication journal was not established");
+  }
+  return created.recoveryPath;
+}
+
+async function ensureSealedPublicationCandidate(
+  projectRoot: string,
+  journal: DockerPublicationJournal,
+): Promise<void> {
+  const observed = await readOptionalRef(projectRoot, journal.gitState.sealedRef);
+  if (observed !== undefined) {
+    if (observed.toLowerCase() !== journal.gitState.candidateHead.toLowerCase()) {
+      throw new Error("sealed publication ref no longer matches the candidate commit");
+    }
+    return;
+  }
+  const candidate = await readRef(projectRoot, `${journal.gitState.candidateHead}^{commit}`);
+  if (candidate.toLowerCase() !== journal.gitState.candidateHead.toLowerCase()) {
+    throw new Error("journaled publication candidate is not an exact commit");
+  }
+  await runGit(projectRoot, [
+    "merge-base",
+    "--is-ancestor",
+    journal.gitState.baseHead,
+    journal.gitState.candidateHead,
+  ]);
+  await runGit(projectRoot, [
+    "update-ref",
+    journal.gitState.sealedRef,
+    journal.gitState.candidateHead,
+    "0".repeat(journal.gitState.candidateHead.length),
+  ]);
+  const confirmed = await readOptionalRef(projectRoot, journal.gitState.sealedRef);
+  if (confirmed?.toLowerCase() !== journal.gitState.candidateHead.toLowerCase()) {
+    throw new Error("journaled publication candidate seal was not confirmed");
+  }
 }
 
 async function executePublication(
@@ -796,6 +1495,13 @@ async function executePublication(
   ) {
     throw recordFailure(recoveryPath, journal, "validation", "publication contract changed");
   }
+  if (journal.repository) {
+    try {
+      await resolveBoundOriginRepository(projectRoot, journal.repository);
+    } catch (error: unknown) {
+      throw recordFailure(recoveryPath, journal, "validation", error);
+    }
+  }
   if (journal.state === "complete") {
     return {
       ...(journal.progress.prUrl ? { prUrl: journal.progress.prUrl } : {}),
@@ -810,10 +1516,7 @@ async function executePublication(
 
   if (!journal.progress.promotedAt) {
     try {
-      const sealedHead = await readRef(projectRoot, journal.gitState.sealedRef);
-      if (sealedHead !== journal.gitState.candidateHead) {
-        throw new Error("sealed publication ref no longer matches the candidate commit");
-      }
+      await ensureSealedPublicationCandidate(projectRoot, journal);
       await runGit(projectRoot, [
         "merge-base",
         "--is-ancestor",
@@ -843,7 +1546,12 @@ async function executePublication(
 
   if (requirements.push && !journal.progress.pushedAt) {
     try {
-      await pushExactBranch(journal.branch, journal.gitState.candidateHead, projectRoot);
+      await pushExactBranch(
+        journal.branch,
+        journal.gitState.candidateHead,
+        projectRoot,
+        journal.repository!,
+      );
       recordProgress(recoveryPath, journal, { pushedAt: new Date().toISOString() });
     } catch (error: unknown) {
       throw recordFailure(recoveryPath, journal, "push", error);
@@ -852,6 +1560,7 @@ async function executePublication(
 
   if (requirements.pullRequest && !journal.progress.pullRequestAt) {
     try {
+      const repository = await resolveBoundOriginGitHubRepository(projectRoot, journal.repository!);
       const created = await createPullRequest(
         {
           taskId: journal.taskId,
@@ -859,8 +1568,10 @@ async function executePublication(
           body: publicationBody(journal.taskId, rawTask),
           baseBranch: journal.targetBranch,
           headBranch: journal.branch,
+          headCommitSha: journal.gitState.candidateHead,
         },
         adapter,
+        repository,
       );
       if (!created.success || !created.prUrl) {
         throw new Error(
@@ -878,21 +1589,48 @@ async function executePublication(
 
   if (requirements.merge && !journal.progress.mergedAt) {
     try {
-      const alreadyMerged = journal.progress.prUrl
-        ? await inspectMergedPullRequest(projectRoot, journal.progress.prUrl)
-        : { merged: false as const };
-      const merged = alreadyMerged.merged
-        ? { success: true as const, mergeCommitSha: alreadyMerged.mergeCommitSha }
-        : await mergeBranchToTarget(
-            journal.taskId,
-            adapter,
-            journal.progress.prUrl,
-            journal.targetBranch,
-            undefined,
-            journal.branch,
-          );
+      const repository = await resolveBoundOriginRepository(projectRoot, journal.repository!);
+      const preparedMerge = journal.progress.preparedMerge;
+      const merged = await mergeBranchToTarget(
+        journal.taskId,
+        adapter,
+        journal.progress.prUrl,
+        journal.targetBranch,
+        undefined,
+        journal.branch,
+        journal.gitState.candidateHead,
+        journal.progress.prUrl
+          ? undefined
+          : {
+              ...(preparedMerge
+                ? {
+                    prepared: {
+                      strategy: preparedMerge.strategy,
+                      candidateHead: preparedMerge.candidateHead,
+                      targetHead: preparedMerge.targetHead,
+                      resultHead: preparedMerge.resultHead,
+                      preparedRef: preparedMerge.preparedRef,
+                    },
+                  }
+                : {}),
+              preparedRef: preparedPublicationRef(journal.gitState.sealedRef),
+              onPrepared: (prepared) => {
+                recordProgress(recoveryPath, journal, {
+                  preparedMerge: { ...prepared, preparedAt: new Date().toISOString() },
+                });
+              },
+            },
+        repository,
+      );
       if (!merged.success) {
         throw new Error(merged.error ?? `Failed to auto-merge ${journal.branch}`);
+      }
+      const recordedPreparation = journal.progress.preparedMerge;
+      if (
+        recordedPreparation &&
+        merged.mergeCommitSha?.toLowerCase() !== recordedPreparation.resultHead.toLowerCase()
+      ) {
+        throw new Error("prepared target publication returned a different merge commit");
       }
       recordProgress(recoveryPath, journal, {
         mergedAt: new Date().toISOString(),
@@ -903,9 +1641,23 @@ async function executePublication(
     }
   }
 
+  if (journal.progress.preparedMerge) {
+    try {
+      await releasePreparedMergeRef(projectRoot, journal.progress.preparedMerge);
+    } catch (error: unknown) {
+      throw recordFailure(recoveryPath, journal, "merge", error);
+    }
+  }
+
   if (requirements.status && !journal.progress.statusAt) {
     try {
-      const status = await updateTaskFileStatus(journal.taskId, adapter, journal.targetBranch);
+      const repository = await resolveBoundOriginRepository(projectRoot, journal.repository!);
+      const status = await updateTaskFileStatus(
+        journal.taskId,
+        adapter,
+        journal.targetBranch,
+        repository.pushUrl,
+      );
       if (!status.success) {
         throw new Error(status.error ?? `Failed to update ${journal.taskId} status`);
       }
@@ -918,13 +1670,34 @@ async function executePublication(
   const warnings: string[] = [];
   if (requirements.cleanup && !journal.progress.cleanupAt) {
     try {
-      if (!(await finishPartiallyDeletedBranch(journal, recoveryPath))) {
-        const cleanup = await deleteAfterMerge(journal.branch, adapter);
+      if (journal.preserveWorktree) {
+        const outcome = "retained-with-worktree";
+        warnings.push(outcome);
+        recordProgress(recoveryPath, journal, {
+          cleanupAt: new Date().toISOString(),
+          cleanupOutcome: outcome,
+        });
+      } else {
+        const repository = await resolveBoundOriginRepository(projectRoot, journal.repository!);
+        await restoreMissingLocalCandidateForCleanup(journal);
+        const cleanup = await deleteAfterMerge(journal.branch, adapter, {
+          baseBranch: journal.targetBranch,
+          expectedHeadCommit: journal.gitState.candidateHead,
+          ...(journal.progress.preparedMerge?.resultHead || journal.progress.mergeCommitSha
+            ? {
+                expectedMergedCommit:
+                  journal.progress.preparedMerge?.resultHead ?? journal.progress.mergeCommitSha,
+              }
+            : {}),
+          expectedOriginPushUrl: repository.pushUrl,
+        });
         if (cleanup.deleted && cleanup.localDeleted) {
           recordProgress(recoveryPath, journal, { cleanupLocalAt: new Date().toISOString() });
         }
         if (
           cleanup.reason === "delete-failed" ||
+          cleanup.reason === "head-mismatch" ||
+          cleanup.reason === "not-merged" ||
           (cleanup.deleted && cleanup.remoteDeleted === false)
         ) {
           throw new Error(cleanup.reason ?? `Failed to delete ${journal.branch} after merge`);
@@ -942,12 +1715,15 @@ async function executePublication(
   }
 
   try {
-    journal.state = "complete";
-    journal.updatedAt = new Date().toISOString();
+    const completed: DockerPublicationJournal = {
+      ...journal,
+      state: "complete",
+      updatedAt: new Date().toISOString(),
+    };
+    delete completed.lastError;
+    Object.assign(journal, persistJournalUpdate(recoveryPath, journal, completed));
     delete journal.lastError;
-    writeJsonAtomic(recoveryPath, journal);
   } catch (error: unknown) {
-    journal.state = "pending";
     throw recordFailure(recoveryPath, journal, "cleanup", error);
   }
   return {
@@ -964,8 +1740,20 @@ export async function resumeDockerPromotedResult(
   recoveryPath: string,
 ): Promise<DockerHostPublicationResult> {
   const resolvedPath = path.resolve(recoveryPath);
-  return withRecoveryLock(resolvedPath, async () => {
+  const initialJournal = readJournal(resolvedPath);
+  return withDockerPublicationRecoveryLock(resolvedPath, initialJournal, async () => {
     const journal = readJournal(resolvedPath);
+    if (
+      journal.publicationId !== initialJournal.publicationId ||
+      journal.projectRoot !== initialJournal.projectRoot ||
+      journal.gitState.sealedRef !== initialJournal.gitState.sealedRef
+    ) {
+      throw new DockerPublicationIncompleteError(
+        "validation",
+        resolvedPath,
+        "Docker publication recovery identity changed while acquiring its lock",
+      );
+    }
     const options: DockerHostPublicationOptions = {
       ...(journal.parentTaskId ? { parentTaskId: journal.parentTaskId } : {}),
       ...(journal.sharedBranchName ? { sharedBranchName: journal.sharedBranchName } : {}),
@@ -1001,30 +1789,46 @@ export async function publishDockerPromotedResult(
     );
   }
   let context: Awaited<ReturnType<typeof resolvePublicationContext>>;
+  let repository: GitOriginBinding | undefined;
   try {
     context = await resolvePublicationContext(taskId, projectRoot, promotedBranch, options);
+    repository = await resolvePublicationRepositoryBinding(projectRoot, context.requirements);
   } catch (error: unknown) {
     throw recordFailure(undefined, undefined, "validation", error);
   }
 
-  const { recoveryPath, journal } = createOrReadJournal(
+  const recovery = options.recovery;
+  const recoveryPath = resolveRecoveryJournalPath(taskId, recovery);
+  const created = createOrReadJournal(
     taskId,
     projectRoot,
     promotedBranch,
     context.targetBranch,
     context.requirements,
+    repository,
     options,
   );
-  if (recoveryPath && journal) {
-    return withRecoveryLock(recoveryPath, () => executePublication(journal, recoveryPath, context));
+  if (!created.journal || created.recoveryPath !== recoveryPath) {
+    throw new DockerPublicationIncompleteError(
+      "validation",
+      recoveryPath,
+      "durable Docker publication journal was not established",
+    );
   }
-  // createOrReadJournal only omits these when no recovery binding was
-  // supplied. That is rejected above; keep this fail-closed assertion so a
-  // future refactor cannot silently reintroduce publication without a
-  // durable retry pointer.
-  throw new DockerPublicationIncompleteError(
-    "validation",
-    undefined,
-    "durable Docker publication journal was not established",
-  );
+  const identity: RecoveryLockIdentity = {
+    projectRoot: fs.realpathSync.native(projectRoot),
+    publicationId: recovery.publicationId,
+    gitState: { sealedRef: recovery.gitState.sealedRef },
+  };
+  return withDockerPublicationRecoveryLock(recoveryPath, identity, async () => {
+    const journal = readJournal(recoveryPath);
+    if (!journalMatchesCreation(journal, created.journal!)) {
+      throw new DockerPublicationIncompleteError(
+        "validation",
+        recoveryPath,
+        "durable Docker publication journal ownership changed before locking",
+      );
+    }
+    return executePublication(journal, recoveryPath, context);
+  });
 }

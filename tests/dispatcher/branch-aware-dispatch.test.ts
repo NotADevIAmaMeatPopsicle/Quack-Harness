@@ -38,6 +38,7 @@ type MockExecResult = {
 };
 
 let mockGitResults: Record<string, MockExecResult> = {};
+const SEALED_HEAD = "a".repeat(40);
 
 function findGitResult(command: string): MockExecResult | undefined {
   for (const [pattern, result] of Object.entries(mockGitResults)) {
@@ -83,6 +84,16 @@ jest.mock("node:child_process", () => {
   const mockExec = jest.fn();
   (mockExec as unknown as Record<symbol, unknown>)[promisify.custom] = customPromisified;
 
+  const customPromisifiedExecFile = (
+    file: string,
+    args: readonly string[],
+    _options: Record<string, unknown>,
+  ): Promise<{ stdout: string; stderr: string }> =>
+    customPromisified([file, ...args].join(" "), _options);
+  const mockExecFile = jest.fn();
+  (mockExecFile as unknown as Record<symbol, unknown>)[promisify.custom] =
+    customPromisifiedExecFile;
+
   const mockExecSync = jest
     .fn()
     .mockImplementation((command: string, _options?: Record<string, unknown>) => {
@@ -104,6 +115,7 @@ jest.mock("node:child_process", () => {
   return {
     ...actual,
     exec: mockExec,
+    execFile: mockExecFile,
     execSync: mockExecSync,
   };
 });
@@ -249,8 +261,10 @@ function makeAdapter(overrides: Partial<ProjectAdapter> = {}): ProjectAdapter {
       branchPrefix: "quack/",
       commitFormat: "[{taskId}] {message}",
       commitTrailer: "Implemented-by: Quack Agent",
-      autoCreatePr: true,
-      autoPush: true,
+      // Publication is unrelated to these branch-resume fixtures. Keep it
+      // disabled so the tests exercise only the lifecycle they claim to cover.
+      autoCreatePr: false,
+      autoPush: false,
     },
     logging: {
       dir: ".quack/logs",
@@ -424,7 +438,7 @@ describe("Branch-Aware Dispatch", () => {
       setupSuccessPath();
 
       // Override: branch exists
-      mockGitResults["rev-parse --verify"] = { stdout: "abc123" };
+      mockGitResults["rev-parse --verify"] = { stdout: SEALED_HEAD };
 
       // Set up checkpoint with incomplete stages — "branch" NOT in completedStages
       // so the branch-aware code path is entered (branch exists in git but
@@ -472,7 +486,7 @@ describe("Branch-Aware Dispatch", () => {
       setupSuccessPath();
 
       // Override: branch exists
-      mockGitResults["rev-parse --verify"] = { stdout: "abc123" };
+      mockGitResults["rev-parse --verify"] = { stdout: SEALED_HEAD };
 
       // Set up checkpoint with REVISE verdict — "branch" NOT in completedStages
       // so the branch-aware code path is entered
@@ -524,7 +538,7 @@ describe("Branch-Aware Dispatch", () => {
       setupSuccessPath();
 
       // Override: branch exists
-      mockGitResults["rev-parse --verify"] = { stdout: "abc123" };
+      mockGitResults["rev-parse --verify"] = { stdout: SEALED_HEAD };
 
       // No checkpoint set — _mockCheckpoints is empty
 
@@ -553,7 +567,7 @@ describe("Branch-Aware Dispatch", () => {
       setupSuccessPath();
 
       // Override: branch exists
-      mockGitResults["rev-parse --verify"] = { stdout: "abc123" };
+      mockGitResults["rev-parse --verify"] = { stdout: SEALED_HEAD };
 
       // Set up checkpoint with exhausted retries and no gitDiff — "branch" NOT in
       // completedStages so the branch-aware code path is entered
@@ -608,7 +622,7 @@ describe("Branch-Aware Dispatch", () => {
       setupSuccessPath();
 
       // Override: branch exists
-      mockGitResults["rev-parse --verify"] = { stdout: "abc123" };
+      mockGitResults["rev-parse --verify"] = { stdout: SEALED_HEAD };
 
       // Set up a perfectly valid checkpoint (would normally resume) — "branch"
       // NOT in completedStages so the branch-aware code path is entered
@@ -667,7 +681,8 @@ describe("Branch-Aware Dispatch", () => {
       // creating the branch; that specific rev-parse must succeed while the
       // generic default still reports the task branch as missing.
       mockGitResults = {
-        "rev-parse --verify origin/main": { stdout: "abc123" },
+        "rev-parse --verify origin/main": { stdout: SEALED_HEAD },
+        "rev-parse --verify refs/heads/quack/TASK-042": { stdout: SEALED_HEAD },
         ...mockGitResults,
       };
 

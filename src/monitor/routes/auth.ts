@@ -7,6 +7,13 @@ import type { AuthService, UserRole, ApiKeyPrincipal } from "../auth.js";
 
 const SESSION_COOKIE = "quack_session";
 
+// Express route matching is case-insensitive unless an application opts into
+// case-sensitive routing. Security decisions must classify the same path that
+// Express will dispatch instead of treating casing as a distinct route.
+function securityRoutePath(req: Request): string {
+  return req.path.toLowerCase();
+}
+
 // ─── Cookie Helpers ───────────────────────────────────────────────
 
 function setSessionCookie(res: Response, sessionId: string, maxAgeMs: number): void {
@@ -36,7 +43,7 @@ function getApiKeyFromRequest(req: Request): string | null {
   if (typeof header === "string" && header.trim().length > 0) {
     return header.trim();
   }
-  if (req.path.startsWith("/v1/")) {
+  if (securityRoutePath(req).startsWith("/v1/")) {
     return null;
   }
   const authHeader = req.headers.authorization;
@@ -49,25 +56,33 @@ function getApiKeyFromRequest(req: Request): string | null {
   return null;
 }
 
-function getRequestedProjectId(req: Request): string | null {
-  const fromParams = typeof req.params.projectId === "string" ? req.params.projectId : undefined;
-  const pathMatch = req.path.match(/^\/api\/projects\/active\/([^/]+)$/);
-  const fromPath = pathMatch ? decodeURIComponent(pathMatch[1]) : undefined;
-  const body = req.body as Record<string, unknown> | undefined;
-  const fromBody = typeof body?.projectId === "string" ? body.projectId : undefined;
-  const fromQuery =
-    typeof req.query.projectId === "string"
-      ? req.query.projectId
-      : typeof req.query.project === "string"
-        ? req.query.project
-        : undefined;
-  const fromHeader =
-    typeof req.headers["x-project-id"] === "string" ? req.headers["x-project-id"] : undefined;
-
-  for (const value of [fromParams, fromPath, fromBody, fromQuery, fromHeader]) {
-    if (value && value.trim().length > 0) {
-      return value.trim();
+/**
+ * Extract selectors available before route matching. This is only an early
+ * rejection layer; the monitor's project registry resolves and authorizes the
+ * effective target (including active-project fallback) later.
+ */
+function getExplicitRequestedProjectId(req: Request): string | null {
+  const projectPathMatch = req.path.match(/^\/api\/projects\/(?:active\/)?([^/]+)\/?$/i);
+  const encodedPathProject =
+    projectPathMatch?.[1]?.toLowerCase() !== "active" ? projectPathMatch?.[1] : undefined;
+  let fromPath: string | undefined;
+  if (encodedPathProject) {
+    try {
+      fromPath = decodeURIComponent(encodedPathProject);
+    } catch {
+      fromPath = encodedPathProject;
     }
+  }
+  const body = req.body as Record<string, unknown> | undefined;
+  const values = [
+    fromPath,
+    body?.projectId,
+    req.query.projectId,
+    req.query.project,
+    req.headers["x-project-id"],
+  ];
+  for (const raw of values) {
+    if (typeof raw === "string" && raw.trim()) return raw.trim();
   }
   return null;
 }
@@ -84,11 +99,31 @@ function isOpenDashboardReadRequest(req: Request): boolean {
   if (req.method !== "GET" && req.method !== "HEAD") {
     return false;
   }
-  return req.path.startsWith("/api/wiki/") || req.path.startsWith("/api/monitoring/");
+  const routePath = securityRoutePath(req);
+  return routePath.startsWith("/api/wiki/") || routePath.startsWith("/api/monitoring/");
 }
 
 function isReadOnlyRequest(req: Request): boolean {
   return req.method === "GET" || req.method === "HEAD";
+}
+
+function isOpenFleetReadRequest(req: Request): boolean {
+  const routePath = securityRoutePath(req);
+  if (!isReadOnlyRequest(req) || !routePath.startsWith("/api/fleet/")) {
+    return false;
+  }
+
+  // Survivor records contain opaque reconciliation tokens that authorize
+  // release of an admission barrier. Keep the ordinary fleet dashboard reads
+  // compatible, but never expose those recovery credentials anonymously when
+  // monitor authentication is enabled.
+  const protectedRecoveryPaths = new Set([
+    "/api/fleet/prep-shutdown-survivors",
+    "/api/fleet/shared-checkout-shutdown-survivor",
+    "/api/fleet/worktree-shutdown-survivors",
+  ]);
+  const normalizedPath = routePath.replace(/\/+$/, "");
+  return !protectedRecoveryPaths.has(normalizedPath);
 }
 
 function isWorkerRefreshServiceTokenRequest(req: Request): boolean {
@@ -97,7 +132,7 @@ function isWorkerRefreshServiceTokenRequest(req: Request): boolean {
     req.method === "POST" &&
     typeof token === "string" &&
     token.trim().length > 0 &&
-    /^\/api\/workers\/[^/]+\/refresh$/.test(req.path)
+    /^\/api\/workers\/[^/]+\/refresh$/.test(securityRoutePath(req))
   );
 }
 
@@ -109,6 +144,7 @@ function isWorkerRefreshServiceTokenRequest(req: Request): boolean {
  */
 export function createAuthMiddleware(auth: AuthService) {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const routePath = securityRoutePath(req);
     const apiKey = auth.enabled ? getApiKeyFromRequest(req) : getExplicitApiKeyFromRequest(req);
     if (apiKey) {
       const principal = await auth.authenticateApiKey(apiKey);
@@ -119,12 +155,28 @@ export function createAuthMiddleware(auth: AuthService) {
         });
         return;
       }
-      const requestedProjectId = getRequestedProjectId(req);
-      if (!auth.isApiKeyAllowedForProject(principal, requestedProjectId)) {
+      // Complete project authorization is intentionally deferred to the
+      // monitor's project-resolution middleware. Global Express middleware
+      // runs before route matching, so req.params is empty here. Explicit
+      // selectors can fail early, while path/effective-project authorization
+      // is repeated against the registry before the operation runs.
+      const explicitProjectId = getExplicitRequestedProjectId(req);
+      const normalizedRoutePath = routePath.replace(/\/+$/, "");
+      const isProjectRegistryOperation =
+        normalizedRoutePath === "/api/projects" || normalizedRoutePath.startsWith("/api/projects/");
+      if (isProjectRegistryOperation && !principal.projectScopes.includes("*")) {
+        res.status(403).json({
+          error: "API key requires wildcard scope for this global operation",
+          code: "API_KEY_GLOBAL_SCOPE_REQUIRED",
+          keyId: principal.id,
+        });
+        return;
+      }
+      if (explicitProjectId && !auth.isApiKeyAllowedForProject(principal, explicitProjectId)) {
         res.status(403).json({
           error: "API key is not authorized for this project",
           code: "API_KEY_SCOPE_MISMATCH",
-          projectId: requestedProjectId,
+          projectId: explicitProjectId,
           keyId: principal.id,
         });
         return;
@@ -180,18 +232,18 @@ export function createAuthMiddleware(auth: AuthService) {
       "/api/queue/",
       "/api/research/",
       "/api/remotes",
-      "/api/fleet/",
       "/api/dispatch/",
       "/api/admin/runs",
       "/api/agent-resources/",
       "/api/workers/",
     ];
     if (
-      req.path === "/api/auth/login" ||
+      routePath === "/api/auth/login" ||
       (isReadOnlyRequest(req) &&
         (isOpenDashboardReadRequest(req) ||
-          openPaths.includes(req.path) ||
-          openPrefixes.some((p) => req.path.startsWith(p))))
+          isOpenFleetReadRequest(req) ||
+          openPaths.includes(routePath) ||
+          openPrefixes.some((p) => routePath.startsWith(p))))
     ) {
       // Still attach session if available (for viewer guard), but don't require auth
       const sid = getSessionIdFromRequest(req);
@@ -208,7 +260,7 @@ export function createAuthMiddleware(auth: AuthService) {
     const sessionId = getSessionIdFromRequest(req);
     if (!sessionId) {
       // For API requests, return 401 JSON
-      if (req.path.startsWith("/api/")) {
+      if (routePath.startsWith("/api/")) {
         res.status(401).json({ error: "Authentication required" });
         return;
       }
@@ -221,7 +273,7 @@ export function createAuthMiddleware(auth: AuthService) {
     const session = auth.getSession(sessionId);
     if (!session) {
       clearSessionCookie(res);
-      if (req.path.startsWith("/api/")) {
+      if (routePath.startsWith("/api/")) {
         res.status(401).json({ error: "Session expired" });
         return;
       }
@@ -240,25 +292,11 @@ export function createAuthMiddleware(auth: AuthService) {
  * Must run AFTER auth middleware.
  */
 export function createViewerGuard() {
-  // Methods that mutate state
   const writeMethods = new Set(["POST", "PUT", "PATCH", "DELETE"]);
-
-  // Write endpoints that viewers cannot access
-  const writePathPrefixes = [
-    "/api/tasks/", // dispatch start/stop
-    "/api/admin/", // admin run start/stop
-    "/api/adapter", // adapter config changes
-    "/api/queue/", // queue management
-    "/api/fleet/", // fleet control (emergency stop)
-    "/api/settings", // settings changes
-    "/api/worktrees", // worktree prune / cleanup operations
-    "/api/workers/", // worker enrollment + install flows
-    "/api/wiki/", // wiki writes + git sync
-    "/v1/wiki/", // service-facing wiki writes + git sync
-  ];
-
-  // Specific POST paths that are safe for viewers (read-like operations)
-  const safePostPaths = ["/api/auth/logout"];
+  // Default-deny every state-changing request for viewers. New routes are
+  // therefore protected automatically and must be consciously reviewed before
+  // being added to this intentionally narrow allowlist.
+  const safeViewerWrites = new Set(["POST /api/auth/logout"]);
 
   return (req: Request, res: Response, next: NextFunction): void => {
     if (!writeMethods.has(req.method)) {
@@ -266,12 +304,7 @@ export function createViewerGuard() {
       return;
     }
 
-    // Allow safe POST paths
-    if (safePostPaths.includes(req.path)) {
-      next();
-      return;
-    }
-
+    const routePath = securityRoutePath(req);
     const authReq = req as AuthenticatedRequest;
     const role = authReq.session?.role ?? authReq.apiPrincipal?.role;
     // If no authenticated principal (auth disabled or unauthenticated pass-through), allow
@@ -281,8 +314,7 @@ export function createViewerGuard() {
     }
 
     if (role === "viewer") {
-      const matchesWritePath = writePathPrefixes.some((prefix) => req.path.startsWith(prefix));
-      if (matchesWritePath) {
+      if (!safeViewerWrites.has(`${req.method} ${routePath}`)) {
         res.status(403).json({
           error: "Insufficient permissions",
           message: "Viewer accounts cannot perform this action",
@@ -306,6 +338,8 @@ export interface AuthenticatedRequest extends Request {
     expiresAt: number;
   };
   apiPrincipal?: ApiKeyPrincipal;
+  /** Effective project authorized for this API-key request. */
+  effectiveProjectId?: string;
 }
 
 export function registerAuthRoutes(app: Express, auth: AuthService): void {

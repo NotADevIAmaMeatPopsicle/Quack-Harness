@@ -8,6 +8,12 @@ import { promisify } from "node:util";
 import type { ProjectAdapter } from "../core/adapter-loader.js";
 import type { JudgeResult, VerificationResult } from "../core/types.js";
 import { getSyncMap } from "../integrations/github/sync-map.js";
+import {
+  originPushUrlMatches,
+  pullRequestUrlMatchesOrigin,
+  resolveOriginGitHubRepository,
+  type GitHubRepositoryIdentity,
+} from "./github-repository.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -21,11 +27,9 @@ const GH_TIMEOUT_MS = 60_000;
 
 // ─── Types ──────────────────────────────────────────────────────────
 
-export interface PrCreateResult {
-  success: boolean;
-  prUrl?: string;
-  error?: string;
-}
+export type PrCreateResult =
+  | { success: true; prUrl: string; error?: never }
+  | { success: false; error: string; prUrl?: never };
 
 export interface PrCreateInput {
   taskId: string;
@@ -33,7 +37,72 @@ export interface PrCreateInput {
   body: string;
   baseBranch: string;
   /** Explicit source branch for host-side/Docker publication. */
-  headBranch?: string;
+  headBranch: string;
+  /** Exact remote head commit required for ambiguous-create recovery. */
+  headCommitSha: string;
+}
+
+const COMMIT_ID_PATTERN = /^[a-f0-9]{40,64}$/iu;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function headRepositoryName(value: Record<string, unknown>): string | undefined {
+  const repository = value.headRepository;
+  if (isRecord(repository) && typeof repository.nameWithOwner === "string") {
+    return repository.nameWithOwner;
+  }
+  const owner = value.headRepositoryOwner;
+  if (
+    isRecord(repository) &&
+    typeof repository.name === "string" &&
+    isRecord(owner) &&
+    typeof owner.login === "string"
+  ) {
+    return `${owner.login}/${repository.name}`;
+  }
+  return undefined;
+}
+
+function matchesExpectedPullRequest(
+  value: unknown,
+  repository: GitHubRepositoryIdentity,
+  input: PrCreateInput,
+): value is Record<string, unknown> & { url: string } {
+  return (
+    isRecord(value) &&
+    typeof value.url === "string" &&
+    pullRequestUrlMatchesOrigin(value.url, repository) &&
+    value.baseRefName === input.baseBranch &&
+    value.headRefName === input.headBranch &&
+    typeof value.headRefOid === "string" &&
+    value.headRefOid.toLowerCase() === input.headCommitSha?.toLowerCase() &&
+    headRepositoryName(value)?.toLowerCase() === repository.nameWithOwner.toLowerCase()
+  );
+}
+
+async function inspectCreatedPullRequest(
+  cwd: string,
+  repository: GitHubRepositoryIdentity,
+  prUrl: string,
+  input: PrCreateInput,
+): Promise<boolean> {
+  if (!(await originPushUrlMatches(cwd, repository.pushUrl))) return false;
+  const { stdout } = await execFileAsync(
+    "gh",
+    [
+      "pr",
+      "view",
+      prUrl,
+      "--repo",
+      repository.selector,
+      "--json",
+      "url,baseRefName,headRefName,headRefOid,headRepository,headRepositoryOwner",
+    ],
+    { cwd, timeout: GH_TIMEOUT_MS, maxBuffer: MAX_BUFFER },
+  );
+  return matchesExpectedPullRequest(JSON.parse(stdout) as unknown, repository, input);
 }
 
 // ─── PR body builder ────────────────────────────────────────────────
@@ -142,10 +211,28 @@ export async function buildPrBodyWithIssueLink(
 export async function createPullRequest(
   input: PrCreateInput,
   adapter: ProjectAdapter,
+  repositoryBinding?: GitHubRepositoryIdentity,
 ): Promise<PrCreateResult> {
   const cwd = adapter.projectRoot;
+  if (!input.headBranch || !COMMIT_ID_PATTERN.test(input.headCommitSha)) {
+    return {
+      success: false,
+      error: "Host-side PR publication requires a branch and exact head commit",
+    };
+  }
+  let repository: GitHubRepositoryIdentity | undefined;
+  let createAttempted = false;
 
   try {
+    // Resolve once, then bind the mutating command to that immutable repository
+    // identity. Relying on gh's ambient/default repository could create the PR
+    // in a different repository if that context changes between validation and
+    // the side effect.
+    repository = repositoryBinding ?? (await resolveOriginGitHubRepository(cwd));
+    if (!(await originPushUrlMatches(cwd, repository.pushUrl))) {
+      throw new Error("Git origin changed after the publication repository was bound");
+    }
+    createAttempted = true;
     const { stdout, stderr } = await execFileAsync(
       "gh",
       [
@@ -157,7 +244,10 @@ export async function createPullRequest(
         input.body,
         "--base",
         input.baseBranch,
-        ...(input.headBranch ? ["--head", input.headBranch] : []),
+        "--repo",
+        repository.selector,
+        "--head",
+        input.headBranch,
       ],
       {
         cwd,
@@ -167,28 +257,30 @@ export async function createPullRequest(
     );
 
     // gh pr create outputs the PR URL on stdout
-    const prUrl = stdout.trim();
-    if (prUrl.startsWith("http")) {
-      return { success: true, prUrl };
-    }
-
-    // Sometimes the URL is in stderr
+    const stdoutUrl = stdout.trim();
     const stderrUrl = stderr.split("\n").find((line) => line.trim().startsWith("http"));
-    if (stderrUrl) {
-      return { success: true, prUrl: stderrUrl.trim() };
+    const prUrl = stdoutUrl.startsWith("http") ? stdoutUrl : stderrUrl?.trim();
+
+    if (!prUrl || !pullRequestUrlMatchesOrigin(prUrl, repository)) {
+      throw new Error("GitHub CLI did not return a pull request URL for the resolved repository");
     }
 
-    return {
-      success: true,
-      prUrl: prUrl || undefined,
-    };
+    if (!(await inspectCreatedPullRequest(cwd, repository, prUrl, input))) {
+      throw new Error("created pull request does not match the exact repository/base/head binding");
+    }
+
+    return { success: true, prUrl };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     // A remote may accept `gh pr create` and lose the response, or the host
     // may crash before its publication journal is advanced. Recover only an
     // unambiguous PR for the exact host-validated head/base pair.
-    if (input.headBranch) {
+    if (createAttempted && input.headBranch && input.headCommitSha) {
       try {
+        repository ??= await resolveOriginGitHubRepository(cwd);
+        if (!(await originPushUrlMatches(cwd, repository.pushUrl))) {
+          throw new Error("Git origin changed before pull request recovery inspection");
+        }
         const { stdout } = await execFileAsync(
           "gh",
           [
@@ -198,26 +290,23 @@ export async function createPullRequest(
             input.headBranch,
             "--base",
             input.baseBranch,
+            "--repo",
+            repository.selector,
             "--state",
             "all",
             "--limit",
             "2",
             "--json",
-            "url",
+            "url,baseRefName,headRefName,headRefOid,headRepository,headRepositoryOwner",
           ],
           { cwd, timeout: GH_TIMEOUT_MS, maxBuffer: MAX_BUFFER },
         );
         const parsed = JSON.parse(stdout) as unknown;
-        if (
-          Array.isArray(parsed) &&
-          parsed.length === 1 &&
-          typeof parsed[0] === "object" &&
-          parsed[0] !== null &&
-          "url" in parsed[0] &&
-          typeof (parsed[0] as { url?: unknown }).url === "string" &&
-          (parsed[0] as { url: string }).url.startsWith("http")
-        ) {
-          return { success: true, prUrl: (parsed[0] as { url: string }).url };
+        const matches = Array.isArray(parsed)
+          ? parsed.filter((value) => matchesExpectedPullRequest(value, repository!, input))
+          : [];
+        if (matches.length === 1) {
+          return { success: true, prUrl: matches[0].url };
         }
       } catch {
         // Preserve the original create failure below. Ambiguous or failed

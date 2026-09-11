@@ -10,7 +10,9 @@ import type { DockerPublicationJournal } from "../../src/dispatcher/docker-publi
 
 const publishDockerPromotedResult = jest.fn();
 const resumeDockerPromotedResult = jest.fn();
+const initializeDockerPublicationRecovery = jest.fn();
 jest.mock("../../src/dispatcher/docker-host-publication", () => ({
+  initializeDockerPublicationRecovery,
   publishDockerPromotedResult,
   resumeDockerPromotedResult,
 }));
@@ -77,6 +79,14 @@ describe("DispatchManager exact Docker approval resume", () => {
     fs.mkdirSync(path.join(projectRoot, ".quack", "prep"), { recursive: true });
     publishDockerPromotedResult.mockResolvedValue({ warnings: [] });
     resumeDockerPromotedResult.mockResolvedValue({ warnings: [] });
+    initializeDockerPublicationRecovery.mockImplementation(
+      (taskId: string, _projectRoot: string, _branch: string, options: Record<string, unknown>) => {
+        const recovery = options.recovery as { rootDir: string; publicationId: string };
+        return Promise.resolve(
+          path.join(recovery.rootDir, `${taskId}-${recovery.publicationId}.json`),
+        );
+      },
+    );
   });
 
   afterEach(() => {
@@ -185,12 +195,13 @@ describe("DispatchManager exact Docker approval resume", () => {
         candidateHead: "b".repeat(40),
         sealedRef: `refs/quack/docker-resume/${taskId}/${ownershipId}`,
       })),
-      sealPrivateGitForPublication: jest.fn((_container: unknown, ownershipId: string) => ({
+      preparePrivateGitForPublication: jest.fn((_container: unknown, ownershipId: string) => ({
         authoritativeRef: `refs/heads/${sharedBranchName}`,
         baseHead,
         candidateHead: "c".repeat(40),
         sealedRef: `refs/quack/docker-publication/${taskId}/${ownershipId}`,
       })),
+      sealPreparedPublicationRef: jest.fn((binding: unknown) => binding),
       releaseSealedResumeRef: jest.fn(() => true),
       releaseSealedPublicationRef: jest.fn(() => true),
       getActiveContainers: jest.fn(() => []),
@@ -331,6 +342,7 @@ describe("DispatchManager exact Docker approval resume", () => {
           targetBranch: "main",
           parentTaskId: publicationOptions.parentTaskId,
           sharedBranchName: publicationOptions.sharedBranchName,
+          repository: { pushUrlHash: "d".repeat(64) },
           gitState: publicationOptions.recovery.gitState,
           worktreePath: fs.realpathSync.native(publicationOptions.recovery.worktreePath),
           worktreeSessionId: publicationOptions.recovery.worktreeSessionId,
@@ -393,6 +405,15 @@ describe("DispatchManager exact Docker approval resume", () => {
     );
     children[1].emit("exit", 0, null);
     await flush(12);
+    expect(initializeDockerPublicationRecovery).toHaveBeenCalledTimes(1);
+    expect(dockerManager.sealPreparedPublicationRef).toHaveBeenCalledTimes(1);
+    expect(publishDockerPromotedResult).toHaveBeenCalledTimes(1);
+    expect(initializeDockerPublicationRecovery.mock.invocationCallOrder[0]).toBeLessThan(
+      dockerManager.sealPreparedPublicationRef.mock.invocationCallOrder[0],
+    );
+    expect(dockerManager.sealPreparedPublicationRef.mock.invocationCallOrder[0]).toBeLessThan(
+      publishDockerPromotedResult.mock.invocationCallOrder[0],
+    );
     expect(resumed.status).toBe("failed");
     expect(resumed.output.join("\n")).toContain("push temporarily unavailable");
     expect(restarted.getDockerPausedRuntimeDir(taskId)).toBe(pausedDir);

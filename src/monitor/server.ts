@@ -2081,13 +2081,35 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       return true;
     }
 
+    // Project registration creates a new global registry entry. A caller must
+    // not be able to turn an arbitrary body.projectId into authorization for
+    // that global mutation; scoped API keys are rejected separately below.
+    if (/^\/api\/projects\/?$/i.test(req.path)) {
+      return false;
+    }
+
     // Worker enrollment create uses body.projectId to bind the new worker to a
     // target repo/project profile, not to select the monitor project context.
-    if (req.path === "/api/workers/enrollments") {
+    if (/^\/api\/workers\/enrollments\/?$/i.test(req.path)) {
       return false;
     }
 
     return true;
+  }
+
+  function projectIdFromRequestPath(req: Request): string | undefined {
+    const routePath = req.path;
+    const activeMatch = routePath.match(/^\/api\/projects\/active\/([^/]+)\/?$/i);
+    const projectMatch = routePath.match(/^\/api\/projects\/([^/]+)\/?$/i);
+    const encoded =
+      activeMatch?.[1] ??
+      (projectMatch?.[1]?.toLowerCase() !== "active" ? projectMatch?.[1] : undefined);
+    if (!encoded) return undefined;
+    try {
+      return decodeURIComponent(encoded);
+    } catch {
+      return encoded;
+    }
   }
 
   function collectProjectIdCandidates(req: Request): ProjectIdCandidate[] {
@@ -2100,7 +2122,10 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       candidates.push({ source, value });
     };
 
-    addCandidate("path", req.params.projectId);
+    // This middleware executes before Express matches a route, so req.params
+    // is necessarily empty. Extract only the paths whose segment is actually
+    // a project identifier; other `:id` segments name tasks, jobs, or hosts.
+    addCandidate("path", projectIdFromRequestPath(req));
     if (shouldReadBodyProjectIdCandidate(req)) {
       addCandidate("body", body?.projectId);
     }
@@ -2185,7 +2210,11 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
   }
 
   function resolveProject(req?: Request): ResolvedProject {
-    const requestProjectId = req ? resolveProjectIdFromRequest(req).projectId : null;
+    const requestProjectId = req
+      ? (resolveProjectIdFromRequest(req).projectId ??
+        (req as AuthenticatedRequest).effectiveProjectId ??
+        null)
+      : null;
     // Multi-project mode: resolve from registry
     if (registry) {
       const ctx = requestProjectId
@@ -2220,7 +2249,11 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
   }
 
   function resolveProjects(req?: Request): ResolvedProject[] {
-    const requestProjectId = req ? resolveProjectIdFromRequest(req).projectId : null;
+    const requestProjectId = req
+      ? (resolveProjectIdFromRequest(req).projectId ??
+        (req as AuthenticatedRequest).effectiveProjectId ??
+        null)
+      : null;
     if (registry && !requestProjectId) {
       return registry.listProjects().map(resolvedProjectFromContext);
     }
@@ -2277,7 +2310,8 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
   }
 
   app.use((req: Request, res: Response, next) => {
-    if (!req.path.startsWith("/api/") && !req.path.startsWith("/v1/")) {
+    const routePath = req.path.toLowerCase();
+    if (!routePath.startsWith("/api/") && !routePath.startsWith("/v1/")) {
       next();
       return;
     }
@@ -2290,6 +2324,71 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         candidates: resolution.candidates,
       });
       return;
+    }
+
+    const authReq = req as AuthenticatedRequest;
+    const apiPrincipal = authReq.apiPrincipal;
+    if (apiPrincipal) {
+      const normalizedPath = routePath.replace(/\/+$/, "") || "/";
+      const hasWildcardScope = apiPrincipal.projectScopes.includes("*");
+      const unscopedReadPaths = new Set(["/api/auth/status", "/api/health"]);
+      const unscopedReadPrefixes = ["/api/monitoring/"];
+      const globalPaths = new Set(["/api/projects", "/api/config"]);
+      const globalPrefixes = [
+        "/api/projects/",
+        "/api/remotes",
+        "/api/events/",
+        "/api/agent-resources",
+        "/api/workers/",
+        "/api/wiki/",
+        "/api/ccusage",
+        "/v1/listeners",
+        "/v1/coordination",
+        "/v1/federation",
+        "/v1/wiki/",
+      ];
+      const isUnscopedRead =
+        (req.method === "GET" || req.method === "HEAD") &&
+        (unscopedReadPaths.has(normalizedPath) ||
+          unscopedReadPrefixes.some((prefix) => normalizedPath.startsWith(prefix)));
+      const isGlobalOperation =
+        globalPaths.has(normalizedPath) ||
+        globalPrefixes.some((prefix) => normalizedPath.startsWith(prefix));
+
+      // Global APIs aggregate or mutate state across projects. They cannot be
+      // safely represented by one project scope, so only an explicitly
+      // wildcard-scoped machine credential may use them.
+      if (!isUnscopedRead && isGlobalOperation && !hasWildcardScope) {
+        res.status(403).json({
+          error: "API key requires wildcard scope for this global operation",
+          code: "API_KEY_GLOBAL_SCOPE_REQUIRED",
+          keyId: apiPrincipal.id,
+        });
+        return;
+      }
+
+      if (!isUnscopedRead && !isGlobalOperation) {
+        const effectiveProjectId =
+          resolution.projectId ?? registry?.getActiveProjectId() ?? legacyProjectId;
+        if (!effectiveProjectId) {
+          res.status(403).json({
+            error: "API key project scope could not be resolved",
+            code: "API_KEY_PROJECT_SCOPE_UNRESOLVED",
+            keyId: apiPrincipal.id,
+          });
+          return;
+        }
+        if (!authService.isApiKeyAllowedForProject(apiPrincipal, effectiveProjectId)) {
+          res.status(403).json({
+            error: "API key is not authorized for this project",
+            code: "API_KEY_SCOPE_MISMATCH",
+            projectId: effectiveProjectId,
+            keyId: apiPrincipal.id,
+          });
+          return;
+        }
+        authReq.effectiveProjectId = effectiveProjectId;
+      }
     }
 
     if (!resolution.projectId) {

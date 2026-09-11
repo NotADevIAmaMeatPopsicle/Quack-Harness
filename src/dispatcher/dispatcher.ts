@@ -33,7 +33,8 @@ import {
   createBranch,
   createFeatureBranch,
   cleanupBranch,
-  pushBranch,
+  pushExactBranch,
+  resolveExactBranchHead,
   abandonBranch,
   hasSealableProgress,
   getBranchCommitCount,
@@ -49,6 +50,11 @@ import { runAgent } from "../worker/agent-worker.js";
 import { runJudge, type JudgeInput } from "../judge/llm-judge.js";
 import { blueprintToChecks } from "../judge/spec-compliance.js";
 import { buildPrBodyWithIssueLink, createPullRequest } from "./pr-creator.js";
+import {
+  resolveOriginRepository,
+  type GitOriginIdentity,
+  type GitHubRepositoryIdentity,
+} from "./github-repository.js";
 import type { IEventWriter } from "../monitor/event-emitter.js";
 import { EventWriter, generateSessionId, createNoOpWriter } from "../monitor/event-emitter.js";
 import { discoverTranscripts, copyTranscript } from "../monitor/transcript-linker.js";
@@ -3539,7 +3545,16 @@ export async function dispatchTask(
           // Push branch so human can review
           if (branchName) {
             try {
-              await pushBranch(taskId, adapter);
+              const sealed = await resolveExactBranchHead(branchName, adapter);
+              if (sealed.success) {
+                const repository = await resolveOriginRepository(adapter.projectRoot);
+                await pushExactBranch(
+                  branchName,
+                  sealed.headCommitSha,
+                  adapter,
+                  repository.pushUrl,
+                );
+              }
             } catch {
               // Non-fatal: branch may already be pushed
             }
@@ -4114,12 +4129,59 @@ async function handleApproval(
     };
   }
 
+  // Freeze the final lifecycle-mutated branch once. Every publication side
+  // effect below uses this object ID rather than dereferencing the mutable
+  // branch name again.
+  let sealedHeadCommit: string | undefined;
+  let repositoryBinding: GitOriginIdentity | undefined;
+  if (branchName) {
+    const sealed = await resolveExactBranchHead(branchName, adapter);
+    if (!sealed.success) {
+      return {
+        taskId,
+        outcome: "error",
+        branchName,
+        agentResult,
+        judgeResult,
+        retriesUsed,
+        error: sealed.error,
+      };
+    }
+    sealedHeadCommit = sealed.headCommitSha;
+    const requiresRemotePublication =
+      adapter.config.git.autoPush !== false ||
+      adapter.config.git.autoMerge === true ||
+      (adapter.config.git.autoCreatePr === true && !options?.skipPr);
+    if (requiresRemotePublication) {
+      try {
+        repositoryBinding = await resolveOriginRepository(adapter.projectRoot);
+        if (
+          adapter.config.git.autoCreatePr === true &&
+          !options?.skipPr &&
+          !repositoryBinding.github
+        ) {
+          throw new Error("Could not resolve a GitHub repository from the exact origin push URL");
+        }
+      } catch (error: unknown) {
+        return {
+          taskId,
+          outcome: "error",
+          branchName,
+          agentResult,
+          judgeResult,
+          retriesUsed,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
+  }
+
   // Push branch (skip if autoPush is disabled in adapter config)
   if (branchName && adapter.config.git.autoPush !== false) {
     // Content validation: verify branch has commits before pushing.
     // Pass branchName explicitly — after worktree teardown, HEAD points to
     // the base branch, so base..HEAD would always be 0 commits.
-    const commitCount = await getBranchCommitCount(adapter, diffBase, branchName);
+    const commitCount = await getBranchCommitCount(adapter, diffBase, sealedHeadCommit);
     if (commitCount === 0) {
       return {
         taskId,
@@ -4132,7 +4194,12 @@ async function handleApproval(
       };
     }
 
-    const pushResult = await pushBranch(taskId, adapter);
+    const pushResult = await pushExactBranch(
+      branchName,
+      sealedHeadCommit!,
+      adapter,
+      repositoryBinding!.pushUrl,
+    );
     if (!pushResult.success) {
       return {
         taskId,
@@ -4156,10 +4223,13 @@ async function handleApproval(
       // Checkout feature branch
       execSync(`git checkout ${featureBranch}`, { cwd, stdio: "pipe" });
       // Merge subtask branch
-      execSync(`git merge --no-ff ${branchName} -m "[${taskId}] merge subtask to feature branch"`, {
-        cwd,
-        stdio: "pipe",
-      });
+      execSync(
+        `git merge --no-ff ${sealedHeadCommit!} -m "[${taskId}] merge subtask to feature branch"`,
+        {
+          cwd,
+          stdio: "pipe",
+        },
+      );
 
       return {
         taskId,
@@ -4187,35 +4257,60 @@ async function handleApproval(
 
   // Create PR
   let prUrl: string | undefined;
+  let prCreationBlockedAutoMerge = false;
   if (adapter.config.git.autoCreatePr && !options?.skipPr) {
-    const prBody = await buildPrBodyWithIssueLink(
-      taskId,
-      task.rawContent,
-      agentResult.verification,
-      judgeResult,
-      adapter,
-    );
-
-    const prResult = await createPullRequest(
-      {
+    if (!branchName || !sealedHeadCommit || !repositoryBinding) {
+      // An explicit skipBranch run has no branch/OID to bind. Preserve its
+      // non-fatal result semantics, but never fall back to an ambient gh head.
+      prCreationBlockedAutoMerge = true;
+    } else {
+      const prBody = await buildPrBodyWithIssueLink(
         taskId,
-        title: `[${taskId}] ${task.title}`,
-        body: prBody,
-        baseBranch: mergeTargetBranch ?? adapter.config.git.baseBranch,
-      },
-      adapter,
-    );
+        task.rawContent,
+        agentResult.verification,
+        judgeResult,
+        adapter,
+      );
 
-    if (prResult.success) {
-      prUrl = prResult.prUrl;
+      const githubRepository: GitHubRepositoryIdentity = {
+        ...repositoryBinding.github!,
+        pushUrl: repositoryBinding.pushUrl,
+        pushUrlHash: repositoryBinding.pushUrlHash,
+      };
+      const prResult = await createPullRequest(
+        {
+          taskId,
+          title: `[${taskId}] ${task.title}`,
+          body: prBody,
+          baseBranch: mergeTargetBranch ?? adapter.config.git.baseBranch,
+          headBranch: branchName,
+          headCommitSha: sealedHeadCommit,
+        },
+        adapter,
+        githubRepository,
+      );
+
+      if (prResult.success && prResult.prUrl) {
+        prUrl = prResult.prUrl;
+      } else {
+        // PR creation remains non-fatal because the branch is already pushed,
+        // but an auto-merge configured to use that PR must not silently fall
+        // through to the separate no-PR/local merge path.
+        prCreationBlockedAutoMerge = true;
+        if (adapter.config.git.autoMerge) {
+          console.warn(
+            `[pr-create] Auto-merge skipped for ${taskId}: ${prResult.error ?? "no confirmed pull request URL"}`,
+          );
+        }
+      }
+      // PR creation failure is non-fatal — the branch is pushed
     }
-    // PR creation failure is non-fatal — the branch is pushed
   }
 
   // Auto-merge to target branch if enabled
   let autoMerged = false;
   let mergeCommitSha: string | undefined;
-  if (adapter.config.git.autoMerge && branchName) {
+  if (adapter.config.git.autoMerge && branchName && !prCreationBlockedAutoMerge) {
     const targetBranch =
       mergeTargetBranch ?? adapter.config.git.autoMergeTarget ?? adapter.config.git.baseBranch;
     const mergeResult = await mergeBranchToTarget(
@@ -4224,6 +4319,10 @@ async function handleApproval(
       prUrl,
       targetBranch,
       eventWriter,
+      branchName,
+      sealedHeadCommit,
+      undefined,
+      repositoryBinding,
     );
 
     if (mergeResult.success) {
@@ -4231,7 +4330,12 @@ async function handleApproval(
       mergeCommitSha = mergeResult.mergeCommitSha;
 
       // Update task file status to COMPLETE on the target branch
-      const statusResult = await updateTaskFileStatus(taskId, adapter, targetBranch);
+      const statusResult = await updateTaskFileStatus(
+        taskId,
+        adapter,
+        targetBranch,
+        repositoryBinding!.pushUrl,
+      );
       if (!statusResult.success) {
         // Non-fatal: merge succeeded, just couldn't update task file
         console.warn(`[auto-merge] Status update failed for ${taskId}: ${statusResult.error}`);
@@ -4241,6 +4345,9 @@ async function handleApproval(
       if (branchName) {
         const deleteResult = await deleteAfterMerge(branchName, adapter, {
           eventWriter,
+          expectedHeadCommit: sealedHeadCommit,
+          ...(mergeCommitSha ? { expectedMergedCommit: mergeCommitSha } : {}),
+          expectedOriginPushUrl: repositoryBinding!.pushUrl,
         });
         if (!deleteResult.deleted) {
           // Non-fatal — log and continue

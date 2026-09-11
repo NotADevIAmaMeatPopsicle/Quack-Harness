@@ -111,6 +111,24 @@ describe("Auth Routes", () => {
     app.get("/api/wiki/status", (_req, res) => res.json({ available: true }));
     app.post("/api/wiki/page", (_req, res) => res.json({ saved: true }));
     app.get("/api/monitoring/environments", (_req, res) => res.json({ environments: [] }));
+    app.post("/api/projects", (_req, res) => res.json({ registered: true }));
+    app.post("/api/testing/run", (_req, res) => res.json({ started: true }));
+    app.post("/api/intake/apply", (_req, res) => res.json({ applied: true }));
+    app.post("/api/future-mutation", (_req, res) => res.json({ mutated: true }));
+
+    app.get("/api/fleet/status", (_req, res) => res.json({ state: "running" }));
+    app.get("/api/fleet/prep-shutdown-survivors", (_req, res) =>
+      res.json({ survivors: [{ confirmationToken: "secret-prep-token" }] }),
+    );
+    app.get("/api/fleet/shared-checkout-shutdown-survivor", (_req, res) =>
+      res.json({ survivor: { reconciliationToken: "secret-shared-token" } }),
+    );
+    app.get("/api/fleet/worktree-shutdown-survivors", (_req, res) =>
+      res.json({ survivors: [{ reconciliationToken: "secret-recovery-token" }] }),
+    );
+    app.post("/api/projects/active/:projectId", (req, res) =>
+      res.json({ activeProjectId: req.params.projectId }),
+    );
 
     // Health endpoint (should always be open)
     app.get("/api/health", (_req, res) => res.json({ status: "ok" }));
@@ -167,6 +185,33 @@ describe("Auth Routes", () => {
       );
       expect(res.status).toBe(403);
       expect(res.body.code).toBe("API_KEY_SCOPE_MISMATCH");
+    });
+
+    it("requires wildcard scope for case-insensitive project-registry routes", async () => {
+      const denied = await makeRequest(
+        server,
+        "POST",
+        "/API/PrOjEcTs/AcTiVe/project-b/",
+        {},
+        undefined,
+        { "x-api-key": "machine-secret" },
+      );
+
+      expect(denied.status).toBe(403);
+      expect(denied.body).toMatchObject({
+        code: "API_KEY_GLOBAL_SCOPE_REQUIRED",
+      });
+
+      const alsoDenied = await makeRequest(
+        server,
+        "POST",
+        "/API/PrOjEcTs/AcTiVe/project-a/",
+        {},
+        undefined,
+        { "x-api-key": "machine-secret" },
+      );
+      expect(alsoDenied.status).toBe(403);
+      expect(alsoDenied.body).toMatchObject({ code: "API_KEY_GLOBAL_SCOPE_REQUIRED" });
     });
   });
 
@@ -252,6 +297,37 @@ describe("Auth Routes", () => {
         const res = await makeRequest(server, "GET", "/api/monitoring/environments");
         expect(res.status).toBe(200);
         expect(Array.isArray(res.body.environments)).toBe(true);
+      });
+
+      it("keeps ordinary fleet status readable without exposing survivor tokens", async () => {
+        const statusRes = await makeRequest(server, "GET", "/ApI/FlEeT/StAtUs");
+        expect(statusRes.status).toBe(200);
+
+        for (const recoveryPath of [
+          "/API/FLEET/PREP-SHUTDOWN-SURVIVORS",
+          "/Api/Fleet/ShArEd-ChEcKoUt-ShUtDoWn-SuRvIvOr/",
+          "/api/fleet/WoRkTrEe-ShUtDoWn-SuRvIvOrS",
+        ]) {
+          const survivorRes = await makeRequest(server, "GET", recoveryPath);
+          expect(survivorRes.status).toBe(401);
+          expect(survivorRes.body).not.toHaveProperty("survivors");
+          expect(survivorRes.body).not.toHaveProperty("survivor");
+          expect(JSON.stringify(survivorRes.body)).not.toContain("secret-");
+        }
+
+        const loginRes = await makeRequest(server, "POST", "/api/auth/login", {
+          username: "admin",
+          password: "admin-pass",
+        });
+        const authorizedRes = await makeRequest(
+          server,
+          "GET",
+          "/Api/Fleet/WoRkTrEe-ShUtDoWn-SuRvIvOrS/",
+          undefined,
+          extractSessionCookie(loginRes.headers)!,
+        );
+        expect(authorizedRes.status).toBe(200);
+        expect(JSON.stringify(authorizedRes.body)).toContain("secret-recovery-token");
       });
 
       it("blocks unauthenticated wiki write routes", async () => {
@@ -351,6 +427,18 @@ describe("Auth Routes", () => {
         expect(res.body.error).toBe("Insufficient permissions");
       });
 
+      it("blocks viewer writes through case-insensitive route aliases", async () => {
+        const res = await makeRequest(
+          server,
+          "POST",
+          "/API/TaSkS/TASK-001/StArT",
+          {},
+          viewerCookie,
+        );
+        expect(res.status).toBe(403);
+        expect(res.body.error).toBe("Insufficient permissions");
+      });
+
       it("allows admin to access dispatch endpoints", async () => {
         const loginRes = await makeRequest(server, "POST", "/api/auth/login", {
           username: "admin",
@@ -384,6 +472,16 @@ describe("Auth Routes", () => {
         expect(res.status).toBe(403);
         expect(res.body.error).toBe("Insufficient permissions");
       });
+
+      it.each(["/api/projects", "/api/testing/run", "/api/intake/apply", "/api/future-mutation"])(
+        "default-denies viewer mutation %s unless explicitly allowlisted",
+        async (routePath) => {
+          const res = await makeRequest(server, "POST", routePath, {}, viewerCookie);
+
+          expect(res.status).toBe(403);
+          expect(res.body.error).toBe("Insufficient permissions");
+        },
+      );
     });
   });
 });

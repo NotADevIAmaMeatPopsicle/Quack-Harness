@@ -2,7 +2,8 @@
 // Git branch creation, push, and cleanup for task execution.
 // Each task runs on an isolated branch: quack/{taskId}
 
-import { exec } from "node:child_process";
+import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
@@ -14,9 +15,17 @@ import {
   resolveProtectedBranches,
 } from "../judgment/producers/branch-mutation.js";
 import type { IEventWriter } from "../monitor/event-emitter.js";
+import { BOUND_GIT_REMOTE, runBoundGitCommand } from "./bound-git-command.js";
+import {
+  originPushUrlMatches,
+  pullRequestUrlMatchesOrigin,
+  resolveOriginGitHubRepository,
+  type GitOriginIdentity,
+  type GitHubRepositoryIdentity,
+} from "./github-repository.js";
 import { parseStatus } from "./output-snapshot.js";
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 /** TASK-1313 S5: guard refusals become visible safety facts. */
 function emitGuardRefusal(
@@ -67,6 +76,27 @@ export interface MergeResult {
   mergeCommitSha?: string;
 }
 
+/**
+ * Immutable evidence for a locally prepared target-branch publication.
+ *
+ * The caller persists this record before the remote push. A retry can then
+ * distinguish the exact prepared result from an unrelated target-branch move
+ * without attempting to recreate squash/rebase commit identities.
+ */
+export interface PreparedTargetMerge {
+  strategy: "merge" | "rebase" | "squash";
+  candidateHead: string;
+  targetHead: string;
+  resultHead: string;
+  preparedRef: string;
+}
+
+export interface TargetMergeRecovery {
+  prepared?: PreparedTargetMerge;
+  preparedRef?: string;
+  onPrepared?: (prepared: PreparedTargetMerge) => void;
+}
+
 export interface CreateBranchOptions {
   fromBranch?: string;
   baseBranch?: string;
@@ -86,7 +116,7 @@ export interface CreateBranchOptions {
  */
 async function resolveMainWorkingDir(cwd: string): Promise<string> {
   try {
-    const { stdout } = await execAsync("git worktree list --porcelain", {
+    const { stdout } = await execFileAsync("git", ["worktree", "list", "--porcelain"], {
       cwd,
       timeout: GIT_TIMEOUT_MS,
       maxBuffer: MAX_BUFFER,
@@ -114,15 +144,18 @@ function isExecError(err: unknown): err is ExecError {
   return typeof err === "object" && err !== null && "stdout" in err && "stderr" in err;
 }
 
-async function runGitCommand(
-  args: string,
+async function runCommand(
+  file: "git" | "gh",
+  args: readonly string[],
   cwd: string,
+  environment?: NodeJS.ProcessEnv,
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   try {
-    const { stdout, stderr } = await execAsync(`git ${args}`, {
+    const { stdout, stderr } = await execFileAsync(file, [...args], {
       cwd,
       timeout: GIT_TIMEOUT_MS,
       maxBuffer: MAX_BUFFER,
+      ...(environment ? { env: { ...process.env, ...environment } } : {}),
     });
     return { exitCode: 0, stdout, stderr };
   } catch (err: unknown) {
@@ -134,16 +167,201 @@ async function runGitCommand(
       };
     }
     const message = err instanceof Error ? err.message : String(err);
-    return { exitCode: 1, stdout: "", stderr: `Git error: ${message}` };
+    return { exitCode: 1, stdout: "", stderr: `${file} error: ${message}` };
   }
+}
+
+async function runGitCommand(
+  args: readonly string[],
+  cwd: string,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  return runCommand("git", args, cwd);
+}
+
+async function readRemoteBranchHead(
+  branchName: string,
+  cwd: string,
+  expectedOriginPushUrl?: string,
+): Promise<{ success: true; head?: string } | { success: false; error: string }> {
+  if (expectedOriginPushUrl && !(await originPushUrlMatches(cwd, expectedOriginPushUrl))) {
+    return { success: false, error: "Git origin changed after publication was bound" };
+  }
+  const branchRef = `refs/heads/${branchName}`;
+  const result = expectedOriginPushUrl
+    ? await runBoundGitCommand(
+        ["ls-remote", "--heads", BOUND_GIT_REMOTE, branchRef],
+        cwd,
+        expectedOriginPushUrl,
+      )
+    : await runGitCommand(["ls-remote", "--heads", "origin", branchRef], cwd);
+  if (result.exitCode !== 0) {
+    return {
+      success: false,
+      error: result.stderr || `Could not inspect remote branch ${branchName}`,
+    };
+  }
+  if (!result.stdout.trim()) return { success: true };
+  const lines = result.stdout.trim().split(/\r?\n/u);
+  if (lines.length !== 1) {
+    return { success: false, error: `Remote branch ${branchName} resolved ambiguously` };
+  }
+  const match = /^([a-f0-9]{40,64})\s+(.+)$/iu.exec(lines[0] ?? "");
+  if (!match || match[2] !== branchRef) {
+    return { success: false, error: `Remote branch ${branchName} returned an invalid ref` };
+  }
+  return { success: true, head: match[1]?.toLowerCase() };
+}
+
+function isConservativeBranchName(value: string): boolean {
+  const shellMetacharacters = /[;&|<>`$!'"(){}]/u;
+  return (
+    value.length > 0 &&
+    value.length <= 500 &&
+    !value.startsWith("-") &&
+    !value.startsWith("/") &&
+    !value.endsWith("/") &&
+    !value.endsWith(".") &&
+    !value.endsWith(".lock") &&
+    !value.includes("..") &&
+    !value.includes("@{") &&
+    !shellMetacharacters.test(value) &&
+    !Array.from(value).some((character) => {
+      const code = character.charCodeAt(0);
+      return (
+        code <= 0x20 ||
+        code === 0x7f ||
+        ["~", "^", ":", "?", "*", "[", "]", "\\"].includes(character)
+      );
+    })
+  );
+}
+
+const COMMIT_ID_PATTERN = /^[a-f0-9]{40,64}$/iu;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function pullRequestHeadRepository(value: Record<string, unknown>): string | undefined {
+  const repository = value.headRepository;
+  if (isRecord(repository) && typeof repository.nameWithOwner === "string") {
+    return repository.nameWithOwner;
+  }
+  const owner = value.headRepositoryOwner;
+  if (
+    isRecord(repository) &&
+    typeof repository.name === "string" &&
+    isRecord(owner) &&
+    typeof owner.login === "string"
+  ) {
+    return `${owner.login}/${repository.name}`;
+  }
+  return undefined;
+}
+
+async function currentRepository(
+  cwd: string,
+): Promise<
+  { success: true; repository: GitHubRepositoryIdentity } | { success: false; error: string }
+> {
+  try {
+    return { success: true, repository: await resolveOriginGitHubRepository(cwd) };
+  } catch (error: unknown) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+interface BoundPullRequest {
+  state: "OPEN" | "MERGED";
+  mergeCommitSha?: string;
+}
+
+async function inspectBoundPullRequest(
+  cwd: string,
+  repository: GitHubRepositoryIdentity,
+  prUrl: string,
+  baseBranch: string,
+  headBranch: string,
+  headCommitSha: string,
+): Promise<{ success: true; pullRequest: BoundPullRequest } | { success: false; error: string }> {
+  if (!pullRequestUrlMatchesOrigin(prUrl, repository)) {
+    return { success: false, error: "pull request URL does not belong to the current repository" };
+  }
+  if (!(await originPushUrlMatches(cwd, repository.pushUrl))) {
+    return { success: false, error: "Git origin changed before pull request inspection" };
+  }
+  const result = await runCommand(
+    "gh",
+    [
+      "pr",
+      "view",
+      prUrl,
+      "--repo",
+      repository.selector,
+      "--json",
+      "url,state,mergeCommit,baseRefName,headRefName,headRefOid,headRepository,headRepositoryOwner",
+    ],
+    cwd,
+  );
+  if (result.exitCode !== 0) {
+    return { success: false, error: result.stderr || "could not inspect pull request" };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result.stdout) as unknown;
+  } catch {
+    return { success: false, error: "pull request inspection returned invalid JSON" };
+  }
+  if (!isRecord(parsed)) {
+    return { success: false, error: "pull request inspection returned an invalid record" };
+  }
+  const headRepository = pullRequestHeadRepository(parsed);
+  if (
+    parsed.url !== prUrl ||
+    parsed.baseRefName !== baseBranch ||
+    parsed.headRefName !== headBranch ||
+    parsed.headRefOid !== headCommitSha ||
+    headRepository?.toLowerCase() !== repository.nameWithOwner.toLowerCase()
+  ) {
+    return {
+      success: false,
+      error: "pull request no longer matches the sealed repository/base/head binding",
+    };
+  }
+  if (parsed.state !== "OPEN" && parsed.state !== "MERGED") {
+    return {
+      success: false,
+      error: `pull request is not mergeable from state ${String(parsed.state)}`,
+    };
+  }
+  const mergeCommit = parsed.mergeCommit;
+  const mergeCommitSha =
+    isRecord(mergeCommit) &&
+    typeof mergeCommit.oid === "string" &&
+    COMMIT_ID_PATTERN.test(mergeCommit.oid)
+      ? mergeCommit.oid
+      : undefined;
+  return {
+    success: true,
+    pullRequest: {
+      state: parsed.state,
+      ...(mergeCommitSha ? { mergeCommitSha } : {}),
+    },
+  };
 }
 
 async function fetchRemoteBranch(
   branchName: string,
   cwd: string,
 ): Promise<{ success: boolean; ref: string; error?: string }> {
+  if (!isConservativeBranchName(branchName)) {
+    return { success: false, ref: `origin/${branchName}`, error: "Unsafe Git branch name" };
+  }
   const fetchResult = await runGitCommand(
-    `fetch origin ${branchName}:refs/remotes/origin/${branchName}`,
+    ["fetch", "origin", `${branchName}:refs/remotes/origin/${branchName}`],
     cwd,
   );
   if (fetchResult.exitCode !== 0) {
@@ -155,7 +373,7 @@ async function fetchRemoteBranch(
   }
 
   const remoteRef = `origin/${branchName}`;
-  const verifyResult = await runGitCommand(`rev-parse --verify ${remoteRef}`, cwd);
+  const verifyResult = await runGitCommand(["rev-parse", "--verify", remoteRef], cwd);
   if (verifyResult.exitCode !== 0) {
     return {
       success: false,
@@ -172,7 +390,10 @@ async function guardAgainstStaleBranchMerge(
   targetBranch: string,
   cwd: string,
 ): Promise<{ success: boolean; error?: string }> {
-  const mergeBaseResult = await runGitCommand(`merge-base ${targetBranch} ${branchName}`, cwd);
+  if (!isConservativeBranchName(branchName) || !isConservativeBranchName(targetBranch)) {
+    return { success: false, error: "Unsafe Git branch name" };
+  }
+  const mergeBaseResult = await runGitCommand(["merge-base", targetBranch, branchName], cwd);
   if (mergeBaseResult.exitCode !== 0) {
     return {
       success: false,
@@ -181,7 +402,7 @@ async function guardAgainstStaleBranchMerge(
   }
 
   const mergeBase = mergeBaseResult.stdout.trim();
-  const targetHeadResult = await runGitCommand(`rev-parse ${targetBranch}`, cwd);
+  const targetHeadResult = await runGitCommand(["rev-parse", targetBranch], cwd);
   if (targetHeadResult.exitCode !== 0) {
     return {
       success: false,
@@ -194,8 +415,14 @@ async function guardAgainstStaleBranchMerge(
     return { success: true };
   }
 
-  const targetChanges = await runGitCommand(`diff --name-only ${mergeBase}..${targetBranch}`, cwd);
-  const branchChanges = await runGitCommand(`diff --name-only ${mergeBase}..${branchName}`, cwd);
+  const targetChanges = await runGitCommand(
+    ["diff", "--name-only", `${mergeBase}..${targetBranch}`],
+    cwd,
+  );
+  const branchChanges = await runGitCommand(
+    ["diff", "--name-only", `${mergeBase}..${branchName}`],
+    cwd,
+  );
   if (targetChanges.exitCode !== 0 || branchChanges.exitCode !== 0) {
     return {
       success: false,
@@ -260,7 +487,7 @@ export async function createFeatureBranch(
   const cwd = adapter.projectRoot;
 
   // Check if feature branch already exists
-  const checkResult = await runGitCommand(`rev-parse --verify ${branchName}`, cwd);
+  const checkResult = await runGitCommand(["rev-parse", "--verify", branchName], cwd);
   if (checkResult.exitCode === 0) {
     return { success: true, branchName };
   }
@@ -274,7 +501,7 @@ export async function createFeatureBranch(
     };
   }
 
-  const remoteResult = await runGitCommand(`branch ${branchName} ${remoteBase.ref}`, cwd);
+  const remoteResult = await runGitCommand(["branch", branchName, remoteBase.ref], cwd);
   if (remoteResult.exitCode === 0) {
     return { success: true, branchName };
   }
@@ -313,12 +540,12 @@ export async function createBranch(
   // changes (e.g. task specs marked COMPLETE) that would block
   // `git checkout -b`. The stash is popped after checkout succeeds,
   // or restored on failure.
-  const stashResult = await runGitCommand("stash --include-untracked", cwd);
+  const stashResult = await runGitCommand(["stash", "--include-untracked"], cwd);
   const didStash = stashResult.exitCode === 0 && !stashResult.stdout.includes("No local changes");
 
   const restoreStash = async (): Promise<void> => {
     if (didStash) {
-      await runGitCommand("stash pop", cwd);
+      await runGitCommand(["stash", "pop"], cwd);
     }
   };
 
@@ -335,7 +562,7 @@ export async function createBranch(
     baseRef = remoteBase.ref;
   }
 
-  const localResult = await runGitCommand(`checkout -b ${branchName} ${baseRef}`, cwd);
+  const localResult = await runGitCommand(["checkout", "-b", branchName, baseRef], cwd);
 
   if (localResult.exitCode === 0) {
     await restoreStash();
@@ -356,8 +583,8 @@ export async function createBranch(
       await restoreStash();
       return { success: false, branchName, error: guard.reason };
     }
-    await runGitCommand(`branch -D ${branchName}`, cwd);
-    const retryResult = await runGitCommand(`checkout -b ${branchName} ${baseRef}`, cwd);
+    await runGitCommand(["branch", "-D", branchName], cwd);
+    const retryResult = await runGitCommand(["checkout", "-b", branchName, baseRef], cwd);
     if (retryResult.exitCode === 0) {
       await restoreStash();
       return { success: true, branchName };
@@ -366,7 +593,7 @@ export async function createBranch(
 
   // For subtasks, the parent branch may only exist on origin.
   const fallbackBase = fromBranch ? (await fetchRemoteBranch(fromBranch, cwd)).ref : baseRef;
-  const remoteResult = await runGitCommand(`checkout -b ${branchName} ${fallbackBase}`, cwd);
+  const remoteResult = await runGitCommand(["checkout", "-b", branchName, fallbackBase], cwd);
 
   if (remoteResult.exitCode === 0) {
     await restoreStash();
@@ -390,7 +617,7 @@ export async function pushBranch(taskId: string, adapter: ProjectAdapter): Promi
   const branchName = buildBranchName(taskId, adapter);
   const cwd = adapter.projectRoot;
 
-  const result = await runGitCommand(`push -u origin ${branchName}`, cwd);
+  const result = await runGitCommand(["push", "-u", "origin", branchName], cwd);
 
   if (result.exitCode !== 0) {
     return {
@@ -400,6 +627,93 @@ export async function pushBranch(taskId: string, adapter: ProjectAdapter): Promi
     };
   }
 
+  return { success: true, branchName };
+}
+
+export type ExactBranchHeadResult =
+  | { success: true; branchName: string; headCommitSha: string }
+  | { success: false; branchName: string; error: string };
+
+/** Freeze the exact local task-branch commit after judgment/lifecycle work. */
+export async function resolveExactBranchHead(
+  branchName: string,
+  adapter: ProjectAdapter,
+): Promise<ExactBranchHeadResult> {
+  if (!isConservativeBranchName(branchName)) {
+    return { success: false, branchName, error: "Unsafe Git branch name" };
+  }
+  const branchRef = `refs/heads/${branchName}`;
+  const result = await runGitCommand(
+    ["rev-parse", "--verify", `${branchRef}^{commit}`],
+    adapter.projectRoot,
+  );
+  const headCommitSha = result.stdout.trim().toLowerCase();
+  if (result.exitCode !== 0 || !COMMIT_ID_PATTERN.test(headCommitSha)) {
+    return {
+      success: false,
+      branchName,
+      error: `Could not seal exact branch head for ${branchName}: ${result.stderr || "invalid commit id"}`,
+    };
+  }
+  return { success: true, branchName, headCommitSha };
+}
+
+/**
+ * Push only a previously sealed object ID. The mutable branch name is checked
+ * immediately before the push and is never used as the refspec source.
+ */
+export async function pushExactBranch(
+  branchName: string,
+  expectedHeadCommit: string,
+  adapter: ProjectAdapter,
+  expectedOriginPushUrl?: string,
+): Promise<BranchResult> {
+  const sealed = expectedHeadCommit.toLowerCase();
+  if (!isConservativeBranchName(branchName) || !COMMIT_ID_PATTERN.test(sealed)) {
+    return { success: false, branchName, error: "Invalid exact branch publication binding" };
+  }
+  const current = await resolveExactBranchHead(branchName, adapter);
+  if (!current.success || current.headCommitSha !== sealed) {
+    return {
+      success: false,
+      branchName,
+      error: current.success
+        ? `Refusing to push ${branchName}: branch advanced after judgment`
+        : current.error,
+    };
+  }
+  if (
+    expectedOriginPushUrl &&
+    !(await originPushUrlMatches(adapter.projectRoot, expectedOriginPushUrl))
+  ) {
+    return { success: false, branchName, error: "Git origin changed after publication was bound" };
+  }
+
+  const branchRef = `refs/heads/${branchName}`;
+  const result = expectedOriginPushUrl
+    ? await runBoundGitCommand(
+        ["push", BOUND_GIT_REMOTE, `${sealed}:${branchRef}`],
+        adapter.projectRoot,
+        expectedOriginPushUrl,
+      )
+    : await runGitCommand(["push", "origin", `${sealed}:${branchRef}`], adapter.projectRoot);
+  if (result.exitCode !== 0) {
+    return {
+      success: false,
+      branchName,
+      error: `Failed to push sealed branch: ${result.stderr}`,
+    };
+  }
+  const remote = await readRemoteBranchHead(branchName, adapter.projectRoot, expectedOriginPushUrl);
+  if (!remote.success || remote.head !== sealed) {
+    return {
+      success: false,
+      branchName,
+      error: remote.success
+        ? `Remote branch ${branchName} did not retain the sealed commit`
+        : remote.error,
+    };
+  }
   return { success: true, branchName };
 }
 
@@ -429,7 +743,7 @@ export async function cleanupBranch(
   }
 
   // Switch back to base branch
-  const checkoutResult = await runGitCommand(`checkout ${baseBranch}`, cwd);
+  const checkoutResult = await runGitCommand(["checkout", baseBranch], cwd);
   if (checkoutResult.exitCode !== 0) {
     return {
       success: false,
@@ -439,7 +753,7 @@ export async function cleanupBranch(
   }
 
   // Delete local branch
-  const deleteResult = await runGitCommand(`branch -D ${branchName}`, cwd);
+  const deleteResult = await runGitCommand(["branch", "-D", branchName], cwd);
   if (deleteResult.exitCode !== 0) {
     return {
       success: false,
@@ -449,7 +763,7 @@ export async function cleanupBranch(
   }
 
   // Delete remote branch (best-effort, don't fail if not pushed)
-  await runGitCommand(`push origin --delete ${branchName}`, cwd);
+  await runGitCommand(["push", "origin", "--delete", branchName], cwd);
 
   return { success: true, branchName };
 }
@@ -467,7 +781,7 @@ export async function abandonBranch(
   const baseBranch = adapter.config.git.baseBranch;
   const cwd = adapter.projectRoot;
 
-  const checkoutResult = await runGitCommand(`checkout ${baseBranch}`, cwd);
+  const checkoutResult = await runGitCommand(["checkout", baseBranch], cwd);
   if (checkoutResult.exitCode !== 0) {
     return {
       success: false,
@@ -485,7 +799,7 @@ export async function abandonBranch(
  */
 export async function getUncommittedChanges(adapter: ProjectAdapter): Promise<string> {
   const cwd = adapter.projectRoot;
-  const result = await runGitCommand("status --short", cwd);
+  const result = await runGitCommand(["status", "--short"], cwd);
   return result.stdout.trim();
 }
 
@@ -505,7 +819,7 @@ export async function autoCommitChanges(
   // conflicts when task branches are squash-merged to the base branch.
   // Two-step approach because pathspec negation (:!file) is unreliable
   // on Windows — git may return exit 1 due to gitignored file warnings.
-  const addResult = await runGitCommand("add -A", cwd);
+  const addResult = await runGitCommand(["add", "-A"], cwd);
   if (addResult.exitCode !== 0) {
     return {
       success: false,
@@ -523,12 +837,21 @@ export async function autoCommitChanges(
   // changes adapter config commits it explicitly, never via this
   // forgot-to-commit safety net.
   await runGitCommand(
-    "reset HEAD -- PROGRESS.md .quack/verified.json .quack/adapter.json .quack/conventions.md .quack/judge-criteria.md",
+    [
+      "reset",
+      "HEAD",
+      "--",
+      "PROGRESS.md",
+      ".quack/verified.json",
+      ".quack/adapter.json",
+      ".quack/conventions.md",
+      ".quack/judge-criteria.md",
+    ],
     cwd,
   );
 
   // Count staged files
-  const stagedResult = await runGitCommand("diff --cached --name-only", cwd);
+  const stagedResult = await runGitCommand(["diff", "--cached", "--name-only"], cwd);
   const stagedFiles = stagedResult.stdout.trim().split("\n").filter(Boolean);
   if (stagedFiles.length === 0) {
     return {
@@ -544,7 +867,7 @@ export async function autoCommitChanges(
     .replace("{message}", "auto-commit: agent did not commit before finishing");
   const fullMsg = trailer ? `${msg}\n\n${trailer}` : msg;
 
-  const commitResult = await runGitCommand(`commit -m "${fullMsg.replace(/"/g, '\\"')}"`, cwd);
+  const commitResult = await runGitCommand(["commit", "-m", fullMsg], cwd);
   if (commitResult.exitCode !== 0) {
     return {
       success: false,
@@ -572,14 +895,14 @@ export async function getBranchDiff(adapter: ProjectAdapter, diffBase?: string):
   if (!diffBase) {
     const remoteBase = await fetchRemoteBranch(baseBranch, cwd);
     if (remoteBase.success) {
-      const remoteResult = await runGitCommand(`diff ${remoteBase.ref}...HEAD`, cwd);
+      const remoteResult = await runGitCommand(["diff", `${remoteBase.ref}...HEAD`], cwd);
       if (remoteResult.exitCode === 0) {
         return remoteResult.stdout.trim();
       }
     }
   }
 
-  const localResult = await runGitCommand(`diff ${baseBranch}...HEAD`, cwd);
+  const localResult = await runGitCommand(["diff", `${baseBranch}...HEAD`], cwd);
 
   if (localResult.exitCode === 0) {
     return localResult.stdout.trim();
@@ -587,7 +910,7 @@ export async function getBranchDiff(adapter: ProjectAdapter, diffBase?: string):
 
   // Fall back to origin/ prefix if the initial fetch failed but the remote ref
   // already exists locally.
-  const remoteResult = await runGitCommand(`diff origin/${baseBranch}...HEAD`, cwd);
+  const remoteResult = await runGitCommand(["diff", `origin/${baseBranch}...HEAD`], cwd);
   return remoteResult.stdout.trim();
 }
 
@@ -606,7 +929,7 @@ export async function hasSealableProgress(
 ): Promise<boolean> {
   const committed = await getBranchDiff(adapter, diffBase);
   if (committed.trim().length > 0) return true;
-  const status = await runGitCommand("status --short", adapter.projectRoot);
+  const status = await runGitCommand(["status", "--short"], adapter.projectRoot);
   if (status.exitCode !== 0) return false;
   return parseStatus(status.stdout).included.length > 0;
 }
@@ -629,7 +952,7 @@ export async function getBranchCommitCount(
   const base = baseBranch ?? adapter.config.git.baseBranch;
   const tip = branchRef ?? "HEAD";
   const cwd = adapter.projectRoot;
-  const result = await runGitCommand(`log --oneline ${base}..${tip}`, cwd);
+  const result = await runGitCommand(["log", "--oneline", `${base}..${tip}`], cwd);
   if (result.exitCode !== 0) return 0;
   const lines = result.stdout.trim().split("\n").filter(Boolean);
   return lines.length;
@@ -657,7 +980,7 @@ async function buildSquashCommitMessage(
 ): Promise<string> {
   try {
     // Get list of changed files with status (A=added, M=modified, D=deleted)
-    const diffResult = await runGitCommand(`diff --cached --name-status`, cwd);
+    const diffResult = await runGitCommand(["diff", "--cached", "--name-status"], cwd);
     if (diffResult.exitCode !== 0 || !diffResult.stdout.trim()) {
       return `[${taskId}] squash merge`;
     }
@@ -725,21 +1048,280 @@ function isBranchLockedInAnotherWorktree(stderr: string, targetBranch: string): 
   );
 }
 
+function isPreparedPublicationRef(value: string | undefined): value is string {
+  return (
+    typeof value === "string" &&
+    (value.startsWith("refs/quack/docker-publication-prepared/") ||
+      value.startsWith("refs/quack/publication-prepared/")) &&
+    isConservativeBranchName(value)
+  );
+}
+
+async function releasePreparedTarget(
+  preparedRef: string,
+  resultHead: string,
+  cwd: string,
+): Promise<{ success: true } | { success: false; error: string }> {
+  const current = await runGitCommand(["rev-parse", "--verify", `${preparedRef}^{commit}`], cwd);
+  if (current.exitCode !== 0) return { success: true };
+  if (current.stdout.trim().toLowerCase() !== resultHead.toLowerCase()) {
+    return {
+      success: false,
+      error: `Prepared publication ref ${preparedRef} changed before release`,
+    };
+  }
+  const release = await runGitCommand(["update-ref", "-d", preparedRef, resultHead], cwd);
+  if (release.exitCode !== 0) {
+    return {
+      success: false,
+      error: `Could not release prepared publication ref: ${release.stderr}`,
+    };
+  }
+  const retained = await runGitCommand(["rev-parse", "--verify", `${preparedRef}^{commit}`], cwd);
+  return retained.exitCode === 0
+    ? { success: false, error: `Prepared publication ref ${preparedRef} was not released` }
+    : { success: true };
+}
+
+function normalizePreparedTargetMerge(
+  prepared: PreparedTargetMerge,
+  candidateHead: string,
+  strategy: "merge" | "rebase" | "squash",
+  expectedPreparedRef: string | undefined,
+): PreparedTargetMerge | undefined {
+  const normalized = {
+    strategy: prepared.strategy,
+    candidateHead: prepared.candidateHead.toLowerCase(),
+    targetHead: prepared.targetHead.toLowerCase(),
+    resultHead: prepared.resultHead.toLowerCase(),
+    preparedRef: prepared.preparedRef,
+  };
+  if (
+    normalized.strategy !== strategy ||
+    !COMMIT_ID_PATTERN.test(normalized.candidateHead) ||
+    !COMMIT_ID_PATTERN.test(normalized.targetHead) ||
+    !COMMIT_ID_PATTERN.test(normalized.resultHead) ||
+    normalized.candidateHead !== candidateHead.toLowerCase() ||
+    normalized.targetHead.length !== normalized.resultHead.length ||
+    normalized.targetHead.length !== normalized.candidateHead.length ||
+    normalized.targetHead === normalized.resultHead ||
+    !isPreparedPublicationRef(normalized.preparedRef) ||
+    normalized.preparedRef !== expectedPreparedRef
+  ) {
+    return undefined;
+  }
+  return normalized;
+}
+
+async function preservePreparedTarget(
+  preparedRef: string,
+  resultHead: string,
+  cwd: string,
+): Promise<{ success: true } | { success: false; error: string }> {
+  if (!isPreparedPublicationRef(preparedRef)) {
+    return { success: false, error: "Prepared target publication ref is invalid" };
+  }
+  const current = await runGitCommand(["rev-parse", "--verify", `${preparedRef}^{commit}`], cwd);
+  const currentHead = current.exitCode === 0 ? current.stdout.trim().toLowerCase() : undefined;
+  if (currentHead !== undefined && !COMMIT_ID_PATTERN.test(currentHead)) {
+    return { success: false, error: `Prepared target publication ref ${preparedRef} is invalid` };
+  }
+  const create =
+    currentHead === resultHead
+      ? { exitCode: 0, stdout: "", stderr: "" }
+      : await runGitCommand(
+          ["update-ref", preparedRef, resultHead, currentHead ?? "0".repeat(resultHead.length)],
+          cwd,
+        );
+  if (create.exitCode !== 0) {
+    return {
+      success: false,
+      error: `Could not preserve prepared target publication: ${create.stderr}`,
+    };
+  }
+  const confirmed = await runGitCommand(["rev-parse", "--verify", `${preparedRef}^{commit}`], cwd);
+  if (confirmed.exitCode !== 0 || confirmed.stdout.trim().toLowerCase() !== resultHead) {
+    return { success: false, error: "Prepared target publication ref was not confirmed" };
+  }
+  return { success: true };
+}
+
+async function finishNoEffectTarget(
+  targetHead: string,
+  targetBranch: string,
+  preparedRef: string | undefined,
+  cwd: string,
+  allowDescendant: boolean,
+  expectedOriginPushUrl?: string,
+): Promise<MergeResult> {
+  const remote = await readRemoteBranchHead(targetBranch, cwd, expectedOriginPushUrl);
+  if (!remote.success) return { success: false, error: remote.error };
+  let confirmed = remote.head === targetHead;
+  if (!confirmed && allowDescendant && remote.head) {
+    const descendant = await runGitCommand(
+      ["merge-base", "--is-ancestor", targetHead, remote.head],
+      cwd,
+    );
+    confirmed = descendant.exitCode === 0;
+  }
+  if (!confirmed) {
+    return {
+      success: false,
+      error: `Refusing no-effect publication for ${targetBranch}: remote target moved from ${targetHead}`,
+    };
+  }
+  if (preparedRef) {
+    if (!isPreparedPublicationRef(preparedRef)) {
+      return { success: false, error: "Prepared target publication ref is invalid" };
+    }
+    const preserved = await runGitCommand(
+      ["rev-parse", "--verify", `${preparedRef}^{commit}`],
+      cwd,
+    );
+    if (preserved.exitCode === 0) {
+      const preservedHead = preserved.stdout.trim().toLowerCase();
+      if (!COMMIT_ID_PATTERN.test(preservedHead)) {
+        return {
+          success: false,
+          error: `Prepared target publication ref ${preparedRef} is invalid`,
+        };
+      }
+      const release = await runGitCommand(["update-ref", "-d", preparedRef, preservedHead], cwd);
+      if (release.exitCode !== 0) {
+        return {
+          success: false,
+          error: `Could not release orphaned prepared publication ref ${preparedRef}: ${release.stderr}`,
+        };
+      }
+      const retained = await runGitCommand(
+        ["rev-parse", "--verify", `${preparedRef}^{commit}`],
+        cwd,
+      );
+      if (retained.exitCode === 0) {
+        return {
+          success: false,
+          error: `Orphaned prepared publication ref ${preparedRef} was not released`,
+        };
+      }
+    }
+  }
+  return { success: true, mergeCommitSha: targetHead };
+}
+
+async function publishPreparedTarget(
+  prepared: PreparedTargetMerge,
+  targetBranch: string,
+  cwd: string,
+  expectedOriginPushUrl?: string,
+): Promise<MergeResult> {
+  const remoteBefore = await readRemoteBranchHead(targetBranch, cwd, expectedOriginPushUrl);
+  if (!remoteBefore.success) {
+    return { success: false, error: remoteBefore.error };
+  }
+  if (remoteBefore.head === prepared.resultHead) {
+    return { success: true, mergeCommitSha: prepared.resultHead };
+  }
+  if (remoteBefore.head && remoteBefore.head !== prepared.targetHead) {
+    const resultStillPublished = await runGitCommand(
+      ["merge-base", "--is-ancestor", prepared.resultHead, remoteBefore.head],
+      cwd,
+    );
+    if (resultStillPublished.exitCode === 0) {
+      return { success: true, mergeCommitSha: prepared.resultHead };
+    }
+  }
+  if (remoteBefore.head !== prepared.targetHead) {
+    return {
+      success: false,
+      error: `Refusing prepared publication for ${targetBranch}: remote target moved from ${prepared.targetHead}`,
+    };
+  }
+
+  const preserved = await runGitCommand(
+    ["rev-parse", "--verify", `${prepared.preparedRef}^{commit}`],
+    cwd,
+  );
+  if (preserved.exitCode !== 0 || preserved.stdout.trim().toLowerCase() !== prepared.resultHead) {
+    const observed = preserved.stdout.trim().toLowerCase() || "missing";
+    return {
+      success: false,
+      error: `Prepared publication ref ${prepared.preparedRef} resolved to ${observed}, expected ${prepared.resultHead}`,
+    };
+  }
+  const descendant = await runGitCommand(
+    ["merge-base", "--is-ancestor", prepared.targetHead, prepared.resultHead],
+    cwd,
+  );
+  if (descendant.exitCode !== 0) {
+    return {
+      success: false,
+      error: `Prepared publication ${prepared.resultHead} is not based on ${prepared.targetHead}`,
+    };
+  }
+
+  const targetRef = `refs/heads/${targetBranch}`;
+  if (expectedOriginPushUrl && !(await originPushUrlMatches(cwd, expectedOriginPushUrl))) {
+    return { success: false, error: "Git origin changed before target publication" };
+  }
+  const pushArgs = [
+    "push",
+    `--force-with-lease=${targetRef}:${prepared.targetHead}`,
+    expectedOriginPushUrl ? BOUND_GIT_REMOTE : "origin",
+    `${prepared.resultHead}:${targetRef}`,
+  ];
+  const pushResult = expectedOriginPushUrl
+    ? await runBoundGitCommand(pushArgs, cwd, expectedOriginPushUrl)
+    : await runGitCommand(pushArgs, cwd);
+  if (pushResult.exitCode !== 0) {
+    return {
+      success: false,
+      error: `Failed to push ${targetBranch}: ${pushResult.stderr}`,
+    };
+  }
+  const remoteAfter = await readRemoteBranchHead(targetBranch, cwd, expectedOriginPushUrl);
+  if (!remoteAfter.success || remoteAfter.head !== prepared.resultHead) {
+    return {
+      success: false,
+      error: remoteAfter.success
+        ? `Remote target ${targetBranch} was not confirmed at ${prepared.resultHead}`
+        : remoteAfter.error,
+    };
+  }
+  return { success: true, mergeCommitSha: prepared.resultHead };
+}
+
 async function mergeViaDetachedWorktree(
   taskId: string,
-  branchName: string,
+  mergeSource: string,
   targetBranch: string,
   strategy: "merge" | "rebase" | "squash",
   repoDir: string,
+  exactCandidate = false,
+  recovery?: TargetMergeRecovery,
+  expectedOriginPushUrl?: string,
 ): Promise<MergeResult> {
+  if (recovery?.prepared) {
+    const prepared = normalizePreparedTargetMerge(
+      recovery.prepared,
+      mergeSource,
+      strategy,
+      recovery.preparedRef,
+    );
+    if (!exactCandidate || !prepared) {
+      return { success: false, error: "Prepared target publication does not match this merge" };
+    }
+    return publishPreparedTarget(prepared, targetBranch, repoDir, expectedOriginPushUrl);
+  }
   const worktreePath = path.join(
     tmpdir(),
     `quack-auto-merge-${taskId.toLowerCase()}-${Date.now()}`,
   );
+  let temporaryRebaseRef: string | undefined;
+  let temporaryRebaseHead: string | undefined;
 
   try {
     const addResult = await runGitCommand(
-      `worktree add --detach "${worktreePath}" origin/${targetBranch}`,
+      ["worktree", "add", "--detach", worktreePath, `origin/${targetBranch}`],
       repoDir,
     );
     if (addResult.exitCode !== 0) {
@@ -749,34 +1331,99 @@ async function mergeViaDetachedWorktree(
       };
     }
 
-    const staleGuard = await guardAgainstStaleBranchMerge(
-      branchName,
-      `origin/${targetBranch}`,
-      worktreePath,
-    );
-    if (!staleGuard.success) {
-      return {
-        success: false,
-        error: staleGuard.error ?? `Stale branch guard failed for ${branchName}`,
-      };
+    let targetHead: string | undefined;
+    if (exactCandidate) {
+      const targetHeadResult = await runGitCommand(["rev-parse", "HEAD"], worktreePath);
+      targetHead = targetHeadResult.stdout.trim().toLowerCase();
+      if (targetHeadResult.exitCode !== 0 || !COMMIT_ID_PATTERN.test(targetHead)) {
+        return {
+          success: false,
+          error: `Could not resolve exact target head for ${targetBranch}: ${targetHeadResult.stderr}`,
+        };
+      }
+
+      // A retry can legitimately arrive after another actor integrated the
+      // exact sealed candidate. Treat that as an idempotent no-effect merge;
+      // there is no new result to anchor or push.
+      const alreadyIntegrated = await runGitCommand(
+        ["merge-base", "--is-ancestor", mergeSource, targetHead],
+        worktreePath,
+      );
+      if (alreadyIntegrated.exitCode === 0) {
+        return await finishNoEffectTarget(
+          targetHead,
+          targetBranch,
+          recovery?.preparedRef,
+          worktreePath,
+          true,
+          expectedOriginPushUrl,
+        );
+      }
+      if (alreadyIntegrated.exitCode !== 1) {
+        return {
+          success: false,
+          error: `Could not determine whether ${targetBranch} already contains the sealed candidate: ${alreadyIntegrated.stderr}`,
+        };
+      }
+    }
+
+    const runStaleGuard = async (): Promise<MergeResult | undefined> => {
+      const staleGuard = await guardAgainstStaleBranchMerge(
+        mergeSource,
+        `origin/${targetBranch}`,
+        worktreePath,
+      );
+      return staleGuard.success
+        ? undefined
+        : {
+            success: false,
+            error: staleGuard.error ?? `Stale branch guard failed for ${mergeSource}`,
+          };
+    };
+    if (!exactCandidate || strategy === "merge") {
+      const refusal = await runStaleGuard();
+      if (refusal) return refusal;
     }
 
     let mergeResult;
     if (strategy === "squash") {
-      mergeResult = await runGitCommand(`merge --squash ${branchName}`, worktreePath);
+      mergeResult = await runGitCommand(["merge", "--squash", mergeSource], worktreePath);
       if (mergeResult.exitCode !== 0) {
-        await runGitCommand("reset --hard HEAD", worktreePath);
+        await runGitCommand(["reset", "--hard", "HEAD"], worktreePath);
         return {
           success: false,
           error: `Squash merge failed: ${mergeResult.stderr}`,
         };
       }
 
-      const commitMessage = await buildSquashCommitMessage(taskId, branchName, worktreePath);
-      const commitResult = await runGitCommand(
-        `commit -m "${commitMessage.replace(/"/g, '\\"')}"`,
-        worktreePath,
-      );
+      if (exactCandidate) {
+        const staged = await runGitCommand(["diff", "--cached", "--quiet"], worktreePath);
+        if (staged.exitCode === 0) {
+          return await finishNoEffectTarget(
+            targetHead!,
+            targetBranch,
+            recovery?.preparedRef,
+            worktreePath,
+            false,
+            expectedOriginPushUrl,
+          );
+        }
+        if (staged.exitCode !== 1) {
+          await runGitCommand(["reset", "--hard", "HEAD"], worktreePath);
+          return {
+            success: false,
+            error: `Could not inspect the prepared squash result: ${staged.stderr}`,
+          };
+        }
+        const refusal = await runStaleGuard();
+        if (refusal) {
+          await runGitCommand(["reset", "--hard", "HEAD"], worktreePath);
+          return refusal;
+        }
+      }
+
+      const commitMessage = await buildSquashCommitMessage(taskId, mergeSource, worktreePath);
+      const commitResult = await runGitCommand(["commit", "-m", commitMessage], worktreePath);
       if (commitResult.exitCode !== 0) {
         return {
           success: false,
@@ -784,31 +1431,91 @@ async function mergeViaDetachedWorktree(
         };
       }
     } else if (strategy === "rebase") {
-      const rebaseResult = await runGitCommand(
-        `rebase origin/${targetBranch} ${branchName}`,
-        worktreePath,
-      );
+      let rebaseResult;
+      if (exactCandidate) {
+        const contentProbe = await runGitCommand(["merge", "--squash", mergeSource], worktreePath);
+        if (contentProbe.exitCode !== 0) {
+          await runGitCommand(["reset", "--hard", "HEAD"], worktreePath);
+          return {
+            success: false,
+            error: `Rebase content probe failed: ${contentProbe.stderr}`,
+          };
+        }
+        const staged = await runGitCommand(["diff", "--cached", "--quiet"], worktreePath);
+        await runGitCommand(["reset", "--hard", "HEAD"], worktreePath);
+        if (staged.exitCode === 0) {
+          return await finishNoEffectTarget(
+            targetHead!,
+            targetBranch,
+            recovery?.preparedRef,
+            worktreePath,
+            false,
+            expectedOriginPushUrl,
+          );
+        }
+        if (staged.exitCode !== 1) {
+          return {
+            success: false,
+            error: `Could not inspect the prepared rebase result: ${staged.stderr}`,
+          };
+        }
+        const refusal = await runStaleGuard();
+        if (refusal) return refusal;
+
+        const temporaryRebaseBranch = `quack-internal/merge-candidate-${randomUUID()}`;
+        temporaryRebaseRef = `refs/heads/${temporaryRebaseBranch}`;
+        temporaryRebaseHead = mergeSource;
+        const checkoutCandidate = await runGitCommand(
+          ["checkout", "-b", temporaryRebaseBranch, mergeSource],
+          worktreePath,
+        );
+        if (checkoutCandidate.exitCode !== 0) {
+          return {
+            success: false,
+            error: `Could not materialize exact rebase candidate: ${checkoutCandidate.stderr}`,
+          };
+        }
+        rebaseResult = await runGitCommand(["rebase", `origin/${targetBranch}`], worktreePath);
+      } else {
+        rebaseResult = await runGitCommand(
+          ["rebase", `origin/${targetBranch}`, mergeSource],
+          worktreePath,
+        );
+      }
       if (rebaseResult.exitCode !== 0) {
-        await runGitCommand("rebase --abort", worktreePath);
+        await runGitCommand(["rebase", "--abort"], worktreePath);
         return {
           success: false,
           error: `Rebase failed: ${rebaseResult.stderr}`,
         };
       }
-      mergeResult = await runGitCommand(`merge --ff-only ${branchName}`, worktreePath);
-      if (mergeResult.exitCode !== 0) {
-        return {
-          success: false,
-          error: `Fast-forward merge failed: ${mergeResult.stderr}`,
-        };
+      mergeResult = rebaseResult;
+      if (exactCandidate) {
+        const rebasedHead = await runGitCommand(["rev-parse", "HEAD"], worktreePath);
+        const resolvedHead = rebasedHead.stdout.trim();
+        if (rebasedHead.exitCode !== 0 || !COMMIT_ID_PATTERN.test(resolvedHead)) {
+          return {
+            success: false,
+            error: `Could not resolve exact rebased candidate: ${rebasedHead.stderr}`,
+          };
+        }
+        temporaryRebaseHead = resolvedHead;
+      } else {
+        mergeResult = await runGitCommand(["merge", "--ff-only", mergeSource], worktreePath);
+        if (mergeResult.exitCode !== 0) {
+          return {
+            success: false,
+            error: `Fast-forward merge failed: ${mergeResult.stderr}`,
+          };
+        }
       }
     } else {
       mergeResult = await runGitCommand(
-        `merge --no-ff ${branchName} -m "[${taskId}] merge"`,
+        ["merge", "--no-ff", mergeSource, "-m", `[${taskId}] merge`],
         worktreePath,
       );
       if (mergeResult.exitCode !== 0) {
-        await runGitCommand("merge --abort", worktreePath);
+        await runGitCommand(["merge", "--abort"], worktreePath);
         return {
           success: false,
           error: `Merge failed: ${mergeResult.stderr}`,
@@ -816,21 +1523,59 @@ async function mergeViaDetachedWorktree(
       }
     }
 
-    const pushResult = await runGitCommand(`push origin HEAD:${targetBranch}`, worktreePath);
-    if (pushResult.exitCode !== 0) {
+    const commitShaResult = await runGitCommand(["rev-parse", "HEAD"], worktreePath);
+    const resultHead = commitShaResult.stdout.trim().toLowerCase();
+    if (!exactCandidate) {
+      const pushResult = await runGitCommand(
+        ["push", "origin", `HEAD:${targetBranch}`],
+        worktreePath,
+      );
+      if (pushResult.exitCode !== 0) {
+        return {
+          success: false,
+          error: `Failed to push ${targetBranch}: ${pushResult.stderr}`,
+        };
+      }
       return {
-        success: false,
-        error: `Failed to push ${targetBranch}: ${pushResult.stderr}`,
+        success: true,
+        ...(commitShaResult.exitCode === 0 && COMMIT_ID_PATTERN.test(resultHead)
+          ? { mergeCommitSha: resultHead }
+          : {}),
       };
     }
-
-    const commitShaResult = await runGitCommand("rev-parse HEAD", worktreePath);
-    return {
-      success: true,
-      mergeCommitSha: commitShaResult.exitCode === 0 ? commitShaResult.stdout.trim() : undefined,
+    if (commitShaResult.exitCode !== 0 || !COMMIT_ID_PATTERN.test(resultHead)) {
+      return {
+        success: false,
+        error: `Could not resolve prepared target result: ${commitShaResult.stderr}`,
+      };
+    }
+    if (resultHead === targetHead) {
+      return {
+        success: false,
+        error: `${strategy} produced no target change even though the sealed candidate content is not present`,
+      };
+    }
+    const prepared: PreparedTargetMerge = {
+      strategy,
+      candidateHead: mergeSource.toLowerCase(),
+      targetHead: targetHead!,
+      resultHead,
+      preparedRef: recovery?.preparedRef ?? "",
     };
+    const preserved = await preservePreparedTarget(prepared.preparedRef, resultHead, worktreePath);
+    if (!preserved.success) return { success: false, error: preserved.error };
+    // Keep the exact prepared ref if journal persistence reports an error.
+    // A rename can have installed the next journal generation even when its
+    // durability barrier also failed. Removing the ref would then make the
+    // recovered preparedMerge impossible to replay. If no update landed, a
+    // retry safely replaces this exact ref through preservePreparedTarget.
+    recovery?.onPrepared?.(prepared);
+    return await publishPreparedTarget(prepared, targetBranch, worktreePath, expectedOriginPushUrl);
   } finally {
-    await runGitCommand(`worktree remove "${worktreePath}" --force`, repoDir);
+    await runGitCommand(["worktree", "remove", worktreePath, "--force"], repoDir);
+    if (temporaryRebaseRef && temporaryRebaseHead) {
+      await runGitCommand(["update-ref", "-d", temporaryRebaseRef, temporaryRebaseHead], repoDir);
+    }
   }
 }
 
@@ -852,17 +1597,97 @@ export async function mergeBranchToTarget(
   targetBranchOverride?: string,
   events?: IEventWriter,
   sourceBranchOverride?: string,
+  expectedHeadCommitOverride?: string,
+  targetMergeRecovery?: TargetMergeRecovery,
+  repositoryBinding?: GitOriginIdentity,
 ): Promise<MergeResult> {
   const cwd = adapter.projectRoot;
   const targetBranch =
     targetBranchOverride ?? adapter.config.git.autoMergeTarget ?? adapter.config.git.baseBranch;
   const strategy = adapter.config.git.autoMergeStrategy ?? "squash";
+  const branchName = sourceBranchOverride ?? buildBranchName(taskId, adapter);
+  if (!isConservativeBranchName(targetBranch) || !isConservativeBranchName(branchName)) {
+    return { success: false, error: "Unsafe Git branch name" };
+  }
+  if (targetMergeRecovery && (prUrl || !expectedHeadCommitOverride)) {
+    return {
+      success: false,
+      error: "Prepared target publication requires an exact local no-PR merge candidate",
+    };
+  }
+  if (targetMergeRecovery && !isPreparedPublicationRef(targetMergeRecovery.preparedRef)) {
+    return { success: false, error: "Prepared target publication ref is invalid" };
+  }
+  if (expectedHeadCommitOverride && !repositoryBinding) {
+    return {
+      success: false,
+      error: "Exact branch publication requires a pre-resolved GitHub repository binding",
+    };
+  }
 
   // Prefer remote merge via gh CLI when we have a PR
   if (prUrl) {
+    const expectedHeadResult = expectedHeadCommitOverride
+      ? { exitCode: 0, stdout: expectedHeadCommitOverride, stderr: "" }
+      : await runGitCommand(["rev-parse", "--verify", branchName], cwd);
+    const expectedHeadCommit = expectedHeadResult.stdout.trim();
+    if (expectedHeadResult.exitCode !== 0 || !COMMIT_ID_PATTERN.test(expectedHeadCommit)) {
+      return {
+        success: false,
+        error: `Could not resolve the exact merge candidate for ${branchName}: ${expectedHeadResult.stderr}`,
+      };
+    }
+    const repository = repositoryBinding
+      ? repositoryBinding.github
+        ? {
+            success: true as const,
+            repository: {
+              ...repositoryBinding.github,
+              pushUrl: repositoryBinding.pushUrl,
+              pushUrlHash: repositoryBinding.pushUrlHash,
+            },
+          }
+        : { success: false as const, error: "Bound Git origin is not a GitHub repository" }
+      : await currentRepository(cwd);
+    if (!repository.success) {
+      return {
+        success: false,
+        error: `Could not bind pull request repository: ${repository.error}`,
+      };
+    }
+    if (!(await originPushUrlMatches(cwd, repository.repository.pushUrl))) {
+      return { success: false, error: "Git origin changed after publication was bound" };
+    }
+    const before = await inspectBoundPullRequest(
+      cwd,
+      repository.repository,
+      prUrl,
+      targetBranch,
+      branchName,
+      expectedHeadCommit,
+    );
+    if (!before.success) {
+      return { success: false, error: before.error };
+    }
+    if (before.pullRequest.state === "MERGED") {
+      return { success: true, mergeCommitSha: before.pullRequest.mergeCommitSha };
+    }
     const strategyFlag = `--${strategy}`;
-    const ghResult = await runGitCommand(
-      `gh pr merge ${prUrl} ${strategyFlag} --delete-branch`,
+    if (!(await originPushUrlMatches(cwd, repository.repository.pushUrl))) {
+      return { success: false, error: "Git origin changed before pull request merge" };
+    }
+    const ghResult = await runCommand(
+      "gh",
+      [
+        "pr",
+        "merge",
+        prUrl,
+        "--repo",
+        repository.repository.selector,
+        strategyFlag,
+        "--match-head-commit",
+        expectedHeadCommit,
+      ],
       cwd,
     );
 
@@ -873,11 +1698,58 @@ export async function mergeBranchToTarget(
       };
     }
 
-    return { success: true };
+    const after = await inspectBoundPullRequest(
+      cwd,
+      repository.repository,
+      prUrl,
+      targetBranch,
+      branchName,
+      expectedHeadCommit,
+    );
+    if (!after.success || after.pullRequest.state !== "MERGED") {
+      return {
+        success: false,
+        error: after.success
+          ? "gh pr merge returned without a confirmed merged state"
+          : `gh pr merge could not be confirmed: ${after.error}`,
+      };
+    }
+    return { success: true, mergeCommitSha: after.pullRequest.mergeCommitSha };
   }
 
   // Fallback: local merge for when there's no PR (autoCreatePr: false)
-  const branchName = sourceBranchOverride ?? buildBranchName(taskId, adapter);
+  let exactCandidate: string | undefined;
+  let publicationRemote = "origin";
+  if (expectedHeadCommitOverride) {
+    if (!COMMIT_ID_PATTERN.test(expectedHeadCommitOverride)) {
+      return {
+        success: false,
+        error: `Could not resolve the exact merge candidate for ${branchName}: invalid commit id`,
+      };
+    }
+    exactCandidate = expectedHeadCommitOverride.toLowerCase();
+    if (!(await originPushUrlMatches(cwd, repositoryBinding!.pushUrl))) {
+      return { success: false, error: "Git origin changed after publication was bound" };
+    }
+    // Pass the validated concrete URL to every Git network command. Even if
+    // origin is rewritten immediately after this read, Git cannot be redirected.
+    publicationRemote = repositoryBinding!.pushUrl;
+    if (!targetMergeRecovery?.prepared) {
+      const branchRef = branchName.startsWith("refs/heads/")
+        ? branchName
+        : `refs/heads/${branchName}`;
+      const branchHead = await runGitCommand(
+        ["rev-parse", "--verify", `${branchRef}^{commit}`],
+        cwd,
+      );
+      if (branchHead.exitCode !== 0 || branchHead.stdout.trim().toLowerCase() !== exactCandidate) {
+        return {
+          success: false,
+          error: `Refusing to merge ${branchName}: branch no longer points to the sealed candidate ${exactCandidate}`,
+        };
+      }
+    }
+  }
 
   // Pattern 36 fix: when dispatching in a worktree, the cwd is the worktree
   // path which can't checkout the target branch (it's checked out in the main
@@ -885,10 +1757,19 @@ export async function mergeBranchToTarget(
   const mainDir = await resolveMainWorkingDir(cwd);
 
   // Fetch latest target branch
-  const fetchResult = await runGitCommand(
-    `fetch origin ${targetBranch}:refs/remotes/origin/${targetBranch}`,
-    mainDir,
-  );
+  if (exactCandidate && !(await originPushUrlMatches(mainDir, publicationRemote))) {
+    return { success: false, error: "Git origin changed before target publication" };
+  }
+  const fetchResult = exactCandidate
+    ? await runBoundGitCommand(
+        ["fetch", BOUND_GIT_REMOTE, `${targetBranch}:refs/remotes/origin/${targetBranch}`],
+        mainDir,
+        publicationRemote,
+      )
+    : await runGitCommand(
+        ["fetch", "origin", `${targetBranch}:refs/remotes/origin/${targetBranch}`],
+        mainDir,
+      );
   if (fetchResult.exitCode !== 0) {
     return {
       success: false,
@@ -896,8 +1777,38 @@ export async function mergeBranchToTarget(
     };
   }
 
+  // A host-sealed candidate must never be dereferenced through its mutable
+  // branch after the binding check above. Run every local strategy in a
+  // detached worktree against the immutable object id; a concurrent branch
+  // move can therefore affect neither the merge nor the target push.
+  if (exactCandidate) {
+    const transientPreparedRef = targetMergeRecovery
+      ? undefined
+      : `refs/quack/publication-prepared/${randomUUID()}`;
+    const recovery = targetMergeRecovery ?? {
+      preparedRef: transientPreparedRef,
+    };
+    const merged = await mergeViaDetachedWorktree(
+      taskId,
+      exactCandidate,
+      targetBranch,
+      strategy,
+      mainDir,
+      true,
+      recovery,
+      publicationRemote,
+    );
+    if (!merged.success || !transientPreparedRef || !merged.mergeCommitSha) return merged;
+    const released = await releasePreparedTarget(
+      transientPreparedRef,
+      merged.mergeCommitSha,
+      mainDir,
+    );
+    return released.success ? merged : { success: false, error: released.error };
+  }
+
   // Checkout target branch (in the main working directory, not the worktree)
-  const checkoutResult = await runGitCommand(`checkout ${targetBranch}`, mainDir);
+  const checkoutResult = await runGitCommand(["checkout", targetBranch], mainDir);
   if (checkoutResult.exitCode !== 0) {
     if (isBranchLockedInAnotherWorktree(checkoutResult.stderr, targetBranch)) {
       const detachedMergeResult = await mergeViaDetachedWorktree(
@@ -916,8 +1827,8 @@ export async function mergeBranchToTarget(
         resolveProtectedBranches(adapter.config.git),
       );
       if (detachedGuard.allowed) {
-        await runGitCommand(`branch -D ${branchName}`, mainDir);
-        await runGitCommand(`push origin --delete ${branchName}`, mainDir);
+        await runGitCommand(["branch", "-D", branchName], mainDir);
+        await runGitCommand(["push", "origin", "--delete", branchName], mainDir);
       } else {
         emitGuardRefusal(events, taskId, branchName, "mergeBranchToTarget.detachedCleanup");
       }
@@ -931,7 +1842,7 @@ export async function mergeBranchToTarget(
   }
 
   // Pull latest to avoid conflicts with remote
-  const pullResult = await runGitCommand(`pull --ff-only origin ${targetBranch}`, mainDir);
+  const pullResult = await runGitCommand(["pull", "--ff-only", "origin", targetBranch], mainDir);
   if (pullResult.exitCode !== 0) {
     return {
       success: false,
@@ -950,11 +1861,11 @@ export async function mergeBranchToTarget(
   // Merge using the configured strategy
   let mergeResult;
   if (strategy === "squash") {
-    mergeResult = await runGitCommand(`merge --squash ${branchName}`, mainDir);
+    mergeResult = await runGitCommand(["merge", "--squash", branchName], mainDir);
     if (mergeResult.exitCode !== 0) {
       // Squash merges don't create MERGE_HEAD, so `merge --abort` silently
       // does nothing — use `reset --hard` to restore the target branch cleanly.
-      await runGitCommand(`reset --hard HEAD`, mainDir);
+      await runGitCommand(["reset", "--hard", "HEAD"], mainDir);
       return {
         success: false,
         error: `Squash merge failed: ${mergeResult.stderr}`,
@@ -962,10 +1873,7 @@ export async function mergeBranchToTarget(
     }
     // Build a detailed commit message from the squashed diff
     const commitMessage = await buildSquashCommitMessage(taskId, branchName, mainDir);
-    const commitResult = await runGitCommand(
-      `commit -m "${commitMessage.replace(/"/g, '\\"')}"`,
-      mainDir,
-    );
+    const commitResult = await runGitCommand(["commit", "-m", commitMessage], mainDir);
     if (commitResult.exitCode !== 0) {
       return {
         success: false,
@@ -975,16 +1883,16 @@ export async function mergeBranchToTarget(
   } else if (strategy === "rebase") {
     // For rebase strategy: rebase task branch onto target, then fast-forward
     // Create a temporary worktree for the rebase to avoid disrupting main
-    const rebaseResult = await runGitCommand(`rebase ${targetBranch} ${branchName}`, mainDir);
+    const rebaseResult = await runGitCommand(["rebase", targetBranch, branchName], mainDir);
     if (rebaseResult.exitCode !== 0) {
-      await runGitCommand("rebase --abort", mainDir);
+      await runGitCommand(["rebase", "--abort"], mainDir);
       return {
         success: false,
         error: `Rebase failed: ${rebaseResult.stderr}`,
       };
     }
-    await runGitCommand(`checkout ${targetBranch}`, mainDir);
-    mergeResult = await runGitCommand(`merge --ff-only ${branchName}`, mainDir);
+    await runGitCommand(["checkout", targetBranch], mainDir);
+    mergeResult = await runGitCommand(["merge", "--ff-only", branchName], mainDir);
     if (mergeResult.exitCode !== 0) {
       return {
         success: false,
@@ -994,11 +1902,11 @@ export async function mergeBranchToTarget(
   } else {
     // merge strategy: --no-ff
     mergeResult = await runGitCommand(
-      `merge --no-ff ${branchName} -m "[${taskId}] merge"`,
+      ["merge", "--no-ff", branchName, "-m", `[${taskId}] merge`],
       mainDir,
     );
     if (mergeResult.exitCode !== 0) {
-      await runGitCommand("merge --abort", mainDir);
+      await runGitCommand(["merge", "--abort"], mainDir);
       return {
         success: false,
         error: `Merge failed: ${mergeResult.stderr}`,
@@ -1007,7 +1915,7 @@ export async function mergeBranchToTarget(
   }
 
   // Push the target branch
-  const pushResult = await runGitCommand(`push origin ${targetBranch}`, mainDir);
+  const pushResult = await runGitCommand(["push", "origin", targetBranch], mainDir);
   if (pushResult.exitCode !== 0) {
     return {
       success: false,
@@ -1015,7 +1923,7 @@ export async function mergeBranchToTarget(
     };
   }
 
-  const commitShaResult = await runGitCommand("rev-parse HEAD", mainDir);
+  const commitShaResult = await runGitCommand(["rev-parse", "HEAD"], mainDir);
   return {
     success: true,
     mergeCommitSha: commitShaResult.exitCode === 0 ? commitShaResult.stdout.trim() : undefined,
@@ -1036,17 +1944,34 @@ export async function updateTaskFileStatus(
   taskId: string,
   adapter: ProjectAdapter,
   targetBranch: string,
+  expectedOriginPushUrl?: string,
 ): Promise<{ success: boolean; error?: string }> {
+  if (!isConservativeBranchName(targetBranch)) {
+    return { success: false, error: "Unsafe Git branch name" };
+  }
   const cwd = adapter.projectRoot;
   const worktreePath = path.resolve(cwd, ".quack/tmp-status-update");
 
   try {
     // Fetch latest
-    await runGitCommand(`fetch origin ${targetBranch}:refs/remotes/origin/${targetBranch}`, cwd);
+    if (expectedOriginPushUrl && !(await originPushUrlMatches(cwd, expectedOriginPushUrl))) {
+      return { success: false, error: "Git origin changed before task-status publication" };
+    }
+    const fetchArgs = [
+      "fetch",
+      expectedOriginPushUrl ? BOUND_GIT_REMOTE : "origin",
+      `${targetBranch}:refs/remotes/origin/${targetBranch}`,
+    ];
+    const fetchResult = expectedOriginPushUrl
+      ? await runBoundGitCommand(fetchArgs, cwd, expectedOriginPushUrl)
+      : await runGitCommand(fetchArgs, cwd);
+    if (fetchResult.exitCode !== 0) {
+      return { success: false, error: `Failed to fetch ${targetBranch}: ${fetchResult.stderr}` };
+    }
 
     // Create temp worktree
     const addResult = await runGitCommand(
-      `worktree add "${worktreePath}" origin/${targetBranch}`,
+      ["worktree", "add", worktreePath, `origin/${targetBranch}`],
       cwd,
     );
     if (addResult.exitCode !== 0) {
@@ -1120,7 +2045,7 @@ export async function updateTaskFileStatus(
 
     // Commit and push from the worktree
     const relativeTaskPath = path.join(adapter.config.project.taskDir, taskFile);
-    const addFileResult = await runGitCommand(`add "${relativeTaskPath}"`, worktreePath);
+    const addFileResult = await runGitCommand(["add", "--", relativeTaskPath], worktreePath);
     if (addFileResult.exitCode !== 0) {
       return {
         success: false,
@@ -1129,7 +2054,7 @@ export async function updateTaskFileStatus(
     }
 
     const commitResult = await runGitCommand(
-      `commit -m "[${taskId}] mark complete (auto-merge)"`,
+      ["commit", "-m", `[${taskId}] mark complete (auto-merge)`],
       worktreePath,
     );
     if (commitResult.exitCode !== 0) {
@@ -1139,7 +2064,20 @@ export async function updateTaskFileStatus(
       };
     }
 
-    const pushResult = await runGitCommand(`push origin HEAD:${targetBranch}`, worktreePath);
+    if (
+      expectedOriginPushUrl &&
+      !(await originPushUrlMatches(worktreePath, expectedOriginPushUrl))
+    ) {
+      return { success: false, error: "Git origin changed before task-status publication" };
+    }
+    const pushArgs = [
+      "push",
+      expectedOriginPushUrl ? BOUND_GIT_REMOTE : "origin",
+      `HEAD:${targetBranch}`,
+    ];
+    const pushResult = expectedOriginPushUrl
+      ? await runBoundGitCommand(pushArgs, worktreePath, expectedOriginPushUrl)
+      : await runGitCommand(pushArgs, worktreePath);
     if (pushResult.exitCode !== 0) {
       return {
         success: false,
@@ -1150,7 +2088,7 @@ export async function updateTaskFileStatus(
     return { success: true };
   } finally {
     // Clean up worktree (always, even on error)
-    await runGitCommand(`worktree remove "${worktreePath}" --force`, cwd);
+    await runGitCommand(["worktree", "remove", worktreePath, "--force"], cwd);
   }
 }
 
@@ -1158,7 +2096,7 @@ export async function updateTaskFileStatus(
 
 export interface DeleteAfterMergeResult {
   deleted: boolean;
-  reason?: BranchCleanupSkipReason | "delete-failed";
+  reason?: BranchCleanupSkipReason | "delete-failed" | "origin-mismatch";
   localDeleted?: boolean;
   remoteDeleted?: boolean;
   owner?: string;
@@ -1179,6 +2117,7 @@ export interface SweepOptions {
 
 export type BranchCleanupSkipReason =
   | "not-merged"
+  | "head-mismatch"
   | "too-recent"
   | "skip-cleanup-marker"
   | "protected-branch"
@@ -1340,7 +2279,7 @@ async function ownerFromCommit(
   cwd: string,
 ): Promise<{ owner?: string; provenance: string[] }> {
   const provenance: string[] = [];
-  const msgResult = await runGitCommand(`log -1 --format=%B ${branch}`, cwd);
+  const msgResult = await runGitCommand(["log", "-1", "--format=%B", branch], cwd);
   if (msgResult.exitCode === 0) {
     const ownerLine = msgResult.stdout.match(/^(?:Owner|Branch-Owner|Task-Owner):\s*(.+)$/im);
     const owner = normalizeOwner(ownerLine?.[1]);
@@ -1349,7 +2288,7 @@ async function ownerFromCommit(
       return { owner, provenance };
     }
   }
-  const authorResult = await runGitCommand(`log -1 --format=%an <%ae> ${branch}`, cwd);
+  const authorResult = await runGitCommand(["log", "-1", "--format=%an <%ae>", branch], cwd);
   if (authorResult.exitCode === 0) {
     const author = authorResult.stdout.toLowerCase();
     if (author.includes("contributor")) {
@@ -1364,10 +2303,11 @@ async function resolveBranchOwner(
   branch: string,
   cwd: string,
   protectedPatterns: string[],
+  inspectionRef = branch,
 ): Promise<{ owner?: string; provenance: string[] }> {
   const byBranch = ownerFromBranch(branch, protectedPatterns);
   if (byBranch.owner) return byBranch;
-  const byCommit = await ownerFromCommit(branch, cwd);
+  const byCommit = await ownerFromCommit(inspectionRef, cwd);
   return {
     owner: byCommit.owner,
     provenance: [...byBranch.provenance, ...byCommit.provenance],
@@ -1379,12 +2319,13 @@ async function resolveBranchOwner(
  *
  * Safety conditions (all must pass):
  *  1. Branch name matches /^quack\/TASK-/
- *  2. Branch is an ancestor of origin/<baseBranch> (fully merged)
+ *  2. Branch, or an exact prepared squash/rebase result, is an ancestor of
+ *     origin/<baseBranch> (fully merged)
  *  3. Branch last commit is older than minAgeDays (default: 1)
  *  4. Last commit message does NOT contain [skip-cleanup]
  *
  * Uses `git branch -d` (safe-delete) — will fail if not merged.
- * Remote delete uses `git push origin --delete` (idempotent).
+ * Exact-candidate cleanup uses compare-and-delete leases locally and remotely.
  */
 export async function deleteAfterMerge(
   branch: string,
@@ -1397,6 +2338,9 @@ export async function deleteAfterMerge(
     protectedPatterns?: string[];
     ownerOverride?: BranchCleanupOwnerOverride;
     eventWriter?: IEventWriter;
+    expectedHeadCommit?: string;
+    expectedMergedCommit?: string;
+    expectedOriginPushUrl?: string;
   },
 ): Promise<DeleteAfterMergeResult> {
   const cwd = adapter.projectRoot;
@@ -1429,7 +2373,36 @@ export async function deleteAfterMerge(
     return { deleted: false, reason: "protected-branch" };
   }
 
-  const ownership = await resolveBranchOwner(branch, cwd, policy.protectedPatterns);
+  const expectedHeadCommit = opts?.expectedHeadCommit?.toLowerCase();
+  const expectedMergedCommit = opts?.expectedMergedCommit?.toLowerCase();
+  const branchRef = branch.startsWith("refs/heads/") ? branch : `refs/heads/${branch}`;
+  if (
+    opts?.expectedOriginPushUrl &&
+    !(await originPushUrlMatches(cwd, opts.expectedOriginPushUrl))
+  ) {
+    return { deleted: false, reason: "origin-mismatch" };
+  }
+  if (expectedHeadCommit) {
+    if (!COMMIT_ID_PATTERN.test(expectedHeadCommit)) {
+      return { deleted: false, reason: "head-mismatch" };
+    }
+    const currentHead = await runGitCommand(["rev-parse", "--verify", branchRef], cwd);
+    if (
+      currentHead.exitCode !== 0 ||
+      currentHead.stdout.trim().toLowerCase() !== expectedHeadCommit
+    ) {
+      return { deleted: false, reason: "head-mismatch" };
+    }
+  }
+  if (expectedMergedCommit && !COMMIT_ID_PATTERN.test(expectedMergedCommit)) {
+    return { deleted: false, reason: "not-merged" };
+  }
+  if (expectedMergedCommit && !expectedHeadCommit) {
+    return { deleted: false, reason: "head-mismatch" };
+  }
+  const inspectionRef = expectedHeadCommit ?? branch;
+
+  const ownership = await resolveBranchOwner(branch, cwd, policy.protectedPatterns, inspectionRef);
   const protectedOwner = ownership.owner ? policy.protectedOwners.includes(ownership.owner) : false;
   const overrideApplied =
     protectedOwner &&
@@ -1446,7 +2419,7 @@ export async function deleteAfterMerge(
   }
 
   // 3. Check age
-  const ageResult = await runGitCommand(`log -1 --format=%ct ${branch}`, cwd);
+  const ageResult = await runGitCommand(["log", "-1", "--format=%ct", inspectionRef], cwd);
   const commitTimestamp = parseInt(ageResult.stdout.trim(), 10);
   if (ageResult.exitCode !== 0 || isNaN(commitTimestamp)) {
     // If we can't determine age, treat as too-recent (defensive)
@@ -1458,22 +2431,50 @@ export async function deleteAfterMerge(
   }
 
   // 4. Check skip-cleanup marker
-  const msgResult = await runGitCommand(`log -1 --format=%B ${branch}`, cwd);
+  const msgResult = await runGitCommand(["log", "-1", "--format=%B", inspectionRef], cwd);
   if (msgResult.exitCode === 0 && msgResult.stdout.includes("[skip-cleanup]")) {
     return { deleted: false, reason: "skip-cleanup-marker" };
   }
 
-  // 5. Check ancestor (merged check)
+  // 5. Check ancestor (merged check). Squash and rebase publication create a
+  // new target-side commit, so the sealed candidate itself is not necessarily
+  // an ancestor. The publication journal supplies the exact prepared result
+  // that was confirmed on the remote; refresh the tracking ref before using
+  // that result as the merge proof.
+  if (expectedMergedCommit) {
+    if (
+      opts?.expectedOriginPushUrl &&
+      !(await originPushUrlMatches(cwd, opts.expectedOriginPushUrl))
+    ) {
+      return { deleted: false, reason: "origin-mismatch" };
+    }
+    const refreshArgs = [
+      "fetch",
+      opts?.expectedOriginPushUrl ? BOUND_GIT_REMOTE : "origin",
+      `${baseBranch}:refs/remotes/origin/${baseBranch}`,
+    ];
+    const refreshTarget = opts?.expectedOriginPushUrl
+      ? await runBoundGitCommand(refreshArgs, cwd, opts.expectedOriginPushUrl)
+      : await runGitCommand(refreshArgs, cwd);
+    if (refreshTarget.exitCode !== 0) {
+      return { deleted: false, reason: "not-merged" };
+    }
+  }
+  const mergedInspectionRef = expectedMergedCommit ?? inspectionRef;
   const ancestorResult = await runGitCommand(
-    `merge-base --is-ancestor ${branch} origin/${baseBranch}`,
+    ["merge-base", "--is-ancestor", mergedInspectionRef, `origin/${baseBranch}`],
     cwd,
   );
   if (ancestorResult.exitCode !== 0) {
     return { deleted: false, reason: "not-merged" };
   }
 
-  // 6. Delete locally (safe-delete: -d not -D)
-  const localDeleteResult = await runGitCommand(`branch -d ${branch}`, cwd);
+  // 6. An exact publication cleanup uses update-ref's old-value compare as
+  // an atomic lease. If another process moves the branch after validation,
+  // the delete fails rather than removing unrelated work.
+  const localDeleteResult = expectedHeadCommit
+    ? await runGitCommand(["update-ref", "-d", branchRef, expectedHeadCommit], cwd)
+    : await runGitCommand(["branch", "-d", branch], cwd);
   const localDeleted = localDeleteResult.exitCode === 0;
 
   if (!localDeleted) {
@@ -1481,12 +2482,52 @@ export async function deleteAfterMerge(
     return { deleted: false, reason: "delete-failed", localDeleted: false };
   }
 
-  // 7. Delete remotely (idempotent)
-  const remoteDeleteResult = await runGitCommand(`push origin --delete ${branch}`, cwd);
-  const remoteAlreadyGone =
-    remoteDeleteResult.exitCode !== 0 &&
-    remoteDeleteResult.stderr.includes("remote ref does not exist");
-  const remoteDeleted = remoteDeleteResult.exitCode === 0 || remoteAlreadyGone;
+  if (
+    opts?.expectedOriginPushUrl &&
+    !(await originPushUrlMatches(cwd, opts.expectedOriginPushUrl))
+  ) {
+    return {
+      deleted: false,
+      reason: "origin-mismatch",
+      localDeleted: true,
+      remoteDeleted: false,
+    };
+  }
+
+  // 7. The remote delete carries the same exact expected old value. Git's
+  // force-with-lease check is evaluated atomically by the remote, closing the
+  // check/delete race without permitting a force update.
+  const deleteArgs = expectedHeadCommit
+    ? [
+        "push",
+        `--force-with-lease=${branchRef}:${expectedHeadCommit}`,
+        opts?.expectedOriginPushUrl ? BOUND_GIT_REMOTE : "origin",
+        `:${branchRef}`,
+      ]
+    : ["push", opts?.expectedOriginPushUrl ? BOUND_GIT_REMOTE : "origin", "--delete", branch];
+  const remoteDeleteResult = opts?.expectedOriginPushUrl
+    ? await runBoundGitCommand(deleteArgs, cwd, opts.expectedOriginPushUrl)
+    : await runGitCommand(deleteArgs, cwd);
+  let remoteDeleted = remoteDeleteResult.exitCode === 0;
+  if (!remoteDeleted && expectedHeadCommit) {
+    // A leased deletion against an already-absent ref is reported by real Git
+    // as rejected `(stale info)`, not as "remote ref does not exist". Resolve
+    // the exact remote ref after any failed push so the retry is idempotent
+    // without ever treating a replacement head as deleted.
+    const remoteAfterFailure = await readRemoteBranchHead(branch, cwd, opts?.expectedOriginPushUrl);
+    if (!remoteAfterFailure.success) {
+      return { deleted: false, reason: "delete-failed", localDeleted: true, remoteDeleted: false };
+    }
+    if (remoteAfterFailure.head === undefined) {
+      remoteDeleted = true;
+    } else if (remoteAfterFailure.head !== expectedHeadCommit) {
+      return { deleted: false, reason: "head-mismatch", localDeleted: true, remoteDeleted: false };
+    } else {
+      return { deleted: false, reason: "delete-failed", localDeleted: true, remoteDeleted: false };
+    }
+  } else if (!remoteDeleted) {
+    remoteDeleted = remoteDeleteResult.stderr.includes("remote ref does not exist");
+  }
 
   // 8. Emit event
   const taskId = extractTaskIdFromBranch(branch);
@@ -1536,7 +2577,7 @@ export async function sweep(
   }
 
   // Step 1: fetch to refresh remote-tracking refs (non-fatal)
-  const fetchResult = await runGitCommand("fetch origin", projectRoot);
+  const fetchResult = await runGitCommand(["fetch", "origin"], projectRoot);
   if (fetchResult.exitCode !== 0) {
     errors.push({ branch: "fetch", error: fetchResult.stderr || "git fetch origin failed" });
     // Continue with stale remote refs
@@ -1544,7 +2585,7 @@ export async function sweep(
 
   // Step 2: List all local branches
   const listResult = await runGitCommand(
-    "for-each-ref --format=%(refname:short) refs/heads/",
+    ["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
     projectRoot,
   );
   if (listResult.exitCode !== 0) {
@@ -1620,7 +2661,7 @@ export async function sweep(
       }
 
       // Age check
-      const ageResult = await runGitCommand(`log -1 --format=%ct ${branch}`, projectRoot);
+      const ageResult = await runGitCommand(["log", "-1", "--format=%ct", branch], projectRoot);
       const commitTimestamp = parseInt(ageResult.stdout.trim(), 10);
       if (ageResult.exitCode !== 0 || isNaN(commitTimestamp)) {
         candidate.reason = "too-recent";
@@ -1641,7 +2682,7 @@ export async function sweep(
       }
 
       // Skip-cleanup marker
-      const msgResult = await runGitCommand(`log -1 --format=%B ${branch}`, projectRoot);
+      const msgResult = await runGitCommand(["log", "-1", "--format=%B", branch], projectRoot);
       if (msgResult.exitCode === 0 && msgResult.stdout.includes("[skip-cleanup]")) {
         candidate.reason = "skip-cleanup-marker";
         skipped.push({ branch, reason: "skip-cleanup-marker", owner: ownership.owner });
@@ -1650,7 +2691,7 @@ export async function sweep(
 
       // Ancestor check (merged check)
       const ancestorResult = await runGitCommand(
-        `merge-base --is-ancestor ${branch} origin/${baseBranch}`,
+        ["merge-base", "--is-ancestor", branch, `origin/${baseBranch}`],
         projectRoot,
       );
       if (ancestorResult.exitCode !== 0) {

@@ -2,9 +2,10 @@
 // Re-dispatch a task with revision feedback from human or PR comments.
 // Skips gate (spec hasn't changed), injects feedback, uses lower budget defaults.
 
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { loadAdapter } from "../core/adapter-loader.js";
 import { dispatchTask } from "../dispatcher/dispatcher.js";
+import { resolveOriginGitHubRepository } from "../dispatcher/github-repository.js";
 import type { DispatchResult } from "../core/types.js";
 
 function formatDispatchResult(result: DispatchResult): string {
@@ -69,10 +70,23 @@ export async function reviseCommand(
       try {
         // Get PR reviews and comments via gh CLI
         const prNumber = options.fromPr;
-        const reviewsJson = execSync(`gh pr view ${prNumber} --json reviews,comments`, {
-          cwd: projectPath,
-          encoding: "utf-8",
-        });
+        const repository = await resolveOriginGitHubRepository(projectPath);
+        const reviewsJson = execFileSync(
+          "gh",
+          [
+            "pr",
+            "view",
+            String(prNumber),
+            "--repo",
+            repository.selector,
+            "--json",
+            "reviews,comments",
+          ],
+          {
+            cwd: projectPath,
+            encoding: "utf-8",
+          },
+        );
         const prData = JSON.parse(reviewsJson) as {
           reviews?: { body: string }[];
           comments?: { path: string; line: number; body: string }[];

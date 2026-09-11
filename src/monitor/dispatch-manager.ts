@@ -442,6 +442,12 @@ export class DispatchManager {
     string,
     { timer: ReturnType<typeof setTimeout>; processGroupId?: number }
   >();
+  /**
+   * POSIX groups that survived the bounded TERM/KILL sequence. Their numeric
+   * IDs are evidence only: after the child handle is gone the ID can be
+   * recycled, so these entries block admission but are never signalled again.
+   */
+  private unconfirmedProcessGroups = new Map<string, number>();
   /** Windows taskkill /T completions are the tree-level exit evidence. */
   private confirmedWindowsTreeKills = new Map<string, string>();
   /** Unreadable survivor records are a global recovery barrier. */
@@ -820,6 +826,7 @@ export class DispatchManager {
           return false;
         }
         if (!treeAbsenceConfirmed) {
+          if (this.unconfirmedProcessGroups.has(job.taskId)) return false;
           if (!marker.processId) return false;
           if (marker.strategy === "windows-process-tree") {
             if (!this.hasConfirmedWindowsTreeKill(job)) return false;
@@ -4319,7 +4326,7 @@ export class DispatchManager {
                       }
                     }
                     if (job.status === "completed" && !retry) {
-                      const gitState = dockerMgr.sealPrivateGitForPublication(
+                      const gitState = dockerMgr.preparePrivateGitForPublication(
                         containerInfo,
                         worktreeOwnership.ownershipId!,
                       );
@@ -4327,32 +4334,40 @@ export class DispatchManager {
                         this.dockerPublicationRecoveryRoot(),
                         `${taskId.replace(/[^A-Za-z0-9._-]/g, "_")}-${worktreeOwnership.ownershipId!}.json`,
                       );
-                      const { publishDockerPromotedResult } =
+                      const { initializeDockerPublicationRecovery, publishDockerPromotedResult } =
                         await import("../dispatcher/docker-host-publication.js");
+                      const publicationOptions = {
+                        ...(options?.sharedBranchName
+                          ? {
+                              parentTaskId: options.parentTaskId,
+                              sharedBranchName: options.sharedBranchName,
+                            }
+                          : {}),
+                        recovery: {
+                          rootDir: this.dockerPublicationRecoveryRoot(),
+                          publicationId: worktreeOwnership.ownershipId!,
+                          gitState,
+                          worktreePath,
+                          worktreeSessionId: sessionId,
+                          worktreeOwnershipId: worktreeOwnership.ownershipId!,
+                          preserveWorktree: cleanup.retained,
+                          ...(containerInfo.resumeSource
+                            ? { sourceResume: containerInfo.resumeSource }
+                            : {}),
+                        },
+                      };
+                      await initializeDockerPublicationRecovery(
+                        taskId,
+                        this.projectRoot,
+                        results.branch,
+                        publicationOptions,
+                      );
+                      dockerMgr.sealPreparedPublicationRef(gitState);
                       const publication = await publishDockerPromotedResult(
                         taskId,
                         this.projectRoot,
                         results.branch,
-                        {
-                          ...(options?.sharedBranchName
-                            ? {
-                                parentTaskId: options.parentTaskId,
-                                sharedBranchName: options.sharedBranchName,
-                              }
-                            : {}),
-                          recovery: {
-                            rootDir: this.dockerPublicationRecoveryRoot(),
-                            publicationId: worktreeOwnership.ownershipId!,
-                            gitState,
-                            worktreePath,
-                            worktreeSessionId: sessionId,
-                            worktreeOwnershipId: worktreeOwnership.ownershipId!,
-                            preserveWorktree: cleanup.retained,
-                            ...(containerInfo.resumeSource
-                              ? { sourceResume: containerInfo.resumeSource }
-                              : {}),
-                          },
-                        },
+                        publicationOptions,
                       );
                       job.publicationRecoveryPath = publication.recoveryPath;
                       if (publication.prUrl) {
@@ -4762,6 +4777,9 @@ export class DispatchManager {
         if (process.platform === "win32") {
           this.confirmedWindowsTreeKills.set(taskId, marker.sessionId);
         }
+        this.unconfirmedProcessGroups.delete(taskId);
+        const job = this.jobs.get(taskId);
+        if (job?.stopRequestedAt && job.status === "running") job.status = "stopped";
         return true;
       });
     } catch {
@@ -4778,6 +4796,7 @@ export class DispatchManager {
         marker.strategy === "posix-process-group" &&
         process.platform !== "win32" &&
         marker.processId &&
+        !this.unconfirmedProcessGroups.has(marker.taskId) &&
         !this.processGroupExists(marker.processId)
       ) {
         const cleared = this.clearWorktreeSurvivor(
@@ -4824,16 +4843,18 @@ export class DispatchManager {
           marker.ownershipId !== ownershipId ||
           !marker.reconciliationToken ||
           marker.reconciliationToken !== reconciliationToken ||
-          marker.strategy === "docker-container" ||
-          (marker.strategy === "posix-process-group" &&
-            process.platform !== "win32" &&
-            marker.processId !== undefined &&
-            this.processGroupExists(marker.processId))
+          marker.strategy === "docker-container"
         ) {
           return false;
         }
         fs.rmSync(markerPath);
-        return !fs.existsSync(markerPath);
+        const removed = !fs.existsSync(markerPath);
+        if (removed) {
+          this.unconfirmedProcessGroups.delete(taskId);
+          const job = this.jobs.get(taskId);
+          if (job?.stopRequestedAt && job.status === "running") job.status = "stopped";
+        }
+        return removed;
       });
     } catch {
       return false;
@@ -4951,6 +4972,7 @@ export class DispatchManager {
   }
 
   private hasLiveStopProcessGroup(taskId: string): boolean {
+    if (this.unconfirmedProcessGroups.has(taskId)) return true;
     const pending = this.stopEscalationTimers.get(taskId);
     return Boolean(pending?.processGroupId && this.processGroupExists(pending.processGroupId));
   }
@@ -4972,13 +4994,13 @@ export class DispatchManager {
       job.stopRequestedAt = new Date().toISOString();
       job.output.push(
         `[dispatch] Root process exited while process group ${child.pid} remained alive; ` +
-          `preserving recovery state and terminating descendants.`,
+          `preserving recovery state for explicit reconciliation.`,
       );
     }
-    if (!this.hasLiveStopProcessGroup(taskId)) {
-      this.updateWorktreeOwnership(job, "stopping", child.pid);
-      this.scheduleForcedTreeTermination(taskId, child, 1_000);
-    }
+    // Once the root exits, its numeric process-group id is no longer tied to
+    // this ChildProcess identity. Cancel any delayed escalation before it can
+    // signal a subsequently recycled PGID, and retain durable evidence instead.
+    this.retainUnconfirmedProcessGroup(taskId, child.pid);
     return true;
   }
 
@@ -4992,32 +5014,38 @@ export class DispatchManager {
     this.stopEscalationTimers.delete(taskId);
   }
 
-  /** Keep a timed-out POSIX group visible to admission/resume until it is gone. */
+  /**
+   * Keep a timed-out POSIX group visible to admission/resume until an operator
+   * reconciles its durable evidence. Never signal or poll the numeric ID from
+   * this point onward because the original process group is no longer bound to
+   * a live ChildProcess handle and the OS may recycle the ID.
+   */
   private retainUnconfirmedProcessGroup(taskId: string, processGroupId: number): void {
     this.clearStopEscalation(taskId, true);
-    const confirmExit = (): void => {
-      if (!this.processGroupExists(processGroupId)) {
-        this.clearStopEscalation(taskId, true);
-        const job = this.jobs.get(taskId);
-        if (job?.stopRequestedAt && job.status === "running") {
-          job.status = "stopped";
-          this.preserveInterruptedSharedCheckout(job, "stopped");
-        }
-        if (job) this.clearWorktreeSurvivor(job);
-        return;
-      }
+    if (this.unconfirmedProcessGroups.get(taskId) === processGroupId) return;
+    this.unconfirmedProcessGroups.set(taskId, processGroupId);
+    const job = this.jobs.get(taskId);
+    if (!job) return;
+    job.stopRequestedAt ??= new Date().toISOString();
+    if (job.worktreePath) {
+      this.updateWorktreeOwnership(job, "stopping", processGroupId);
       try {
-        process.kill(-processGroupId, "SIGKILL");
-      } catch {
-        // The next evidence probe distinguishes an exit from a survivor.
+        this.persistWorktreeSurvivor(job, processGroupId);
+      } catch (error: unknown) {
+        const detail = error instanceof Error ? error.message : String(error);
+        job.output.push(
+          `[dispatch] Could not persist worktree survivor evidence (${detail}); in-process admission remains blocked.`,
+        );
       }
-      const timer = setTimeout(confirmExit, 250);
-      timer.unref();
-      this.stopEscalationTimers.set(taskId, { timer, processGroupId });
-    };
-    const timer = setTimeout(confirmExit, 250);
-    timer.unref();
-    this.stopEscalationTimers.set(taskId, { timer, processGroupId });
+    } else if (this.isolationConfig?.method !== "docker") {
+      this.preserveInterruptedSharedCheckout(job, "running");
+    }
+  }
+
+  private isPosixRootIdentityLive(taskId: string, child: ChildProcess): boolean {
+    return (
+      this.processes.get(taskId) === child && child.exitCode == null && child.signalCode == null
+    );
   }
 
   private scheduleForcedTreeTermination(
@@ -5025,11 +5053,16 @@ export class DispatchManager {
     child: ChildProcess,
     delayMs: number,
   ): void {
+    if (this.unconfirmedProcessGroups.has(taskId)) return;
     this.clearStopEscalation(taskId, true);
     const job = this.jobs.get(taskId);
     const processGroupId =
       process.platform !== "win32" && !job?.containerId && child.pid ? child.pid : undefined;
     const timer = setTimeout(() => {
+      if (processGroupId && !this.isPosixRootIdentityLive(taskId, child)) {
+        this.retainUnconfirmedProcessGroup(taskId, processGroupId);
+        return;
+      }
       const stillPresent = processGroupId
         ? this.processGroupExists(processGroupId)
         : this.processes.get(taskId) === child;
@@ -5064,11 +5097,11 @@ export class DispatchManager {
           return;
         }
         if (Date.now() >= deadline) {
-          this.jobs
-            .get(taskId)
-            ?.output.push(
-              `[dispatch] Process group ${processGroupId} did not exit after forced termination; admission remains blocked.`,
-            );
+          const currentJob = this.jobs.get(taskId);
+          currentJob?.output.push(
+            `[dispatch] Process group ${processGroupId} did not exit after forced termination; admission remains blocked pending explicit reconciliation.`,
+          );
+          this.retainUnconfirmedProcessGroup(taskId, processGroupId);
           return;
         }
         const confirmationTimer = setTimeout(confirmExit, 25);
@@ -5091,6 +5124,12 @@ export class DispatchManager {
     windowsTimeoutMs: number,
   ): void {
     const job = this.jobs.get(taskId);
+    const unconfirmedProcessGroupId = this.unconfirmedProcessGroups.get(taskId);
+    if (unconfirmedProcessGroupId !== undefined) {
+      throw new Error(
+        `Refusing to re-signal unconfirmed process group for ${taskId}; its numeric ID may have been recycled`,
+      );
+    }
     if (process.platform === "win32" && child.pid) {
       if (this.attemptedWindowsTreeKills.has(child)) {
         throw new Error(
@@ -5105,6 +5144,12 @@ export class DispatchManager {
       });
       if (job) this.confirmedWindowsTreeKills.set(taskId, job.sessionId);
     } else if (process.platform !== "win32" && !job?.containerId && child.pid) {
+      if (!this.isPosixRootIdentityLive(taskId, child)) {
+        this.retainUnconfirmedProcessGroup(taskId, child.pid);
+        throw new Error(
+          `Refusing to signal process group for ${taskId} after its root identity was lost`,
+        );
+      }
       try {
         process.kill(-child.pid, signal);
       } catch {
@@ -5146,6 +5191,10 @@ export class DispatchManager {
       (entry): entry is { taskId: string; processGroupId: number } =>
         entry.processGroupId !== undefined,
     );
+    const unconfirmedProcessGroups = Array.from(
+      this.unconfirmedProcessGroups,
+      ([taskId, processGroupId]) => ({ taskId, processGroupId }),
+    );
     const trackedIds = new Set(tracked.map(({ taskId }) => taskId));
     const pendingWithoutChild = Array.from(this.jobs.values()).filter(
       (job) =>
@@ -5158,6 +5207,7 @@ export class DispatchManager {
         ...pendingWithoutChild.map((job) => job.taskId),
         ...pendingDockerStarts.map(({ taskId }) => taskId),
         ...pendingProcessGroups.map(({ taskId }) => taskId),
+        ...unconfirmedProcessGroups.map(({ taskId }) => taskId),
         ...trackedDockerTasks,
       ]),
     );
@@ -5264,29 +5314,23 @@ export class DispatchManager {
         .filter(({ taskId }) => !settledDockerStarts.has(taskId))
         .map(({ taskId }) => taskId);
     })();
-    const pendingGroupWait = (async (): Promise<string[]> => {
-      if (pendingProcessGroups.length === 0) return [];
-      for (const entry of pendingProcessGroups) {
-        if (!this.processGroupExists(entry.processGroupId)) continue;
-        if (!escalated.includes(entry.taskId)) escalated.push(entry.taskId);
-        try {
-          process.kill(-entry.processGroupId, "SIGKILL");
-        } catch {
-          // The bounded probe below distinguishes a concurrent exit from a survivor.
-        }
-      }
-      const deadline = Date.now() + forceTimeoutMs;
-      let remaining = pendingProcessGroups.filter((entry) =>
-        this.processGroupExists(entry.processGroupId),
+    // A timer-only PGID has outlived the root ChildProcess identity that made
+    // the number trustworthy. Never signal or poll it during shutdown: retain
+    // it as unresolved evidence for tokened operator reconciliation. Entries
+    // still backed by a tracked child are handled by signalTrackedTree below.
+    const unboundPendingProcessGroups = pendingProcessGroups.filter((entry) => {
+      const trackedEntry = tracked.find(
+        (candidate) =>
+          candidate.taskId === entry.taskId && candidate.child.pid === entry.processGroupId,
       );
-      while (remaining.length > 0 && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, Math.min(25, deadline - Date.now())));
-        remaining = pendingProcessGroups.filter((entry) =>
-          this.processGroupExists(entry.processGroupId),
-        );
-      }
-      return remaining.map(({ taskId }) => taskId);
-    })();
+      return !trackedEntry || !this.isPosixRootIdentityLive(entry.taskId, trackedEntry.child);
+    });
+    for (const entry of unboundPendingProcessGroups) {
+      this.retainUnconfirmedProcessGroup(entry.taskId, entry.processGroupId);
+    }
+    const pendingGroupWait = Promise.resolve(
+      unboundPendingProcessGroups.map(({ taskId }) => taskId),
+    );
 
     let remaining = tracked;
     if (process.platform === "win32") {
@@ -5347,6 +5391,7 @@ export class DispatchManager {
         ...remaining.map(({ taskId }) => taskId),
         ...pendingDockerTimedOut,
         ...pendingGroupTimedOut,
+        ...this.unconfirmedProcessGroups.keys(),
         ...dockerCleanupTimedOut,
       ]),
     );
@@ -5361,9 +5406,12 @@ export class DispatchManager {
       const processId =
         tracked.find((entry) => entry.taskId === taskId)?.child.pid ??
         pendingProcessGroups.find((entry) => entry.taskId === taskId)?.processGroupId;
-      if (!processId) continue;
+      const retainedProcessId =
+        processId ??
+        unconfirmedProcessGroups.find((entry) => entry.taskId === taskId)?.processGroupId;
+      if (!retainedProcessId) continue;
       try {
-        this.persistWorktreeSurvivor(job, processId);
+        this.persistWorktreeSurvivor(job, retainedProcessId);
       } catch (error: unknown) {
         const detail = error instanceof Error ? error.message : String(error);
         job.output.push(
@@ -5374,6 +5422,10 @@ export class DispatchManager {
     const exited = requested.filter((taskId) => !timedOutSet.has(taskId));
     for (const taskId of exited) {
       const job = this.jobs.get(taskId);
+      const trackedEntry = tracked.find((entry) => entry.taskId === taskId);
+      if (trackedEntry && hasExited(trackedEntry)) {
+        this.unconfirmedProcessGroups.delete(taskId);
+      }
       if (job) this.clearWorktreeSurvivor(job);
     }
     for (const { taskId, processGroupId } of pendingProcessGroups) {
@@ -5399,6 +5451,7 @@ export class DispatchManager {
     const hasLiveGroup = Array.from(this.stopEscalationTimers.values()).some(
       ({ processGroupId }) => processGroupId && this.processGroupExists(processGroupId),
     );
+    const hasUnconfirmedProcessGroup = this.unconfirmedProcessGroups.size > 0;
     const hasActiveContainer = this.getDockerUnresolvedContainers().length > 0;
     const sharedCheckoutOwner =
       this.isolationConfig?.method === "docker" ? undefined : this.readSharedCheckoutPause();
@@ -5411,6 +5464,7 @@ export class DispatchManager {
       this.processes.size > 0 ||
       this.pendingDockerStarts.size > 0 ||
       hasLiveGroup ||
+      hasUnconfirmedProcessGroup ||
       hasActiveContainer ||
       hasUnconfirmedSharedCheckoutTree ||
       hasWorktreeSurvivor

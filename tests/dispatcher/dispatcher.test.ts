@@ -26,6 +26,7 @@ type MockExecResult = {
 };
 
 let mockGitResults: Record<string, MockExecResult> = {};
+let mockExecutedChildCommands: string[] = [];
 
 function findGitResult(command: string): MockExecResult | undefined {
   for (const [pattern, result] of Object.entries(mockGitResults)) {
@@ -43,8 +44,27 @@ jest.mock("node:child_process", () => {
     command: string,
     _options: Record<string, unknown>,
   ): Promise<{ stdout: string; stderr: string }> => {
+    command = command.replace(
+      /^git --config-env=remote\.(quack-bound-[0-9a-f-]+)\.url=QUACK_PUBLICATION_REMOTE_URL --config-env=remote\.\1\.pushurl=QUACK_PUBLICATION_REMOTE_URL /iu,
+      "git ",
+    );
+    command = command.replace(/quack-bound-[0-9a-f-]+/giu, "origin");
+    mockExecutedChildCommands.push(command);
     const matchedResult = findGitResult(command);
     if (!matchedResult) {
+      if (command === "git remote get-url --push --all origin") {
+        return Promise.resolve({ stdout: "git@github.com:org/repo.git\n", stderr: "" });
+      }
+      if (
+        command.startsWith("git rev-parse --verify refs/heads/quack/") &&
+        command.endsWith("^{commit}")
+      ) {
+        return Promise.resolve({ stdout: `${"d".repeat(40)}\n`, stderr: "" });
+      }
+      if (command.startsWith("git ls-remote --heads origin refs/heads/quack/")) {
+        const branchRef = command.slice("git ls-remote --heads origin ".length);
+        return Promise.resolve({ stdout: `${"d".repeat(40)}\t${branchRef}\n`, stderr: "" });
+      }
       return Promise.resolve({ stdout: "", stderr: "" });
     }
 
@@ -68,6 +88,16 @@ jest.mock("node:child_process", () => {
   const mockExec = jest.fn();
   (mockExec as unknown as Record<symbol, unknown>)[promisify.custom] = customPromisified;
 
+  const customPromisifiedExecFile = (
+    file: string,
+    args: readonly string[],
+    _options: Record<string, unknown>,
+  ): Promise<{ stdout: string; stderr: string }> =>
+    customPromisified([file, ...args].join(" "), _options);
+  const mockExecFile = jest.fn();
+  (mockExecFile as unknown as Record<symbol, unknown>)[promisify.custom] =
+    customPromisifiedExecFile;
+
   const mockExecSync = jest.fn().mockImplementation((command: string) => {
     const matchedResult = findGitResult(command);
     if (!matchedResult) {
@@ -86,6 +116,7 @@ jest.mock("node:child_process", () => {
   return {
     ...actual,
     exec: mockExec,
+    execFile: mockExecFile,
     execSync: mockExecSync,
   };
 });
@@ -229,6 +260,10 @@ jest.mock("../../src/dispatcher/checkpoint-manager", () => {
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { dispatchTask, ensureDiffOrAutoCommit } =
   require("../../src/dispatcher/dispatcher") as typeof import("../../src/dispatcher/dispatcher");
+const branchManagerModule =
+  require("../../src/dispatcher/branch-manager") as typeof import("../../src/dispatcher/branch-manager");
+const githubRepositoryModule =
+  require("../../src/dispatcher/github-repository") as typeof import("../../src/dispatcher/github-repository");
 
 // Handle to the module-level post-judge mock so safety-stop tests can
 // assert it was never reached (TASK-1313 F2 unreachability proof).
@@ -445,6 +480,7 @@ beforeEach(async () => {
   _mockCheckpoints.clear();
   mockCheckpointRewindFrom.mockResolvedValue(null);
   mockGitResults = {};
+  mockExecutedChildCommands = [];
 
   // Mock blueprint generation by default (returns minimal blueprint)
   mockGenerateBlueprint.mockResolvedValue({
@@ -3631,6 +3667,132 @@ describe("dispatchTask", () => {
       const failEvent = emitted.find((e) => e.stage === "auto_merge_failed");
       expect(failEvent).toBeDefined();
       expect(failEvent!.payload.worktreePath).toBe(tmpDir);
+    }, 15000);
+  });
+
+  describe("PR-gated auto-merge", () => {
+    test("carries one origin binding through no-PR merge, status, and cleanup", async () => {
+      const adapter = makeAdapter({
+        projectRoot: tmpDir,
+        config: {
+          ...makeAdapter().config,
+          git: {
+            ...makeAdapter().config.git,
+            autoCreatePr: false,
+            autoPush: false,
+            autoMerge: true,
+            autoMergeTarget: "main",
+          },
+        },
+      });
+      const repositoryBinding = {
+        pushUrl: "file:///trusted/repository.git",
+        pushUrlHash: "f".repeat(64),
+      };
+      const resolveOrigin = jest
+        .spyOn(githubRepositoryModule, "resolveOriginRepository")
+        .mockResolvedValue(repositoryBinding);
+      const merge = jest
+        .spyOn(branchManagerModule, "mergeBranchToTarget")
+        .mockResolvedValue({ success: true, mergeCommitSha: "e".repeat(40) });
+      const updateStatus = jest
+        .spyOn(branchManagerModule, "updateTaskFileStatus")
+        .mockResolvedValue({ success: true });
+      const cleanup = jest
+        .spyOn(branchManagerModule, "deleteAfterMerge")
+        .mockResolvedValue({ deleted: true, localDeleted: true, remoteDeleted: true });
+
+      mockRunReadinessGate.mockResolvedValue({ outcome: "pass", task: {} as ParsedTask });
+      mockAssembleContext.mockResolvedValue(makeContext());
+      mockRunAgent.mockResolvedValue(makeAgentResult("TASK-042"));
+      mockRunJudge.mockResolvedValue(makeJudgeResult());
+      mockGitResults = {
+        "checkout -b": { stdout: "Switched to branch" },
+        "diff main": { stdout: "diff content" },
+      };
+
+      try {
+        const result = await dispatchTask("TASK-042", adapter, { skipGate: true });
+
+        expect(result.outcome).toBe("approved");
+        expect(result.autoMerged).toBe(true);
+        expect(resolveOrigin).toHaveBeenCalledWith(tmpDir);
+        expect(merge).toHaveBeenCalledWith(
+          "TASK-042",
+          adapter,
+          undefined,
+          "main",
+          expect.anything(),
+          expect.any(String),
+          "d".repeat(40),
+          undefined,
+          repositoryBinding,
+        );
+        expect(updateStatus).toHaveBeenCalledWith(
+          "TASK-042",
+          adapter,
+          "main",
+          repositoryBinding.pushUrl,
+        );
+        expect(cleanup).toHaveBeenCalledWith(
+          expect.any(String),
+          adapter,
+          expect.objectContaining({ expectedOriginPushUrl: repositoryBinding.pushUrl }),
+        );
+        expect(mockExecutedChildCommands.some((command) => command.startsWith("gh "))).toBe(false);
+      } finally {
+        resolveOrigin.mockRestore();
+        merge.mockRestore();
+        updateStatus.mockRestore();
+        cleanup.mockRestore();
+      }
+    }, 15000);
+
+    test("does not fall through to the local merge path when PR creation has no confirmed URL", async () => {
+      const adapter = makeAdapter({
+        projectRoot: tmpDir,
+        config: {
+          ...makeAdapter().config,
+          git: {
+            ...makeAdapter().config.git,
+            autoCreatePr: true,
+            autoPush: true,
+            autoMerge: true,
+            autoMergeTarget: "main",
+          },
+        },
+      });
+
+      mockRunReadinessGate.mockResolvedValue({ outcome: "pass", task: {} as ParsedTask });
+      mockAssembleContext.mockResolvedValue(makeContext());
+      mockRunAgent.mockResolvedValue(makeAgentResult("TASK-042"));
+      mockRunJudge.mockResolvedValue(makeJudgeResult());
+      mockGitResults = {
+        "fetch origin main": { stdout: "" },
+        "checkout -b": { stdout: "Switched to branch" },
+        "diff main": { stdout: "diff content" },
+        "log --oneline": { stdout: "abc123 some commit\n" },
+        "push -u origin": { stdout: "Branch pushed" },
+        "gh repo view": {
+          stdout: JSON.stringify({ nameWithOwner: "org/repo", url: "https://github.com/org/repo" }),
+        },
+        "gh pr create": { stdout: "", stderr: "Pull request created" },
+      };
+
+      const result = await dispatchTask("TASK-042", adapter, { skipGate: true });
+
+      expect(result.outcome).toBe("approved");
+      expect(result.prUrl).toBeUndefined();
+      expect(result.autoMerged).toBeUndefined();
+      expect(mockExecutedChildCommands.some((command) => command.startsWith("gh pr create "))).toBe(
+        true,
+      );
+      expect(mockExecutedChildCommands.some((command) => command.startsWith("gh pr merge "))).toBe(
+        false,
+      );
+      expect(
+        mockExecutedChildCommands.some((command) => command.includes("worktree add --detach")),
+      ).toBe(false);
     }, 15000);
   });
 
