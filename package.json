@@ -4,7 +4,6 @@
   "description": "Codebase-agnostic harness for isolated coding-agent tasks and verification",
   "author": "Quack Harness contributors",
   "license": "AGPL-3.0-only",
-  "private": true,
   "repository": {
     "type": "git",
     "url": "git+https://github.com/NotADevIAmaMeatPopsicle/Quack-Harness.git"
@@ -29,6 +28,7 @@
   },
   "scripts": {
     "postinstall": "npm --prefix frontend ci --no-audit --no-fund",
+    "prepack": "npm run build",
     "build": "tsc && npm run build:frontend && npm run build:copy:legacy-ui && npm run build:copy:frontend-ui && npm run build:build-info",
     "build:frontend": "npm --prefix frontend run build",
     "build:copy:legacy-ui": "node -e \"require('fs').cpSync('src/monitor/public','dist/monitor/public',{recursive:true})\"",
