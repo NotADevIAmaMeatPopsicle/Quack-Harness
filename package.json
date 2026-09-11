@@ -4,7 +4,6 @@
   "description": "Codebase-agnostic harness for isolated coding-agent tasks and verification",
   "author": "Quack Harness contributors",
   "license": "AGPL-3.0-only",
-  "private": true,
   "repository": {
     "type": "git",
     "url": "git+https://github.com/NotADevIAmaMeatPopsicle/Quack-Harness.git"
