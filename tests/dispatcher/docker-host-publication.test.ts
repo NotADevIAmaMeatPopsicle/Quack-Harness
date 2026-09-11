@@ -1087,14 +1087,25 @@ describe("Docker host publication", () => {
     const realFsync = actualFs.fsyncSync;
     let posixBarrierFailures = 0;
     let observedFailures = 0;
+    let installedBeforePreparation: ReturnType<typeof actualFs.statSync> | undefined;
     const sync =
       process.platform === "win32"
         ? undefined
         : jest.spyOn(actualFs, "fsyncSync").mockImplementation((fd) => {
-            if (posixBarrierFailures > 0 && actualFs.existsSync(recoveryPath)) {
+            if (
+              posixBarrierFailures > 0 &&
+              installedBeforePreparation !== undefined &&
+              actualFs.existsSync(recoveryPath)
+            ) {
               const opened = actualFs.fstatSync(fd);
               const installed = actualFs.statSync(recoveryPath);
-              if (opened.isFile() && opened.dev === installed.dev && opened.ino === installed.ino) {
+              if (
+                opened.isFile() &&
+                opened.dev === installed.dev &&
+                opened.ino === installed.ino &&
+                (opened.dev !== installedBeforePreparation.dev ||
+                  opened.ino !== installedBeforePreparation.ino)
+              ) {
                 posixBarrierFailures -= 1;
                 observedFailures += 1;
                 throw Object.assign(new Error("simulated post-rename durability failure"), {
@@ -1108,7 +1119,10 @@ describe("Docker host publication", () => {
       const recovery = args[7] as { onPrepared?: (value: typeof prepared) => void };
       recoveryPreparedRefs.set(prepared.preparedRef, prepared.resultHead);
       if (process.platform === "win32") durableMoveAfterRenameFailures = 2;
-      else posixBarrierFailures = 2;
+      else {
+        installedBeforePreparation = actualFs.statSync(recoveryPath);
+        posixBarrierFailures = 2;
+      }
       recovery.onPrepared?.(prepared);
       return Promise.resolve({ success: true, mergeCommitSha: prepared.resultHead });
     });

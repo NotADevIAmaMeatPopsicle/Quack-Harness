@@ -33,6 +33,19 @@ async function waitForCondition(
 }
 
 function processIsAlive(pid: number): boolean {
+  if (process.platform === "linux") {
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf-8");
+      const state = stat.slice(stat.lastIndexOf(")") + 2).split(/\s+/u, 1)[0];
+      if (state === "Z") return false;
+    } catch (error: unknown) {
+      const code =
+        typeof error === "object" && error !== null && "code" in error
+          ? String((error as { code?: unknown }).code)
+          : "";
+      if (code === "ENOENT") return false;
+    }
+  }
   try {
     process.kill(pid, 0);
     return true;
@@ -149,7 +162,7 @@ describe("DispatchManager", () => {
         "const fs = require('node:fs');",
         "const { spawn } = require('node:child_process');",
         "if (process.platform !== 'win32') process.on('SIGTERM', () => undefined);",
-        "const grandchild = spawn(process.execPath, ['-e', \"if (process.platform !== 'win32') process.on('SIGTERM', () => undefined); setInterval(() => undefined, 1000);\"], { stdio: 'ignore' });",
+        "const grandchild = spawn(process.execPath, ['-e', \"setInterval(() => undefined, 1000);\"], { stdio: 'ignore' });",
         `fs.writeFileSync(${JSON.stringify(readyPath)}, JSON.stringify({ grandchildPid: grandchild.pid }), 'utf-8');`,
         "setInterval(() => undefined, 1000);",
       ].join("\n"),
@@ -218,6 +231,7 @@ describe("DispatchManager", () => {
       createWorktree(taskId: string): string | undefined;
       processes: Map<string, ChildProcess>;
       signalProcessTree: TreeSignaler;
+      unconfirmedProcessGroups: Map<string, number>;
     };
     internals.createWorktree = () => worktreePath;
     const signalProcessTree = internals.signalProcessTree.bind(mgr);
@@ -245,6 +259,7 @@ describe("DispatchManager", () => {
 
       const firstShutdown = await mgr.shutdownAll({ gracefulTimeoutMs: 10, forceTimeoutMs: 10 });
       expect(firstShutdown.timedOut).toEqual(["TASK-STOP-ERROR"]);
+      expect(internals.unconfirmedProcessGroups.has("TASK-STOP-ERROR")).toBe(false);
       const survivorMarker = path.join(
         tmpDir,
         ".quack",
@@ -278,23 +293,27 @@ describe("DispatchManager", () => {
     }
   });
 
-  test("shutdown inherits a stopped root's process group and kills its resistant descendant", async () => {
+  test("shutdown retains a stopped root's unconfirmed process group for reconciliation", async () => {
     if (process.platform === "win32") return;
 
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-stop-tree-"));
-    const worktreePath = path.join(tmpDir, "worktree");
+    const worktreePath = path.join(tmpDir, ".quack", "worktrees", "TASK-STOP-TREE");
     const readyPath = path.join(tmpDir, "child-ready");
     const scriptPath = path.join(tmpDir, "cooperative-root.cjs");
     fs.mkdirSync(worktreePath, { recursive: true });
     fs.writeFileSync(path.join(worktreePath, "uncommitted.txt"), "preserve me\n", "utf-8");
+    const descendantCode = [
+      "const fs = require('node:fs');",
+      "process.on('SIGTERM', () => undefined);",
+      `fs.writeFileSync(${JSON.stringify(readyPath)}, JSON.stringify({ grandchildPid: process.pid }), 'utf-8');`,
+      "setInterval(() => undefined, 1000);",
+    ].join("\n");
     fs.writeFileSync(
       scriptPath,
       [
-        "const fs = require('node:fs');",
         "const { spawn } = require('node:child_process');",
-        "const grandchild = spawn(process.execPath, ['-e', \"process.on('SIGTERM', () => undefined); setInterval(() => undefined, 1000);\"], { stdio: 'ignore' });",
-        `fs.writeFileSync(${JSON.stringify(readyPath)}, JSON.stringify({ grandchildPid: grandchild.pid }), 'utf-8');`,
         "process.on('SIGTERM', () => process.exit(0));",
+        `spawn(process.execPath, ['-e', ${JSON.stringify(descendantCode)}], { stdio: 'ignore' });`,
         "setInterval(() => undefined, 1000);",
       ].join("\n"),
       "utf-8",
@@ -327,20 +346,44 @@ describe("DispatchManager", () => {
       expect(job.status).toBe("running");
       expect(processIsAlive(grandchildPid)).toBe(true);
       const shutdown = await mgr.shutdownAll({ gracefulTimeoutMs: 50, forceTimeoutMs: 2_000 });
-      await waitForCondition(
-        () => !processIsAlive(grandchildPid as number),
-        "resistant descendant escalation",
-        3_000,
-      );
 
       expect(shutdown.requested).toContain("TASK-STOP-TREE");
-      expect(shutdown.escalated).toContain("TASK-STOP-TREE");
-      expect(shutdown.timedOut).toEqual([]);
-      expect(job.status).toBe("stopped");
+      expect(shutdown.escalated).not.toContain("TASK-STOP-TREE");
+      expect(shutdown.timedOut).toEqual(["TASK-STOP-TREE"]);
+      expect(job.status).toBe("running");
+      expect(mgr.canResumeAfterShutdown()).toBe(false);
       expect(fs.existsSync(worktreePath)).toBe(true);
       expect(fs.readFileSync(path.join(worktreePath, "uncommitted.txt"), "utf-8")).toBe(
         "preserve me\n",
       );
+
+      const [survivor] = mgr.getWorktreeShutdownSurvivors();
+      if (!survivor) throw new Error("Expected durable process-group survivor evidence");
+      expect(survivor).toEqual(
+        expect.objectContaining({
+          taskId: "TASK-STOP-TREE",
+          processId: job.pid,
+          strategy: "posix-process-group",
+        }),
+      );
+      expect(survivor.reconciliationToken).toEqual(expect.any(String));
+      process.kill(grandchildPid, "SIGKILL");
+      await waitForCondition(
+        () => !processIsAlive(grandchildPid as number),
+        "operator-confirmed descendant exit",
+        3_000,
+      );
+      expect(
+        mgr.reconcileWorktreeShutdownSurvivor(
+          survivor.taskId,
+          survivor.sessionId,
+          survivor.ownershipId!,
+          survivor.reconciliationToken!,
+          true,
+        ),
+      ).toBe(true);
+      expect(job.status).toBe("stopped");
+      expect(mgr.canResumeAfterShutdown()).toBe(true);
     } finally {
       await mgr.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
       if (grandchildPid && processIsAlive(grandchildPid)) {

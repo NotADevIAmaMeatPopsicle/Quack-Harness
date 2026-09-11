@@ -5196,10 +5196,15 @@ export class DispatchManager {
       ([taskId, processGroupId]) => ({ taskId, processGroupId }),
     );
     const trackedIds = new Set(tracked.map(({ taskId }) => taskId));
+    const retainedProcessGroupTasks = new Set([
+      ...pendingProcessGroups.map(({ taskId }) => taskId),
+      ...unconfirmedProcessGroups.map(({ taskId }) => taskId),
+    ]);
     const pendingWithoutChild = Array.from(this.jobs.values()).filter(
       (job) =>
         !trackedIds.has(job.taskId) &&
-        (job.status === "running" || job.status === "awaiting_approval"),
+        (job.status === "awaiting_approval" ||
+          (job.status === "running" && !retainedProcessGroupTasks.has(job.taskId))),
     );
     const requested = Array.from(
       new Set([
@@ -5227,9 +5232,10 @@ export class DispatchManager {
       this.clearStopEscalation(entry.taskId, true);
     }
 
-    // Approval-paused jobs have no child handle. Stopping the CLI should make
-    // their in-memory state terminal, while the durable shared-checkout marker
-    // continues protecting recoverable work across restart.
+    // Approval-paused jobs and childless jobs without retained process-group
+    // evidence can become terminal here. A childless job whose POSIX group is
+    // still pending or unconfirmed must remain running until absence or an
+    // explicit reconciliation is recorded.
     for (const job of pendingWithoutChild) {
       if (job.status === "running" || job.status === "awaiting_approval") {
         job.stopRequestedAt = stopRequestedAt;
@@ -5430,7 +5436,15 @@ export class DispatchManager {
     }
     for (const { taskId, processGroupId } of pendingProcessGroups) {
       if (timedOutSet.has(taskId)) {
-        this.retainUnconfirmedProcessGroup(taskId, processGroupId);
+        const trackedEntry = tracked.find(
+          (entry) => entry.taskId === taskId && entry.child.pid === processGroupId,
+        );
+        // A still-live tracked root keeps the PGID bound to the original
+        // ChildProcess identity, so a later bounded shutdown may safely retry
+        // it. Promote only timer-only evidence to the no-re-signal state.
+        if (!trackedEntry || !this.isPosixRootIdentityLive(taskId, trackedEntry.child)) {
+          this.retainUnconfirmedProcessGroup(taskId, processGroupId);
+        }
         const job = this.jobs.get(taskId);
         if (job) this.preserveInterruptedSharedCheckout(job, "running");
         continue;

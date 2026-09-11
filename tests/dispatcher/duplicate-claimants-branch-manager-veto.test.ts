@@ -1,7 +1,7 @@
 // TASK-1338-B pre-change record: all four target-branch-only duplicate arms
 // executed and FAILED at the intended success:false assertion after commit and
-// push. The COMPLETE-status target is a CONTROL for the earlier no-write
-// return and is covered behaviorally by the READY matrix.
+// push. REJECTED is the non-updatable CONTROL for the earlier no-write
+// return; COMPLETE separately proves the recovery path is idempotent.
 
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
@@ -146,7 +146,7 @@ describeWithGit.each(DUPLICATE_FIXTURE_CASES)(
 );
 
 itWithGit("non-updatable status returns before the veto", async () => {
-  const fixture = createRepoFixture("cross-population", "forward", "COMPLETE");
+  const fixture = createRepoFixture("cross-population", "forward", "REJECTED");
   try {
     const beforeSha = git(fixture.root, [
       "--git-dir",
@@ -157,6 +157,25 @@ itWithGit("non-updatable status returns before the veto", async () => {
     const result = await updateTaskFileStatus("TASK-100", fixture.adapter, "dev");
     expect(result.success).toBe(false);
     expect(result.error).toContain("No updatable status");
+    expect(git(fixture.root, ["--git-dir", fixture.origin, "rev-parse", "refs/heads/dev"])).toBe(
+      beforeSha,
+    );
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+  }
+});
+
+itWithGit("an already-complete target is an idempotent success before the veto", async () => {
+  const fixture = createRepoFixture("cross-population", "forward", "COMPLETE");
+  try {
+    const beforeSha = git(fixture.root, [
+      "--git-dir",
+      fixture.origin,
+      "rev-parse",
+      "refs/heads/dev",
+    ]);
+    const result = await updateTaskFileStatus("TASK-100", fixture.adapter, "dev");
+    expect(result).toEqual({ success: true });
     expect(git(fixture.root, ["--git-dir", fixture.origin, "rev-parse", "refs/heads/dev"])).toBe(
       beforeSha,
     );
