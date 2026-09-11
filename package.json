@@ -27,6 +27,7 @@
     "quack": "dist/index.js"
   },
   "scripts": {
+    "prepack": "npm run build",
     "build": "tsc && npm run build:frontend && npm run build:copy:legacy-ui && npm run build:copy:frontend-ui && npm run build:build-info",
     "build:frontend": "npm --prefix frontend run build",
     "build:copy:legacy-ui": "node -e \"require('fs').cpSync('src/monitor/public','dist/monitor/public',{recursive:true})\"",
