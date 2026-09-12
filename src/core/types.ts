@@ -91,6 +91,10 @@ export interface ParsedTask {
    *  section (one bullet per fact). Feeds the brief synthesizer's
    *  constraint block; absent section = no Tier S fidelity claim. */
   decidedFacts?: string[];
+  /** TASK-1325: exact verification forms from a `## Mandated Checks`
+   *  section (one bullet per form). The brief must preserve every entry
+   *  verbatim; absent section = no mandated-check fidelity claim. */
+  mandatedChecks?: string[];
   rawContent: string;
 }
 
@@ -113,12 +117,24 @@ export interface AdapterProjectConfig {
 }
 
 export interface AdapterAgentConfig {
+  /** Implementation backend. Omitted is the legacy/default Claude SDK path. */
+  runner?: "claude-sdk" | "codex-cli";
   model: string;
   judgeModel: string;
   enrichModel: string;
   maxTurns: number;
   maxBudgetPerTask: number;
   maxRetries: number;
+  codex?: {
+    binaryPath: string;
+    /** Fixed security floor; no danger-full-access value is representable. */
+    sandbox: "workspace-write";
+    codexHome?: string;
+    profile?: string;
+    provider?: string;
+    credentialEnvVar?: string;
+    timeoutMs: number;
+  };
   apiKeys?: {
     pool: string[];
     strategy: "round-robin" | "least-used" | "least-cost";
@@ -294,7 +310,51 @@ export interface TieredTestingConfig {
   outputDir: string;
 }
 
+/** One integrity-pinned package whose native install script may run without network access. */
+export interface DockerOfflineNativeRebuild {
+  /** Configured dependency root containing this package. */
+  dependencyRoot: string;
+  /** Exact npm package name passed as one argv element to `npm rebuild`. */
+  packageName: string;
+  /** Exact installed package version required by the lockfile and package metadata. */
+  version: string;
+  /** Exact sha512 SRI required by the lockfile. */
+  integrity: string;
+  /** Exact package install script expected before npm is allowed to run it. */
+  installScript: string;
+}
+
+/** Disposable Docker boundary for executing worker-controlled verification code. */
+export interface DockerVerificationSandboxConfig {
+  /** Immutable official Node image reference, including an sha256 digest. */
+  image: string;
+  /** Maximum process count available to the verification container. */
+  pidsLimit: number;
+  /** Container memory ceiling in MiB. */
+  memoryMb: number;
+  /** Container CPU ceiling. */
+  cpus: number;
+  /** Size of the non-executable /tmp tmpfs in MiB. */
+  tmpfsSizeMb: number;
+  /** Relative npm package roots whose immutable lockfiles are installed. */
+  dependencyRoots: string[];
+  /** Exact HTTPS registry origins reachable during dependency setup. */
+  allowedRegistryOrigins: string[];
+  /** Explicit native packages rebuilt only after all dependency egress is removed. */
+  offlineNativeRebuilds?: DockerOfflineNativeRebuild[];
+  /** Maximum time allowed for each dependency setup command. */
+  setupTimeoutMs: number;
+  /** Maximum bytes copied from the worktree into the disposable workspace. */
+  maxContextBytes: number;
+  /** Maximum captured stdout or stderr bytes returned by a Docker command. */
+  maxOutputBytes: number;
+}
+
 export interface AdapterVerificationConfig {
+  /** Execution boundary for host-side verification commands. */
+  hostExecution?: "direct" | "codex-sandbox" | "docker-sandbox";
+  /** Required when hostExecution is docker-sandbox. */
+  dockerSandbox?: DockerVerificationSandboxConfig;
   commands: VerificationCommand[];
   conventionChecks: ConventionCheck[];
   postJudge?: PostJudgeConfig;
@@ -306,6 +366,12 @@ export interface AdapterVerificationConfig {
 export interface AdapterSandboxConfig {
   writablePaths: string[];
   deniedPaths: string[];
+  /**
+   * Exact protected directory roots that may be copied into the worktree as
+   * disposable mirrors for the Codex turn. The quarantined originals remain
+   * authoritative and are restored before verification.
+   */
+  disposablePaths?: string[];
   allowedBashPatterns: string[];
   deniedBashPatterns: string[];
 }
@@ -546,6 +612,17 @@ export interface LoopConfig {
   recordOnFinalize: boolean;
 }
 
+export interface EvaluationProvidersConfig {
+  readinessDepth?: ReviewerRunnerConfig;
+  specReview?: ReviewerRunnerConfig;
+  blueprint?: ReviewerRunnerConfig;
+  taskDecomposition?: ReviewerRunnerConfig;
+  childSpecMaterialization?: ReviewerRunnerConfig;
+  judge?: ReviewerRunnerConfig;
+  semanticPostJudge?: ReviewerRunnerConfig;
+  lifecycleVerify?: ReviewerRunnerConfig;
+}
+
 export interface IntegrationsConfig {
   github?: GitHubConfig;
 }
@@ -607,6 +684,8 @@ export interface AdapterConfig {
   workerOverlay?: AdapterWorkerOverlayConfig;
   executionMode?: ExecutionMode;
   loop?: LoopConfig;
+  /** Explicit read-only provider selection for structured evaluator stages. */
+  evaluationProviders?: EvaluationProvidersConfig;
   judgment?: JudgmentConfig;
 }
 
@@ -668,7 +747,7 @@ export interface WorktreeInitStep {
   command: string;
   /** Working directory relative to the worktree root. Defaults to worktree root. */
   cwd?: string;
-  /** Additional environment variables merged with process.env for this step */
+  /** Non-reserved variables merged into Quack's stripped initialization environment. */
   env?: Record<string, string>;
   /** Human-readable label used in log output and event emission */
   label?: string;
@@ -699,7 +778,8 @@ export interface DispatchConfig {
   /**
    * Explicit list of init steps to run after worktree creation.
    * When omitted, auto-discovery runs: finds all package.json files
-   * (excluding node_modules/) up to 3 levels deep, runs npm ci for each.
+   * (excluding node_modules/) up to 3 levels deep, runs safe npm installs.
+   * An explicit empty array disables initialization.
    */
   worktreeInit?: Array<string | WorktreeInitStep>;
 }
@@ -929,7 +1009,10 @@ export interface VerificationPattern {
   checkType: "grep" | "grep_count" | "file_exists" | "file_not_exists";
   pattern: string;
   fileGlob: string;
+  /** grep_count threshold: 0 means exactly zero; positive means minimum count. */
   expectedMatches?: number;
+  /** Exact task-authored mandated form represented by this pattern. */
+  mandatedCheck?: string;
 }
 
 // ─── Context Size Estimation Types ────────────────────────────────
@@ -989,10 +1072,19 @@ export interface TaskContext {
 
 // ─── Verification Types ────────────────────────────────────────────
 
+export type VerifyCommandStatus = "passed" | "failed" | "skipped" | "optional-unavailable";
+
 export interface VerifyCommandResult {
   name: string;
   passed: boolean;
   output: string;
+  /** Whether this check is contractually required. Absent on legacy checkpoints. */
+  required?: boolean;
+  /**
+   * Explicit verifier disposition. Absent on legacy checkpoints, which the
+   * judge reconciles against the current adapter command configuration.
+   */
+  status?: VerifyCommandStatus;
 }
 
 export type AdapterFreshnessStatus = "fresh" | "refreshed" | "stale" | "unknown";
@@ -1050,11 +1142,13 @@ export interface DeterministicCheck {
   /** Criterion text substring to match (case-insensitive) */
   criterionMatch: string;
   /** Type of check to perform */
-  type: "grep" | "file_exists" | "file_not_exists";
+  type: "grep" | "grep_count" | "file_exists" | "file_not_exists";
   /** Pattern for grep, or path for file checks */
   pattern: string;
-  /** Files to search (glob) — only for grep type */
+  /** Files to search (glob) — only for grep types */
   glob?: string;
+  /** grep_count threshold: 0 means exactly zero; positive means minimum count. */
+  expectedMatches?: number;
   /** Severity level */
   severity: "warning" | "flag";
 }
@@ -1209,7 +1303,11 @@ export interface AgentResult {
   totalCostUsd: number;
   messages: AgentMessage[];
   error?: string;
-  /** Claude Agent SDK session ID — used for session resume */
+  /**
+   * Implementation-provider session ID used for resume. The legacy field
+   * name is retained for checkpoint/API compatibility; Codex workers map
+   * their `thread.started.thread_id` here as well.
+   */
   claudeSessionId?: string;
   /**
    * TASK-1313: PRE-FILTER producer facts accumulated by the worker's
@@ -1323,6 +1421,8 @@ export interface LifecycleResult {
 // ─── Runtime Check Types ─────────────────────────────────────────
 
 export interface RuntimeCheckConfig {
+  /** Explicit acknowledgement that project server code runs with host authority. */
+  execution: "direct-trusted";
   startCommand: string;
   healthUrl: string;
   routes: string[];

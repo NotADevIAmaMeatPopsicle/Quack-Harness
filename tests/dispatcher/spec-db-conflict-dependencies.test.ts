@@ -45,6 +45,10 @@ jest.mock("node:child_process", () => ({
   execSync: jest.fn(() => ""),
 }));
 
+jest.mock("../../src/dispatcher/trusted-git", () => ({
+  runTrustedGitSync: jest.fn(() => ""),
+}));
+
 // HOW THIS SUITE WAS PROVEN ABLE TO FAIL (round-2 F7 is the reason it
 // needed proving). Every test below was re-run against a simulation of
 // the exact pre-fix defect: `src/core/task-state-overlay.js` mocked so

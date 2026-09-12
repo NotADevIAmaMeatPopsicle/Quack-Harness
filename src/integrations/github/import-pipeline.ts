@@ -40,14 +40,19 @@ export async function importIssue(
   }
 
   // Check for duplicates
-  const syncMap = await getSyncMap(adapter.config);
+  const syncMap = await getSyncMap(adapter.projectRoot);
   if (syncMap.hasIssue(issueNumber)) {
     const existingTaskId = syncMap.getTaskForIssue(issueNumber);
     throw new Error(`Issue #${issueNumber} already imported as ${existingTaskId}`);
   }
 
   // Fetch issue
-  const issue = await fetchIssue(githubConfig.owner, githubConfig.repo, issueNumber);
+  const issue = await fetchIssue(
+    githubConfig.owner,
+    githubConfig.repo,
+    issueNumber,
+    adapter.projectRoot,
+  );
 
   // Check if issue is open
   if (issue.state !== "open") {
@@ -101,6 +106,7 @@ export async function importIssue(
         },
       },
       githubConfig,
+      adapter.projectRoot,
     );
   }
 
@@ -141,6 +147,7 @@ export async function importIssue(
               },
             },
             githubConfig,
+            adapter.projectRoot,
           );
         } else {
           await postLifecycleComment(
@@ -154,6 +161,7 @@ export async function importIssue(
               },
             },
             githubConfig,
+            adapter.projectRoot,
           );
         }
       }
@@ -185,9 +193,14 @@ export async function importIssuesByLabel(
     throw new Error("GitHub integration not configured in adapter.json");
   }
 
-  const issues = await fetchIssuesByLabel(githubConfig.owner, githubConfig.repo, label);
+  const issues = await fetchIssuesByLabel(
+    githubConfig.owner,
+    githubConfig.repo,
+    label,
+    adapter.projectRoot,
+  );
   const results: ImportResult[] = [];
-  const syncMap = await getSyncMap(adapter.config);
+  const syncMap = await getSyncMap(adapter.projectRoot);
 
   for (const issue of issues) {
     // Skip if already imported
@@ -229,14 +242,19 @@ export async function refreshIssueComments(
     return undefined;
   }
 
-  const syncMap = await getSyncMap(adapter.config);
+  const syncMap = await getSyncMap(adapter.projectRoot);
   const issueNumber = syncMap.getIssueForTask(taskId);
   if (!issueNumber) {
     return undefined;
   }
 
   try {
-    const issue = await fetchIssue(githubConfig.owner, githubConfig.repo, issueNumber);
+    const issue = await fetchIssue(
+      githubConfig.owner,
+      githubConfig.repo,
+      issueNumber,
+      adapter.projectRoot,
+    );
 
     // Filter out quack's own comments (they start with ### Quack: or ### 🦆 Quack:)
     const humanComments = issue.comments.filter(

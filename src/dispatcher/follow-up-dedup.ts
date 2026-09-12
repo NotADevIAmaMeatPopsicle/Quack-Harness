@@ -7,6 +7,9 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { ProjectAdapter } from "../core/adapter-loader.js";
+import { parseTaskFile } from "../core/task-parser.js";
+import { withCanonicalTaskSpecMutationFence } from "../preflight/canonical-task-spec-mutation.js";
 
 export interface BacklogEntry {
   taskId: string;
@@ -119,16 +122,11 @@ export async function loadBacklogEntries(taskDir: string): Promise<BacklogEntry[
     return [];
   }
 
-  const taskFiles = files
-    .filter((f) => /^(?:TASK-\d+|SAURUS-REM-\d{3}).*\.md$/.test(f))
-    .sort()
-    .reverse(); // descending by name → newest IDs first
+  const taskFiles = files.filter((file) => /\.md$/i.test(file));
 
   const entries: BacklogEntry[] = [];
 
   for (const file of taskFiles) {
-    if (entries.length >= MAX_BACKLOG_ENTRIES) break;
-
     const filePath = path.join(taskDir, file);
     let content: string;
     try {
@@ -137,35 +135,34 @@ export async function loadBacklogEntries(taskDir: string): Promise<BacklogEntry[
       continue;
     }
 
-    // Only include BACKLOG or READY tasks
-    const statusMatch = content.match(/^\s*-\s*\*\*Status:\*\*\s*(\w+)/m);
-    if (!statusMatch) continue;
-    const status = statusMatch[1].toUpperCase();
-    if (status !== "BACKLOG" && status !== "READY") continue;
-
-    // Extract task ID from filename
-    const idMatch = file.match(/^(TASK-[\w-]+?)[-.]md$|^(TASK-[\w-]+)/);
-    const taskId = idMatch
-      ? (idMatch[1] ?? idMatch[2] ?? file.replace(/\.md$/, ""))
-      : file.replace(/\.md$/, "");
-
-    // Extract title from the first heading line: # TASK-NNN: Title
-    const titleMatch = content.match(/^#\s+(?:TASK-[\w-]+:\s+)?(.+)$/m);
-    const title = titleMatch ? titleMatch[1].trim() : file.replace(/\.md$/, "");
-
-    // Extract tags
-    const tagsMatch = content.match(/^\s*-\s*\*\*Tags:\*\*\s*(.+)$/m);
-    const tags = tagsMatch
-      ? tagsMatch[1]
-          .split(",")
-          .map((t) => t.trim())
-          .filter(Boolean)
-      : [];
-
-    entries.push({ taskId, title, tags, filePath });
+    try {
+      const task = parseTaskFile(content, filePath);
+      if (task.status !== "BACKLOG" && task.status !== "READY") continue;
+      entries.push({ taskId: task.id, title: task.title, tags: task.tags, filePath });
+    } catch {
+      // A malformed document cannot safely serve as a canonical dedup target.
+    }
   }
 
-  return entries;
+  return entries
+    .sort(
+      (a, b) =>
+        b.taskId.localeCompare(a.taskId, "en", { numeric: true }) ||
+        a.filePath.localeCompare(b.filePath),
+    )
+    .slice(0, MAX_BACKLOG_ENTRIES);
+}
+
+/** The compact judge summary uses exactly the same declared-ID window as dedup. */
+export async function loadRecentBacklogSummary(taskDir: string): Promise<string | undefined> {
+  const entries = await loadBacklogEntries(taskDir);
+  if (entries.length === 0) return undefined;
+  return entries
+    .map(
+      (entry) =>
+        `- ${entry.taskId}: ${entry.title}${entry.tags.length > 0 ? ` [${entry.tags.join(", ")}]` : ""}`,
+    )
+    .join("\n");
 }
 
 /**
@@ -193,7 +190,9 @@ export async function loadIgnoreList(projectRoot: string): Promise<string[]> {
  */
 export async function appendLinkedFromComment(
   taskFilePath: string,
+  targetTaskId: string,
   fromTaskId: string,
+  adapter: ProjectAdapter,
   beforeMutation?: () => Promise<boolean>,
 ): Promise<void> {
   let content: string;
@@ -210,10 +209,13 @@ export async function appendLinkedFromComment(
     return;
   }
 
-  if (beforeMutation && !(await beforeMutation())) {
-    return;
-  }
-
   const updated = content.trimEnd() + "\n" + marker + "\n";
-  await fs.writeFile(taskFilePath, updated, "utf-8");
+  await withCanonicalTaskSpecMutationFence({
+    adapter,
+    taskId: targetTaskId,
+    taskFilePath,
+    expectedContent: content,
+    replacementContent: updated,
+    authorize: beforeMutation,
+  });
 }

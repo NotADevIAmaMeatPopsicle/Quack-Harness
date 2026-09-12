@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-require-imports */
 import { describe, it, expect, jest, beforeEach } from "@jest/globals";
 import type { AdapterConfig } from "../../src/core/types";
 
@@ -48,6 +47,7 @@ jest.mock("node:child_process", () => {
       return { pid: undefined };
     },
   );
+
   return {
     ...actual,
     exec: mockExec,

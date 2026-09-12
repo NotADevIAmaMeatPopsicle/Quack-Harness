@@ -36,7 +36,8 @@ describe("Monitor UI 2.0 production smoke", () => {
   let page: Page | undefined;
   let consoleErrors: string[];
   let pageErrors: string[];
-  const port = 30000 + Math.floor(Math.random() * 10000);
+  let httpErrors: string[];
+  let port: number;
 
   beforeAll(async () => {
     logDir = makeTempDir("quack-vis-log-");
@@ -44,6 +45,7 @@ describe("Monitor UI 2.0 production smoke", () => {
     uiBuildDir = path.join(process.cwd(), "frontend", "dist");
     consoleErrors = [];
     pageErrors = [];
+    httpErrors = [];
 
     execSync("npm --prefix frontend run build", {
       cwd: process.cwd(),
@@ -166,13 +168,15 @@ describe("Monitor UI 2.0 production smoke", () => {
 
     const serverObj = createMonitorServer({
       logDir,
-      port,
+      port: 0,
+      host: "127.0.0.1",
       projectRoot,
       taskDir: "docs/tasks",
       uiBuildDir,
     });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    const started = await serverObj.start();
+    port = started.port;
+    stopServer = started.stop;
 
     browser = await chromium.launch({ headless: true });
     page = await browser.newPage({ viewport: { width: 1440, height: 980 } });
@@ -185,8 +189,16 @@ describe("Monitor UI 2.0 production smoke", () => {
     page.on("pageerror", (error) => {
       pageErrors.push(error.message);
     });
+    page.on("response", (response) => {
+      if (response.status() >= 400) {
+        const request = response.request();
+        httpErrors.push(
+          `${response.status()} ${request.method()} ${response.url()} (${request.resourceType()})`,
+        );
+      }
+    });
 
-    await page.goto(`http://localhost:${port}/`);
+    await page.goto(`http://127.0.0.1:${port}/`);
     await page.waitForLoadState("domcontentloaded");
     await page.waitForSelector("text=Overview", { timeout: 15_000 });
   });
@@ -236,7 +248,7 @@ describe("Monitor UI 2.0 production smoke", () => {
   it("supports direct task-detail routes through the production app shell", async () => {
     if (!page) throw new Error("Playwright page not initialized");
 
-    await page.goto(`http://localhost:${port}/tasks/TASK-001`);
+    await page.goto(`http://127.0.0.1:${port}/tasks/TASK-001`);
     await page.waitForLoadState("domcontentloaded");
     await page.waitForSelector("text=Run History", { timeout: 15_000 });
     await expectText(page, "TASK-001");
@@ -245,15 +257,18 @@ describe("Monitor UI 2.0 production smoke", () => {
   it("keeps the classic dashboard available at /legacy", async () => {
     if (!page) throw new Error("Playwright page not initialized");
 
-    await page.goto(`http://localhost:${port}/legacy`);
+    await page.goto(`http://127.0.0.1:${port}/legacy`);
     await page.waitForLoadState("domcontentloaded");
     await page.waitForSelector("text=Dashboard", { timeout: 15_000 });
     await expect(page.title()).resolves.toContain("Quack Monitor");
   });
 
-  it("does not emit browser console or page errors during the smoke flow", () => {
-    expect(consoleErrors).toEqual([]);
-    expect(pageErrors).toEqual([]);
+  it("does not emit browser console, page, or HTTP errors during the smoke flow", () => {
+    expect({ consoleErrors, pageErrors, httpErrors }).toEqual({
+      consoleErrors: [],
+      pageErrors: [],
+      httpErrors: [],
+    });
   });
 });
 

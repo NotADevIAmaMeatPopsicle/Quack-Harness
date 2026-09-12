@@ -15,6 +15,35 @@ export type ReviewKind = "brief" | "diff";
 export type ReviewerRunnerKind = "claude-sdk" | "codex-cli";
 
 /**
+ * Pipeline-stamped identity of the model that produced or reviewed an artifact.
+ * Provider and model stay optional so pre-provenance artifacts remain readable;
+ * absence is UNKNOWN evidence, never permission to claim cross-model review.
+ */
+export interface ModelProvenance {
+  runner: ReviewerRunnerKind;
+  provider?: string;
+  model?: string;
+}
+
+export type CrossModelEvidenceStatus = "satisfied" | "same" | "unknown";
+export type CrossModelEvidenceBasis =
+  | "different_runner"
+  | "different_provider"
+  | "different_model"
+  | "same_identity"
+  | "producer_unknown"
+  | "producer_incomplete"
+  | "reviewer_incomplete";
+
+/** Durable explanation for a cross-model gate decision. */
+export interface CrossModelEvidence {
+  status: CrossModelEvidenceStatus;
+  basis: CrossModelEvidenceBasis;
+  producer?: ModelProvenance;
+  reviewer: ModelProvenance;
+}
+
+/**
  * Verdict vocabulary of the manual cross-model loop, deliberately:
  * SHIP (proceed), AMEND (fold findings, then proceed), FIX_FIRST
  * (blocking issues; do not proceed).
@@ -52,6 +81,29 @@ export interface ReviewAnchorsAudit {
 }
 
 /**
+ * Evidence that a Claude SDK review inspected the authoritative checkout.
+ *
+ * `successfulReads` contains repository-relative paths plus a digest of the
+ * bytes that existed when Quack accepted the tool result.  The digest does not
+ * attempt to prove the model's reasoning; it makes the exact source material
+ * behind the review auditable.  A Claude review is never returned as
+ * `completed` when this audit contains violations.
+ */
+export interface ReviewGroundingAudit {
+  requestedProjectRoot: string;
+  initializedCwd?: string;
+  cwdMatched: boolean;
+  observedToolUses: number;
+  successfulGroundingToolUses: number;
+  successfulReads: Array<{
+    path: string;
+    sha256: string;
+  }>;
+  ungroundedAnchors: string[];
+  violations: string[];
+}
+
+/**
  * Environment-failure classification. Gates branch on
  * `completed` vs `runner_error`; the kind is for human triage.
  */
@@ -60,7 +112,8 @@ export type ReviewRunnerErrorKind =
   | "spawn_failed" // process failed to start (the 0xC0000142 class)
   | "timeout" // exceeded timeoutMs and was killed / raced out
   | "session_error" // ran but exited non-zero / SDK error-subtype result / unexpected throw
-  | "parse_failed"; // ran to completion but produced no valid verdict JSON
+  | "parse_failed" // ran to completion but produced no valid verdict JSON
+  | "grounding_failed"; // verdict lacked verified reads from the authoritative checkout
 
 /** A completed review with a verdict. */
 export interface ReviewCompleted {
@@ -77,6 +130,8 @@ export interface ReviewCompleted {
   costUsd?: number;
   /** findings' file anchors checked against disk */
   anchorsAudit?: ReviewAnchorsAudit;
+  /** Claude SDK cwd/tool evidence; present when that runner performed the review. */
+  groundingAudit?: ReviewGroundingAudit;
   /** codex-cli only: git tree was dirty after a supposedly read-only review */
   treeDirtyAfterReview?: boolean;
   /** codex-cli only: path of the persisted review-request file (audit link) */
@@ -96,6 +151,8 @@ export interface ReviewRunnerError {
   signal?: string;
   stderrTail?: string;
   requestFile?: string;
+  /** Available when a Claude SDK verdict was rejected as ungrounded. */
+  groundingAudit?: ReviewGroundingAudit;
 }
 
 /**

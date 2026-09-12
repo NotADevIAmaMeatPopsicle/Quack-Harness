@@ -152,6 +152,36 @@ export async function runRuntimeValidation(
     };
   }
 
+  // Runtime server commands execute project-controlled code with host filesystem
+  // authority. Keep the legacy path fail-closed unless the trusted adapter makes
+  // that authority explicit, and never bypass a configured verification sandbox.
+  if (config.execution !== "direct-trusted") {
+    events.emit("runtime_check_skipped", {
+      taskId,
+      reason: "direct_trusted_opt_in_required",
+    } as unknown as import("../monitor/event-types.js").EventPayload);
+    return {
+      ...emptyResult,
+      available: false,
+      warnings: [
+        "Runtime validation refused: runtimeCheck.execution must explicitly be direct-trusted",
+      ],
+    };
+  }
+  if ((adapter.config.verification.hostExecution ?? "direct") !== "direct") {
+    events.emit("runtime_check_skipped", {
+      taskId,
+      reason: "verification_sandbox_conflict",
+    } as unknown as import("../monitor/event-types.js").EventPayload);
+    return {
+      ...emptyResult,
+      available: false,
+      warnings: [
+        "Runtime validation refused: a host dev server cannot bypass the configured verification sandbox",
+      ],
+    };
+  }
+
   // ── Guard: Playwright not installed ────────────────────────────
   if (!(await isPlaywrightAvailable())) {
     events.emit("runtime_check_skipped", {

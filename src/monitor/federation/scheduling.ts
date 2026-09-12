@@ -1,3 +1,4 @@
+import { parsePrepGateResult } from "../prep-job-result.js";
 import type { EventWriter } from "../event-emitter.js";
 import { routeFederatedJob } from "../../federation/job-router.js";
 import type { BlockReasonCode } from "../../workflow/workflow-state-types.js";
@@ -6,8 +7,14 @@ import { defaultFederatedHosts, federatedHostEventDetailsFromHost } from "./host
 import { federatedDependencyBlockers, federatedSessionId, sortFederatedQueue } from "./jobs.js";
 import { createFederatedLease, federationNow, leaseExpired } from "./lease.js";
 import { ReadinessService } from "../readiness-service.js";
-import { holdsWorkerAttachment } from "./status.js";
-import { listFederatedJobs, saveFederatedJob } from "./store.js";
+import { federatedJobHoldsWorkerAttachment, holdsWorkerAttachment } from "./status.js";
+import { releasedPauseNeedsRecovery } from "./pause-resume.js";
+import {
+  listFederatedJobs,
+  updateFederatedJobWithPostPersistEffect,
+  updateFederatedJob,
+  updateFederatedJobExclusive,
+} from "./store.js";
 import { listTaskClaimantDeclarations } from "../../core/task-file-resolver.js";
 import type {
   FederatedJobRecord,
@@ -35,6 +42,12 @@ export interface FederationSchedulingDeps {
     claimantIndex?: DuplicateClaimantIndex,
   ) => Promise<FederatedJobRecord[]>;
   scanTaskClaimants?: DuplicateClaimantScanProducer;
+  canDispatch?: (project: FederationProjectContext) => boolean;
+}
+
+export interface FederatedDependencyReleaseOptions {
+  /** Internal deterministic seam after stale discovery but before the fenced reread. */
+  afterCandidateDiscoveredForTest?: (job: FederatedJobRecord) => void | Promise<void>;
 }
 
 export async function buildFederationClaimantIndex(
@@ -81,57 +94,82 @@ export async function releaseFederatedDependencyBlocks(
   p: FederationProjectContext,
   completedTaskId: string,
   claimantIndex?: DuplicateClaimantIndex,
+  options: FederatedDependencyReleaseOptions = {},
 ): Promise<FederatedJobRecord[]> {
   if (!p.projectRoot) return [];
 
-  const index = claimantIndex ?? (await buildFederationClaimantIndex(p));
   const normalizedCompletedTaskId = normalizeClaimantTaskId(completedTaskId);
 
   const released: FederatedJobRecord[] = [];
-  const now = federationNow();
   for (const job of await listFederatedJobs(p.projectRoot)) {
-    const blockers = federatedDependencyBlockers(job);
-    if (!blockers.map(normalizeClaimantTaskId).includes(normalizedCompletedTaskId)) continue;
-
-    const dependencyFailure = duplicateIntegrityFailure(index, [normalizedCompletedTaskId]);
-    const gate = dependencyFailure ?? (await evaluateFederatedSchedulingGate(p, job, {}, index));
-    if (!gate.ok) {
-      const updated: FederatedJobRecord = {
-        ...job,
-        blockReasonCode: gate.blockReasonCode,
-        error: gate.error,
-        nextAction: gate.nextAction,
-        retryable: gate.retryable,
-        decision: {
-          ...job.decision,
-          dependencyBlockers: blockers,
-        },
-        updatedAt: now,
-      };
-      await saveFederatedJob(p.projectRoot, updated);
+    if (
+      !federatedDependencyBlockers(job)
+        .map(normalizeClaimantTaskId)
+        .includes(normalizedCompletedTaskId)
+    ) {
       continue;
     }
+    await options.afterCandidateDiscoveredForTest?.(job);
 
-    const updated: FederatedJobRecord = {
-      ...job,
-      status: "queued",
-      hostId: undefined,
-      lease: undefined,
-      blockReasonCode: undefined,
-      error: undefined,
-      retryable: undefined,
-      nextAction: "schedule_after_dependency_verified",
-      queuedAt: now,
-      updatedAt: now,
-      decision: {
-        ...job.decision,
-        dependencyBlockers: undefined,
-        reason: `Dependency ${completedTaskId} verified; job released for scheduling.`,
-        unblockedBy: completedTaskId,
-      },
-    };
-    await saveFederatedJob(p.projectRoot, updated);
-    released.push(updated);
+    let releasedByThisTransition = false;
+    const result = await updateFederatedJobExclusive(p.projectRoot, job.jobId, async (current) => {
+      // The directory listing is discovery only. Re-read and decide under the
+      // per-job fence so a concurrent cancel/claim can never be overwritten by
+      // a stale blocked snapshot.
+      if (
+        !isDependencyCompletionReleaseCandidate(current) ||
+        (current.projectId !== undefined && current.projectId !== p.projectId)
+      )
+        return undefined;
+      const blockers = federatedDependencyBlockers(current);
+      if (!blockers.map(normalizeClaimantTaskId).includes(normalizedCompletedTaskId)) {
+        return undefined;
+      }
+
+      const freshIndex = await buildFederationClaimantIndex(p);
+      // A supplied unavailable scan remains a barrier, but a prior successful
+      // scan never substitutes for current declarations inside this job fence.
+      const index = claimantIndex?.status === "unavailable" ? claimantIndex : freshIndex;
+      const dependencyFailure = duplicateIntegrityFailure(index, [normalizedCompletedTaskId]);
+      const gate =
+        dependencyFailure ?? (await evaluateFederatedSchedulingGate(p, current, {}, index));
+      const now = federationNow();
+      if (!gate.ok) {
+        return {
+          ...current,
+          blockReasonCode: gate.blockReasonCode,
+          error: gate.error,
+          nextAction: gate.nextAction,
+          retryable: gate.retryable,
+          decision: {
+            ...current.decision,
+            dependencyBlockers: blockers,
+          },
+          updatedAt: now,
+        };
+      }
+
+      releasedByThisTransition = true;
+      return {
+        ...current,
+        status: "queued",
+        hostId: undefined,
+        lease: undefined,
+        blockReasonCode: undefined,
+        error: undefined,
+        retryable: undefined,
+        nextAction: "schedule_after_dependency_verified",
+        queuedAt: now,
+        updatedAt: now,
+        decision: {
+          ...current.decision,
+          dependencyBlockers: undefined,
+          reason: `Dependency ${completedTaskId} verified; job released for scheduling.`,
+          unblockedBy: completedTaskId,
+        },
+      };
+    });
+    if (releasedByThisTransition && result.record) released.push(result.record);
   }
 
   return released;
@@ -293,9 +331,19 @@ export async function evaluateFederatedSchedulingGate(
     // when the preflight gate section reads failed; a passing preflight
     // still admits on its own (the designed rescue for stale prep).
     const currentPrep = state?.prep ?? null;
+    let prepContractValid = true;
+    if (currentPrep) {
+      try {
+        parsePrepGateResult(currentPrep);
+      } catch {
+        prepContractValid = false;
+      }
+    }
     const prepPasses =
+      prepContractValid &&
       currentPrep !== null &&
       state?.hasStalePrep !== true &&
+      currentPrep.schemaValid &&
       currentPrep.depthReady &&
       currentPrep.depthScore >= 4.7 &&
       currentPrep.outcome !== "rejected";
@@ -318,6 +366,14 @@ export async function evaluateFederatedSchedulingGate(
     // to the prep-side evaluation exactly like an absent preflight.
 
     const prep = state?.prep ?? null;
+    if (!prepContractValid)
+      return {
+        ok: false,
+        blockReasonCode: "pending_manual_handoff",
+        error: "preflight_gate_invalid",
+        nextAction: "reprep",
+        retryable: true,
+      };
     if (state?.hasStalePrep) {
       return {
         ok: false,
@@ -336,7 +392,13 @@ export async function evaluateFederatedSchedulingGate(
         retryable: true,
       };
     }
-    if (prep && (!prep.depthReady || prep.depthScore < 4.7 || prep.outcome === "rejected")) {
+    if (
+      prep &&
+      (!prep.schemaValid ||
+        !prep.depthReady ||
+        prep.depthScore < 4.7 ||
+        prep.outcome === "rejected")
+    ) {
       return {
         ok: false,
         blockReasonCode: "pending_manual_handoff",
@@ -350,6 +412,187 @@ export async function evaluateFederatedSchedulingGate(
   return { ok: true };
 }
 
+function isUnstartedFederatedSchedulingBlock(job: FederatedJobRecord): boolean {
+  if (
+    job.status !== "blocked" ||
+    job.hostId ||
+    job.lease ||
+    job.remoteSessionId ||
+    job.assignedAt ||
+    job.pendingGate ||
+    job.pause ||
+    job.completedAt ||
+    job.canceledBy ||
+    job.verificationWorkflowId ||
+    job.mergeBinding ||
+    (job.evidence?.length ?? 0) > 0
+  )
+    return false;
+  return true;
+}
+
+/** Only machine-produced pre-start blockers can self-heal. */
+export function isRecoverableFederatedSchedulingBlock(job: FederatedJobRecord): boolean {
+  if (!isUnstartedFederatedSchedulingBlock(job)) return false;
+  if (job.blockReasonCode === "pending_manual_handoff" && job.retryable === true) {
+    return (
+      (job.error === "preflight_gate_missing" && job.nextAction === "prep_or_preflight") ||
+      (["preflight_gate_stale", "preflight_gate_invalid"].includes(job.error ?? "") &&
+        job.nextAction === "reprep") ||
+      (/^preflight_gate_failed:(?:[0-4]\.[0-9]|5\.0)$/.test(job.error ?? "") &&
+        ["enrich_and_reprep", "decompose"].includes(job.nextAction ?? "")) ||
+      ((job.error ?? "").startsWith("blocked_by_unresolved:") &&
+        job.nextAction === "wait_for_dependencies")
+    );
+  }
+  if (job.blockReasonCode === "host_unhealthy")
+    return (
+      job.error === "host_unhealthy" &&
+      job.retryable === true &&
+      job.nextAction === "wait_for_listener"
+    );
+  return (
+    job.blockReasonCode === "pending_remote_listener" &&
+    ((job.retryable === true &&
+      job.nextAction === "wait_for_listener" &&
+      ["preferred_host_unavailable", "host_unhealthy"].includes(job.error ?? "")) ||
+      (job.error === "no_capable_listener" && job.decision.schedulerBlock === "listener"))
+  );
+}
+
+/** Completion replay also owns legacy dependency records predating scheduler tuples.
+ * This is deliberately narrower than allowing arbitrary blocked records at a tick.
+ */
+function isDependencyCompletionReleaseCandidate(job: FederatedJobRecord): boolean {
+  if (!isUnstartedFederatedSchedulingBlock(job) || federatedDependencyBlockers(job).length === 0)
+    return false;
+  if (isRecoverableFederatedSchedulingBlock(job)) return true;
+  // Older dependency writers emitted this machine-owned tuple without retryable.
+  // Completion replay still rechecks current declarations and readiness under the
+  // job fence; generic scheduler ticks must not infer retry permission from it.
+  if (
+    job.blockReasonCode === "pending_manual_handoff" &&
+    job.retryable === undefined &&
+    job.nextAction === "wait_for_dependencies" &&
+    (job.error ?? "").startsWith("blocked_by_unresolved:")
+  )
+    return true;
+  // A prior strict claimant refusal retains dependency identity. The same
+  // completion effect may retry it after the current declarations are repaired.
+  if (
+    job.blockReasonCode === "pending_manual_handoff" &&
+    job.nextAction === "resolve_duplicate_claimants" &&
+    /^duplicate_claimants(?:_unavailable)?:/.test(job.error ?? "")
+  )
+    return true;
+  return (
+    job.blockReasonCode === undefined &&
+    job.retryable !== false &&
+    (job.error === undefined || job.error.startsWith("blocked_by_unresolved:")) &&
+    (job.nextAction === undefined ||
+      job.nextAction === "schedule" ||
+      job.nextAction === "wait_for_dependencies")
+  );
+}
+
+export async function recheckRecoverableFederatedBlocks(
+  p: FederationProjectContext,
+  options: {
+    taskId?: string;
+    scanTaskClaimants?: DuplicateClaimantScanProducer;
+    afterCandidateDiscoveredForTest?: (job: FederatedJobRecord) => Promise<void>;
+  } = {},
+): Promise<FederatedJobRecord[]> {
+  if (!p.projectRoot) return [];
+  const changed: FederatedJobRecord[] = [];
+  for (const discovered of await listFederatedJobs(p.projectRoot)) {
+    if (
+      !isRecoverableFederatedSchedulingBlock(discovered) ||
+      (options.taskId &&
+        normalizeClaimantTaskId(discovered.taskId) !== normalizeClaimantTaskId(options.taskId))
+    )
+      continue;
+    await options.afterCandidateDiscoveredForTest?.(discovered);
+    const result = await updateFederatedJobExclusive(
+      p.projectRoot,
+      discovered.jobId,
+      async (current) => {
+        if (
+          !isRecoverableFederatedSchedulingBlock(current) ||
+          (current.projectId !== undefined && current.projectId !== p.projectId)
+        )
+          return undefined;
+        const index = await buildFederationClaimantIndex(p, options.scanTaskClaimants);
+        // Automatic recovery has no operator bypass flags: current identity,
+        // dependencies, source hash and full readiness must all pass again.
+        const gate = await evaluateFederatedSchedulingGate(p, current, {}, index);
+        if (!gate.ok) {
+          if (
+            current.error === gate.error &&
+            current.blockReasonCode === gate.blockReasonCode &&
+            current.nextAction === gate.nextAction &&
+            current.retryable === gate.retryable
+          )
+            return undefined;
+          return {
+            ...current,
+            error: gate.error,
+            blockReasonCode: gate.blockReasonCode,
+            nextAction: gate.nextAction,
+            retryable: gate.retryable,
+            updatedAt: federationNow(),
+          };
+        }
+        const route = routeFederatedJob({
+          taskId: current.taskId,
+          jobType: current.jobType,
+          requiredCapabilities: current.requiredCapabilities,
+          preferredHostId: current.preferredHostId,
+          hosts: await defaultFederatedHosts(p.projectRoot!),
+        });
+        if (!route.ok && route.error !== "host_at_capacity") {
+          const nextAction = route.retryable ? "wait_for_listener" : "manual_handoff";
+          if (
+            current.error === route.error &&
+            current.blockReasonCode === route.blockReasonCode &&
+            current.nextAction === nextAction
+          )
+            return undefined;
+          return {
+            ...current,
+            error: route.error,
+            blockReasonCode: route.blockReasonCode,
+            retryable: route.retryable,
+            nextAction,
+            decision: { ...route.fallback, schedulerBlock: "listener" },
+            updatedAt: federationNow(),
+          };
+        }
+        const now = federationNow();
+        return {
+          ...current,
+          status: "queued",
+          error: undefined,
+          blockReasonCode: undefined,
+          retryable: undefined,
+          hostId: undefined,
+          lease: undefined,
+          queuedAt: now,
+          updatedAt: now,
+          nextAction: "schedule_after_prerequisites_ready",
+          decision: {
+            ...current.decision,
+            dependencyBlockers: undefined,
+            reason: "Current task identity, readiness and prerequisites passed automatic recheck.",
+          },
+        };
+      },
+    );
+    if (result.changed && result.record) changed.push(result.record);
+  }
+  return changed;
+}
+
 export async function assignFederatedJob(
   p: FederationProjectContext,
   record: FederatedJobRecord,
@@ -358,6 +601,35 @@ export async function assignFederatedJob(
   claimantIndex?: DuplicateClaimantIndex,
 ): Promise<FederatedJobRecord> {
   if (!p.projectRoot) return record;
+  const result = await updateFederatedJobWithPostPersistEffect(
+    p.projectRoot,
+    record.jobId,
+    async (current) => {
+      if (
+        current.status !== "queued" ||
+        (current.projectId !== undefined && current.projectId !== p.projectId) ||
+        deps.canDispatch?.(p) === false
+      )
+        return undefined;
+      // Ordinary queued assignments share the strict tick inventory. Newly
+      // recovered blockers are separately rescanned inside their own job fence.
+      const index =
+        claimantIndex ?? (await buildFederationClaimantIndex(p, deps.scanTaskClaimants));
+      return prepareFederatedAssignment(p, current, deps, options, index);
+    },
+  );
+  if (!result.record) throw new Error("Federated job disappeared before assignment");
+  return result.record;
+}
+
+async function prepareFederatedAssignment(
+  p: FederationProjectContext,
+  record: FederatedJobRecord,
+  deps: FederationSchedulingDeps,
+  options: FederatedSchedulingOptions = {},
+  claimantIndex?: DuplicateClaimantIndex,
+): Promise<{ record: FederatedJobRecord; effect: () => Promise<void> } | undefined> {
+  if (!p.projectRoot) return undefined;
 
   const gate = await evaluateFederatedSchedulingGate(p, record, options, claimantIndex);
   if (!gate.ok) {
@@ -368,10 +640,10 @@ export async function assignFederatedJob(
       blockReasonCode: gate.blockReasonCode,
       error: gate.error,
       nextAction: gate.nextAction,
+      decision: { ...record.decision, schedulerBlock: "readiness" },
       updatedAt: federationNow(),
     };
-    await saveFederatedJob(p.projectRoot, blocked);
-    return blocked;
+    return { record: blocked, effect: () => Promise.resolve() };
   }
 
   const routedHosts = await defaultFederatedHosts(p.projectRoot);
@@ -379,7 +651,7 @@ export async function assignFederatedJob(
     taskId: record.taskId,
     jobType: record.jobType,
     requiredCapabilities: record.requiredCapabilities,
-    preferredHostId: options.preferredHostId,
+    preferredHostId: options.preferredHostId ?? record.preferredHostId,
     hosts: routedHosts,
   });
   const now = federationNow();
@@ -396,8 +668,7 @@ export async function assignFederatedJob(
         nextAction: "wait_for_capacity",
         updatedAt: now,
       };
-      await saveFederatedJob(p.projectRoot, waiting);
-      return waiting;
+      return { record: waiting, effect: () => Promise.resolve() };
     }
     const blocked: FederatedJobRecord = {
       ...record,
@@ -405,14 +676,14 @@ export async function assignFederatedJob(
       retryable: route.retryable,
       blockReasonCode: route.blockReasonCode,
       error: route.error,
-      decision: route.fallback,
+      decision: { ...route.fallback, schedulerBlock: "listener" },
       nextAction: route.retryable ? "wait_for_listener" : "manual_handoff",
       updatedAt: now,
     };
-    await saveFederatedJob(p.projectRoot, blocked);
-    return blocked;
+    return { record: blocked, effect: () => Promise.resolve() };
   }
 
+  if (deps.canDispatch?.(p) === false) return undefined;
   const assigned: FederatedJobRecord = {
     ...record,
     status: "assigned",
@@ -433,31 +704,33 @@ export async function assignFederatedJob(
     assignedAt: now,
     updatedAt: now,
   };
-  await saveFederatedJob(p.projectRoot, assigned);
-
-  const taskDetails = await resolveFederatedTaskEventDetails(p, assigned.taskId);
-  const taskTitle = sessionTitleForFederatedTask(taskDetails);
-  const writer = deps.createWriter(
-    p,
-    federatedSessionId(record.jobId),
-    assigned.taskId,
-    taskTitle ?? assigned.taskId,
-  );
-  writer.recordSession("active", {
-    outcome: "federated_job_assigned",
-    title: taskTitle,
-  });
-  writer.emit("federated_job_assigned", {
-    jobId: assigned.jobId,
-    taskId: assigned.taskId,
-    taskTitle: taskDetails.taskTitle,
-    hostId: assigned.hostId ?? route.host.id,
-    ...federatedHostEventDetailsFromHost(route.host),
-    correlationId: assigned.correlationId,
-    fallbackUsed: route.fallbackUsed,
-    requiredCapabilities: assigned.requiredCapabilities,
-  });
-  return assigned;
+  return {
+    record: assigned,
+    effect: async () => {
+      const taskDetails = await resolveFederatedTaskEventDetails(p, assigned.taskId);
+      const taskTitle = sessionTitleForFederatedTask(taskDetails);
+      const writer = deps.createWriter(
+        p,
+        federatedSessionId(record.jobId),
+        assigned.taskId,
+        taskTitle ?? assigned.taskId,
+      );
+      writer.recordSession("active", {
+        outcome: "federated_job_assigned",
+        title: taskTitle,
+      });
+      writer.emit("federated_job_assigned", {
+        jobId: assigned.jobId,
+        taskId: assigned.taskId,
+        taskTitle: taskDetails.taskTitle,
+        hostId: assigned.hostId ?? route.host.id,
+        ...federatedHostEventDetailsFromHost(route.host),
+        correlationId: assigned.correlationId,
+        fallbackUsed: route.fallbackUsed,
+        requiredCapabilities: assigned.requiredCapabilities,
+      });
+    },
+  };
 }
 
 function staleLeaseCanAutoRetry(job: FederatedJobRecord): boolean {
@@ -476,61 +749,91 @@ export async function recoverStaleFederatedLeases(
   if (!p.projectRoot) return [];
   const index = claimantIndex ?? (await buildFederationClaimantIndex(p));
   const now = federationNow();
+  const nowMs = Date.parse(now);
   const recovered: FederatedJobRecord[] = [];
-  for (const job of await listFederatedJobs(p.projectRoot)) {
-    // TASK-1329 R1-6: paused jobs MUST stay in the stale-lease sweep. They are
-    // attached, so if the host holding one genuinely dies, this is the only path
-    // that reclaims it. Filtering on the scheduler's active set here would leave
-    // a paused job unreclaimable forever.
-    if (!holdsWorkerAttachment(job.status) || !leaseExpired(job)) continue;
-    const retryCount = (job.retryCount ?? 0) + 1;
-    const retryBudgetAvailable = retryCount <= (job.maxRetries ?? 2);
-    const canAutoRetry = retryBudgetAvailable && staleLeaseCanAutoRetry(job);
-    const integrityFailure = canAutoRetry
-      ? duplicateIntegrityFailure(index, [job.taskId])
-      : undefined;
-    const admittedAutoRetry = canAutoRetry && !integrityFailure;
-    const requiresManualRecovery = !admittedAutoRetry;
-    const staleRecoveryReason = integrityFailure
-      ? `Lease expired before worker activity was observed, but requeue was refused: ${integrityFailure.error}`
-      : requiresManualRecovery
-        ? retryBudgetAvailable
-          ? "Lease expired after worker activity was observed; blocked for manual recovery to avoid duplicate execution."
-          : "Lease expired after retry budget was exhausted; manual recovery is required."
-        : "Lease expired before worker activity was observed; job requeued for scheduler retry.";
-    const updated: FederatedJobRecord = {
-      ...job,
-      status: admittedAutoRetry ? "queued" : "blocked",
-      hostId: admittedAutoRetry ? undefined : job.hostId,
-      lease: undefined,
-      staleAt: now,
-      retryCount,
-      retryable: integrityFailure?.retryable ?? admittedAutoRetry,
-      blockReasonCode: admittedAutoRetry ? undefined : "pending_manual_handoff",
-      error: admittedAutoRetry
-        ? undefined
-        : integrityFailure
-          ? integrityFailure.error
-          : retryBudgetAvailable
-            ? "lease_expired_after_worker_activity"
-            : "lease_expired_retry_budget_exhausted",
-      nextAction: admittedAutoRetry
-        ? "reschedule_after_stale_lease"
-        : integrityFailure
-          ? integrityFailure.nextAction
-          : retryBudgetAvailable
-            ? "investigate_stale_worker"
-            : "manual_handoff",
-      decision: {
-        ...job.decision,
-        staleRecoveryMode: admittedAutoRetry ? "auto_retry" : "manual_recovery",
-        staleRecoveryReason,
-        staleRecoveryRecoveredFromStatus: job.status,
-      },
-      updatedAt: now,
-    };
-    await saveFederatedJob(p.projectRoot, updated);
-    recovered.push(updated);
+  for (const snapshot of await listFederatedJobs(p.projectRoot)) {
+    // The listing is only a candidate set.  Re-read and re-check under the
+    // per-job lock so an ack/start/renewal that wins the race cannot be
+    // overwritten by this older snapshot.
+    const result = await updateFederatedJob(p.projectRoot, snapshot.jobId, (job) => {
+      if (releasedPauseNeedsRecovery(job, nowMs)) {
+        return {
+          ...job,
+          status: "blocked",
+          lease: undefined,
+          staleAt: now,
+          retryable: false,
+          blockReasonCode: "pending_manual_handoff",
+          error: "released_pause_original_host_unavailable",
+          nextAction: "recover_paused_worktree_on_original_host",
+          pause: job.pause
+            ? {
+                ...job.pause,
+                state: "manual_recovery",
+                recoveryReason:
+                  "Released pause or resume claim expired; worktree transfer requires explicit operator recovery.",
+              }
+            : undefined,
+          decision: {
+            ...job.decision,
+            staleRecoveryMode: "manual_recovery",
+            staleRecoveryReason:
+              "Released pause expired without a completed resume handshake; automatic reassignment is unsafe.",
+            staleRecoveryRecoveredFromStatus: job.status,
+          },
+          updatedAt: now,
+        };
+      }
+      // Attached/claimed pauses stay in ordinary stale-lease recovery.
+      if (!federatedJobHoldsWorkerAttachment(job) || !leaseExpired(job, nowMs)) return undefined;
+      const retryCount = (job.retryCount ?? 0) + 1;
+      const retryBudgetAvailable = retryCount <= (job.maxRetries ?? 2);
+      const canAutoRetry = retryBudgetAvailable && staleLeaseCanAutoRetry(job);
+      const integrityFailure = canAutoRetry
+        ? duplicateIntegrityFailure(index, [job.taskId])
+        : undefined;
+      const admittedAutoRetry = canAutoRetry && !integrityFailure;
+      const requiresManualRecovery = !admittedAutoRetry;
+      const staleRecoveryReason = integrityFailure
+        ? `Lease expired before worker activity was observed, but requeue was refused: ${integrityFailure.error}`
+        : requiresManualRecovery
+          ? retryBudgetAvailable
+            ? "Lease expired after worker activity was observed; blocked for manual recovery to avoid duplicate execution."
+            : "Lease expired after retry budget was exhausted; manual recovery is required."
+          : "Lease expired before worker activity was observed; job requeued for scheduler retry.";
+      return {
+        ...job,
+        status: admittedAutoRetry ? "queued" : "blocked",
+        hostId: admittedAutoRetry ? undefined : job.hostId,
+        lease: undefined,
+        staleAt: now,
+        retryCount,
+        retryable: integrityFailure?.retryable ?? admittedAutoRetry,
+        blockReasonCode: admittedAutoRetry ? undefined : "pending_manual_handoff",
+        error: admittedAutoRetry
+          ? undefined
+          : integrityFailure
+            ? integrityFailure.error
+            : retryBudgetAvailable
+              ? "lease_expired_after_worker_activity"
+              : "lease_expired_retry_budget_exhausted",
+        nextAction: admittedAutoRetry
+          ? "reschedule_after_stale_lease"
+          : integrityFailure
+            ? integrityFailure.nextAction
+            : retryBudgetAvailable
+              ? "investigate_stale_worker"
+              : "manual_handoff",
+        decision: {
+          ...job.decision,
+          staleRecoveryMode: admittedAutoRetry ? "auto_retry" : "manual_recovery",
+          staleRecoveryReason,
+          staleRecoveryRecoveredFromStatus: job.status,
+        },
+        updatedAt: now,
+      };
+    });
+    if (result.changed && result.record) recovered.push(result.record);
   }
   return recovered;
 }
@@ -556,6 +859,7 @@ export async function runSwarmSchedulerTick(
     claimantIndex.status === "scanned" && deps.reconcileJobs
       ? await deps.reconcileJobs(p, claimantIndex)
       : [];
+  await recheckRecoverableFederatedBlocks(p, { scanTaskClaimants: deps.scanTaskClaimants });
   const jobs = sortFederatedQueue(
     (await listFederatedJobs(p.projectRoot)).filter((job) => job.status === "queued"),
   );
@@ -596,6 +900,11 @@ export async function maybeRunSwarmSchedulerRefill(
   deps: FederationSchedulingDeps,
 ): Promise<Awaited<ReturnType<typeof runSwarmSchedulerTick>> | undefined> {
   if (!p.projectRoot) return undefined;
-  if (!(await hasQueuedFederatedJobs(p.projectRoot))) return undefined;
+  if (
+    !(await listFederatedJobs(p.projectRoot)).some(
+      (job) => job.status === "queued" || isRecoverableFederatedSchedulingBlock(job),
+    )
+  )
+    return undefined;
   return runSwarmSchedulerTick(p, options, deps);
 }

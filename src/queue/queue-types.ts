@@ -9,6 +9,7 @@ export type QueueItemStatus =
   | "queued" // In queue, dependencies may not yet be met
   | "ready" // All dependencies met, waiting for concurrency slot
   | "running" // Currently dispatching
+  | "awaiting_approval" // Dispatch paused at a blueprint or judge human gate
   | "completed" // Judge approved
   | "failed" // Agent error, judge reject, or gate failure
   | "blocked" // Upstream task failed, cannot proceed
@@ -27,6 +28,7 @@ export interface QueueItem {
   blockedBy: string[]; // Task IDs this depends on
   enqueuedAt: string;
   startedAt?: string;
+  awaitingApprovalAt?: string;
   completedAt?: string;
   outcome?: string; // "approved", "rejected", "gate_failed", etc.
   costUsd?: number;
@@ -54,6 +56,7 @@ export interface QueueStats {
   queued: number;
   ready: number;
   running: number;
+  awaitingApproval: number;
   completed: number;
   failed: number;
   blocked: number;

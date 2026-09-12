@@ -282,10 +282,10 @@ describe("slugifyAlias", () => {
 describe("validateRemoteInstance", () => {
   const validInstance: Partial<RemoteInstance> = {
     alias: "my_remote_server",
-    host: "203.0.113.100",
+    host: "10.0.0.100",
     localPort: 3334,
     remotePort: 3334,
-    sshTarget: "user@203.0.113.100",
+    sshTarget: "user@10.0.0.100",
     sshKeyPath: "~/.ssh/my_remote_server",
     enabled: true,
   };
@@ -336,10 +336,10 @@ describe("remoteInstances in GlobalConfig", () => {
     const remote: RemoteInstance = {
       id: "my-remote-server",
       alias: "my_remote_server",
-      host: "203.0.113.100",
+      host: "10.0.0.100",
       localPort: 3334,
       remotePort: 3334,
-      sshTarget: "user@203.0.113.100",
+      sshTarget: "user@10.0.0.100",
       sshKeyPath: "~/.ssh/my_remote_server",
       healthCheckInterval: 30000,
       enabled: true,

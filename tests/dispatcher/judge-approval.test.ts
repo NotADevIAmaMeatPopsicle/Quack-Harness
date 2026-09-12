@@ -16,6 +16,9 @@ import {
   type JudgeAutoApproveRules,
   type JudgeApproval,
 } from "../../src/dispatcher/judge-approval.js";
+import { computeSpecIdentity } from "../../src/core/spec-identity.js";
+
+const TEST_SPEC_IDENTITY = computeSpecIdentity("# TASK-TEST\n\nTest contract\n");
 
 describe("Judge Approval", () => {
   let tempDir: string;
@@ -145,7 +148,16 @@ describe("Judge Approval", () => {
         },
         reviewedAt: "2026-07-16T00:00:00.000Z",
         reviewGate: {
-          crossModelSatisfied: true,
+          crossModelSatisfied: false,
+          crossModelEvidence: {
+            status: "unknown",
+            basis: "producer_unknown",
+            reviewer: {
+              runner: "codex-cli",
+              provider: "openai",
+              model: "gpt-5.6-terra",
+            },
+          },
           anchorAuditPassed: false,
           treeClean: false,
           fidelityPassed: true,
@@ -159,6 +171,12 @@ describe("Judge Approval", () => {
         executionMode: "loop",
         agentSessionId: "worker-session",
         review: { status: "runner_error", errorKind: "spawn_failed" },
+        reviewGate: {
+          crossModelEvidence: {
+            status: "unknown",
+            basis: "producer_unknown",
+          },
+        },
       });
     });
   });
@@ -166,9 +184,17 @@ describe("Judge Approval", () => {
   describe("updateJudgeApprovalState", () => {
     it("should update approval state to approved", async () => {
       const taskId = "TASK-003";
-      await savePendingJudgeApproval(taskId, "diff", ["file.ts"], true, logDir);
+      await savePendingJudgeApproval(taskId, "diff", ["file.ts"], true, logDir, TEST_SPEC_IDENTITY);
 
-      await updateJudgeApprovalState(taskId, "approved", logDir, "human");
+      await updateJudgeApprovalState(
+        taskId,
+        "approved",
+        logDir,
+        "human",
+        undefined,
+        undefined,
+        TEST_SPEC_IDENTITY,
+      );
       const loaded = await loadJudgeApproval(taskId, logDir);
 
       expect(loaded?.state).toBe("approved");
@@ -198,8 +224,16 @@ describe("Judge Approval", () => {
   describe("isApprovalExpired", () => {
     it("should return false for non-pending approvals", async () => {
       const taskId = "TASK-005";
-      await savePendingJudgeApproval(taskId, "diff", ["file.ts"], true, logDir);
-      await updateJudgeApprovalState(taskId, "approved", logDir, "human");
+      await savePendingJudgeApproval(taskId, "diff", ["file.ts"], true, logDir, TEST_SPEC_IDENTITY);
+      await updateJudgeApprovalState(
+        taskId,
+        "approved",
+        logDir,
+        "human",
+        undefined,
+        undefined,
+        TEST_SPEC_IDENTITY,
+      );
       const loaded = await loadJudgeApproval(taskId, logDir);
 
       const expired = isApprovalExpired(loaded!, 1000);

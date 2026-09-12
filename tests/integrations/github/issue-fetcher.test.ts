@@ -1,144 +1,150 @@
 // ─── GitHub Issue Fetcher Tests ─────────────────────────────────────
 
-type RunGh = (
-  args: string[],
-  options?: { input?: string; timeoutMs?: number },
-) => Promise<{ stdout: string; stderr: string }>;
+type RunBoundGitHubCommand =
+  typeof import("../../../src/integrations/github/trusted-github").runBoundGitHubCommand;
+const mockRunBoundGitHubCommand = jest.fn<
+  ReturnType<RunBoundGitHubCommand>,
+  Parameters<RunBoundGitHubCommand>
+>();
 
-const mockRunGh = jest.fn<ReturnType<RunGh>, Parameters<RunGh>>();
-jest.mock("../../../src/integrations/github/gh-cli", () => ({
-  runGh: (args: string[], options?: { input?: string; timeoutMs?: number }): ReturnType<RunGh> =>
-    mockRunGh(args, options),
+jest.mock("../../../src/integrations/github/trusted-github", () => ({
+  ...jest.requireActual<object>("../../../src/integrations/github/trusted-github"),
+  runBoundGitHubCommand: (...args: Parameters<RunBoundGitHubCommand>) =>
+    mockRunBoundGitHubCommand(...args),
 }));
 
-// Import after mock setup
 import { fetchIssue, fetchIssuesByLabel } from "../../../src/integrations/github/issue-fetcher";
+
+const PROJECT_ROOT = "C:\\trusted\\project";
+const REPOSITORY = { host: "github.com", owner: "owner", repo: "repo" };
+
+function result(stdout: string): {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  repository: typeof REPOSITORY;
+} {
+  return { exitCode: 0, stdout, stderr: "", repository: REPOSITORY };
+}
+
+function issueJson(number: number, overrides: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    number,
+    title: `Issue ${number}`,
+    body: "",
+    labels: [{ name: "quack-ready" }],
+    assignees: [],
+    comments: [],
+    state: "open",
+    url: `https://github.com/owner/repo/issues/${number}`,
+    ...overrides,
+  });
+}
 
 describe("GitHub Issue Fetcher", () => {
   beforeEach(() => {
-    mockRunGh.mockReset();
+    mockRunBoundGitHubCommand.mockReset();
   });
 
-  it("should parse gh issue view JSON output into GitHubIssue", async () => {
-    const ghOutput = JSON.stringify({
+  it("parses a repository-bound issue response", async () => {
+    mockRunBoundGitHubCommand.mockResolvedValueOnce(
+      result(
+        issueJson(42, {
+          title: "Fix authentication bug",
+          body: "The login flow fails when using `src/auth.ts` tokens.",
+          labels: [{ name: "bug" }, { name: "priority-high" }],
+          assignees: [{ login: "alice" }],
+          comments: [
+            {
+              author: { login: "bob" },
+              body: "I can reproduce this. Check `src/middleware.ts` too.",
+              createdAt: "2026-01-15T10:00:00Z",
+            },
+          ],
+        }),
+      ),
+    );
+
+    const issue = await fetchIssue("owner", "repo", 42, PROJECT_ROOT);
+
+    expect(issue).toMatchObject({
       number: 42,
       title: "Fix authentication bug",
-      body: "The login flow fails when using `src/auth.ts` tokens.",
-      labels: [{ name: "bug" }, { name: "priority-high" }],
-      assignees: [{ login: "alice" }],
-      comments: [
-        {
-          author: { login: "bob" },
-          body: "I can reproduce this. Check `src/middleware.ts` too.",
-          createdAt: "2026-01-15T10:00:00Z",
-        },
-      ],
+      labels: ["bug", "priority-high"],
+      assignees: ["alice"],
       state: "open",
       url: "https://github.com/owner/repo/issues/42",
     });
-
-    mockRunGh.mockResolvedValueOnce({ stdout: ghOutput, stderr: "" });
-
-    const issue = await fetchIssue("owner", "repo", 42);
-
-    expect(issue.number).toBe(42);
-    expect(issue.title).toBe("Fix authentication bug");
-    expect(issue.labels).toEqual(["bug", "priority-high"]);
-    expect(issue.assignees).toEqual(["alice"]);
-    expect(issue.comments).toHaveLength(1);
-    expect(issue.comments[0].author).toBe("bob");
-    expect(issue.state).toBe("open");
-    expect(issue.url).toBe("https://github.com/owner/repo/issues/42");
-    expect(issue.referencedFiles).toContain("src/auth.ts");
-    expect(issue.referencedFiles).toContain("src/middleware.ts");
+    expect(issue.comments[0]?.author).toBe("bob");
+    expect(issue.referencedFiles).toEqual(["src/auth.ts", "src/middleware.ts"]);
+    expect(mockRunBoundGitHubCommand).toHaveBeenCalledWith(
+      PROJECT_ROOT,
+      { owner: "owner", repo: "repo" },
+      ["issue", "view", "42", "--json", "number,title,body,labels,assignees,comments,state,url"],
+      { timeoutMs: 30_000, maxBuffer: 1024 * 1024 },
+    );
   });
 
-  it("should handle missing fields gracefully", async () => {
-    const ghOutput = JSON.stringify({
-      number: 1,
-      title: "Empty issue",
-      body: null,
-      labels: [],
-      assignees: [],
-      comments: [],
-      state: "open",
-      url: "https://github.com/owner/repo/issues/1",
-    });
+  it("normalizes a null body while preserving strict arrays", async () => {
+    mockRunBoundGitHubCommand.mockResolvedValueOnce(result(issueJson(1, { body: null })));
 
-    mockRunGh.mockResolvedValueOnce({ stdout: ghOutput, stderr: "" });
+    const issue = await fetchIssue("owner", "repo", 1, PROJECT_ROOT);
 
-    const issue = await fetchIssue("owner", "repo", 1);
-
-    expect(issue.number).toBe(1);
     expect(issue.body).toBe("");
-    expect(issue.labels).toEqual([]);
     expect(issue.assignees).toEqual([]);
     expect(issue.comments).toEqual([]);
     expect(issue.referencedFiles).toEqual([]);
   });
 
-  it("should throw an error when gh CLI fails", async () => {
-    mockRunGh.mockRejectedValueOnce(new Error("gh: not found"));
+  it("rejects a mismatched response identity", async () => {
+    mockRunBoundGitHubCommand.mockResolvedValueOnce(
+      result(
+        issueJson(42, {
+          url: "https://github.com/attacker/repo/issues/42",
+        }),
+      ),
+    );
 
-    await expect(fetchIssue("owner", "repo", 99)).rejects.toThrow(
-      "Failed to fetch issue #99: gh: not found",
+    await expect(fetchIssue("owner", "repo", 42, PROJECT_ROOT)).rejects.toThrow(
+      "GitHub response issue URL does not match github.com/owner/repo#42",
     );
   });
 
-  it("should fetch issues by label and call fetchIssue for each", async () => {
-    const listOutput = JSON.stringify([
-      {
-        number: 10,
-        title: "Issue A",
-        body: "Body A",
-        labels: [{ name: "quack-ready" }],
-        assignees: [],
-        state: "open",
-        url: "https://github.com/owner/repo/issues/10",
-      },
-      {
-        number: 11,
-        title: "Issue B",
-        body: "Body B",
-        labels: [{ name: "quack-ready" }],
-        assignees: [],
-        state: "open",
-        url: "https://github.com/owner/repo/issues/11",
-      },
-    ]);
+  it("preserves a trusted boundary failure in the fetch context", async () => {
+    mockRunBoundGitHubCommand.mockRejectedValueOnce(new Error("repository binding mismatch"));
 
-    const fullIssue10 = JSON.stringify({
-      number: 10,
-      title: "Issue A",
-      body: "Body A",
-      labels: [{ name: "quack-ready" }],
-      assignees: [],
-      comments: [],
-      state: "open",
-      url: "https://github.com/owner/repo/issues/10",
-    });
+    await expect(fetchIssue("owner", "repo", 99, PROJECT_ROOT)).rejects.toThrow(
+      "Failed to fetch issue #99: repository binding mismatch",
+    );
+  });
 
-    const fullIssue11 = JSON.stringify({
-      number: 11,
-      title: "Issue B",
-      body: "Body B",
-      labels: [{ name: "quack-ready" }],
-      assignees: [],
-      comments: [],
-      state: "open",
-      url: "https://github.com/owner/repo/issues/11",
-    });
+  it("fetches each repository-bound issue returned by an exact label query", async () => {
+    mockRunBoundGitHubCommand
+      .mockResolvedValueOnce(
+        result(JSON.stringify([JSON.parse(issueJson(10)), JSON.parse(issueJson(11))])),
+      )
+      .mockResolvedValueOnce(result(issueJson(10)))
+      .mockResolvedValueOnce(result(issueJson(11)));
 
-    mockRunGh
-      .mockResolvedValueOnce({ stdout: listOutput, stderr: "" })
-      .mockResolvedValueOnce({ stdout: fullIssue10, stderr: "" })
-      .mockResolvedValueOnce({ stdout: fullIssue11, stderr: "" });
+    const issues = await fetchIssuesByLabel("owner", "repo", "quack-ready", PROJECT_ROOT);
 
-    const issues = await fetchIssuesByLabel("owner", "repo", "quack-ready");
+    expect(issues.map((issue) => issue.number)).toEqual([10, 11]);
+    expect(mockRunBoundGitHubCommand).toHaveBeenCalledTimes(3);
+  });
 
-    expect(issues).toHaveLength(2);
-    expect(issues[0].number).toBe(10);
-    expect(issues[1].number).toBe(11);
-    expect(mockRunGh).toHaveBeenCalledTimes(3);
+  it("keeps a hostile import label in one option value and cannot change query semantics", async () => {
+    const hostileLabel = 'ready" --state=closed; echo owned';
+    mockRunBoundGitHubCommand.mockResolvedValueOnce(result("[]"));
+
+    await expect(fetchIssuesByLabel("owner", "repo", hostileLabel, PROJECT_ROOT)).resolves.toEqual(
+      [],
+    );
+
+    const args = mockRunBoundGitHubCommand.mock.calls[0]?.[2] as string[];
+    expect(args).toContain(`--label=${hostileLabel}`);
+    expect(args).toContain("--state=open");
+    expect(args).not.toContain("--state=closed");
+    expect(args).not.toContain("echo");
+    expect(mockRunBoundGitHubCommand.mock.calls[0]?.[0]).toBe(PROJECT_ROOT);
   });
 });

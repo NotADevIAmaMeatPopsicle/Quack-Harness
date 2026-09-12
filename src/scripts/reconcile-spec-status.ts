@@ -72,6 +72,7 @@ async function main(): Promise<void> {
   try {
     const result = await reconcileSpecStatuses(taskDir, db.getAllStatuses(), {
       apply: options.apply,
+      adapter,
     });
 
     console.log(

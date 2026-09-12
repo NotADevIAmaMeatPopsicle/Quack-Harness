@@ -130,17 +130,17 @@ describe("coordination broker: CC-inbox echo<->cc lane", () => {
     fs.mkdirSync(path.join(projectRoot, ".quack", "logs"), { recursive: true });
     writeAuthConfig(quackRoot);
 
-    const port = 48000 + Math.floor(Math.random() * 1000);
     const server = createMonitorServer({
       projectRoot,
       taskDir: "docs/tasks",
       logDir: path.join(projectRoot, ".quack", "logs"),
       quackRoot,
-      port,
+      port: 0,
+      host: "127.0.0.1",
     });
     const started = await server.start();
     stop = started.stop;
-    baseUrl = `http://127.0.0.1:${port}`;
+    baseUrl = `http://127.0.0.1:${started.port}`;
     await pause(150);
   });
 

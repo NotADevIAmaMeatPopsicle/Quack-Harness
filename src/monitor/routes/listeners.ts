@@ -1,7 +1,12 @@
 import type { Express, Request, Response } from "express";
 import { z } from "zod";
 
-import { ListenerRegistry } from "../../federation/listener-registry.js";
+import {
+  ListenerRegistry,
+  ListenerTokenBindingError,
+  ListenerRecordReadError,
+  LISTENER_HOST_ID_PATTERN,
+} from "../../federation/listener-registry.js";
 import {
   WORKER_COMMAND_PROTOCOL_VERSION,
   type WorkerCommandResultStatus,
@@ -21,7 +26,7 @@ import type { FederationProjectContext } from "../federation/types.js";
 import type { FederationSchedulingDeps } from "../federation/scheduling.js";
 
 const listenerRegistrationSchema = z.object({
-  hostId: z.string().trim().min(1),
+  hostId: z.string().trim().regex(LISTENER_HOST_ID_PATTERN),
   alias: z.string().trim().min(1).optional(),
   baseUrl: z.string().trim().min(1).optional(),
   capabilities: z.array(z.string().trim().min(1)).min(1),
@@ -59,7 +64,11 @@ const listenerHeartbeatSchema = z.object({
         "retryable",
         "non_retryable",
       ] satisfies readonly WorkerCommandResultStatus[]),
-      completedAt: z.string().trim().min(1).optional(),
+      completedAt: z
+        .string()
+        .trim()
+        .refine((value) => Number.isFinite(Date.parse(value)))
+        .optional(),
       durationMs: z.number().int().min(0).optional(),
       errorCategory: z
         .enum([
@@ -179,8 +188,17 @@ export function registerListenerRoutes(app: Express, deps: ListenerRouteDeps): v
     }
 
     const registry = new ListenerRegistry(p.projectRoot);
-    const listeners = await applyActiveFederatedLeases(p.projectRoot, await registry.list());
-    res.json({ ok: true, listeners });
+    const snapshot = await registry.listWithDiagnostics();
+    const listeners = await applyActiveFederatedLeases(p.projectRoot, snapshot.records);
+    res.json({
+      ok: true,
+      listeners,
+      registryHealth: {
+        healthy: snapshot.issues.length === 0,
+        unavailable: snapshot.unavailable,
+        issues: snapshot.issues,
+      },
+    });
   });
 
   app.post("/v1/listeners/register", async (req: Request, res: Response) => {
@@ -202,7 +220,22 @@ export function registerListenerRoutes(app: Express, deps: ListenerRouteDeps): v
     }
 
     const registry = new ListenerRegistry(p.projectRoot);
-    const listener = await registry.register(parsed.data, tokenId);
+    let listener;
+    try {
+      listener = await registry.register(parsed.data, tokenId);
+    } catch (error: unknown) {
+      if (error instanceof ListenerTokenBindingError) {
+        res.status(409).json({ error: error.code, message: error.message, hostId: error.hostId });
+        return;
+      }
+      res.status(503).json({
+        error: "listener_registry_unavailable",
+        message:
+          "Listener registry operation could not finish; inspect the current record before retrying.",
+        ...(error instanceof ListenerRecordReadError ? { issue: error.issue } : {}),
+      });
+      return;
+    }
     const scheduler = await maybeRunSwarmSchedulerRefill(p, {}, federationSchedulingDeps);
     res.status(201).json({ ok: true, accepted: true, listener, scheduler });
   });
@@ -259,8 +292,24 @@ export function registerListenerRoutes(app: Express, deps: ListenerRouteDeps): v
 
     const hostId = req.params.hostId as string;
     const registry = new ListenerRegistry(p.projectRoot);
-    const previous = await registry.get(hostId);
-    const listener = await registry.heartbeat(hostId, parsed.data);
+    let previous;
+    let listener;
+    try {
+      previous = await registry.get(hostId);
+      listener = await registry.heartbeat(hostId, parsed.data, tokenId);
+    } catch (error: unknown) {
+      if (error instanceof ListenerTokenBindingError) {
+        res.status(403).json({ error: error.code, message: error.message, hostId: error.hostId });
+        return;
+      }
+      res.status(503).json({
+        error: "listener_registry_unavailable",
+        message:
+          "Listener registry operation could not finish; inspect the current record before retrying.",
+        ...(error instanceof ListenerRecordReadError ? { issue: error.issue } : {}),
+      });
+      return;
+    }
     if (!listener) {
       res.status(404).json({
         error: "listener_not_found",
@@ -528,6 +577,20 @@ export function registerListenerRoutes(app: Express, deps: ListenerRouteDeps): v
     }
 
     const hostId = req.params.hostId as string;
+    try {
+      await new ListenerRegistry(p.projectRoot).assertTokenBinding(hostId, tokenId);
+    } catch (error: unknown) {
+      if (error instanceof ListenerTokenBindingError) {
+        res.status(403).json({ error: error.code, message: error.message, hostId });
+        return;
+      }
+      res.status(503).json({
+        error: "listener_registry_unavailable",
+        message: "Listener identity cannot be verified from its current registry record.",
+        ...(error instanceof ListenerRecordReadError ? { issue: error.issue } : {}),
+      });
+      return;
+    }
     const commandIds = [
       ...(parsed.data.commandIds ?? []),
       ...(parsed.data.commandId ? [parsed.data.commandId] : []),
@@ -566,16 +629,23 @@ export function registerListenerRoutes(app: Express, deps: ListenerRouteDeps): v
     const jobs = sortFederatedQueue(
       (await listFederatedJobs(p.projectRoot))
         .filter((job) => job.hostId === hostId)
-        // TASK-1329: this one DELIBERATELY keeps `isActiveFederatedStatus` while
-        // the load/lease sites moved to `holdsWorkerAttachment`. This is the feed a
-        // listener PULLS WORK FROM, so it must answer "assignable", not "attached".
-        // Offering a paused job here would have a restarted listener pick it up and
-        // re-POST start against a run that is already paused — the destructive path
-        // TASK-1326 exists to refuse. An explicit ?status= filter can still ask for
-        // paused jobs for read-only inspection.
+        // TASK-1330: released pauses re-enter this feed only with a durable pause
+        // generation. New listeners treat them as resume handshakes, never fresh
+        // starts; old listeners still ignore them because they select only assigned.
         .filter((job) =>
-          statusFilter ? statusFilter.has(job.status) : isActiveFederatedStatus(job.status),
-        ),
+          statusFilter
+            ? statusFilter.has(job.status)
+            : isActiveFederatedStatus(job.status) ||
+              (job.status === "awaiting_approval" &&
+                Boolean(job.pause) &&
+                [
+                  "released",
+                  "resume_requested",
+                  "resume_claimed",
+                  "approved_but_not_started",
+                ].includes(job.pause?.state ?? "")),
+        )
+        .map((job) => ({ ...job, projectId: job.projectId ?? p.projectId })),
     );
     res.json({ ok: true, hostId, jobs });
   });

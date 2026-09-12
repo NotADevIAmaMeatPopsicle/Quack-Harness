@@ -1,3 +1,4 @@
+import { getClaudeSdkEnvironment } from "../sdk/claude-auth.js";
 // ─── Agent Worker ───────────────────────────────────────────────────
 // Core SDK integration: creates a Claude Agent SDK session, assembles
 // the system prompt, configures MCP tools and hooks, runs the agent
@@ -23,6 +24,7 @@ import { verifyBeforeStop } from "../hooks/verify-before-stop.js";
 import type { IEventWriter } from "../monitor/event-emitter.js";
 import { getSdkPermissionOptions } from "../sdk/permission-mode.js";
 import { parseTaskFile } from "../core/task-parser.js";
+import { runCodexImplementationAgent } from "./codex-agent-worker.js";
 
 // ─── SDK type shims ─────────────────────────────────────────────────
 // Defined locally to avoid ESM/CJS import issues with the SDK package.
@@ -83,6 +85,15 @@ const MAX_RESULT_ERROR_ITEMS = 10;
 const MAX_RESULT_ERROR_ITEM_CHARS = 500;
 const MAX_RESULT_ERROR_AGGREGATE_CHARS = 4000;
 const TRUNCATION_MARKER = "…(truncated)";
+const MANAGED_DOCKER_IMAGE_ALLOWLIST_ENV = "QUACK_TRUSTED_MANAGED_DOCKER_IMAGES";
+
+function sanitizedAgentEnvironment(): NodeJS.ProcessEnv {
+  return Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([key]) => key.toUpperCase() !== MANAGED_DOCKER_IMAGE_ALLOWLIST_ENV,
+    ),
+  );
+}
 
 /**
  * Bound the SDK's errors[] per the TASK-1314 contract. HARD caps
@@ -248,6 +259,13 @@ export async function runAgent(
   options?: RunAgentOptions,
   events?: IEventWriter,
 ): Promise<AgentResult> {
+  // The implementation provider is adapter-explicit and additive. Existing
+  // adapters (including configs constructed by older callers/tests) continue
+  // down the Claude Agent SDK path when `runner` is absent.
+  if ((adapter.config.agent.runner ?? "claude-sdk") === "codex-cli") {
+    return runCodexImplementationAgent(taskId, context, adapter, options, events);
+  }
+
   const model = options?.model ?? adapter.config.agent.model;
   const maxTurns = options?.maxTurns ?? adapter.config.agent.maxTurns;
   const maxBudget = options?.maxBudgetUsd ?? adapter.config.agent.maxBudgetPerTask;
@@ -436,12 +454,15 @@ export async function runAgent(
         });
       },
     });
+    const verificationCommands = result.verification.commands.map((command) => ({
+      name: command.name,
+      passed: command.passed,
+      required: command.required,
+      status: command.status,
+    }));
     events?.emit("verification_result", {
       allPassed: result.verification.allPassed,
-      commands: result.verification.commands.map((c) => ({
-        name: c.name,
-        passed: c.passed,
-      })),
+      commands: verificationCommands,
     });
     if (!result.canStop) {
       return {
@@ -507,6 +528,10 @@ export async function runAgent(
         ...(maxBudget > 0 ? { maxBudgetUsd: maxBudget } : {}),
         ...getSdkPermissionOptions(),
         cwd: adapter.projectRoot,
+        // The operator-owned managed-Docker image allowlist is control-plane
+        // policy, not workload input. Direct CLI SDK sessions otherwise inherit
+        // the host environment and could disclose or mutate that policy value.
+        env: getClaudeSdkEnvironment(adapter.config.agent.apiKeys, sanitizedAgentEnvironment()),
         ...(Object.keys(mcpServers).length > 0 ? { mcpServers } : {}),
         hooks,
         // Resume support: load previous session and fork to preserve original

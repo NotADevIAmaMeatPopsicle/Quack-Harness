@@ -21,6 +21,7 @@ import { DispatchManager } from "../../src/monitor/dispatch-manager";
 
 let projectRoot: string;
 let logDir: string;
+let trustedReadOrigin: string | undefined;
 const managers: DispatchManager[] = [];
 
 // Pend timestamps must be RECENT. `resolvePausedRunState` honours the 24h
@@ -77,6 +78,7 @@ function writeCheckpoint(sessionId: string, branchName?: string): void {
 }
 
 beforeEach(() => {
+  trustedReadOrigin = undefined;
   projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "quack-paused-run-"));
   logDir = path.join(projectRoot, ".quack", "logs");
   fs.mkdirSync(logDir, { recursive: true });
@@ -88,15 +90,16 @@ beforeEach(() => {
   git(["commit", "-m", "seed"]);
 });
 
-afterEach(() => {
+afterEach(async () => {
   // The negative-control tests deliberately let start() through, which
-  // spawns a child and creates a worktree; Windows holds those handles
-  // briefly after kill, so cleanup is best-effort (the temp dir is
-  // disposable either way).
+  // spawns a child and creates a worktree. Await the stronger close/exit-
+  // cleanup boundary before removing its temporary repository.
   for (const m of managers) m.killAll();
+  await Promise.all(managers.map((manager) => manager.waitForIdle()));
   managers.length = 0;
   try {
     fs.rmSync(projectRoot, { recursive: true, force: true });
+    if (trustedReadOrigin) fs.rmSync(trustedReadOrigin, { recursive: true, force: true });
   } catch {
     // EBUSY on Windows — leave it to the OS temp sweeper.
   }
@@ -157,6 +160,59 @@ describe("resolvePausedRunState", () => {
 });
 
 describe("archivePausedRunState", () => {
+  const windowsTest = process.platform === "win32" ? it : it.skip;
+
+  it("commits an override by clearing live gate/checkpoint state only after archiving it", () => {
+    writeApproval("TASK-500.json", "pending", PEND_FIRST, { marker: "original-brief" });
+    writeCheckpoint("quack-TASK-500-run1");
+
+    const liveApproval = path.join(logDir, "approvals", "TASK-500.json");
+    const liveCheckpoint = path.join(logDir, "checkpoint-TASK-500.json");
+    const approvalBefore = fs.readFileSync(liveApproval, "utf-8");
+    const checkpointBefore = fs.readFileSync(liveCheckpoint, "utf-8");
+
+    const archive = archivePausedRunState(
+      projectRoot,
+      logDir,
+      "TASK-500",
+      resolvePausedRunState(logDir, "TASK-500")!,
+    );
+
+    expect(fs.existsSync(liveApproval)).toBe(false);
+    expect(fs.existsSync(liveCheckpoint)).toBe(false);
+    expect(resolvePausedRunState(logDir, "TASK-500")).toBeNull();
+    expect(fs.readFileSync(archive.approvalPath!, "utf-8")).toBe(approvalBefore);
+    expect(fs.readFileSync(archive.checkpointPath!, "utf-8")).toBe(checkpointBefore);
+    expect(fs.existsSync(archive.manifestPath!)).toBe(true);
+  });
+
+  it("archives and clears both gate records so a judge override cannot inherit an old brief", () => {
+    writeApproval("TASK-500.json", "auto-approved", PEND_FIRST, {
+      marker: "old-blueprint-clearance",
+    });
+    writeApproval("TASK-500-judge.json", "pending", PEND_SECOND, {
+      marker: "old-diff-review",
+    });
+    writeCheckpoint("quack-TASK-500-run2");
+
+    const archive = archivePausedRunState(
+      projectRoot,
+      logDir,
+      "TASK-500",
+      resolvePausedRunState(logDir, "TASK-500")!,
+    );
+
+    expect(archive.approvalPaths).toHaveLength(2);
+    expect(fs.existsSync(path.join(logDir, "approvals", "TASK-500.json"))).toBe(false);
+    expect(fs.existsSync(path.join(logDir, "approvals", "TASK-500-judge.json"))).toBe(false);
+    expect(
+      archive.approvalPaths!.map((file) => fs.readFileSync(file, "utf-8")).join("\n"),
+    ).toContain("old-blueprint-clearance");
+    expect(
+      archive.approvalPaths!.map((file) => fs.readFileSync(file, "utf-8")).join("\n"),
+    ).toContain("old-diff-review");
+  });
+
   it("preserves the branch tip so a later branch -D cannot orphan the work", () => {
     git(["checkout", "-b", "quack/TASK-500"]);
     fs.writeFileSync(path.join(projectRoot, "worker-output.txt"), "expensive\n", "utf-8");
@@ -181,6 +237,47 @@ describe("archivePausedRunState", () => {
     // The commit is still reachable, and its content is intact.
     expect(git(["rev-parse", archive.branchRef!])).toBe(workSha);
     expect(git(["show", `${workSha}:worker-output.txt`])).toBe("expensive");
+  });
+
+  windowsTest.each(["git.exe", "git.cmd"])(
+    "archives through canonical Git when the mutable project shadows %s",
+    (shadowName) => {
+      git(["checkout", "-b", "quack/TASK-500"]);
+      fs.writeFileSync(path.join(projectRoot, "worker-output.txt"), "expensive\n", "utf-8");
+      git(["add", "."]);
+      git(["commit", "-m", "worker commit"]);
+      git(["checkout", "main"]);
+      const marker = path.join(projectRoot, "shadow-ran.txt");
+      if (shadowName.endsWith(".exe")) {
+        fs.writeFileSync(path.join(projectRoot, shadowName), "not an executable", "utf-8");
+      } else {
+        fs.writeFileSync(
+          path.join(projectRoot, shadowName),
+          `@echo off\r\necho shadow>"${marker}"\r\nexit /b 91\r\n`,
+          "utf-8",
+        );
+      }
+      writeApproval("TASK-500-judge.json", "pending", PEND_JUDGE);
+      writeCheckpoint("quack-TASK-500-shadow", "quack/TASK-500");
+
+      const archive = archivePausedRunState(
+        projectRoot,
+        logDir,
+        "TASK-500",
+        resolvePausedRunState(logDir, "TASK-500")!,
+      );
+
+      expect(archive.branchRef).toBe("refs/quack-archive/TASK-500/quack-TASK-500-shadow");
+      expect(fs.existsSync(marker)).toBe(false);
+    },
+  );
+
+  it("rejects unsafe task ids before constructing archive paths or refs", () => {
+    writeApproval("TASK-500.json", "pending", PEND_FIRST);
+    const paused = resolvePausedRunState(logDir, "TASK-500")!;
+    expect(() => archivePausedRunState(projectRoot, logDir, "../TASK-500", paused)).toThrow(
+      PausedRunArchiveError,
+    );
   });
 
   it("keys archives by session, so a SECOND override cannot swallow the first", () => {
@@ -291,6 +388,7 @@ describe("archivePausedRunState", () => {
 
   it("THROWS rather than let an override proceed over unarchivable state", () => {
     writeApproval("TASK-500.json", "pending", new Date().toISOString());
+    const liveApproval = path.join(logDir, "approvals", "TASK-500.json");
     // Occupy the archive directory path with a FILE so mkdir must fail.
     fs.writeFileSync(path.join(logDir, "approvals", "archive"), "blocker", "utf-8");
 
@@ -298,11 +396,54 @@ describe("archivePausedRunState", () => {
     expect(() => archivePausedRunState(projectRoot, logDir, "TASK-500", paused)).toThrow(
       PausedRunArchiveError,
     );
+    // Archive failure is fail-closed: the live pend remains the guard.
+    expect(fs.existsSync(liveApproval)).toBe(true);
+    expect(resolvePausedRunState(logDir, "TASK-500")).not.toBeNull();
+  });
+
+  it("can retry safely after a partial archive failure without overwriting evidence", () => {
+    writeApproval("TASK-500.json", "pending", PEND_FIRST, { marker: "paid-run" });
+    writeCheckpoint("quack-TASK-500-partial");
+    const checkpointArchiveDir = path.join(logDir, "checkpoints-archive");
+    // Approval copying happens first; this forces the later checkpoint copy to
+    // fail and leaves a partial archive plus intact live state.
+    fs.writeFileSync(checkpointArchiveDir, "blocker", "utf-8");
+
+    const paused = resolvePausedRunState(logDir, "TASK-500")!;
+    expect(() => archivePausedRunState(projectRoot, logDir, "TASK-500", paused)).toThrow(
+      PausedRunArchiveError,
+    );
+    expect(resolvePausedRunState(logDir, "TASK-500")).not.toBeNull();
+    const partialApproval = path.join(
+      logDir,
+      "approvals",
+      "archive",
+      "TASK-500-quack-TASK-500-partial.json",
+    );
+    expect(fs.existsSync(partialApproval)).toBe(true);
+
+    fs.unlinkSync(checkpointArchiveDir);
+    const retry = archivePausedRunState(
+      projectRoot,
+      logDir,
+      "TASK-500",
+      resolvePausedRunState(logDir, "TASK-500")!,
+    );
+
+    expect(retry.approvalPath).toContain("quack-TASK-500-partial-2.json");
+    expect(fs.existsSync(partialApproval)).toBe(true);
+    expect(resolvePausedRunState(logDir, "TASK-500")).toBeNull();
   });
 });
 
 describe("DispatchManager start guard (the seam ahead of the branch delete)", () => {
   function manager(): DispatchManager {
+    // Worktree isolation reads only this disposable, operator-authorized bare origin.
+    if (!trustedReadOrigin) {
+      trustedReadOrigin = fs.mkdtempSync(path.join(os.tmpdir(), "quack-paused-origin-"));
+      git(["clone", "--bare", projectRoot, trustedReadOrigin]);
+      git(["remote", "add", "origin", trustedReadOrigin]);
+    }
     // A FRESH manager: no in-memory job entry, which is exactly the
     // post-restart state the old guard could not see.
     const m = new DispatchManager(
@@ -311,9 +452,28 @@ describe("DispatchManager start guard (the seam ahead of the branch delete)", ()
       undefined,
       undefined,
       logDir,
+      undefined,
+      [trustedReadOrigin],
     );
     managers.push(m);
     return m;
+  }
+
+  function injectAwaitingApprovalJob(m: DispatchManager): object {
+    const worktreePath = path.join(projectRoot, ".quack", "worktrees", "TASK-500");
+    git(["worktree", "add", "-b", "quack/TASK-500", worktreePath, "HEAD"]);
+    const job = {
+      worktreePath,
+      taskId: "TASK-500",
+      sessionId: "quack-TASK-500-in-memory",
+      pid: 0,
+      startedAt: new Date().toISOString(),
+      status: "awaiting_approval" as const,
+      output: ["waiting for operator"],
+    };
+    const jobs = (m as unknown as { jobs: Map<string, object> }).jobs;
+    jobs.set(job.taskId, job);
+    return job;
   }
 
   it("refuses a start for a task paused on disk, with no in-memory job", () => {
@@ -344,6 +504,7 @@ describe("DispatchManager start guard (the seam ahead of the branch delete)", ()
   // makes the approve flow safe is that it DECIDES the pend first, not
   // that it says `resume`.
   it("does not refuse a resume once the gate has been DECIDED (the approve path)", () => {
+    git(["branch", "quack/TASK-500"]);
     writeApproval("TASK-500-judge.json", "approved", new Date().toISOString());
     let error: unknown;
     try {
@@ -357,6 +518,72 @@ describe("DispatchManager start guard (the seam ahead of the branch delete)", ()
   it("2-F1: DOES refuse a resume while the gate is still pending", () => {
     writeApproval("TASK-500-judge.json", "pending", new Date().toISOString());
     expect(() => manager().start("TASK-500", { resume: true })).toThrow(PausedRunRefusalError);
+  });
+
+  it("an explicit override archives and clears the live state before the monitor launches", () => {
+    writeApproval("TASK-500.json", "pending", new Date().toISOString(), {
+      marker: "old-paid-brief",
+    });
+    writeCheckpoint("quack-TASK-500-old");
+    const liveApproval = path.join(logDir, "approvals", "TASK-500.json");
+    const liveCheckpoint = path.join(logDir, "checkpoint-TASK-500.json");
+    const events = jest.fn<void, [string, string, Record<string, unknown>]>();
+    const m = manager();
+    m.setEventCallback(events);
+
+    m.start("TASK-500", { overridePausedRun: true });
+
+    expect(fs.existsSync(liveApproval)).toBe(false);
+    expect(fs.existsSync(liveCheckpoint)).toBe(false);
+    expect(resolvePausedRunState(logDir, "TASK-500")).toBeNull();
+    expect(events).toHaveBeenCalledWith(
+      "paused_run_archived",
+      "TASK-500",
+      expect.objectContaining({
+        gate: "blueprint",
+      }),
+    );
+    const archivePayload = events.mock.calls.find(
+      ([stage]) => stage === "paused_run_archived",
+    )?.[2];
+    expect(String(archivePayload?.approvalPath)).toContain("approvals");
+    expect(String(archivePayload?.checkpointPath)).toContain("checkpoints-archive");
+  });
+
+  it("allows an explicit override while the paused job is still present in memory", () => {
+    writeApproval("TASK-500.json", "pending", new Date().toISOString(), {
+      marker: "in-memory-old-paid-brief",
+    });
+    writeCheckpoint("quack-TASK-500-in-memory", "quack/TASK-500");
+    const m = manager();
+    const oldJob = injectAwaitingApprovalJob(m);
+    const events = jest.fn<void, [string, string, Record<string, unknown>]>();
+    m.setEventCallback(events);
+
+    const replacement = m.start("TASK-500", { overridePausedRun: true });
+
+    expect(replacement).not.toBe(oldJob);
+    expect(m.getJob("TASK-500")).toBe(replacement);
+    expect(resolvePausedRunState(logDir, "TASK-500")).toBeNull();
+    expect(events).toHaveBeenCalledWith(
+      "paused_run_archived",
+      "TASK-500",
+      expect.objectContaining({ gate: "blueprint" }),
+    );
+  });
+
+  it("keeps the in-memory paused job when its explicit override cannot be archived", () => {
+    writeApproval("TASK-500.json", "pending", new Date().toISOString());
+    writeCheckpoint("quack-TASK-500-in-memory", "quack/TASK-500");
+    const checkpointArchiveDir = path.join(logDir, "checkpoints-archive");
+    fs.writeFileSync(checkpointArchiveDir, "blocker", "utf-8");
+    const m = manager();
+    const oldJob = injectAwaitingApprovalJob(m);
+
+    expect(() => m.start("TASK-500", { overridePausedRun: true })).toThrow(PausedRunArchiveError);
+    expect(m.getJob("TASK-500")).toBe(oldJob);
+    expect(m.getActiveJob("TASK-500")).toBe(oldJob);
+    expect(resolvePausedRunState(logDir, "TASK-500")).not.toBeNull();
   });
 
   // Round-2b F1: the confirmation round EXECUTED this matrix and found

@@ -5,10 +5,18 @@ import * as path from "node:path";
 
 import type { GitHubConfig, SyncEvent } from "./github-types.js";
 import type { AdapterConfig } from "../../core/types.js";
-import { getSyncMap } from "./sync-map.js";
+import { getSyncMap, resolveGitHubSyncMapPath, withSyncMapTransaction } from "./sync-map.js";
 import { postLifecycleComment } from "./comment-thread.js";
 import { listDuplicateClaimants, resolveTaskFile } from "../../core/task-file-resolver.js";
-import { runGh } from "./gh-cli.js";
+import {
+  assertIssueNumber,
+  assertIssueUrl,
+  parseIssueLabels,
+  parseJsonObject,
+  runBoundGitHubCommand,
+} from "./trusted-github.js";
+
+const syncAllTasksInFlight = new Map<string, Promise<SyncAllTasksOutcome>>();
 
 // ─── Label Management ───────────────────────────────────────────────
 
@@ -19,18 +27,19 @@ async function addLabels(
   issueNumber: number,
   labels: string[],
   config: GitHubConfig,
+  projectRoot: string,
 ): Promise<void> {
   if (labels.length === 0) return;
 
   try {
-    await runGh([
+    assertIssueNumber(issueNumber);
+    await runBoundGitHubCommand(projectRoot, config, [
       "issue",
       "edit",
       String(issueNumber),
-      "--repo",
-      `${config.owner}/${config.repo}`,
-      ...labels.flatMap((label) => ["--add-label", label]),
+      ...labels.map((label) => `--add-label=${label}`),
     ]);
+    await assertLabelsReadback(issueNumber, labels, true, config, projectRoot);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(`Failed to add labels to issue #${issueNumber}: ${message}`);
@@ -44,18 +53,19 @@ async function removeLabels(
   issueNumber: number,
   labels: string[],
   config: GitHubConfig,
+  projectRoot: string,
 ): Promise<void> {
   if (labels.length === 0) return;
 
   try {
-    await runGh([
+    assertIssueNumber(issueNumber);
+    await runBoundGitHubCommand(projectRoot, config, [
       "issue",
       "edit",
       String(issueNumber),
-      "--repo",
-      `${config.owner}/${config.repo}`,
-      ...labels.flatMap((label) => ["--remove-label", label]),
+      ...labels.map((label) => `--remove-label=${label}`),
     ]);
+    await assertLabelsReadback(issueNumber, labels, false, config, projectRoot);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(`Failed to remove labels from issue #${issueNumber}: ${message}`);
@@ -71,6 +81,7 @@ export async function syncLifecycleEvent(
   issueNumber: number,
   event: SyncEvent,
   config: GitHubConfig,
+  projectRoot: string = process.cwd(),
 ): Promise<void> {
   const labels = config.labels || {};
 
@@ -100,14 +111,14 @@ export async function syncLifecycleEvent(
 
   // Apply label changes
   if (toAdd.length > 0) {
-    await addLabels(issueNumber, toAdd, config);
+    await addLabels(issueNumber, toAdd, config, projectRoot);
   }
   if (toRemove.length > 0) {
-    await removeLabels(issueNumber, toRemove, config);
+    await removeLabels(issueNumber, toRemove, config, projectRoot);
   }
 
   // Post lifecycle comment
-  await postLifecycleComment(issueNumber, event, config);
+  await postLifecycleComment(issueNumber, event, config, projectRoot);
 }
 
 // ─── High-Level Sync Functions ──────────────────────────────────────
@@ -120,13 +131,14 @@ export async function syncDispatchStarted(
   model: string | undefined,
   budget: number | undefined,
   adapterConfig: AdapterConfig,
+  projectRoot: string,
 ): Promise<void> {
   const githubConfig = adapterConfig.integrations?.github;
   if (!githubConfig || !githubConfig.reportBack) {
     return;
   }
 
-  const syncMap = await getSyncMap(adapterConfig);
+  const syncMap = await getSyncMap(projectRoot);
   const issueNumber = syncMap.getIssueForTask(taskId);
   if (!issueNumber) {
     return;
@@ -139,7 +151,7 @@ export async function syncDispatchStarted(
     data: { model, budget },
   };
 
-  await syncLifecycleEvent(issueNumber, event, githubConfig);
+  await syncLifecycleEvent(issueNumber, event, githubConfig, projectRoot);
   syncMap.updateSyncTime(taskId);
   await syncMap.save();
 }
@@ -152,13 +164,14 @@ export async function syncDispatchComplete(
   outcome: string,
   feedback: string | undefined,
   adapterConfig: AdapterConfig,
+  projectRoot: string,
 ): Promise<void> {
   const githubConfig = adapterConfig.integrations?.github;
   if (!githubConfig || !githubConfig.reportBack) {
     return;
   }
 
-  const syncMap = await getSyncMap(adapterConfig);
+  const syncMap = await getSyncMap(projectRoot);
   const issueNumber = syncMap.getIssueForTask(taskId);
   if (!issueNumber) {
     return;
@@ -171,7 +184,7 @@ export async function syncDispatchComplete(
     data: { outcome, feedback },
   };
 
-  await syncLifecycleEvent(issueNumber, event, githubConfig);
+  await syncLifecycleEvent(issueNumber, event, githubConfig, projectRoot);
   syncMap.updateSyncTime(taskId);
   await syncMap.save();
 }
@@ -183,13 +196,14 @@ export async function syncPRCreated(
   taskId: string,
   prUrl: string,
   adapterConfig: AdapterConfig,
+  projectRoot: string,
 ): Promise<void> {
   const githubConfig = adapterConfig.integrations?.github;
   if (!githubConfig || !githubConfig.reportBack) {
     return;
   }
 
-  const syncMap = await getSyncMap(adapterConfig);
+  const syncMap = await getSyncMap(projectRoot);
   const issueNumber = syncMap.getIssueForTask(taskId);
   if (!issueNumber) {
     return;
@@ -202,7 +216,7 @@ export async function syncPRCreated(
     data: { prUrl },
   };
 
-  await syncLifecycleEvent(issueNumber, event, githubConfig);
+  await syncLifecycleEvent(issueNumber, event, githubConfig, projectRoot);
   syncMap.updateSyncTime(taskId);
   await syncMap.save();
 }
@@ -214,13 +228,14 @@ export async function syncTaskStatusToIssue(
   taskId: string,
   status: string,
   adapterConfig: AdapterConfig,
+  projectRoot: string,
 ): Promise<void> {
   const githubConfig = adapterConfig.integrations?.github;
   if (!githubConfig) {
     return;
   }
 
-  const syncMap = await getSyncMap(adapterConfig);
+  const syncMap = await getSyncMap(projectRoot);
   syncMap.updateTaskStatus(taskId, status);
   await syncMap.save();
 }
@@ -271,100 +286,169 @@ export interface SyncAllTasksOutcome {
  * Sync all mapped tasks (called from quack sync --github).
  * Reads the current task file status and syncs labels to GitHub.
  */
-export async function syncAllTasks(adapterConfig: AdapterConfig): Promise<SyncAllTasksOutcome> {
+export async function syncAllTasks(
+  adapterConfig: AdapterConfig,
+  projectRoot: string,
+): Promise<SyncAllTasksOutcome> {
   const githubConfig = adapterConfig.integrations?.github;
   if (!githubConfig) {
     return { outcomes: [] };
   }
 
-  const syncMap = await getSyncMap(adapterConfig);
-  const entries = syncMap.getAllEntries();
-  const outcomes: TaskSyncOutcome[] = [];
-  const taskDir = path.resolve(adapterConfig.project.root, adapterConfig.project.taskDir);
+  const syncFilePath = resolveGitHubSyncMapPath(projectRoot);
+  const active = syncAllTasksInFlight.get(syncFilePath);
+  if (active) return active;
 
-  for (const entry of entries) {
-    try {
-      const resolved = await resolveTaskFile(taskDir, entry.taskId);
-      if (!resolved) {
-        outcomes.push({
-          taskId: entry.taskId,
-          issueNumber: entry.issueNumber,
-          outcome: "skipped",
-          reason: "task_file_unresolvable",
-        });
-        continue;
-      }
+  const run = withSyncMapTransaction(projectRoot, async (syncMap) => {
+    const entries = syncMap.getAllEntries();
+    const outcomes: TaskSyncOutcome[] = [];
+    const taskDir = path.resolve(projectRoot, adapterConfig.project.taskDir);
 
-      const claimants = await listDuplicateClaimants(taskDir, entry.taskId);
-      if (claimants.length > 1) {
-        outcomes.push({
-          taskId: entry.taskId,
-          issueNumber: entry.issueNumber,
-          outcome: "skipped",
-          reason: "duplicate_claimants",
-          claimants,
-        });
-        continue;
-      }
-
-      const statusMatch = resolved.content.match(/\*\*Status:\*\*\s*(\S+)/);
-      const currentStatus = statusMatch ? statusMatch[1] : entry.taskStatus;
-      const statusChanged = currentStatus !== entry.taskStatus;
-
-      if (statusChanged && githubConfig.reportBack) {
-        const labels = githubConfig.labels || {};
-        if (currentStatus === "COMPLETE") {
-          await addLabels(entry.issueNumber, [labels.approved || "quack-approved"], githubConfig);
-          await removeLabels(
-            entry.issueNumber,
-            [labels.inProgress || "quack-in-progress"],
-            githubConfig,
-          );
-        } else if (currentStatus === "IN_PROGRESS") {
-          await addLabels(
-            entry.issueNumber,
-            [labels.inProgress || "quack-in-progress"],
-            githubConfig,
-          );
-          await removeLabels(entry.issueNumber, [labels.ready || "quack-ready"], githubConfig);
-        } else if (currentStatus === "READY") {
-          await addLabels(entry.issueNumber, [labels.ready || "quack-ready"], githubConfig);
+    for (const entry of entries) {
+      try {
+        const resolved = await resolveTaskFile(taskDir, entry.taskId);
+        if (!resolved) {
+          outcomes.push({
+            taskId: entry.taskId,
+            issueNumber: entry.issueNumber,
+            outcome: "skipped",
+            reason: "task_file_unresolvable",
+          });
+          continue;
         }
-      }
 
-      if (statusChanged) {
-        syncMap.updateTaskStatus(entry.taskId, currentStatus);
-      } else {
-        syncMap.updateSyncTime(entry.taskId);
+        const claimants = await listDuplicateClaimants(taskDir, entry.taskId);
+        if (claimants.length > 1) {
+          outcomes.push({
+            taskId: entry.taskId,
+            issueNumber: entry.issueNumber,
+            outcome: "skipped",
+            reason: "duplicate_claimants",
+            claimants,
+          });
+          continue;
+        }
+
+        const statusMatch = resolved.content.match(/\*\*Status:\*\*\s*(\S+)/);
+        const currentStatus = statusMatch ? statusMatch[1] : entry.taskStatus;
+        const statusChanged = currentStatus !== entry.taskStatus;
+
+        if (statusChanged && githubConfig.reportBack) {
+          const labels = githubConfig.labels || {};
+          if (currentStatus === "COMPLETE") {
+            await addLabels(
+              entry.issueNumber,
+              [labels.approved || "quack-approved"],
+              githubConfig,
+              projectRoot,
+            );
+            await removeLabels(
+              entry.issueNumber,
+              [labels.inProgress || "quack-in-progress"],
+              githubConfig,
+              projectRoot,
+            );
+          } else if (currentStatus === "IN_PROGRESS") {
+            await addLabels(
+              entry.issueNumber,
+              [labels.inProgress || "quack-in-progress"],
+              githubConfig,
+              projectRoot,
+            );
+            await removeLabels(
+              entry.issueNumber,
+              [labels.ready || "quack-ready"],
+              githubConfig,
+              projectRoot,
+            );
+          } else if (currentStatus === "READY") {
+            await addLabels(
+              entry.issueNumber,
+              [labels.ready || "quack-ready"],
+              githubConfig,
+              projectRoot,
+            );
+          }
+        }
+
+        if (statusChanged) {
+          syncMap.updateTaskStatus(entry.taskId, currentStatus);
+        } else {
+          syncMap.updateSyncTime(entry.taskId);
+        }
+        outcomes.push({
+          taskId: entry.taskId,
+          issueNumber: entry.issueNumber,
+          outcome: "synced",
+          taskStatus: currentStatus,
+          statusChanged,
+        });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`Failed to sync ${entry.taskId}: ${msg}`);
+        outcomes.push({
+          taskId: entry.taskId,
+          issueNumber: entry.issueNumber,
+          outcome: "skipped",
+          reason: "sync_failed",
+          message: msg,
+        });
       }
-      outcomes.push({
-        taskId: entry.taskId,
-        issueNumber: entry.issueNumber,
-        outcome: "synced",
-        taskStatus: currentStatus,
-        statusChanged,
-      });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`Failed to sync ${entry.taskId}: ${msg}`);
-      outcomes.push({
-        taskId: entry.taskId,
-        issueNumber: entry.issueNumber,
-        outcome: "skipped",
-        reason: "sync_failed",
-        message: msg,
-      });
+    }
+
+    return { outcomes };
+  });
+  syncAllTasksInFlight.set(syncFilePath, run);
+  try {
+    return await run;
+  } finally {
+    if (syncAllTasksInFlight.get(syncFilePath) === run) {
+      syncAllTasksInFlight.delete(syncFilePath);
     }
   }
+}
 
-  await syncMap.save();
-  return { outcomes };
+async function assertLabelsReadback(
+  issueNumber: number,
+  expectedLabels: string[],
+  expectedPresent: boolean,
+  config: GitHubConfig,
+  projectRoot: string,
+): Promise<void> {
+  const readback = await runBoundGitHubCommand(projectRoot, config, [
+    "issue",
+    "view",
+    String(issueNumber),
+    "--json",
+    "number,url,labels",
+  ]);
+  const data = parseJsonObject(readback.stdout, "GitHub issue label readback");
+  if (data.number !== issueNumber) {
+    throw new Error("GitHub issue label readback returned the wrong issue number");
+  }
+  assertIssueUrl(data.url, readback.repository, issueNumber);
+  const actualLabels = new Set(
+    parseIssueLabels(data.labels, "GitHub issue label readback").map((label) =>
+      label.toLowerCase(),
+    ),
+  );
+  const mismatched = expectedLabels.find(
+    (label) => actualLabels.has(label.toLowerCase()) !== expectedPresent,
+  );
+  if (mismatched !== undefined) {
+    throw new Error(
+      `GitHub issue label readback did not confirm ${expectedPresent ? "addition" : "removal"} of ${JSON.stringify(mismatched)}`,
+    );
+  }
 }
 
 /**
  * Get sync status for all mapped tasks.
  */
-export async function getSyncStatus(adapterConfig: AdapterConfig): Promise<{
+export async function getSyncStatus(
+  _adapterConfig: AdapterConfig,
+  projectRoot: string,
+): Promise<{
   totalEntries: number;
   entries: Array<{
     taskId: string;
@@ -373,7 +457,7 @@ export async function getSyncStatus(adapterConfig: AdapterConfig): Promise<{
     lastSyncedAt: string;
   }>;
 }> {
-  const syncMap = await getSyncMap(adapterConfig);
+  const syncMap = await getSyncMap(projectRoot);
   const entries = syncMap.getAllEntries();
 
   return {

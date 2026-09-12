@@ -49,9 +49,7 @@ describe("durable JSON files", () => {
     const target = path.join(root, "journal.json");
     try {
       fs.writeFileSync(target, "original\n", "utf-8");
-
       expect(() => writeJsonAtomicDurable(target, { replacement: true }, true)).toThrow();
-
       expect(fs.readFileSync(target, "utf-8")).toBe("original\n");
       expect(fs.readdirSync(root)).toEqual(["journal.json"]);
     } finally {
@@ -156,9 +154,7 @@ describe("durable JSON files", () => {
       fs.linkSync(installedTemp, target);
       expect(fs.existsSync(target)).toBe(true);
       expect(fs.lstatSync(target).nlink).toBe(2);
-
       reconcileDurableJsonInstall(target);
-
       expect(fs.readFileSync(target, "utf-8")).toContain('"durable": true');
       expect(fs.existsSync(installedTemp)).toBe(false);
       expect(fs.lstatSync(target).nlink).toBe(1);
@@ -177,9 +173,7 @@ describe("durable JSON files", () => {
     const sync = jest.spyOn(actualFs, "fsyncSync").mockImplementation((fd) => {
       calls += 1;
       if (calls === 2) {
-        throw Object.assign(new Error("simulated installed-file barrier failure"), {
-          code: "EIO",
-        });
+        throw Object.assign(new Error("simulated installed-file barrier failure"), { code: "EIO" });
       }
       return realFsync(fd);
     });
@@ -191,8 +185,6 @@ describe("durable JSON files", () => {
       sync.mockRestore();
     }
     try {
-      // Rename may already be visible, but the caller did not receive a false
-      // durability acknowledgement. Admission re-establishes both barriers.
       expect(fs.readFileSync(target, "utf-8")).toContain('"progress": "old"');
       expect(() => reconcileDurableJsonInstall(target)).not.toThrow();
     } finally {

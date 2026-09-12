@@ -4,6 +4,8 @@ import { DispatchManager } from "../../src/monitor/dispatch-manager";
 
 describe("DispatchManager POSIX survivor process-group safety", () => {
   it("keeps timed-out evidence admission-blocking without re-signalling a recycled group id", async () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
     const manager = new DispatchManager("/fixture/project", "/fixture/quack.js", {
       method: "worktree",
       dockerCleanup: false,
@@ -52,8 +54,10 @@ describe("DispatchManager POSIX survivor process-group safety", () => {
       expect(killSpy).not.toHaveBeenCalled();
       expect(childKill).not.toHaveBeenCalled();
     } finally {
+      jest.clearAllTimers();
       jest.useRealTimers();
       killSpy.mockRestore();
+      Object.defineProperty(process, "platform", originalPlatform);
     }
   });
 
@@ -98,6 +102,7 @@ describe("DispatchManager POSIX survivor process-group safety", () => {
       expect(shutdown.timedOut).toContain("TASK-PRE-TIMEOUT-REUSE");
       expect(killSpy).not.toHaveBeenCalled();
     } finally {
+      jest.clearAllTimers();
       jest.useRealTimers();
       killSpy.mockRestore();
       Object.defineProperty(process, "platform", originalPlatform);
@@ -124,6 +129,7 @@ describe("DispatchManager POSIX survivor process-group safety", () => {
       .mockImplementation((() => true) as typeof process.kill);
 
     try {
+      jest.useFakeTimers();
       const timer = setTimeout(() => undefined, 60_000);
       timer.unref();
       internals.stopEscalationTimers.set("TASK-ORPHAN-TIMER", { timer, processGroupId });
@@ -135,6 +141,8 @@ describe("DispatchManager POSIX survivor process-group safety", () => {
       expect(internals.unconfirmedProcessGroups.get("TASK-ORPHAN-TIMER")).toBe(processGroupId);
       expect(killSpy).not.toHaveBeenCalled();
     } finally {
+      jest.clearAllTimers();
+      jest.useRealTimers();
       killSpy.mockRestore();
       Object.defineProperty(process, "platform", originalPlatform);
     }
@@ -169,6 +177,7 @@ describe("DispatchManager POSIX survivor process-group safety", () => {
     }) as typeof process.kill);
 
     try {
+      jest.useFakeTimers();
       internals.processes.set(taskId, child);
       const shutdown = await manager.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 0 });
 
@@ -177,6 +186,8 @@ describe("DispatchManager POSIX survivor process-group safety", () => {
       expect(internals.unconfirmedProcessGroups.get(taskId)).toBe(processGroupId);
       expect(shutdown.timedOut).toContain(taskId);
     } finally {
+      jest.clearAllTimers();
+      jest.useRealTimers();
       killSpy.mockRestore();
       Object.defineProperty(process, "platform", originalPlatform);
     }

@@ -12,13 +12,15 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
+import { execFileSync } from "node:child_process";
 
-import type { ChildDraft } from "../../src/preflight/decompose-types";
+import type { ChildDraft, DecompositionTopology } from "../../src/preflight/decompose-types";
+import { computeDecompositionParentHash } from "../../src/preflight/task-decomposer";
 import { createMonitorServer } from "../../src/monitor/server";
 
-function spec(id: string, status = "READY"): string {
+function spec(id: string, status = "READY", title = "selection fixture"): string {
   return [
-    `# ${id}: selection fixture`,
+    `# ${id}: ${title}`,
     "",
     "## Metadata",
     "- **Priority:** P2-MEDIUM",
@@ -29,34 +31,89 @@ function spec(id: string, status = "READY"): string {
     "- **Tags:** fixture",
     "",
     "## Problem Statement",
-    `${id} must resolve to its own file before decomposition.`,
+    `${id} must resolve to its own authoritative file before decomposition so another prefix-matching task cannot be mutated.`,
     "",
     "## Current State",
     "The fixture has not been decomposed.",
     "",
     "## Recommended Approach",
-    "Create one independent child task.",
+    "Create two independently dispatchable child tasks.",
     "",
     "## Files to Modify",
     "",
     "| File | Action | Notes |",
     "|------|--------|-------|",
-    "| `src/fixture.ts` | Create | Fixture module |",
+    "| `src/fixture-a.ts` | Create | First fixture module |",
+    "| `src/fixture-b.ts` | Create | Final fixture module |",
     "",
     "## Success Criteria",
-    "- [ ] The correct parent becomes a tracker",
+    "- [ ] The first child owns fixture A",
+    "- [ ] The final child verifies fixture B",
     "",
     "## Testing Requirements",
     "- [ ] Exercise the real directory",
+    "- [ ] Verify the parent changes while the existing child remains byte-identical",
+    "",
+    "## Anti-Patterns",
+    "- Do not select a task file by filename prefix alone",
+    "",
+    "## Context References",
+    "- Parent task: TASK-100",
     "",
   ].join("\n");
 }
 
-function makeDraft(): ChildDraft {
+function makeDraft(suffix: "A" | "B"): ChildDraft {
+  const subtaskId = `TASK-100-${suffix}`;
+  const title = suffix === "A" ? "generated first child" : "generated final child";
+  const filePath = suffix === "A" ? "src/fixture-a.ts" : "src/fixture-b.ts";
+  const criterion =
+    suffix === "A" ? "The first child owns fixture A" : "The final child verifies fixture B";
+  const blockedBy = suffix === "A" ? "[]" : "[TASK-100-A]";
+  const markdown = [
+    `# ${subtaskId}: ${title}`,
+    "",
+    "## Metadata",
+    "- **Priority:** P2-MEDIUM",
+    "- **Effort:** 2-3 hours",
+    "- **Status:** READY",
+    `- **Blocked By:** ${blockedBy}`,
+    "- **Blocks:** []",
+    "- **Tags:** fixture, decomposition",
+    "",
+    "## Problem Statement",
+    `${subtaskId} owns one bounded fixture module and must remain independently dispatchable without changing its sibling's implementation scope.`,
+    "",
+    "## Current State",
+    "The assigned fixture module does not exist yet and has no implementation coverage.",
+    "",
+    "## Recommended Approach",
+    "Create only the assigned module, follow the parent contract, and verify its exact behavior.",
+    "",
+    "## Files to Modify",
+    "",
+    "| File | Action | Notes |",
+    "|------|--------|-------|",
+    `| \`${filePath}\` | Create | Owned fixture module |`,
+    "",
+    "## Success Criteria",
+    `- [ ] ${criterion}`,
+    "",
+    "## Testing Requirements",
+    "- [ ] Exercise the owned fixture behavior",
+    "- [ ] Verify the task identity remains stable",
+    "",
+    "## Anti-Patterns",
+    "- Do not widen the child beyond its assigned fixture module",
+    "",
+    "## Context References",
+    "- Parent task: TASK-100",
+    "",
+  ].join("\n");
   return {
-    subtaskId: "TASK-100-B",
-    title: "generated child",
-    markdown: spec("TASK-100-B"),
+    subtaskId,
+    title,
+    markdown,
     sectionsPresent: [
       "Problem Statement",
       "Current State",
@@ -68,6 +125,53 @@ function makeDraft(): ChildDraft {
     prepScore: 4.8,
     prepReady: true,
     deficiencies: [],
+  };
+}
+
+function makeDrafts(): ChildDraft[] {
+  return [makeDraft("A"), makeDraft("B")];
+}
+
+function makeTopology(parentContent: string): DecompositionTopology {
+  return {
+    parentTaskId: "TASK-100",
+    parentContentHash: computeDecompositionParentHash(parentContent),
+    subtasks: [
+      {
+        id: "TASK-100-A",
+        title: "generated first child",
+        filesToModify: [
+          { path: "src/fixture-a.ts", action: "Create", notes: "First fixture module" },
+        ],
+        successCriteria: ["The first child owns fixture A"],
+        dependsOn: [],
+        isFinal: false,
+      },
+      {
+        id: "TASK-100-B",
+        title: "generated final child",
+        filesToModify: [
+          { path: "src/fixture-b.ts", action: "Create", notes: "Final fixture module" },
+        ],
+        successCriteria: ["The final child verifies fixture B"],
+        dependsOn: ["TASK-100-A"],
+        isFinal: true,
+      },
+    ],
+    coverageReport: {
+      fileOwnership: [
+        { filePath: "src/fixture-a.ts", ownedBy: "TASK-100-A", isShared: false },
+        { filePath: "src/fixture-b.ts", ownedBy: "TASK-100-B", isShared: false },
+      ],
+      criterionOwnership: [
+        { criterion: "The first child owns fixture A", ownedBy: ["TASK-100-A"] },
+        { criterion: "The final child verifies fixture B", ownedBy: ["TASK-100-B"] },
+      ],
+      unmappedFiles: [],
+      unmappedCriteria: [],
+      duplicatedFiles: [],
+      hasCoverageGap: false,
+    },
   };
 }
 
@@ -131,7 +235,7 @@ async function postJson(
     const encoded = JSON.stringify(body);
     const req = http.request(
       {
-        hostname: "localhost",
+        hostname: "127.0.0.1",
         port,
         path: pathname,
         method: "POST",
@@ -188,10 +292,10 @@ describe.each(cases)(
       taskDir = path.join(root, "docs", "tasks");
       fs.mkdirSync(taskDir, { recursive: true });
       parentPath = path.join(taskDir, "TASK-100-parent.md");
-      childPath = path.join(taskDir, "TASK-100-A-child.md");
+      childPath = path.join(taskDir, "TASK-100-0-child.md");
 
       const childContent =
-        childShape === "valid" ? spec("TASK-100-A") : "unparseable child sentinel\n";
+        childShape === "valid" ? spec("TASK-100-Z") : "unparseable child sentinel\n";
       const files: Array<[string, string]> = [
         [childPath, childContent],
         [parentPath, spec("TASK-100")],
@@ -205,6 +309,12 @@ describe.each(cases)(
       adapterPath = writeAdapter(root);
       fs.mkdirSync(path.join(root, ".quack", "logs"), { recursive: true });
       fs.writeFileSync(path.join(root, ".quack", "logs", "sessions.jsonl"), "", "utf-8");
+      execFileSync("git", ["init", "-q", "-b", "main"], { cwd: root });
+      execFileSync("git", ["config", "user.email", "quack-test@example.com"], { cwd: root });
+      execFileSync("git", ["config", "user.name", "Quack Test"], { cwd: root });
+      execFileSync("git", ["config", "commit.gpgsign", "false"], { cwd: root });
+      execFileSync("git", ["add", ".quack/adapter.json", "docs/tasks"], { cwd: root });
+      execFileSync("git", ["commit", "-q", "-m", "fixture"], { cwd: root });
 
       // Finalize compares the parent spec mtime with this record, so the prep
       // fixture must be written only after both task files exist.
@@ -228,14 +338,15 @@ describe.each(cases)(
         .find((f) => f.startsWith("TASK-100") && f.endsWith(".md"));
       expect(naive).toBeDefined();
       if (order === "child-first") {
-        expect(naive).toBe("TASK-100-A-child.md");
+        expect(naive).toBe("TASK-100-0-child.md");
       }
     });
 
     it("finalizes the parent tracker, writes the draft, and preserves the child", async () => {
       const server = createMonitorServer({
         logDir: path.join(root, ".quack", "logs"),
-        port: 30000 + Math.floor(Math.random() * 10000),
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: root,
         taskDir: "docs/tasks",
         adapterPath,
@@ -247,18 +358,19 @@ describe.each(cases)(
       const response = await postJson(started.port, "/api/tasks/TASK-100/decompose", {
         mode: "finalize",
         reviewAcknowledged: true,
-        drafts: [makeDraft()],
+        drafts: makeDrafts(),
+        plan: makeTopology(spec("TASK-100")),
       });
 
-      expect(response.status).toBe(200);
-      expect(response.body.ok).toBe(true);
+      expect(response).toMatchObject({ status: 200, body: { ok: true } });
       expect(response.body.parentStatusUpdated).toBe(true);
-      expect(response.body.subtaskIds).toEqual(["TASK-100-B"]);
+      expect(response.body.subtaskIds).toEqual(["TASK-100-A", "TASK-100-B"]);
 
       const parentAfter = fs.readFileSync(parentPath, "utf-8");
       expect(parentAfter).toContain("**Status:** DECOMPOSED");
       expect(parentAfter).toContain("## Decomposition Summary");
-      expect(fs.existsSync(path.join(taskDir, "TASK-100-B-generated-child.md"))).toBe(true);
+      expect(fs.existsSync(path.join(taskDir, "TASK-100-A-generated-first-child.md"))).toBe(true);
+      expect(fs.existsSync(path.join(taskDir, "TASK-100-B-generated-final-child.md"))).toBe(true);
       expect(fs.readFileSync(childPath, "utf-8")).toBe(childBefore);
     });
   },

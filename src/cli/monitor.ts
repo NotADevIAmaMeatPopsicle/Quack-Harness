@@ -10,7 +10,7 @@ import * as path from "node:path";
 import { getBuildInfo } from "../core/build-info.js";
 
 import { loadAdapter } from "../core/adapter-loader.js";
-import { createMonitorServer } from "../monitor/server.js";
+import { createMonitorServer, type MonitorServerOptions } from "../monitor/server.js";
 import type { ProjectAdapter } from "../core/adapter-loader.js";
 
 export function resolveMonitorBindHost(host?: string): string {
@@ -35,6 +35,26 @@ export function describeMonitorNetwork(
   );
   lines.push(`Health:    http://${urlHost}:${port}/api/health`);
   return { bindHost: host, lines };
+}
+
+/** Build the legacy single-project envelope without dropping operator trust. */
+export function buildSingleProjectMonitorServerOptions(
+  adapter: ProjectAdapter,
+  port: number,
+  host: string,
+): MonitorServerOptions {
+  return {
+    logDir: path.resolve(adapter.projectRoot, adapter.config.logging.dir),
+    port,
+    host,
+    adapterPath: path.resolve(adapter.projectRoot, ".quack", "adapter.json"),
+    projectRoot: adapter.projectRoot,
+    taskDir: adapter.config.project.taskDir,
+    ...(adapter.trustedLocalReadRemotePaths
+      ? { trustedLocalReadRemotePaths: adapter.trustedLocalReadRemotePaths }
+      : {}),
+    runtimeRole: "headnode",
+  };
 }
 
 export async function monitorCommand(options: {
@@ -124,20 +144,15 @@ export async function monitorCommand(options: {
       console.log(`Log dir: ${logDir}`);
       console.log(`Port:    ${port}\n`);
 
-      const network = describeMonitorNetwork(host, port, "single");
-      const adapterPath = path.resolve(adapter.projectRoot, ".quack", "adapter.json");
-      const server = createMonitorServer({
-        logDir,
-        port,
-        adapterPath,
-        projectRoot: adapter.projectRoot,
-        taskDir: adapter.config.project.taskDir,
-        runtimeRole: "headnode",
-        host: network.bindHost,
-      });
+      const server = createMonitorServer(
+        buildSingleProjectMonitorServerOptions(adapter, port, host),
+      );
       await server.start();
 
-      for (const line of network.lines) console.log(line);
+      console.log(`Bind:      ${host}:${port}`);
+      console.log(`Dashboard: http://${host}:${port}`);
+      console.log(`SSE:       http://${host}:${port}/api/events/stream`);
+      console.log(`Health:    http://${host}:${port}/api/health`);
       console.log(`\nPress Ctrl+C to stop.\n`);
       // createMonitorServer owns the once-only SIGINT/SIGTERM lifecycle.
     } else {
@@ -148,9 +163,9 @@ export async function monitorCommand(options: {
       const network = describeMonitorNetwork(host, port, "multi");
       const server = createMonitorServer({
         port,
+        host,
         projectAdapters: adapters,
         runtimeRole: "headnode",
-        host: network.bindHost,
       });
       await server.start();
 

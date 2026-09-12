@@ -4,6 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { createMonitorServer } from "../../src/monitor/server";
+import { generateProjectId } from "../../src/monitor/project-registry";
+import { saveFederatedJob } from "../../src/monitor/federation/store";
+import type { FederatedJobRecord } from "../../src/monitor/federation/types";
+import { withTaskCreationReservation } from "../../src/core/task-creation-reservation";
 
 jest.mock("../../src/monitor/auth", () => ({
   ...jest.requireActual<object>("../../src/monitor/auth"),
@@ -98,6 +102,36 @@ function writeTask(projectRoot: string): void {
   );
 }
 
+async function writeFederatedClaim(
+  projectRoot: string,
+  overrides: Partial<FederatedJobRecord> = {},
+): Promise<FederatedJobRecord> {
+  const now = new Date().toISOString();
+  const record: FederatedJobRecord = {
+    projectId: generateProjectId(projectRoot),
+    jobId: "fed-TASK-001",
+    taskId: "TASK-001",
+    jobType: "dispatch",
+    status: "assigned",
+    correlationId: "fed-TASK-001",
+    requiredCapabilities: ["dispatch"],
+    hostId: "laptop",
+    decision: {},
+    lease: {
+      leaseId: "lease-1",
+      hostId: "laptop",
+      acquiredAt: now,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    },
+    createdAt: now,
+    updatedAt: now,
+    queuedAt: now,
+    ...overrides,
+  };
+  await saveFederatedJob(projectRoot, record);
+  return record;
+}
+
 function parseErrorBody(body: string): { error?: string; code?: string } {
   return JSON.parse(body) as { error?: string; code?: string };
 }
@@ -122,15 +156,15 @@ describe("direct dispatch guard", () => {
   });
 
   async function startServer(): Promise<string> {
-    const port = 30000 + Math.floor(Math.random() * 10000);
     const serverObj = createMonitorServer({
-      port,
+      port: 0,
+      host: "127.0.0.1",
       projectRoot,
       taskDir: "docs/tasks",
     });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
-    return `http://localhost:${port}`;
+    const started = await serverObj.start();
+    stopServer = started.stop;
+    return `http://127.0.0.1:${started.port}`;
   }
 
   it("blocks direct starts when a federated listener is registered", async () => {
@@ -199,6 +233,98 @@ describe("direct dispatch guard", () => {
 
     expect(status).toBe(409);
     expect(parseErrorBody(body)).toMatchObject({
+      code: "federated_claim_unverified",
+    });
+  });
+
+  it("binds a federated start claim to the exact task and lease", async () => {
+    await writeFederatedClaim(projectRoot);
+    const baseUrl = await startServer();
+
+    const wrongTask = await httpPost(`${baseUrl}/api/tasks/TASK-999/start`, {
+      skipGate: true,
+      federatedJobId: "fed-TASK-001",
+      federatedHostId: "laptop",
+      federatedLeaseId: "lease-1",
+    });
+    expect(wrongTask.status).toBe(409);
+    expect(parseErrorBody(wrongTask.body)).toMatchObject({
+      code: "federated_claim_unverified",
+    });
+
+    const wrongLease = await httpPost(`${baseUrl}/api/tasks/TASK-001/start`, {
+      skipGate: true,
+      federatedJobId: "fed-TASK-001",
+      federatedHostId: "laptop",
+      federatedLeaseId: "lease-forged",
+    });
+    expect(wrongLease.status).toBe(409);
+    expect(parseErrorBody(wrongLease.body)).toMatchObject({
+      code: "federated_claim_unverified",
+    });
+  });
+
+  it("rejects an expired federated lease before revision state can be changed", async () => {
+    await writeFederatedClaim(projectRoot, {
+      jobType: "fix",
+      lease: {
+        leaseId: "lease-expired",
+        hostId: "laptop",
+        acquiredAt: "2000-01-01T00:00:00.000Z",
+        expiresAt: "2000-01-01T00:01:00.000Z",
+      },
+    });
+    const baseUrl = await startServer();
+
+    const response = await httpPost(`${baseUrl}/api/tasks/TASK-001/revise`, {
+      feedback: "retry",
+      federatedJobId: "fed-TASK-001",
+      federatedHostId: "laptop",
+      federatedLeaseId: "lease-expired",
+    });
+    expect(response.status).toBe(409);
+    expect(parseErrorBody(response.body)).toMatchObject({
+      code: "federated_claim_unverified",
+    });
+  });
+
+  it("revalidates a reassigned lease after waiting for decomposition admission", async () => {
+    const original = await writeFederatedClaim(projectRoot);
+    const baseUrl = await startServer();
+    let responsePromise!: Promise<{ status: number; body: string }>;
+    let settled = false;
+
+    await withTaskCreationReservation(
+      path.join(projectRoot, "docs", "tasks"),
+      { creator: "dispatch-admission", requestedIds: [] },
+      async () => {
+        responsePromise = httpPost(`${baseUrl}/api/tasks/TASK-001/start`, {
+          skipGate: true,
+          federatedJobId: original.jobId,
+          federatedHostId: "laptop",
+          federatedLeaseId: original.lease!.leaseId,
+        }).then((response) => {
+          settled = true;
+          return response;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        expect(settled).toBe(false);
+        await saveFederatedJob(projectRoot, {
+          ...original,
+          hostId: "headnode",
+          lease: {
+            ...original.lease!,
+            leaseId: "lease-reassigned",
+            hostId: "headnode",
+          },
+          updatedAt: new Date().toISOString(),
+        });
+      },
+    );
+
+    const response = await responsePromise;
+    expect(response.status).toBe(409);
+    expect(parseErrorBody(response.body)).toMatchObject({
       code: "federated_claim_unverified",
     });
   });

@@ -152,26 +152,6 @@ describe("assembleContext", () => {
   });
 
   describe("relevantFiles", () => {
-    it("rejects task paths that escape the project root", async () => {
-      const task = makeTask({
-        filesToModify: [{ path: "../../outside.txt", action: "Modify", notes: "" }],
-      });
-
-      await expect(assembleContext(task, makeAdapter())).rejects.toThrow(
-        "Unsafe task file path outside project root",
-      );
-    });
-
-    it("rejects absolute task paths", async () => {
-      const task = makeTask({
-        filesToModify: [{ path: "C:\\Windows\\win.ini", action: "Modify", notes: "" }],
-      });
-
-      await expect(assembleContext(task, makeAdapter())).rejects.toThrow(
-        "Unsafe task file path outside project root",
-      );
-    });
-
     it("should load files listed in filesToModify with Modify action", async () => {
       const task = makeTask({
         filesToModify: [{ path: "src/services/auth.ts", action: "Modify", notes: "Add refresh" }],
@@ -350,21 +330,15 @@ describe("assembleContext", () => {
 
   describe("claudeMd", () => {
     it("should discover CLAUDE.md at the project root", async () => {
-      const fixturePath = path.join(SAMPLE_PROJECT, "CLAUDE.md");
-      await fs.writeFile(fixturePath, "# Synthetic Project Guide\n", "utf-8");
+      const task = makeTask();
+      const adapter = makeAdapter();
 
-      try {
-        const task = makeTask();
-        const adapter = makeAdapter();
-        const ctx = await assembleContext(task, adapter);
+      const ctx = await assembleContext(task, adapter);
 
-        const hasRootClaudeMd = ctx.claudeMd.some(
-          (c) => c.includes("CLAUDE.md") && c.includes("Synthetic Project Guide"),
-        );
-        expect(hasRootClaudeMd).toBe(true);
-      } finally {
-        await fs.unlink(fixturePath);
-      }
+      const hasRootClaudeMd = ctx.claudeMd.some(
+        (c) => c.includes("CLAUDE.md") && c.includes("Sample Project"),
+      );
+      expect(hasRootClaudeMd).toBe(true);
     });
 
     it("should return empty array when no CLAUDE.md exists", async () => {

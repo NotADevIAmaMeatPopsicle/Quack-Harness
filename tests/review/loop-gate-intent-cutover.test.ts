@@ -3,9 +3,9 @@
 // cutover would be inert), the never-upgrade pin, the degradation
 // posture, and the two deliberate skips.
 //
-// NOTE: `tests/review/loop-gate.test.ts` is left UNTOUCHED on purpose —
-// it calls `evaluateLoopReview` without a cutover argument, so it is
-// the off-mode byte-identity control for everything here.
+// The base suite remains the off-mode behavior control. This suite wraps the
+// evaluator with explicit producer provenance so cross-model enforcement does
+// not obscure the intent-cutover assertions below.
 
 import type {
   IntentJudgmentRequest,
@@ -24,7 +24,10 @@ jest.mock("../../src/judgment/runner/intent-judgment-runner", () => ({
   createIntentJudgmentRunner: (...args: unknown[]) => mockCreateRunner(...(args as [])),
 }));
 
-import { evaluateLoopReview, type LoopJudgmentCutover } from "../../src/review/loop-gate";
+import {
+  evaluateLoopReview as evaluateLoopReviewBase,
+  type LoopJudgmentCutover,
+} from "../../src/review/loop-gate";
 import type {
   ReviewerRunner,
   ReviewRequest,
@@ -34,10 +37,37 @@ import type { ReviewerRunnerConfig } from "../../src/review/reviewer-config";
 
 const config: ReviewerRunnerConfig = {
   runner: "claude-sdk",
+  model: "gpt-5.6-terra",
   maxTurns: 30,
   timeoutMs: 600_000,
-  codex: { binaryPath: "codex", sandbox: "read-only" },
+  codex: { binaryPath: "codex", sandbox: "read-only", provider: "openai" },
 };
+
+const crossModelProducer = {
+  runner: "claude-sdk" as const,
+  provider: "anthropic",
+  model: "claude-sonnet-4-6",
+};
+
+function evaluateLoopReview(
+  runnerConfig: ReviewerRunnerConfig,
+  requireCrossModel: boolean,
+  request: ReviewRequest,
+  runnerFactory?: Parameters<typeof evaluateLoopReviewBase>[3],
+  injectedSignals: JudgmentSignal[] = [],
+  reviewCutover?: LoopJudgmentCutover,
+) {
+  return evaluateLoopReviewBase(
+    runnerConfig,
+    requireCrossModel,
+    request,
+    runnerFactory,
+    injectedSignals,
+    reviewCutover,
+    undefined,
+    crossModelProducer,
+  );
+}
 
 const SPEC_WITH_INTENT = [
   "## Intent",
@@ -79,6 +109,7 @@ function completed(
     summary: "clean",
     rawText: "{}",
     runner: "codex-cli",
+    model: "gpt-5.6-terra",
     durationMs: 1,
     ...overrides,
   };

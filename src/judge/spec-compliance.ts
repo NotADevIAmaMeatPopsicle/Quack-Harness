@@ -10,7 +10,7 @@
 
 import type { ParsedTask, VerificationPattern } from "../core/types.js";
 import { promises as fs } from "fs";
-import { join } from "path";
+import { isAbsolute, join, relative, resolve } from "path";
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -73,11 +73,13 @@ export interface DeterministicCheck {
   /** Criterion text substring to match (case-insensitive) */
   criterionMatch: string;
   /** Type of check to perform */
-  type: "grep" | "file_exists" | "file_not_exists";
+  type: "grep" | "grep_count" | "file_exists" | "file_not_exists";
   /** Pattern for grep, or path for file checks */
   pattern: string;
   /** Files to search (glob) — only for grep type */
   glob?: string;
+  /** Exact zero when 0; minimum required count when positive. */
+  expectedMatches?: number;
   /** Severity level */
   severity: "warning" | "flag";
 }
@@ -86,18 +88,18 @@ export interface DeterministicCheck {
 
 /**
  * Maps VerificationPattern.checkType to DeterministicCheck.type.
- * grep_count maps to grep — the count threshold is advisory.
+ * grep_count remains distinct so zero-count assertions cannot silently
+ * degrade into ordinary presence checks.
  */
 function mapCheckType(
   checkType: "grep" | "grep_count" | "file_exists" | "file_not_exists",
-): "grep" | "file_exists" | "file_not_exists" {
-  if (checkType === "grep_count") return "grep";
+): DeterministicCheck["type"] {
   return checkType;
 }
 
 /**
  * Convert Blueprint verification patterns into DeterministicCheck format.
- * Maps checkType: grep_count → grep (count threshold is advisory).
+ * Preserves grep_count and its threshold for deterministic enforcement.
  */
 export function blueprintToChecks(
   verificationPatterns: VerificationPattern[],
@@ -108,6 +110,7 @@ export function blueprintToChecks(
     type: mapCheckType(vp.checkType),
     pattern: vp.pattern,
     glob: vp.fileGlob,
+    ...(vp.expectedMatches !== undefined ? { expectedMatches: vp.expectedMatches } : {}),
     severity: "flag" as const,
   }));
 }
@@ -370,6 +373,37 @@ async function runAdapterCheck(
       break;
     }
 
+    case "grep_count": {
+      const candidateFiles = new Set([
+        ...changedFiles,
+        ...addedLines.map((line) => line.file).filter(Boolean),
+      ]);
+      const matchingFiles = [...candidateFiles].filter(
+        (file) => !check.glob || matchesSimpleGlob(file, check.glob),
+      );
+      const fullFileLines = await readProjectFileLines(projectRoot, matchingFiles);
+      const linesToSearch =
+        fullFileLines.length > 0
+          ? fullFileLines
+          : addedLines.filter((line) => !check.glob || matchesSimpleGlob(line.file, check.glob));
+
+      let matchCount = 0;
+      for (const { file, line, content } of linesToSearch) {
+        const lineMatches = countPatternMatches(content, check.pattern);
+        matchCount += lineMatches;
+        for (let occurrence = 0; occurrence < lineMatches; occurrence++) {
+          evidence.push(`${file}:${line}`);
+        }
+      }
+
+      const expectedMatches = check.expectedMatches ?? 1;
+      found = expectedMatches === 0 ? matchCount === 0 : matchCount >= expectedMatches;
+      if (found && expectedMatches === 0) {
+        evidence.push(`0 matches across ${matchingFiles.length} changed file(s)`);
+      }
+      break;
+    }
+
     case "file_exists": {
       const filePath = join(projectRoot, check.pattern);
       try {
@@ -403,6 +437,63 @@ async function runAdapterCheck(
     description: `Adapter check: ${check.name}`,
     severity: check.severity,
   };
+}
+
+function matchesSimpleGlob(file: string, glob: string): boolean {
+  const normalizedFile = file.replace(/\\/g, "/");
+  const normalizedGlob = glob.replace(/\\/g, "/");
+  const globstarDirectory = "__QUACK_GLOBSTAR_DIRECTORY__";
+  const globstar = "__QUACK_GLOBSTAR__";
+  const wildcard = "__QUACK_WILDCARD__";
+  const singleCharacter = "__QUACK_SINGLE_CHARACTER__";
+  const tokenized = normalizedGlob
+    .replace(/\*\*\//g, globstarDirectory)
+    .replace(/\*\*/g, globstar)
+    .replace(/\*/g, wildcard)
+    .replace(/\?/g, singleCharacter);
+  const escaped = tokenized.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  const pattern = escaped
+    .replaceAll(globstarDirectory, "(?:.*/)?")
+    .replaceAll(globstar, ".*")
+    .replaceAll(wildcard, "[^/]*")
+    .replaceAll(singleCharacter, "[^/]");
+  return new RegExp(`^${pattern}$`).test(normalizedFile);
+}
+
+async function readProjectFileLines(
+  projectRoot: string,
+  files: string[],
+): Promise<Array<{ file: string; line: number; content: string }>> {
+  const root = resolve(projectRoot);
+  const lines: Array<{ file: string; line: number; content: string }> = [];
+
+  for (const file of files) {
+    const absolute = resolve(root, file);
+    const withinRoot = relative(root, absolute);
+    if (withinRoot.startsWith("..") || isAbsolute(withinRoot)) continue;
+
+    try {
+      const content = await fs.readFile(absolute, "utf8");
+      content.split(/\r?\n/).forEach((lineContent, index) => {
+        lines.push({ file: file.replace(/\\/g, "/"), line: index + 1, content: lineContent });
+      });
+    } catch {
+      // A deleted or unavailable changed file contributes no matches.
+    }
+  }
+
+  return lines;
+}
+
+function countPatternMatches(content: string, source: string): number {
+  const regex = new RegExp(source, "g");
+  let count = 0;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(content)) !== null) {
+    count++;
+    if (match[0].length === 0) regex.lastIndex++;
+  }
+  return count;
 }
 
 // ─── Main Checker ───────────────────────────────────────────────────

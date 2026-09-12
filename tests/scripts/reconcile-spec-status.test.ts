@@ -24,6 +24,29 @@ async function writeTaskFile(taskDir: string, fileName: string, content: string)
   await fs.writeFile(path.join(taskDir, fileName), content, "utf-8");
 }
 
+function taskSpec(taskId: string, status: string, extraMetadata: string[] = []): string {
+  return [
+    `# ${taskId}: Example`,
+    "## Metadata",
+    "- **Priority:** P2-MEDIUM",
+    "- **Effort:** 1-2 hours",
+    `- **Status:** ${status}`,
+    "- **Blocked By:** []",
+    "- **Blocks:** []",
+    "- **Tags:** fixture",
+    ...extraMetadata,
+    "",
+    "## Problem Statement",
+    "Exercise canonical status reconciliation.",
+    "",
+    "## Success Criteria",
+    "- [x] Status is reconciled.",
+    "",
+    "## Testing Requirements",
+    "- [x] The fixture is covered.",
+  ].join("\n");
+}
+
 function makeStatus(taskId: string, status: string): TaskStatusRow {
   return {
     task_id: taskId,
@@ -57,17 +80,11 @@ describe("parseSpecStatus", () => {
 describe("reconcileSpecStatuses", () => {
   test("reports drift, missing specs, and skips valid On Hold rows in dry-run mode", async () => {
     const { taskDir } = await makeProject();
-    await writeTaskFile(
-      taskDir,
-      "TASK-758-example.md",
-      ["# TASK-758: Example", "## Metadata", "- **Status:** READY"].join("\n"),
-    );
+    await writeTaskFile(taskDir, "TASK-758-example.md", taskSpec("TASK-758", "READY"));
     await writeTaskFile(
       taskDir,
       "TASK-584-example.md",
-      ["# TASK-584: Example", "## Metadata", "- **Status:** READY", "- **On Hold:** true"].join(
-        "\n",
-      ),
+      taskSpec("TASK-584", "READY", ["- **On Hold:** true"]),
     );
     await writeTaskFile(
       taskDir,
@@ -109,11 +126,7 @@ describe("reconcileSpecStatuses", () => {
 
   test("apply mode rewrites mismatched spec statuses and reports failures for missing specs", async () => {
     const { taskDir } = await makeProject();
-    await writeTaskFile(
-      taskDir,
-      "TASK-758-example.md",
-      ["# TASK-758: Example", "## Metadata", "- **Status:** READY"].join("\n"),
-    );
+    await writeTaskFile(taskDir, "TASK-758-example.md", taskSpec("TASK-758", "READY"));
 
     const result = await reconcileSpecStatuses(
       taskDir,
@@ -126,5 +139,62 @@ describe("reconcileSpecStatuses", () => {
     expect(updated).toContain("**Status:** COMPLETE");
     expect(result.fixed).toEqual(["TASK-758"]);
     expect(result.failedToFix).toEqual(["TASK-999"]);
+  });
+});
+
+// TASK-1336-C: H1-level reconciliation deliberately retains partial specs.
+describe.each(["forward", "reverse"])("declared spec reconciliation (%s)", (order) => {
+  test("drift lookup and apply use the declared task despite swapped filename identities", async () => {
+    const { taskDir } = await makeProject();
+    const entries = [
+      ["TASK-100-first.md", taskSpec("TASK-200", "READY")],
+      ["TASK-200-second.md", taskSpec("TASK-100", "COMPLETE")],
+    ];
+    for (const [name, content] of order === "forward" ? entries : [...entries].reverse())
+      await writeTaskFile(taskDir, name, content);
+    const untouched = await fs.readFile(path.join(taskDir, "TASK-200-second.md"), "utf8");
+    const result = await reconcileSpecStatuses(taskDir, [makeStatus("TASK-200", "COMPLETE")], {
+      apply: true,
+    });
+    expect(result.drift).toEqual([
+      expect.objectContaining({
+        taskId: "TASK-200",
+        specPath: path.join(taskDir, "TASK-100-first.md"),
+        reason: "status_mismatch",
+      }),
+    ]);
+    expect(result.fixed).toEqual(["TASK-200"]);
+    expect(await fs.readFile(path.join(taskDir, "TASK-100-first.md"), "utf8")).toContain(
+      "**Status:** COMPLETE",
+    );
+    expect(await fs.readFile(path.join(taskDir, "TASK-200-second.md"), "utf8")).toBe(untouched);
+  });
+  test("indexes partial and explicit legacy H1 families without admitting absent or malformed declarations", async () => {
+    const { taskDir } = await makeProject();
+    const ids = ["TASK-1402-A", "SAURUS-REM-001", "TASK-BS-01", "TASK-SAURUS-REM-001"];
+    const entries = ids.map((id, index) => [
+      `TASK-${index + 1}-divergent.md`,
+      `# ${id}: partial\n## Metadata\n- **Status:** READY\n`,
+    ]);
+    entries.push(["TASK-9000-no-heading.md", "- **Status:** READY\n"]);
+    entries.push([
+      "TASK-9001-malformed-heading.md",
+      "# Not a task\n# TASK-9001: ignored second H1\n- **Status:** READY\n",
+    ]);
+    for (const [name, content] of order === "forward" ? entries : [...entries].reverse())
+      await writeTaskFile(taskDir, name, content);
+    const result = await reconcileSpecStatuses(
+      taskDir,
+      [...ids, "TASK-9000", "TASK-9001", "TASK-9002"].map((id) => makeStatus(id, "COMPLETE")),
+    );
+    expect(
+      result.drift
+        .filter((item) => item.reason === "status_mismatch")
+        .map((item) => item.taskId)
+        .sort(),
+    ).toEqual([...ids].sort());
+    expect(
+      result.drift.filter((item) => item.reason === "missing_spec").map((item) => item.taskId),
+    ).toEqual(["TASK-9000", "TASK-9001", "TASK-9002"]);
   });
 });

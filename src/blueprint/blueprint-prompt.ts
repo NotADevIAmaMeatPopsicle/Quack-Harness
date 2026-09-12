@@ -39,7 +39,8 @@ Analyze the codebase and produce a Blueprint JSON object with these fields:
 - **codeExamples**: Before/after code snippets showing HOW to implement key changes.
   Include at least one example per file being modified. Show the exact integration.
 - **verificationPatterns**: Deterministic checks (grep patterns, file existence checks)
-  for each success criterion. These will be run before the LLM judge.
+  for each success criterion. These will be run before the LLM judge. When the
+  task has Mandated Checks, attach each exact form to a pattern via mandatedCheck.
 - **antiPatterns**: Explicit "do NOT" instructions based on common agent failure modes
   (stubbing, partial wiring, placeholder comments, shell implementations).
 - **preconditions**: Things that must be true before starting (e.g., "existing tests
@@ -85,7 +86,8 @@ Blueprint interface:
       "checkType": "grep" | "grep_count" | "file_exists" | "file_not_exists",
       "pattern": string,         // Regex pattern or file path
       "fileGlob": string,        // Target file(s)
-      "expectedMatches"?: number // Minimum match count (for grep_count only)
+      "expectedMatches"?: number,// grep_count: 0 means exactly zero; positive means minimum count
+      "mandatedCheck"?: string   // Exact Mandated Checks bullet represented by this pattern
     }
   ],
   "antiPatterns": [string],   // "do NOT" instructions
@@ -115,21 +117,23 @@ Blueprint interface:
   // human gate. If your prose tells the builder to import or call
   // something, it MUST also appear here — an unexported or nonexistent
   // directive FAILS the whole brief. ──
-  "importsToUse"?: [          // Every existing symbol the builder should import/call.
+  "importsToUse"?: [          // Existing REPO-LOCAL exported symbols the builder should import/call.
     {
       "symbol": string,       // The exported symbol name, exactly as declared
-      "fromFile": string,     // Repo-relative file that EXPORTS it (verify with Read/Grep first)
+      "fromFile": string,     // Existing repo-relative file that EXPORTS it (verify with Read/Grep first)
       "kind"?: "value" | "type" // "type" ONLY for type-only imports (export type / interface).
                               // Omit for runtime symbols — a type-only export directed as a
                               // runtime symbol FAILS the audit.
     }
   ],
-  "entryPoints"?: [           // Existing entry points the change wires into
+  "entryPoints"?: [           // Existing repo-local exported runtime symbols the change wires into
     { "symbol": string, "file": string }
   ],
-  "specFacts"?: [string]      // ONLY when the spec has a "## Decided Facts" section:
+  "specFacts"?: [string],     // ONLY when the spec has a "## Decided Facts" section:
                               // restate each decided fact you honored, verbatim or near-verbatim.
                               // Contradicting a decided fact is a review-blocking defect.
+  "mandatedChecks"?: [string] // ONLY when the spec has a "## Mandated Checks" section:
+                              // echo every bullet EXACTLY, with command and expectation unchanged.
 }
 
 ## Instructions
@@ -142,12 +146,23 @@ Blueprint interface:
 6. Generate before/after code examples for key integration points
 7. Generate verification patterns for each success criterion (prefer grep over file_exists)
 8. List anti-patterns based on common failure modes (stubbing, incomplete wiring, placeholders)
-9. **Emit your directives**: every existing symbol your plan tells the builder to import,
-   call, or wire into MUST appear in importsToUse/entryPoints with the file that exports it.
-   VERIFY the export exists (Read or Grep the file) before writing the directive — a
-   deterministic auditor rejects the entire brief on an unexported or nonexistent directive.
-   Never direct the builder at a symbol you have not confirmed is exported.
-10. Output the Blueprint JSON object
+9. **Emit only repo-local export directives**: every EXISTING REPO-LOCAL symbol your
+   plan tells the builder to import, call, or wire into MUST appear in
+   importsToUse/entryPoints with the EXISTING repo file that exports it. VERIFY the
+   export exists with Read or Grep before writing the directive — a deterministic
+   auditor rejects the entire brief on an unexported or nonexistent directive.
+   Never put any of these in importsToUse or entryPoints: external package imports;
+   dependencies that are not installed yet; symbols or files that will be created by
+   this task; npm script names; package.json keys; configuration or object keys;
+   environment variables; command names; file paths; or prose labels. Describe those
+   ordinary implementation details only in fileAnalyses/codeExamples. An empty
+   directive array is correct when the plan uses no existing repo-local export.
+10. **Preserve mandated checks verbatim**: when the task contains Mandated Checks,
+    copy every bullet byte-for-byte into the top-level mandatedChecks array AND into
+    the mandatedCheck field of at least one verificationPatterns entry. Never omit,
+    paraphrase, normalize, or weaken a command or its expectation qualifier. You may
+    add extra verification patterns. The pipeline rejects an inexact or missing echo.
+11. Output the Blueprint JSON object
 
 ---`);
 
@@ -169,6 +184,24 @@ decisions; your blueprint must never direct the builder to contradict
 one. Restate each fact you honored in the "specFacts" output field.
 
 ${task.decidedFacts.map((fact) => `- ${fact}`).join("\n")}`);
+  }
+
+  // TASK-1325: exact verification forms are elevated out of surrounding
+  // prose into a binding block. The auditor compares the parsed source
+  // entries against both machine-readable brief surfaces after synthesis.
+  if (task.mandatedChecks && task.mandatedChecks.length > 0) {
+    sections.push(`## MANDATED CHECKS — VERBATIM CONTRACT
+
+The spec above contains a "Mandated Checks" section. Copy EVERY form below
+EXACTLY into the top-level "mandatedChecks" array and into the "mandatedCheck"
+field of at least one verificationPatterns entry. Preserve command text and
+every expectation qualifier byte-for-byte. Additional patterns are allowed;
+omission, paraphrase, or softening fails the deterministic fidelity audit.
+
+This contract proves preservation into the Brief only. It does not prove a
+check or mutation/bite was executed.
+
+${task.mandatedChecks.map((check) => `- ${check}`).join("\n")}`);
   }
 
   // Files to modify (explicitly list them for clarity)
@@ -250,6 +283,21 @@ const MAX_BLUEPRINT_CHARS = 32_000;
 
 /** Maximum hand-back items rendered (operator info, not work orders) */
 const MAX_HAND_BACK_ITEMS = 8;
+
+/**
+ * Render mandates at the front of the worker/reviewer artifact so size
+ * truncation cannot silently demote the task-authored verification contract.
+ */
+function renderMandatedCheckSections(blueprint: Blueprint): string[] {
+  if (!blueprint.mandatedChecks || blueprint.mandatedChecks.length === 0) {
+    return [];
+  }
+  return [
+    `### Mandated Checks (verbatim from the spec)`,
+    blueprint.mandatedChecks.map((check) => `- ${check}`).join("\n"),
+    `Preservation evidence only: this does not prove a check or mutation/bite was executed.`,
+  ];
+}
 
 /**
  * Render the TASK-1306 brief sections (base validation, constraints, tests to
@@ -369,6 +417,7 @@ export function formatBlueprintForPrompt(blueprint: Blueprint): string {
   const sections: string[] = [];
 
   sections.push(`## Implementation Blueprint`);
+  sections.push(...renderMandatedCheckSections(blueprint));
 
   // File analyses
   if (blueprint.fileAnalyses.length > 0) {
@@ -421,7 +470,12 @@ export function formatBlueprintForPrompt(blueprint: Blueprint): string {
     );
     for (let i = 0; i < patternsShown; i++) {
       const pattern = blueprint.verificationPatterns[i];
-      const expected = pattern.expectedMatches !== undefined ? `${pattern.expectedMatches}+` : "-";
+      const expected =
+        pattern.expectedMatches !== undefined
+          ? pattern.expectedMatches === 0
+            ? "exactly 0"
+            : `${pattern.expectedMatches}+`
+          : "-";
       sections.push(
         `| ${pattern.criterion.slice(0, 50)} | ${pattern.checkType} | \`${pattern.pattern}\` | ${pattern.fileGlob} | ${expected} |`,
       );
@@ -532,6 +586,7 @@ function formatBlueprintWithCaps(
   const sections: string[] = [];
 
   sections.push(`## Implementation Blueprint`);
+  sections.push(...renderMandatedCheckSections(blueprint));
 
   // File analyses (possibly reduced)
   if (blueprint.fileAnalyses.length > 0) {
@@ -592,7 +647,12 @@ function formatBlueprintWithCaps(
     );
     for (let i = 0; i < patternsShown; i++) {
       const pattern = blueprint.verificationPatterns[i];
-      const expected = pattern.expectedMatches !== undefined ? `${pattern.expectedMatches}+` : "-";
+      const expected =
+        pattern.expectedMatches !== undefined
+          ? pattern.expectedMatches === 0
+            ? "exactly 0"
+            : `${pattern.expectedMatches}+`
+          : "-";
       sections.push(
         `| ${pattern.criterion.slice(0, 50)} | ${pattern.checkType} | \`${pattern.pattern}\` | ${pattern.fileGlob} | ${expected} |`,
       );

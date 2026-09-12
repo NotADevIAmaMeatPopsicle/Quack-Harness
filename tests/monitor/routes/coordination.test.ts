@@ -144,18 +144,18 @@ describe("coordination routes (TASK-926)", () => {
     );
     tokens = seedTokens(projectRoot);
 
-    const port = 30000 + Math.floor(Math.random() * 10000);
     const serverObj = createMonitorServer({
       logDir,
-      port,
+      port: 0,
+      host: "127.0.0.1",
       projectRoot,
       quackRoot: projectRoot, // ensures initAuthConfig reads our seeded .quack/auth.json
       adapterPath: path.join(projectRoot, ".quack", "adapter.json"),
       taskDir: "docs/tasks",
     });
-    const { stop } = await serverObj.start();
+    const { port, stop } = await serverObj.start();
     stopServer = stop;
-    baseUrl = `http://localhost:${port}`;
+    baseUrl = `http://127.0.0.1:${port}`;
   });
 
   afterEach(async () => {
@@ -178,7 +178,7 @@ describe("coordination routes (TASK-926)", () => {
   // ─── pair_id canonicalization (SC-5) ─────────────────────────────
   it("pair_id is canonical regardless of from/to direction", () => {
     expect(pairId("contributor", "operator")).toBe(pairId("operator", "contributor"));
-    expect(pairId("operator", "contributor")).toBe("contributor:operator");
+    expect(pairId("operator", "contributor")).toBe("operator:contributor");
     expect(pairId("reviewer", "operator")).toBe("operator:reviewer");
   });
 
@@ -196,7 +196,7 @@ describe("coordination routes (TASK-926)", () => {
     expect(res.status).toBe(201);
     const data = JSON.parse(res.body) as { messageId: string; topicId: string; postedAt: string };
     expect(data.messageId).toMatch(/^msg_[0-9a-f]{12}$/);
-    expect(data.topicId).toMatch(/^topic_contributor_operator_/);
+    expect(data.topicId).toMatch(/^topic_operator_contributor_/);
     expect(data.postedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 

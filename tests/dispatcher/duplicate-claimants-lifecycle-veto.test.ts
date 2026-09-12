@@ -58,7 +58,7 @@ it("updates normally with one claimant", async () => {
   }
 });
 
-it("status-pattern-not-found remains the original no-write failure when contested", async () => {
+it("refuses declared duplicate owners before considering a malformed filename fallback", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "quack-lifecycle-noop-"));
   const taskDir = path.join(root, "docs", "tasks");
   fs.mkdirSync(taskDir, { recursive: true });
@@ -84,6 +84,27 @@ it("status-pattern-not-found remains the original no-write failure when conteste
     for (const [filePath, content] of before) {
       expect(fs.readFileSync(filePath, "utf-8")).toBe(content);
     }
+    const entry = JSON.parse(
+      fs.readFileSync(path.join(root, ".quack", "lifecycle-errors.jsonl"), "utf-8"),
+    ) as Record<string, unknown>;
+    expect(entry.errorType).toBe("duplicate_claimants");
+    expect(entry.claimants).toEqual([path.basename(firstClaimant), path.basename(secondClaimant)]);
+  } finally {
+    removeFixture(root);
+  }
+});
+
+it("retains the status-pattern refusal for a malformed raw candidate with no declared owner", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "quack-lifecycle-raw-noop-"));
+  const taskDir = path.join(root, "docs", "tasks");
+  fs.mkdirSync(taskDir, { recursive: true });
+  fs.mkdirSync(path.join(root, ".quack"), { recursive: true });
+  const rawCandidate = path.join(taskDir, "TASK-100-statusless-fixture.md");
+  const content = taskSpec("TASK-100").replace("- **Status:** READY", "- Status omitted");
+  fs.writeFileSync(rawCandidate, content, "utf-8");
+  try {
+    expect(await updateTaskStatus("TASK-100", taskDir, "COMPLETE")).toBe(false);
+    expect(fs.readFileSync(rawCandidate, "utf-8")).toBe(content);
     const entry = JSON.parse(
       fs.readFileSync(path.join(root, ".quack", "lifecycle-errors.jsonl"), "utf-8"),
     ) as Record<string, unknown>;

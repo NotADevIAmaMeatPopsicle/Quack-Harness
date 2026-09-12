@@ -330,6 +330,40 @@ describe("runPreflight", () => {
     );
   });
 
+  it("forwards the explicit Codex spec-review provider in the normal preflight path", async () => {
+    const evaluator = {
+      runner: "codex-cli" as const,
+      model: "gpt-5.6-terra",
+      maxTurns: 30,
+      timeoutMs: 600_000,
+      codex: { binaryPath: "codex", sandbox: "read-only" as const },
+    };
+    adapter.config.evaluationProviders = { specReview: evaluator };
+
+    await runPreflight(task, adapter, { force: true });
+
+    expect(mockReviewSpecAmbiguity).toHaveBeenCalledWith(
+      task,
+      expect.objectContaining({
+        model: "gpt-5.6-terra",
+        evaluator,
+        projectRoot: adapter.projectRoot,
+      }),
+    );
+  });
+
+  it("contains a spec-review provider failure without claiming a low-risk result", async () => {
+    mockReviewSpecAmbiguity.mockRejectedValue(
+      new Error("Codex spec review parse_failed: invalid output"),
+    );
+
+    const result = await runPreflight(task, adapter, { force: true });
+
+    expect(result.specReview).toBeUndefined();
+    expect(result.gate.ready).toBe(true);
+    expect(mockGenerateBlueprint).toHaveBeenCalledWith(task, adapter);
+  });
+
   it("skips gate when skipGate option is set", async () => {
     const result: PreflightResult = await runPreflight(task, adapter, {
       skipGate: true,
@@ -634,6 +668,42 @@ describe("runPreflight", () => {
     // and it round-trips through the file cache
     const cached = await new PrepCache(tmpDir).readPreflight("TASK-099", result.contentHash);
     expect(cached?.blueprint.structured?.constraints).toEqual(["express 4 only"]);
+  });
+
+  it("degrades to the deterministic blueprint when LLM fidelity fails", async () => {
+    mockGenerateBlueprint.mockResolvedValue({
+      taskId: task.id,
+      fileAnalyses: [],
+      codeExamples: [],
+      verificationPatterns: [],
+      antiPatterns: [],
+      preconditions: [],
+      fidelity: {
+        status: "failed",
+        violations: [{ kind: "empty_brief", detail: "No typed directives were produced" }],
+        checkedAt: "2026-09-08T00:00:00.000Z",
+        scope: "typed-surface+file-existence+mandated-checks",
+      },
+    });
+    const emitted: Array<{ stage: string; payload: unknown }> = [];
+
+    const result = await runPreflight(task, adapter, {
+      force: true,
+      events: makeEventWriter(emitted),
+    });
+
+    expect(result.mode).toBe("deterministic");
+    expect(result.degraded?.diagnostics.stderrTail).toContain(
+      "Generated blueprint failed deterministic fidelity validation",
+    );
+    expect(result.blueprint.fileAnalyses).toBe(task.filesToModify.length);
+    expect(result.blueprint.structured).toBeUndefined();
+    const degradedEvent = emitted.find((event) => event.stage === "preflight_degraded");
+    expect(degradedEvent?.payload).toMatchObject({
+      taskId: task.id,
+      mode: "deterministic",
+      reason: "runtime_unavailable",
+    });
   });
 
   it("leaves structured ABSENT on the deterministic path (honesty over stubs)", async () => {

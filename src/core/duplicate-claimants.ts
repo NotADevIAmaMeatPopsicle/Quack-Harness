@@ -8,15 +8,24 @@ export type DuplicateClaimantIndex =
   | { status: "scanned"; contested: Map<string, string[]> }
   | { status: "unavailable"; reason: string };
 
+/**
+ * Strict, non-collapsing claimant index for creator-side ownership checks.
+ * Unlike {@link DuplicateClaimantIndex}, a single claimant is retained: a
+ * creator must refuse the *second* claimant before the id becomes contested.
+ */
+export type TaskClaimantIndex =
+  | { status: "scanned"; claimants: Map<string, string[]> }
+  | { status: "unavailable"; reason: string };
+
 export type DuplicateClaimantScanProducer = () => Promise<readonly TaskClaimantDeclaration[]>;
 
-export async function buildStrictDuplicateClaimantIndex(
+export async function buildStrictTaskClaimantIndex(
   producer?: DuplicateClaimantScanProducer,
-): Promise<DuplicateClaimantIndex> {
+): Promise<TaskClaimantIndex> {
   if (!producer) {
     return {
       status: "unavailable",
-      reason: "TaskService is unavailable for duplicate claimant scan.",
+      reason: "TaskService is unavailable for claimant scan.",
     };
   }
 
@@ -26,23 +35,42 @@ export async function buildStrictDuplicateClaimantIndex(
       fileName: declaration.fileName,
       declaredId: normalizeClaimantTaskId(declaration.declaredId),
     }));
-    const contested = new Map<string, string[]>();
-    for (const [taskId, claimants] of groupTaskClaimantsByDeclaredId(normalized)) {
-      if (claimants.length > 1) {
-        contested.set(
-          taskId,
-          [...claimants].sort((a, b) => a.localeCompare(b)),
-        );
-      }
+    const claimants = groupTaskClaimantsByDeclaredId(normalized);
+    for (const [taskId, fileNames] of claimants) {
+      claimants.set(
+        taskId,
+        [...fileNames].sort((a, b) => a.localeCompare(b)),
+      );
     }
-    return { status: "scanned", contested };
+    return { status: "scanned", claimants };
   } catch (err: unknown) {
     const detail = err instanceof Error ? err.message : String(err);
     return {
       status: "unavailable",
-      reason: `Duplicate claimant scan failed: ${detail}`,
+      reason: `Claimant scan failed: ${detail}`,
     };
   }
+}
+
+export async function buildStrictDuplicateClaimantIndex(
+  producer?: DuplicateClaimantScanProducer,
+): Promise<DuplicateClaimantIndex> {
+  const index = await buildStrictTaskClaimantIndex(producer);
+  if (index.status === "unavailable") {
+    return {
+      status: "unavailable",
+      reason:
+        index.reason === "TaskService is unavailable for claimant scan."
+          ? "TaskService is unavailable for duplicate claimant scan."
+          : index.reason.replace("Claimant scan", "Duplicate claimant scan"),
+    };
+  }
+
+  const contested = new Map<string, string[]>();
+  for (const [taskId, claimants] of index.claimants) {
+    if (claimants.length > 1) contested.set(taskId, [...claimants]);
+  }
+  return { status: "scanned", contested };
 }
 
 export function normalizeClaimantTaskId(taskId: string): string {

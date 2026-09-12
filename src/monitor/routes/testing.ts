@@ -16,6 +16,7 @@ import type {
   VerificationCommand,
 } from "../../core/types.js";
 import { verificationCommandShellString } from "../../core/types.js";
+import { loadAdapter } from "../../core/adapter-loader.js";
 
 export interface TestingRouteProject {
   projectRoot?: string;
@@ -25,6 +26,7 @@ export interface TestingRouteProject {
 export interface TestingRouteDeps {
   resolveProject: (req: Request) => TestingRouteProject;
   testRunner: TestRunner | null;
+  getTestRunner?: (projectRoot: string) => TestRunner;
   sse: SSEManager;
   getVerificationCommands: (adapterPath?: string) => VerificationCommand[];
   getSmartTestingConfig: (adapterPath?: string) => SmartTestingConfig | undefined;
@@ -52,13 +54,14 @@ export function registerTestingRoutes(app: Express, deps: TestingRouteDeps): voi
     res.json(getVerificationCommands(p.adapterPath));
   });
 
-  app.post("/api/testing/run", (req: Request, res: Response) => {
+  app.post("/api/testing/run", async (req: Request, res: Response) => {
     const p = resolveProject(req);
     if (!p.projectRoot) {
       res.status(500).json({ error: "No project root configured" });
       return;
     }
-    if (!testRunner) {
+    const selectedRunner = deps.getTestRunner?.(p.projectRoot) ?? testRunner;
+    if (!selectedRunner) {
       res.status(500).json({ error: "Test runner not available" });
       return;
     }
@@ -80,7 +83,7 @@ export function registerTestingRoutes(app: Express, deps: TestingRouteDeps): voi
       return;
     }
 
-    if (testRunner.isRunning()) {
+    if (selectedRunner.isRunning()) {
       res.status(409).json({ error: "A command is already running" });
       return;
     }
@@ -90,13 +93,18 @@ export function registerTestingRoutes(app: Express, deps: TestingRouteDeps): voi
       const gitConfig = getAdapterGitConfig(p.adapterPath);
       const adapterFreshness = getAdapterFreshness(p.adapterPath);
       const cmdShellString = verificationCommandShellString(cmd);
-      const started = testRunner.start(cmd.name, cmdShellString, {
+      const adapter = await loadAdapter(p.projectRoot);
+      const runnerOptions = {
         timeoutMs: cmd.timeout,
         force,
         smartTesting,
         baseBranch: gitConfig?.baseBranch ?? "main",
         adapterFreshness,
-      });
+      };
+      const started =
+        (adapter.config.verification.hostExecution ?? "direct") === "direct"
+          ? selectedRunner.start(cmd.name, cmdShellString, runnerOptions)
+          : selectedRunner.startAdapterVerification(adapter, cmd.name, runnerOptions);
       res.json({
         ok: true,
         name: cmd.name,
@@ -112,32 +120,51 @@ export function registerTestingRoutes(app: Express, deps: TestingRouteDeps): voi
   });
 
   app.get("/api/testing/status", (_req: Request, res: Response) => {
-    if (!testRunner) {
+    const p = resolveProject(_req);
+    const selectedRunner = p.projectRoot
+      ? (deps.getTestRunner?.(p.projectRoot) ?? testRunner)
+      : testRunner;
+    if (!selectedRunner) {
       res.json({ running: false, name: "", command: "", authority });
       return;
     }
-    res.json({ ...testRunner.getStatus(), authority });
+    res.json({ ...selectedRunner.getStatus(), authority });
   });
 
-  app.post("/api/testing/stop", (_req: Request, res: Response) => {
-    if (!testRunner) {
+  app.post("/api/testing/stop", (req: Request, res: Response) => {
+    const p = resolveProject(req);
+    const selectedRunner = p.projectRoot
+      ? (deps.getTestRunner?.(p.projectRoot) ?? testRunner)
+      : testRunner;
+    if (!selectedRunner) {
       res.status(404).json({ error: "Test runner not available" });
       return;
     }
-    const stopped = testRunner.stop();
+    const wasRunning = selectedRunner.isRunning();
+    const stopped = selectedRunner.stop();
     if (stopped) {
       res.json({ ok: true, message: "Command stopped" });
+    } else if (wasRunning) {
+      res.status(409).json({
+        error:
+          "The sandboxed verification run cannot be interrupted safely; it remains fenced and will finish or time out.",
+        code: "SANDBOXED_VERIFICATION_STOP_PENDING",
+      });
     } else {
       res.status(404).json({ error: "No command is running" });
     }
   });
 
-  app.get("/api/testing/history", (_req: Request, res: Response) => {
-    if (!testRunner) {
+  app.get("/api/testing/history", (req: Request, res: Response) => {
+    const p = resolveProject(req);
+    const selectedRunner = p.projectRoot
+      ? (deps.getTestRunner?.(p.projectRoot) ?? testRunner)
+      : testRunner;
+    if (!selectedRunner) {
       res.json([]);
       return;
     }
-    res.json(testRunner.getHistory());
+    res.json(selectedRunner.getHistory());
   });
 
   app.get("/api/testing/stream", (req: Request, res: Response) => {

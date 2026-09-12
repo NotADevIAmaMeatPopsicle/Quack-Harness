@@ -12,6 +12,8 @@ describe("ReviewerRunnerConfigSchema", () => {
     expect(config.codex.binaryPath).toBe("codex");
     expect(config.codex.sandbox).toBe("read-only");
     expect(config.codex.codexHome).toBeUndefined();
+    expect(config.codex.profile).toBeUndefined();
+    expect(config.codex.provider).toBeUndefined();
     expect(config.model).toBeUndefined();
   });
 
@@ -45,6 +47,50 @@ describe("ReviewerRunnerConfigSchema", () => {
     expect(() =>
       ReviewerRunnerConfigSchema.parse({
         codex: { extraArgs: ["--sandbox", "danger-full-access"] },
+      }),
+    ).toThrow();
+  });
+
+  it("accepts a named Codex profile without opening an argv escape hatch", () => {
+    const config = ReviewerRunnerConfigSchema.parse({
+      runner: "codex-cli",
+      codex: { profile: "openai" },
+    });
+    expect(config.codex.profile).toBe("openai");
+  });
+
+  it("accepts a safe provider id and rejects config syntax", () => {
+    expect(
+      ReviewerRunnerConfigSchema.parse({
+        runner: "codex-cli",
+        codex: { provider: "openai" },
+      }).codex.provider,
+    ).toBe("openai");
+    expect(() =>
+      ReviewerRunnerConfigSchema.parse({
+        runner: "codex-cli",
+        codex: { provider: 'openai"; sandbox="danger-full-access' },
+      }),
+    ).toThrow();
+  });
+
+  it("accepts only a safe non-Quack credential environment name", () => {
+    expect(
+      ReviewerRunnerConfigSchema.parse({
+        runner: "codex-cli",
+        codex: { credentialEnvVar: "AZURE_OPENAI_API_KEY" },
+      }).codex.credentialEnvVar,
+    ).toBe("AZURE_OPENAI_API_KEY");
+    expect(() =>
+      ReviewerRunnerConfigSchema.parse({
+        runner: "codex-cli",
+        codex: { credentialEnvVar: "QUACK_SERVICE_TOKEN" },
+      }),
+    ).toThrow();
+    expect(() =>
+      ReviewerRunnerConfigSchema.parse({
+        runner: "codex-cli",
+        codex: { credentialEnvVar: "OPENAI_API_KEY;rm" },
       }),
     ).toThrow();
   });

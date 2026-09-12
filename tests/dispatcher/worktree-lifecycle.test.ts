@@ -1,8 +1,7 @@
-import { execSync } from "node:child_process";
 import { existsSync, symlinkSync, mkdirSync, lstatSync, readdirSync } from "node:fs";
 
-jest.mock("node:child_process", () => ({
-  execSync: jest.fn(),
+jest.mock("../../src/dispatcher/trusted-git", () => ({
+  runTrustedGitSync: jest.fn(),
 }));
 
 jest.mock("node:fs", () => ({
@@ -13,82 +12,65 @@ jest.mock("node:fs", () => ({
   readdirSync: jest.fn(),
 }));
 
-jest.mock("../../src/testing/docker-test-runner", () => ({
-  tearDown: jest.fn(),
+jest.mock("../../src/dispatcher/docker-cleanup", () => ({
+  cleanupWorktreeContainers: jest.fn(),
 }));
 
-import { tearDown } from "../../src/testing/docker-test-runner";
+import { cleanupWorktreeContainers } from "../../src/dispatcher/docker-cleanup";
+import { runTrustedGitSync } from "../../src/dispatcher/trusted-git";
 import {
   removeWorktree,
   prepareWorktreeFrontendDeps,
 } from "../../src/dispatcher/worktree-lifecycle";
 
-const mockExecSync = execSync as jest.MockedFunction<typeof execSync>;
+const mockRunTrustedGitSync = runTrustedGitSync as jest.MockedFunction<typeof runTrustedGitSync>;
 const mockExistsSync = existsSync as jest.MockedFunction<typeof existsSync>;
 const mockSymlinkSync = symlinkSync as jest.MockedFunction<typeof symlinkSync>;
 const mockMkdirSync = mkdirSync as jest.MockedFunction<typeof mkdirSync>;
 const mockLstatSync = lstatSync as jest.MockedFunction<typeof lstatSync>;
 const mockReaddirSync = readdirSync as jest.MockedFunction<typeof readdirSync>;
-const mockTearDown = tearDown as jest.MockedFunction<typeof tearDown>;
+const mockCleanupWorktreeContainers = cleanupWorktreeContainers as jest.MockedFunction<
+  typeof cleanupWorktreeContainers
+>;
 
 describe("worktree-lifecycle", () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockExecSync.mockReturnValue("" as unknown as ReturnType<typeof execSync>);
+    mockRunTrustedGitSync.mockReturnValue("");
+    mockCleanupWorktreeContainers.mockReturnValue(true);
   });
 
-  test("calls tearDown when compose file is present in worktree root", () => {
-    mockExistsSync.mockImplementation((p) => String(p).endsWith("docker-compose.yml"));
+  test("uses trusted Docker metadata cleanup before removing the worktree", () => {
+    expect(removeWorktree("/wt/TASK-826", "TASK-826", "/project")).toBe(true);
 
-    removeWorktree("/wt/TASK-826", "TASK-826", "/project");
-
-    expect(mockTearDown).toHaveBeenCalledWith(
-      expect.stringContaining("docker-compose.yml"),
-      "/wt/TASK-826",
-      60_000,
-    );
-    expect(mockExecSync).toHaveBeenCalledWith(
-      expect.stringContaining("git worktree remove"),
-      expect.any(Object),
+    expect(mockCleanupWorktreeContainers).toHaveBeenCalledWith("/wt/TASK-826", expect.any(Object));
+    expect(mockRunTrustedGitSync).toHaveBeenCalledWith(
+      ["worktree", "remove", "--force", "/wt/TASK-826"],
+      "/project",
+      expect.objectContaining({ trustedBoundaryRoot: "/project" }),
     );
   });
 
-  test("skips tearDown when no compose file exists in worktree root", () => {
-    mockExistsSync.mockReturnValue(false);
+  test("preserves the worktree when trusted Docker cleanup cannot prove absence", () => {
+    mockCleanupWorktreeContainers.mockReturnValue(false);
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
 
-    removeWorktree("/wt/TASK-826", "TASK-826", "/project");
+    expect(removeWorktree("/wt/TASK-826", "TASK-826", "/project")).toBe(false);
 
-    expect(mockTearDown).not.toHaveBeenCalled();
-    expect(mockExecSync).toHaveBeenCalledWith(
-      expect.stringContaining("git worktree remove"),
-      expect.any(Object),
-    );
-  });
-
-  test("proceeds with git worktree remove even when tearDown logs a warning", () => {
-    mockExistsSync.mockImplementation((p) => String(p).endsWith("docker-compose.yml"));
-    // tearDown itself doesn't throw (it logs); simulate it completing normally
-    mockTearDown.mockImplementation(() => {
-      // no-op — warning already logged inside tearDown
-    });
-
-    expect(() => removeWorktree("/wt/TASK-826", "TASK-826", "/project")).not.toThrow();
-
-    expect(mockExecSync).toHaveBeenCalledWith(
-      expect.stringContaining("git worktree remove"),
-      expect.any(Object),
-    );
+    expect(mockRunTrustedGitSync).not.toHaveBeenCalled();
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("preserving worktree"));
+    errorSpy.mockRestore();
   });
 
   test("git worktree remove failure is logged at error level and does not throw", () => {
     mockExistsSync.mockReturnValue(false);
-    mockExecSync.mockImplementation(() => {
+    mockRunTrustedGitSync.mockImplementation(() => {
       throw new Error("worktree locked");
     });
 
     const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
 
-    expect(() => removeWorktree("/wt/TASK-826", "TASK-826", "/project")).not.toThrow();
+    expect(removeWorktree("/wt/TASK-826", "TASK-826", "/project")).toBe(false);
 
     expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("git worktree remove failed"));
     expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("TASK-826"));
@@ -97,15 +79,14 @@ describe("worktree-lifecycle", () => {
     errorSpy.mockRestore();
   });
 
-  test("skips tearDown when dockerCleanup is false", () => {
-    mockExistsSync.mockImplementation((p) => String(p).endsWith("docker-compose.yml"));
-
+  test("skips Docker cleanup when dockerCleanup is false", () => {
     removeWorktree("/wt/TASK-826", "TASK-826", "/project", false);
 
-    expect(mockTearDown).not.toHaveBeenCalled();
-    expect(mockExecSync).toHaveBeenCalledWith(
-      expect.stringContaining("git worktree remove"),
-      expect.any(Object),
+    expect(mockCleanupWorktreeContainers).not.toHaveBeenCalled();
+    expect(mockRunTrustedGitSync).toHaveBeenCalledWith(
+      ["worktree", "remove", "--force", "/wt/TASK-826"],
+      "/project",
+      expect.objectContaining({ trustedBoundaryRoot: "/project" }),
     );
   });
 });
@@ -113,7 +94,7 @@ describe("worktree-lifecycle", () => {
 describe("worktree-lifecycle prepareWorktreeFrontendDeps", () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockExecSync.mockReturnValue("" as unknown as ReturnType<typeof execSync>);
+    mockRunTrustedGitSync.mockReturnValue("");
     mockReaddirSync.mockReturnValue([]);
   });
 

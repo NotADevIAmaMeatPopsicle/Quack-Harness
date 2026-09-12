@@ -12,14 +12,30 @@ import { createMonitorServer } from "../../src/monitor/server";
 import { taskSpec } from "../helpers/divergent-task-fixture";
 import { createContestedTaskFixture, writeSyncMap } from "../helpers/task-1338e-fixture";
 
-jest.mock("../../src/integrations/github/gh-cli", () => ({
-  runGh: jest.fn(() =>
-    Promise.resolve({
-      stdout: "https://github.com/fixture/repo/issues/720\n",
-      stderr: "",
-    }),
-  ),
+type RunBoundGitHubCommand =
+  typeof import("../../src/integrations/github/trusted-github").runBoundGitHubCommand;
+const mockRunBoundGitHubCommand = jest.fn<
+  ReturnType<RunBoundGitHubCommand>,
+  Parameters<RunBoundGitHubCommand>
+>();
+
+type ReadBoundGitHubIssuePage =
+  typeof import("../../src/integrations/github/trusted-github").readBoundGitHubIssuePage;
+const mockReadBoundGitHubIssuePage = jest.fn<
+  ReturnType<ReadBoundGitHubIssuePage>,
+  Parameters<ReadBoundGitHubIssuePage>
+>();
+
+jest.mock("../../src/integrations/github/trusted-github", () => ({
+  ...jest.requireActual<object>("../../src/integrations/github/trusted-github"),
+  runBoundGitHubCommand: (...args: Parameters<RunBoundGitHubCommand>) =>
+    mockRunBoundGitHubCommand(...args),
+  readBoundGitHubIssuePage: (...args: Parameters<ReadBoundGitHubIssuePage>) =>
+    mockReadBoundGitHubIssuePage(...args),
 }));
+
+const REPOSITORY = { host: "github.com", owner: "fixture-owner", repo: "fixture-repo" };
+const ISSUE_URL = "https://github.com/fixture-owner/fixture-repo/issues/720";
 
 jest.mock("../../src/monitor/auth", () => ({
   ...jest.requireActual<object>("../../src/monitor/auth"),
@@ -78,6 +94,69 @@ function post(
 describe("TASK-1338-E: monitor GitHub mutation outcomes", () => {
   let stopServer: (() => Promise<void>) | undefined;
 
+  beforeEach(() => {
+    let createdIssue: { title: string; body: string; label: string } | undefined;
+    const result = (stdout: string) =>
+      Promise.resolve({
+        exitCode: 0,
+        stdout,
+        stderr: "",
+        repository: REPOSITORY,
+      });
+    mockReadBoundGitHubIssuePage.mockReset().mockImplementation((_root, config, after) => {
+      expect(config).toMatchObject({ owner: REPOSITORY.owner, repo: REPOSITORY.repo });
+      if (after !== undefined) return Promise.reject(new Error("Unexpected issue-page cursor"));
+      return result(
+        JSON.stringify({
+          data: {
+            repository: {
+              nameWithOwner: "fixture-owner/fixture-repo",
+              issues: {
+                nodes: [],
+                totalCount: 0,
+                pageInfo: { hasNextPage: false, endCursor: null },
+              },
+            },
+          },
+        }),
+      );
+    });
+    mockRunBoundGitHubCommand.mockReset().mockImplementation((_root, config, args, options) => {
+      expect(config).toMatchObject({ owner: REPOSITORY.owner, repo: REPOSITORY.repo });
+      if (
+        args.length === 6 &&
+        args[0] === "issue" &&
+        args[1] === "create" &&
+        args[2]?.startsWith("--title=") &&
+        args[3]?.startsWith("--label=") &&
+        args[4] === "--body-file" &&
+        args[5] === "-" &&
+        typeof options?.input === "string"
+      ) {
+        createdIssue = { title: args[2].slice(8), label: args[3].slice(8), body: options.input };
+        return result(ISSUE_URL + "\n");
+      }
+      const viewArgs = ["issue", "view", "720", "--json", "number,url,title,body,labels,state"];
+      if (
+        createdIssue &&
+        args.length === viewArgs.length &&
+        args.every((argument, index) => argument === viewArgs[index])
+      ) {
+        return result(
+          JSON.stringify({
+            number: 720,
+            url: ISSUE_URL,
+            title: createdIssue.title,
+            body: createdIssue.body,
+            labels: [{ name: createdIssue.label }],
+            state: "OPEN",
+          }),
+        );
+      }
+      return Promise.reject(new Error("Unexpected GitHub args: " + args.join(" ")));
+    });
+  });
+
   afterEach(async () => {
     if (stopServer) await stopServer();
     stopServer = undefined;
@@ -115,9 +194,9 @@ describe("TASK-1338-E: monitor GitHub mutation outcomes", () => {
         success: false,
         published: [
           {
-            taskId: "TASK-520-clean",
+            taskId: "TASK-520",
             issueNumber: 720,
-            url: "https://github.com/fixture/repo/issues/720",
+            url: ISSUE_URL,
           },
         ],
         skipped: fixture.claimants.map((file) => ({
@@ -133,7 +212,7 @@ describe("TASK-1338-E: monitor GitHub mutation outcomes", () => {
       const syncMap = JSON.parse(fs.readFileSync(syncPath, "utf-8")) as {
         entries: Array<{ taskId: string }>;
       };
-      expect(syncMap.entries.map((entry) => entry.taskId)).toEqual(["TASK-520-clean"]);
+      expect(syncMap.entries.map((entry) => entry.taskId)).toEqual(["TASK-520"]);
     } finally {
       if (stopServer) await stopServer();
       stopServer = undefined;
@@ -182,9 +261,9 @@ describe("TASK-1338-E: monitor GitHub mutation outcomes", () => {
         success: false,
         published: [
           {
-            taskId: "TASK-500-alpha",
+            taskId: "TASK-500",
             issueNumber: 720,
-            url: "https://github.com/fixture/repo/issues/720",
+            url: ISSUE_URL,
           },
         ],
         skipped: [

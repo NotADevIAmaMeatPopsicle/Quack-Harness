@@ -127,18 +127,21 @@ describe("hasSealableProgress (real git)", () => {
 
     await expect(hasSealableProgress(makeRepoAdapter(repoDir))).resolves.toBe(true);
 
-    // The shared classification must yield paths that ACTUALLY exist —
-    // no stray quotes, no corrupted escapes (the old parser produced
-    // `"new name.txt` for exactly this status line).
+    // The shared classification preserves BOTH rename endpoints so
+    // `git commit --only` records the deletion as well as the destination.
+    // Only the destination and untracked file exist in the worktree; the
+    // source is intentionally absent after `git mv`.
     const statusOut = execFileSync("git", ["status", "--short"], {
       cwd: repoDir,
     }).toString();
-    const { included } = parseStatus(statusOut);
+    const { included, includedToStage } = parseStatus(statusOut);
+    expect(included).toContain("old name.txt");
     expect(included).toContain("new name.txt");
     expect(included).toContain("café.txt");
-    for (const includedPath of included) {
-      expect(fs.existsSync(path.join(repoDir, includedPath))).toBe(true);
-    }
+    expect(fs.existsSync(path.join(repoDir, "old name.txt"))).toBe(false);
+    expect(fs.existsSync(path.join(repoDir, "new name.txt"))).toBe(true);
+    expect(fs.existsSync(path.join(repoDir, "café.txt"))).toBe(true);
+    expect(includedToStage).toEqual(["café.txt"]);
   });
 
   it("an excluded-path rename is NOT progress (round-2 F1)", async () => {

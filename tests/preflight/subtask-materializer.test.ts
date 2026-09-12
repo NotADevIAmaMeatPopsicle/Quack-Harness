@@ -178,13 +178,17 @@ function makeTwoSubtaskTopology(): DecompositionTopology {
 
 /** Build a valid rich markdown that will pass the quality gate */
 function buildRichMarkdown(subtaskId: string, title: string): string {
+  const isFinal = subtaskId.endsWith("-B");
+  const filePath = isFinal ? "src/api.ts" : "src/registry.ts";
+  const criterion = isFinal ? "API endpoints return valid JSON" : "Registry works";
+  const blockedBy = isFinal ? "[TASK-042-A]" : "[]";
   return `# ${subtaskId}: ${title}
 
 ## Metadata
 - **Priority:** P1-HIGH
 - **Effort:** 2-3 hours
 - **Status:** READY
-- **Blocked By:** []
+- **Blocked By:** ${blockedBy}
 - **Blocks:** []
 - **Tags:** feature, subtask
 
@@ -192,19 +196,19 @@ function buildRichMarkdown(subtaskId: string, title: string): string {
 This child task implements the ${title} component within the multi-project system. It is responsible for establishing the data layer that sibling subtasks will build upon. Without this child completing successfully, downstream components cannot proceed.
 
 ## Current State
-The src/registry.ts file does not exist yet. The registry module must be created from scratch following the Map-based pattern described in the blueprint. No existing code to migrate.
+The ${filePath} file does not exist yet. The owned module must be created from scratch following the pattern described in the blueprint. No existing code needs migration.
 
 ## Recommended Approach
-Create src/registry.ts with a Map<string, Project> backing store. Expose addProject, removeProject, and getProject functions. Follow the existing pattern from src/core/types.ts for the Project interface. Add input validation for all public functions.
+Create ${filePath} with the exact behavior assigned by the topology. Follow the existing pattern from src/core/types.ts, preserve the dependency boundary, and add input validation for public functions.
 
 ## Files to Modify
 | File | Action | Notes |
 |------|--------|-------|
-| \`src/registry.ts\` | Create | Project registry module |
+| \`${filePath}\` | Create | Owned project module |
 
 ## Success Criteria
-- [ ] Registry works
-- [ ] getProject returns undefined for unknown IDs
+- [ ] ${criterion}
+${isFinal ? "- [ ] All parent task success criteria verified" : ""}
 
 ## Testing Requirements
 - [ ] Unit test: addProject stores a project and getProject retrieves it by ID
@@ -239,7 +243,7 @@ describe("subtask-materializer", () => {
       // eslint-disable-next-line @typescript-eslint/require-await
       const mockQueryFn = async function* (params: { prompt: string }) {
         // Determine which subtask this is from the prompt
-        const isA = params.prompt.includes("TASK-042-A");
+        const isA = params.prompt.includes("**ID:** TASK-042-A\n");
         const subtaskId = isA ? "TASK-042-A" : "TASK-042-B";
         const title = isA ? "Implement Registry" : "Implement API";
 
@@ -264,11 +268,15 @@ describe("subtask-materializer", () => {
       const adapter = makeAdapter();
 
       // eslint-disable-next-line @typescript-eslint/require-await
-      const mockQueryFn = async function* () {
+      const mockQueryFn = async function* (params: { prompt: string }) {
+        const isA = params.prompt.includes("**ID:** TASK-042-A\n");
         yield {
           type: "result",
           subtype: "success",
-          result: buildRichMarkdown("TASK-042-A", "Implement Registry"),
+          result: buildRichMarkdown(
+            isA ? "TASK-042-A" : "TASK-042-B",
+            isA ? "Implement Registry" : "Implement API",
+          ),
         };
       };
 
@@ -286,34 +294,18 @@ describe("subtask-materializer", () => {
     });
 
     it("should return prepReady=true for high-quality drafts", async () => {
-      const topology: DecompositionTopology = {
-        parentTaskId: "TASK-042",
-        subtasks: [
-          {
-            id: "TASK-042-A",
-            title: "Implement Registry",
-            filesToModify: [{ path: "src/registry.ts", action: "Create" as const, notes: "" }],
-            successCriteria: ["Registry works"],
-            dependsOn: [],
-            isFinal: false,
-          },
-        ],
-        coverageReport: {
-          fileOwnership: [{ filePath: "src/registry.ts", ownedBy: "TASK-042-A", isShared: false }],
-          criterionOwnership: [{ criterion: "Registry works", ownedBy: ["TASK-042-A"] }],
-          unmappedFiles: [],
-          unmappedCriteria: [],
-          duplicatedFiles: [],
-          hasCoverageGap: false,
-        },
-      };
+      const topology = makeTwoSubtaskTopology();
 
       // eslint-disable-next-line @typescript-eslint/require-await
-      const mockQueryFn = async function* () {
+      const mockQueryFn = async function* (params: { prompt: string }) {
+        const isA = params.prompt.includes("**ID:** TASK-042-A\n");
         yield {
           type: "result",
           subtype: "success",
-          result: buildRichMarkdown("TASK-042-A", "Implement Registry"),
+          result: buildRichMarkdown(
+            isA ? "TASK-042-A" : "TASK-042-B",
+            isA ? "Implement Registry" : "Implement API",
+          ),
         };
       };
 
@@ -322,8 +314,18 @@ describe("subtask-materializer", () => {
       const adapter = makeAdapter();
       const drafts = await materializeChildDrafts(topology, baseTask, adapter, baseBlueprint);
 
-      expect(drafts[0].prepReady).toBe(true);
-      expect(drafts[0].prepScore).toBeGreaterThanOrEqual(4.0);
+      expect(drafts).toHaveLength(2);
+      expect(
+        drafts.map((draft) => ({
+          subtaskId: draft.subtaskId,
+          prepReady: draft.prepReady,
+          prepScore: draft.prepScore,
+          deficiencies: draft.deficiencies,
+        })),
+      ).toEqual([
+        expect.objectContaining({ prepReady: true, prepScore: 5, deficiencies: [] }),
+        expect.objectContaining({ prepReady: true, prepScore: 5, deficiencies: [] }),
+      ]);
     });
 
     it("should produce a parse-error draft when LLM call throws", async () => {
@@ -351,7 +353,7 @@ describe("subtask-materializer", () => {
       }
     });
 
-    it("should handle empty subtask list", async () => {
+    it("should reject an empty subtask list", async () => {
       const topology: DecompositionTopology = {
         parentTaskId: "TASK-042",
         subtasks: [],
@@ -366,9 +368,9 @@ describe("subtask-materializer", () => {
       };
 
       const adapter = makeAdapter();
-      const drafts = await materializeChildDrafts(topology, baseTask, adapter, baseBlueprint);
-
-      expect(drafts).toHaveLength(0);
+      await expect(
+        materializeChildDrafts(topology, baseTask, adapter, baseBlueprint),
+      ).rejects.toThrow(/must contain 2\.\.configuredMax/i);
     });
   });
 

@@ -175,7 +175,7 @@ describe("decompose-integration", () => {
 
       const prompt = buildDecomposePrompt(task, blueprint);
 
-      expect(prompt).toContain("2-4 subtasks maximum");
+      expect(prompt).toContain("Create between 2 and 4 subtasks");
       expect(prompt).toContain("File ownership");
       expect(prompt).toContain("isFinal");
       expect(prompt).toContain("dependsOn");

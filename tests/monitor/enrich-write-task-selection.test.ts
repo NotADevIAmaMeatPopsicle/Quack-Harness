@@ -85,7 +85,7 @@ async function postJson(
     const encoded = JSON.stringify(body);
     const req = http.request(
       {
-        hostname: "localhost",
+        hostname: "127.0.0.1",
         port,
         path: pathname,
         method: "POST",
@@ -210,10 +210,10 @@ describe.each([["child-first"], ["parent-first"]])(
       };
       mockedRunReadinessGate.mockResolvedValue(gateResult);
 
-      const requestedPort = 30000 + Math.floor(Math.random() * 10000);
       const server = createMonitorServer({
         logDir: path.join(root, ".quack", "logs"),
-        port: requestedPort,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: root,
         taskDir: "docs/tasks",
         adapterPath,
@@ -249,10 +249,10 @@ describe.each([["child-first"], ["parent-first"]])(
       };
       mockedRunReadinessGate.mockResolvedValue(gateResult);
 
-      const requestedPort = 30000 + Math.floor(Math.random() * 10000);
       const server = createMonitorServer({
         logDir: path.join(root, ".quack", "logs"),
-        port: requestedPort,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: root,
         taskDir: "docs/tasks",
         adapterPath,

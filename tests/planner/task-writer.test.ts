@@ -11,6 +11,7 @@ import {
 } from "../../src/planner/task-writer.js";
 import type { ProjectAdapter } from "../../src/core/adapter-loader.js";
 import type { AdapterConfig } from "../../src/core/types.js";
+import { taskSpec } from "../helpers/duplicate-claimants-fixture.js";
 
 describe("task-writer", () => {
   let tempDir: string;
@@ -395,7 +396,7 @@ Second task blocked by first
     // Create an existing task file in the task directory
     const taskDir = path.join(tempDir, "docs", "tasks");
     await fs.mkdir(taskDir, { recursive: true });
-    await fs.writeFile(path.join(taskDir, "TASK-010-existing.md"), "# existing");
+    await fs.writeFile(path.join(taskDir, "TASK-010-existing.md"), taskSpec("TASK-010"));
 
     const taskSpecs: TaskSpec[] = [
       {
@@ -632,5 +633,67 @@ Test slug generation
     const taskDir = path.join(tempDir, "docs", "tasks");
     const files = await fs.readdir(taskDir);
     expect(files[0]).toMatch(/^TASK-001-complex-task-title-with-special-characters\.md$/);
+  });
+
+  test("TASK-1345: refuses a differently named owner of the declared id", async () => {
+    const taskDir = path.join(tempDir, "docs", "tasks");
+    await fs.mkdir(taskDir, { recursive: true });
+    const ownerName = "TASK-999-existing-owner.md";
+    await fs.writeFile(
+      path.join(taskDir, ownerName),
+      taskSpec("TASK-140", { title: "Existing owner" }),
+      "utf-8",
+    );
+
+    const result = writeTaskFiles(
+      [{ id: "TASK-140", content: taskSpec("TASK-140", { title: "New claimant" }) }],
+      mockAdapter,
+    );
+    await expect(result).rejects.toMatchObject({
+      name: "TaskCreateConflictError",
+      conflictIds: ["TASK-140"],
+      claimants: { "TASK-140": [ownerName] },
+    });
+    expect(await fs.readdir(taskDir)).toEqual([ownerName]);
+  });
+
+  test("TASK-1345: direct planner batches refuse duplicate declared ids before writing", async () => {
+    await expect(
+      writeTaskFiles(
+        [
+          { id: "TASK-141", content: taskSpec("TASK-141", { title: "First title" }) },
+          { id: "TASK-141", content: taskSpec("TASK-141", { title: "Second title" }) },
+        ],
+        mockAdapter,
+      ),
+    ).rejects.toMatchObject({
+      name: "TaskCreateConflictError",
+      conflictIds: ["TASK-141"],
+    });
+
+    const taskDir = path.join(tempDir, "docs", "tasks");
+    expect(await fs.readdir(taskDir)).toEqual([]);
+  });
+
+  test("TASK-1345: planner accepts the globally allocated four-digit base-id shape", async () => {
+    const result = await createTaskFilesFromInput(
+      [
+        {
+          id: "TASK-0201",
+          title: "Generated follow up compatibility",
+          priority: "P3-LOW",
+          effort: "1 hour",
+          status: "BACKLOG",
+          blockedBy: [],
+          blocks: [],
+          problemStatement: "Prove the base id is accepted by planner validation.",
+          successCriteria: ["Accepted"],
+          testingRequirements: ["Covered here"],
+        },
+      ],
+      mockAdapter,
+    );
+
+    expect(result.taskIds).toEqual(["TASK-0201"]);
   });
 });

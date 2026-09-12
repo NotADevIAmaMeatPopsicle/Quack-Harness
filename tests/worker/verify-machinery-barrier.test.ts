@@ -131,6 +131,26 @@ describe("runVerification machinery barrier (shared-executor mount)", () => {
     expect(fs.existsSync(path.join(worktree, SENTINEL))).toBe(false);
   });
 
+  it("enforce: CRLF/LF-only differences do not block adapter commands", async () => {
+    const adapterJson = JSON.stringify({
+      judgment: { safetyFloor: { preVerificationIntegrity: { mode: "enforce" } } },
+    });
+    write(authoritative, ".quack/adapter.json", adapterJson);
+    write(worktree, ".quack/adapter.json", adapterJson);
+    write(authoritative, ".quack/conventions.md", "authoritative\r\nconventions\r\n");
+    write(worktree, ".quack/conventions.md", "authoritative\nconventions\n");
+
+    const sunk: Array<{ path: string; reason: string }> = [];
+    const result = await runVerification(makeBarrierAdapter(worktree), "all", {
+      onIntegrityMismatch: (mismatches) => sunk.push(...mismatches),
+    });
+
+    expect(sunk).toEqual([]);
+    expect(result.allPassed).toBe(true);
+    expect(result.commands.some((command) => command.name === "machinery-integrity")).toBe(false);
+    expect(fs.existsSync(path.join(worktree, SENTINEL))).toBe(true);
+  });
+
   it("warn: the finding rides along visibly while the body executes", async () => {
     setup(
       JSON.stringify({

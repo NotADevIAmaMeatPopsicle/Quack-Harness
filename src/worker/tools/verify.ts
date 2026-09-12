@@ -8,6 +8,7 @@
 
 import {
   exec,
+  execFile,
   spawn,
   type ChildProcess,
   type ExecException,
@@ -18,8 +19,13 @@ import path from "node:path";
 
 import type { ProjectAdapter } from "../../core/adapter-loader.js";
 import {
+  AdapterSandboxConfigSchema,
+  AdapterVerificationConfigSchema,
+} from "../../core/adapter-schema.js";
+import {
   isStructuredVerificationCommand,
   verificationCommandShellString,
+  type AdapterVerificationConfig,
   type AdapterBundleMetadata,
   type AdapterFreshnessMetadata,
   type ParsedTask,
@@ -41,6 +47,8 @@ import {
   readAuthoritativeSafetyFloor,
   resolveAuthoritativeRoot,
 } from "../../judgment/producers/machinery-integrity.js";
+import { DockerVerificationSession } from "../docker-verification-sandbox.js";
+import { runCodexSandboxedVerification } from "../verification-sandbox.js";
 
 // ─── Command execution ────────────────────────────────────────────
 
@@ -206,7 +214,25 @@ function killProcessTree(pid: number | undefined): void {
   if (!pid) return;
   try {
     if (process.platform === "win32") {
-      exec(`taskkill /F /T /PID ${pid}`, { windowsHide: true }, () => undefined);
+      const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? process.env.WINDIR;
+      if (!systemRoot || !path.win32.isAbsolute(systemRoot)) return;
+      const executable = fs.realpathSync.native(
+        path.win32.join(systemRoot, "System32", "taskkill.exe"),
+      );
+      execFile(
+        executable,
+        ["/F", "/T", "/PID", String(pid)],
+        {
+          cwd: path.dirname(executable),
+          env: {
+            SystemRoot: systemRoot,
+            WINDIR: systemRoot,
+            PATH: path.dirname(executable),
+          },
+          windowsHide: true,
+        },
+        () => undefined,
+      );
       return;
     }
     try {
@@ -219,7 +245,7 @@ function killProcessTree(pid: number | undefined): void {
   }
 }
 
-function normalizeVerificationTimeoutMs(timeout: number | undefined): number {
+export function normalizeVerificationTimeoutMs(timeout: number | undefined): number {
   const raw = timeout ?? 300_000;
   if (!Number.isFinite(raw) || raw <= 0) return 300_000;
   // Historical generated adapters used seconds (60, 120, 300); docs and newer
@@ -277,8 +303,13 @@ function execCommand(
   });
 }
 
-async function runCommand(command: string, timeoutMs: number, cwd: string): Promise<ExecResult> {
-  const runtime = prepareVerificationCommandRuntime(command);
+async function runCommand(
+  command: string,
+  timeoutMs: number,
+  cwd: string,
+  environment?: NodeJS.ProcessEnv,
+): Promise<ExecResult> {
+  const runtime = prepareVerificationCommandRuntime(command, { env: environment });
   if (runtime.error) {
     return {
       exitCode: 1,
@@ -427,20 +458,83 @@ async function runVerificationCommandShell(
   command: VerificationCommand,
   cwd: string,
   timeoutMs: number,
+  options: {
+    hostExecution: "direct" | "codex-sandbox" | "docker-sandbox";
+    authoritativeRoot: string;
+    codexBinaryPath?: string;
+    dockerSession?: DockerVerificationSession;
+  },
 ): Promise<ExecResult> {
+  const resolvedCwd = command.cwd ? path.resolve(cwd, command.cwd) : cwd;
+  const commandEnvironment = command.env ? { ...process.env, ...command.env } : { ...process.env };
+
+  if (options.hostExecution === "docker-sandbox") {
+    if (!options.dockerSession) {
+      return {
+        exitCode: 1,
+        stdout: "",
+        stderr: "Docker sandbox refusal: disposable verification session is unavailable",
+      };
+    }
+    if (isStructuredVerificationCommand(command)) {
+      return options.dockerSession.run(
+        {
+          cwd: resolvedCwd,
+          executable: command.cmd,
+          args: command.args,
+          env: command.env,
+        },
+        timeoutMs,
+      );
+    }
+    return options.dockerSession.run(
+      { cwd: resolvedCwd, command: command.command, env: command.env },
+      timeoutMs,
+    );
+  }
+
+  if (options.hostExecution === "codex-sandbox") {
+    if (isStructuredVerificationCommand(command)) {
+      return runCodexSandboxedVerification({
+        cwd: resolvedCwd,
+        authoritativeRoot: options.authoritativeRoot,
+        codexBinaryPath: options.codexBinaryPath,
+        timeoutMs,
+        command: {
+          executable: command.cmd,
+          args: command.args,
+          env: command.env,
+        },
+      });
+    }
+    const runtime = prepareVerificationCommandRuntime(command.command, {
+      env: commandEnvironment,
+    });
+    if (runtime.error) {
+      return { exitCode: 1, stdout: "", stderr: runtime.error };
+    }
+    return runCodexSandboxedVerification({
+      cwd: resolvedCwd,
+      authoritativeRoot: options.authoritativeRoot,
+      codexBinaryPath: options.codexBinaryPath,
+      timeoutMs,
+      command: {
+        command: runtime.command,
+        shell: runtime.shell,
+        env: command.env,
+      },
+    });
+  }
+
   if (isStructuredVerificationCommand(command)) {
-    const resolvedCwd = command.cwd ? path.resolve(cwd, command.cwd) : cwd;
-    const env: NodeJS.ProcessEnv = command.env
-      ? { ...process.env, ...command.env }
-      : { ...process.env };
     return runStructuredCommand(command.cmd, command.args, {
       cwd: resolvedCwd,
-      env,
+      env: commandEnvironment,
       timeoutMs,
       maxBuffer: 10 * 1024 * 1024,
     });
   }
-  return runCommand(command.command, timeoutMs, cwd);
+  return runCommand(command.command, timeoutMs, resolvedCwd, commandEnvironment);
 }
 
 interface ExecError {
@@ -460,7 +554,14 @@ function isExecError(err: unknown): err is ExecError {
 async function runVerificationCommand(
   cmd: VerificationCommand,
   cwd: string,
-  options: { task?: ParsedTask; baseBranch?: string } = {},
+  options: {
+    task?: ParsedTask;
+    baseBranch?: string;
+    hostExecution: "direct" | "codex-sandbox" | "docker-sandbox";
+    authoritativeRoot: string;
+    codexBinaryPath?: string;
+    dockerSession?: DockerVerificationSession;
+  },
 ): Promise<VerifyCommandResult> {
   // Shell-string view of the command for pattern matching, scoped-test
   // building, and human-readable evidence. Same value for both legacy and
@@ -469,10 +570,18 @@ async function runVerificationCommand(
 
   // Route Docker-environment commands to DockerTestRunner
   if (cmd.environment === "docker" && cmd.docker) {
+    if (options.hostExecution !== "direct") {
+      return {
+        name: cmd.name,
+        passed: false,
+        output:
+          "Sandbox refusal: compose-backed verification cannot run inside a contained verification boundary.",
+      };
+    }
     if (!isDockerAvailable()) {
       return {
         name: cmd.name,
-        passed: true, // Warn but don't fail when Docker is unavailable
+        passed: false,
         output: `[Docker unavailable] Skipping Docker command "${cmd.name}" — Docker Desktop not running`,
       };
     }
@@ -506,7 +615,7 @@ async function runVerificationCommand(
   // Default: run on host. Polymorphic — structured commands take the spawn
   // path (no shell), legacy take the existing exec+shell-fixup path.
   const timeoutMs = normalizeVerificationTimeoutMs(cmd.timeout);
-  const result = await runVerificationCommandShell(cmd, cwd, timeoutMs);
+  const result = await runVerificationCommandShell(cmd, cwd, timeoutMs, options);
   const combinedOutput = [result.stdout, result.stderr].filter(Boolean).join("\n");
   const testAnalysis = isTestCommand(cmd.name, cmdString)
     ? analyzeTestOutput(result.stdout, result.stderr)
@@ -519,7 +628,18 @@ async function runVerificationCommand(
     if (scopedCommand) {
       // Scoped retries always go through the legacy shell path because the
       // scoped-command builder produces a shell string.
-      const scopedResult = await runCommand(scopedCommand, timeoutMs, cwd);
+      const scopedResult =
+        options.hostExecution === "codex-sandbox"
+          ? await runCodexSandboxedVerification({
+              cwd,
+              authoritativeRoot: options.authoritativeRoot,
+              codexBinaryPath: options.codexBinaryPath,
+              timeoutMs,
+              command: { command: scopedCommand },
+            })
+          : options.hostExecution === "docker-sandbox" && options.dockerSession
+            ? await options.dockerSession.run({ cwd, command: scopedCommand }, timeoutMs)
+            : await runCommand(scopedCommand, timeoutMs, cwd);
       const scopedOutput = [scopedResult.stdout, scopedResult.stderr].filter(Boolean).join("\n");
       const scopedAnalysis = analyzeTestOutput(scopedResult.stdout, scopedResult.stderr);
 
@@ -555,8 +675,25 @@ async function runVerificationCommand(
 async function runConventionCheck(
   check: ConventionCheck,
   cwd: string,
+  options: {
+    hostExecution: "direct" | "codex-sandbox" | "docker-sandbox";
+    authoritativeRoot: string;
+    codexBinaryPath?: string;
+    dockerSession?: DockerVerificationSession;
+  },
 ): Promise<VerifyCommandResult> {
-  const result = await runCommand(check.command, 30_000, cwd);
+  const result =
+    options.hostExecution === "codex-sandbox"
+      ? await runCodexSandboxedVerification({
+          cwd,
+          authoritativeRoot: options.authoritativeRoot,
+          codexBinaryPath: options.codexBinaryPath,
+          timeoutMs: 30_000,
+          command: { command: check.command },
+        })
+      : options.hostExecution === "docker-sandbox" && options.dockerSession
+        ? await options.dockerSession.run({ cwd, command: check.command }, 30_000)
+        : await runCommand(check.command, 30_000, cwd);
   const passed = result.exitCode === 0;
 
   let output: string;
@@ -625,13 +762,42 @@ function evaluateAdapterFreshness(
   };
 }
 
+interface AuthoritativeVerificationPolicy {
+  verification: AdapterVerificationConfig;
+  deniedPaths: string[];
+}
+
+async function loadAuthoritativeVerificationPolicy(
+  adapter: ProjectAdapter,
+  authoritativeRoot: string,
+): Promise<AuthoritativeVerificationPolicy> {
+  if (path.resolve(authoritativeRoot) === path.resolve(adapter.projectRoot)) {
+    return {
+      verification: adapter.config.verification,
+      deniedPaths: [...adapter.config.sandbox.deniedPaths],
+    };
+  }
+  const adapterPath = path.join(authoritativeRoot, ".quack", "adapter.json");
+  const raw = await fs.promises.readFile(adapterPath, "utf8");
+  const parsed: unknown = JSON.parse(raw);
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("authoritative adapter must be a JSON object");
+  }
+  const record = parsed as { verification?: unknown; sandbox?: unknown };
+  const verification =
+    record.verification === undefined
+      ? adapter.config.verification
+      : AdapterVerificationConfigSchema.parse(record.verification);
+  const sandbox = AdapterSandboxConfigSchema.parse(record.sandbox ?? {});
+  return { verification, deniedPaths: [...sandbox.deniedPaths] };
+}
+
 export async function runVerification(
   adapter: ProjectAdapter,
   scope: string,
   options?: VerificationRunOptions,
 ): Promise<VerificationResult> {
   const cwd = adapter.projectRoot;
-  const verificationConfig = adapter.config.verification;
 
   // ── Machinery-integrity barrier (TASK-1313 S3) ────────────────────
   // Mounted HERE, not only in the Stop hook: the in-session MCP verify
@@ -641,6 +807,31 @@ export async function runVerification(
   // self-compare and are structurally clean, so CLI/API verification on
   // ordinary clones is unaffected.
   const authoritativeRoot = resolveAuthoritativeRoot(cwd);
+  let verificationPolicy: AuthoritativeVerificationPolicy;
+  try {
+    verificationPolicy = await loadAuthoritativeVerificationPolicy(adapter, authoritativeRoot);
+  } catch (error) {
+    return {
+      allPassed: false,
+      commands: [
+        {
+          name: "authoritative-verification-config",
+          passed: false,
+          output: `Cannot load authoritative verification config: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        },
+      ],
+      conventionChecks: [],
+    };
+  }
+  const verificationConfig = verificationPolicy.verification;
+  const hostExecution = verificationConfig.hostExecution ?? "direct";
+  const executionOptions = {
+    hostExecution,
+    authoritativeRoot,
+    codexBinaryPath: adapter.config.agent.codex?.binaryPath,
+  };
   if (path.resolve(authoritativeRoot) !== path.resolve(cwd)) {
     const floorConfig = await readAuthoritativeSafetyFloor(authoritativeRoot);
     if (floorConfig.preVerificationIntegrityMode !== "off") {
@@ -733,9 +924,6 @@ export async function runVerification(
 
     if (scope === "all") {
       commandsToRun = filterByPhase(verificationConfig.commands, runThorough);
-      if (!includeOptional) {
-        commandsToRun = commandsToRun.filter((command) => command.required !== false);
-      }
       checksToRun = verificationConfig.conventionChecks;
     } else {
       // Find matching command or convention check by name
@@ -765,27 +953,113 @@ export async function runVerification(
       checksToRun = matchingCheck ? [matchingCheck] : [];
     }
 
-    // Run all verification commands
+    let dockerSession: DockerVerificationSession | undefined;
+    if (hostExecution === "docker-sandbox") {
+      if (!verificationConfig.dockerSandbox) {
+        return {
+          allPassed: false,
+          commands: [
+            {
+              name: "docker-sandbox",
+              passed: false,
+              output: "Docker sandbox refusal: authoritative adapter has no dockerSandbox config",
+            },
+          ],
+          conventionChecks: [],
+          adapterFreshness,
+        };
+      }
+      try {
+        dockerSession = await DockerVerificationSession.create({
+          worktreeRoot: cwd,
+          authoritativeRoot,
+          config: verificationConfig.dockerSandbox,
+          deniedPaths: verificationPolicy.deniedPaths,
+        });
+      } catch (error) {
+        return {
+          allPassed: false,
+          commands: [
+            {
+              name: "docker-sandbox",
+              passed: false,
+              output: `Docker sandbox setup failed: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            },
+          ],
+          conventionChecks: [],
+          adapterFreshness,
+        };
+      }
+    }
+
     const commandResults: VerifyCommandResult[] = [];
-    for (const cmd of commandsToRun) {
-      const result = await runVerificationCommand(cmd, cwd, {
-        task: options?.task,
-        baseBranch,
-      });
-      commandResults.push(result);
-    }
-
-    // Run all convention checks
     const checkResults: VerifyCommandResult[] = [];
-    for (const check of checksToRun) {
-      const result = await runConventionCheck(check, cwd);
-      checkResults.push(result);
+    let cleanupError: string | undefined;
+    try {
+      // Run all verification commands
+      for (const cmd of commandsToRun) {
+        const required = cmd.required !== false;
+        if (!includeOptional && !required && scope === "all") {
+          commandResults.push({
+            name: cmd.name,
+            passed: false,
+            required: false,
+            status: "skipped",
+            output: "Skipped because optional verifier execution was disabled.",
+          });
+          continue;
+        }
+
+        const result = await runVerificationCommand(cmd, cwd, {
+          task: options?.task,
+          baseBranch,
+          ...executionOptions,
+          dockerSession,
+        });
+        commandResults.push({
+          ...result,
+          required,
+          status: result.passed ? "passed" : required ? "failed" : "optional-unavailable",
+        });
+      }
+
+      // Run all convention checks
+      for (const check of checksToRun) {
+        const result = await runConventionCheck(check, cwd, {
+          ...executionOptions,
+          dockerSession,
+        });
+        checkResults.push({
+          ...result,
+          required: true,
+          status: result.passed ? "passed" : "failed",
+        });
+      }
+    } finally {
+      if (dockerSession) {
+        try {
+          await dockerSession.dispose();
+        } catch (error) {
+          cleanupError = error instanceof Error ? error.message : String(error);
+        }
+      }
     }
 
-    const commandsPassed = commandResults.every((result, index) => {
-      const command = commandsToRun[index];
-      return command?.required === false || result.passed;
-    });
+    if (cleanupError) {
+      commandResults.push({
+        name: "docker-sandbox-cleanup",
+        passed: false,
+        required: true,
+        status: "failed",
+        output: cleanupError,
+      });
+    }
+
+    const commandsPassed = commandResults.every(
+      (result) => result.required === false || result.passed,
+    );
     const allPassed = commandsPassed && checkResults.every((r) => r.passed);
 
     return {
@@ -819,7 +1093,14 @@ export function formatVerificationResult(result: VerificationResult): string {
   if (result.commands.length > 0) {
     lines.push("Commands:");
     for (const cmd of result.commands) {
-      const status = cmd.passed ? "PASS" : "FAIL";
+      const status =
+        cmd.status === "skipped"
+          ? "SKIPPED"
+          : cmd.status === "optional-unavailable" || (!cmd.passed && cmd.required === false)
+            ? "OPTIONAL UNAVAILABLE"
+            : cmd.passed
+              ? "PASS"
+              : "FAIL";
       lines.push(`  [${status}] ${cmd.name}: ${cmd.output}`);
     }
   }

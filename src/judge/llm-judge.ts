@@ -1,3 +1,4 @@
+import { getClaudeSdkEnvironment, type ClaudeApiKeys } from "../sdk/claude-auth.js";
 // ─── LLM-as-Judge ──────────────────────────────────────────────────
 // Evaluates agent-produced changes against the original task spec.
 // Uses a separate Claude Agent SDK session with read-only codebase
@@ -31,6 +32,7 @@ import type {
 import { runSpecComplianceChecks } from "./spec-compliance.js";
 import { BatchClient, BatchRequest, DEFAULT_BATCH_CONFIG } from "../core/batch-client.js";
 import { getSdkPermissionOptions } from "../sdk/permission-mode.js";
+import { runCodexStructuredEvaluation } from "../llm/codex-structured-evaluator.js";
 
 // ─── SDK type shims ─────────────────────────────────────────────────
 // Defined locally to avoid ESM/CJS import issues with the SDK package.
@@ -157,8 +159,16 @@ export async function runJudge(
     injectedSignals?: JudgmentSignal[];
   },
 ): Promise<JudgeResult> {
-  const model = options?.model ?? adapter.config.agent.judgeModel ?? DEFAULT_MODEL;
+  const evaluator = adapter.config.evaluationProviders?.judge;
+  const model =
+    options?.model ?? evaluator?.model ?? adapter.config.agent.judgeModel ?? DEFAULT_MODEL;
   const maxTurns = options?.maxTurns ?? JUDGE_MAX_TURNS;
+  const verificationCommandRequirements = Object.fromEntries(
+    adapter.config.verification.commands.map((command) => [
+      command.name,
+      command.required !== false,
+    ]),
+  );
 
   // Run pre-judge compliance checks if we have task and diff
   let complianceChecks = undefined;
@@ -182,6 +192,7 @@ export async function runJudge(
     taskSpec: input.taskSpec,
     gitDiff: input.gitDiff,
     verificationResults: input.verificationResults,
+    verificationCommandRequirements,
     judgeCriteria: adapter.judgeCriteria,
     complianceChecks,
     parsedTask: input.task,
@@ -195,7 +206,16 @@ export async function runJudge(
   // Attempt up to 2 times (initial + 1 retry)
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const rawResult = await callJudgeEvaluation(prompt, model, maxTurns, adapter.projectRoot);
+      const rawResult =
+        evaluator?.runner === "codex-cli"
+          ? await callCodexJudgeEvaluation(prompt, model, adapter.projectRoot, evaluator)
+          : await callJudgeEvaluation(
+              prompt,
+              model,
+              maxTurns,
+              adapter.projectRoot,
+              adapter.config.agent.apiKeys,
+            );
       const judgmentTrace: JudgeJudgmentTraceEntry[] = [];
       let judgmentProjectionFailure: JudgmentProjectionFailure | undefined;
       const rawProjection = containJudgmentProjection(() =>
@@ -306,6 +326,36 @@ export async function runJudge(
   }
 
   throw new Error(`Judge evaluation failed after retry: ${lastError?.message ?? "unknown error"}`);
+}
+
+async function callCodexJudgeEvaluation(
+  prompt: string,
+  model: string,
+  projectRoot: string,
+  config: NonNullable<ProjectAdapter["config"]["evaluationProviders"]>["judge"],
+): Promise<JudgeResult> {
+  if (!config) throw new Error("Codex judge provider is missing configuration");
+  const result = await runCodexStructuredEvaluation(
+    {
+      projectRoot,
+      model,
+      systemPrompt: JUDGE_SYSTEM_PROMPT,
+      prompt,
+      outputSchema: JUDGE_RESPONSE_SCHEMA,
+      parse: (rawText) => {
+        try {
+          return parseJudgeResponse(rawText);
+        } catch {
+          return null;
+        }
+      },
+    },
+    config,
+  );
+  if (result.status === "runner_error") {
+    throw new Error(`Codex judge ${result.errorKind}: ${result.message}`);
+  }
+  return { ...result.value, claudeSessionId: result.sessionId };
 }
 
 /**
@@ -457,6 +507,7 @@ async function callJudgeEvaluation(
   model: string,
   maxTurns: number,
   projectRoot: string,
+  apiKeys?: ClaudeApiKeys,
 ): Promise<JudgeResult> {
   const queryFn = await getQueryFn();
 
@@ -471,6 +522,7 @@ async function callJudgeEvaluation(
       allowedTools: ["Read", "Glob", "Grep"],
       disallowedTools: ["Edit", "Write", "Bash", "WebSearch", "WebFetch"],
       ...getSdkPermissionOptions(),
+      env: getClaudeSdkEnvironment(apiKeys),
       cwd: projectRoot,
     },
   });
@@ -568,6 +620,12 @@ export async function batchJudge(
   const config = batchConfig ?? DEFAULT_BATCH_CONFIG;
   const model = options?.model ?? adapter.config.agent.judgeModel ?? DEFAULT_MODEL;
   const results = new Map<string, JudgeResult>();
+  const verificationCommandRequirements = Object.fromEntries(
+    adapter.config.verification.commands.map((command) => [
+      command.name,
+      command.required !== false,
+    ]),
+  );
 
   // Fall back to sequential if batch disabled or too few inputs
   if (!config.enabled || inputs.length < config.minBatchSize) {
@@ -586,6 +644,7 @@ export async function batchJudge(
       taskSpec: input.taskSpec,
       gitDiff: input.gitDiff,
       verificationResults: input.verificationResults,
+      verificationCommandRequirements,
       judgeCriteria: adapter.judgeCriteria,
       parsedTask: input.task,
       specReview: input.specReview,

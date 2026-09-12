@@ -164,7 +164,7 @@ export interface IntentJudgmentRunnerError {
 export type IntentJudgmentRunResult = IntentJudgmentRunCompleted | IntentJudgmentRunnerError;
 
 export interface IntentJudgmentRunner {
-  readonly kind: "claude-sdk";
+  readonly kind: "claude-sdk" | "codex-cli";
   run(request: IntentJudgmentRequest): Promise<IntentJudgmentRunResult>;
 }
 

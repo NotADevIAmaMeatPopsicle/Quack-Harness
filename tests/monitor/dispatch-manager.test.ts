@@ -1,12 +1,50 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { execFileSync, type ChildProcess } from "node:child_process";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
+
+jest.mock("../../src/dispatcher/docker-cleanup", () => ({
+  cleanupWorktreeContainers: jest.fn(() => true),
+  detectStaleContainers: jest.fn(() => Promise.resolve([])),
+  resolveTrustedDockerExecutable: jest.fn(() => "docker"),
+  trustedDockerEnvironment: jest.fn(() => process.env),
+}));
+
+import { cleanupWorktreeContainers } from "../../src/dispatcher/docker-cleanup";
+import { TRUSTED_MANAGED_DOCKER_IMAGES_ENV } from "../../src/dispatcher/docker-manager";
+import * as childExitLog from "../../src/monitor/child-exit-log";
 import {
   DegradedSharedCheckoutBusyError,
   DispatchManager,
   type DispatchJob,
 } from "../../src/monitor/dispatch-manager";
+import {
+  DECOMPOSITION_ADMISSION_HASH_ENV,
+  DECOMPOSITION_ADMISSION_MARKER_ENV,
+  DECOMPOSITION_ADMISSION_TOKEN_ENV,
+} from "../../src/preflight/decomposition-dispatch-admission";
+
+const mockCleanupWorktreeContainers = cleanupWorktreeContainers as jest.MockedFunction<
+  typeof cleanupWorktreeContainers
+>;
+const TRUSTED_MANAGED_IMAGE = `node@sha256:${"a".repeat(64)}`;
+
+/**
+ * Test-only operator authorization for the exact bare origin created by a
+ * fixture. Production obtains the same value from the process-owned adapter
+ * envelope, never from repository-controlled Git configuration.
+ */
+function createLocalOriginFixtureManager(
+  projectRoot: string,
+  quackBin: string,
+  bareOrigin = path.join(path.dirname(projectRoot), "origin.git"),
+): DispatchManager {
+  return new DispatchManager(projectRoot, quackBin, undefined, undefined, undefined, undefined, [
+    bareOrigin,
+  ]);
+}
 
 async function waitForFile(filePath: string, timeoutMs = 5000): Promise<void> {
   const startedAt = Date.now();
@@ -26,26 +64,15 @@ async function waitForCondition(
 ): Promise<void> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    if (predicate()) return;
+    if (predicate()) {
+      return;
+    }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`Timed out waiting for ${description}`);
 }
 
 function processIsAlive(pid: number): boolean {
-  if (process.platform === "linux") {
-    try {
-      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf-8");
-      const state = stat.slice(stat.lastIndexOf(")") + 2).split(/\s+/u, 1)[0];
-      if (state === "Z") return false;
-    } catch (error: unknown) {
-      const code =
-        typeof error === "object" && error !== null && "code" in error
-          ? String((error as { code?: unknown }).code)
-          : "";
-      if (code === "ENOENT") return false;
-    }
-  }
   try {
     process.kill(pid, 0);
     return true;
@@ -71,25 +98,65 @@ function markWindowsTreeKillConfirmed(manager: DispatchManager, taskId: string):
   ).confirmedWindowsTreeKills.set(taskId, sessionId);
 }
 
+function stubDockerWorktree(
+  manager: DispatchManager,
+  projectRoot: string,
+  taskId: string,
+): { worktreePath: string; runtimeLogDir: string } {
+  const worktreePath = path.join(projectRoot, ".quack", "worktrees", taskId);
+  const runtimeLogDir = path.join(projectRoot, ".quack", "docker-runtime", taskId);
+  fs.mkdirSync(path.join(worktreePath, ".quack"), { recursive: true });
+  fs.mkdirSync(runtimeLogDir, { recursive: true });
+  (
+    manager as unknown as {
+      createWorktree: (requestedTaskId: string, options?: object) => string;
+    }
+  ).createWorktree = jest.fn(() => worktreePath);
+  (
+    manager as unknown as {
+      prepareDockerAdmittedBranch: (
+        requestedTaskId: string,
+        requestedWorktreePath: string,
+      ) => { branch: string; head: string };
+    }
+  ).prepareDockerAdmittedBranch = jest.fn(() => ({
+    branch: `quack/${taskId}`,
+    head: "a".repeat(40),
+  }));
+  return { worktreePath, runtimeLogDir };
+}
+
+function dockerManagerLifecycleStubs() {
+  return {
+    reconcileExistingContainers: jest.fn(() =>
+      Promise.resolve({
+        removedTaskIds: [],
+        failedTaskIds: [],
+        discoveredTaskIds: [],
+        ambiguousContainerIds: [],
+      }),
+    ),
+    getContainer: jest.fn(() => undefined),
+    getTrackedContainers: jest.fn(() => []),
+    getUnresolvedContainers: jest.fn(() => []),
+    abortPendingCommands: jest.fn(),
+  };
+}
+
 describe("DispatchManager", () => {
   let manager: DispatchManager;
-  let suiteLogDir: string;
+  let managerRoot: string;
 
   beforeEach(() => {
-    // Use a dummy project root and bin path — we won't actually spawn
-    suiteLogDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-dispatch-manager-suite-"));
-    manager = new DispatchManager(
-      "/fake/project",
-      "/fake/bin.js",
-      undefined,
-      undefined,
-      suiteLogDir,
-    );
+    mockCleanupWorktreeContainers.mockReturnValue(true);
+    managerRoot = fs.mkdtempSync(path.join(os.tmpdir(), "quack-dispatch-manager-"));
+    // Use an isolated dummy project root and bin path.
+    manager = new DispatchManager(managerRoot, "/fake/bin.js");
   });
 
   afterEach(() => {
     manager.killAll();
-    fs.rmSync(suiteLogDir, { recursive: true, force: true });
+    fs.rmSync(managerRoot, { recursive: true, force: true });
   });
 
   test("getActiveJobs returns empty when no jobs", () => {
@@ -149,252 +216,58 @@ describe("DispatchManager", () => {
     expect(manager.getAllJobs()).toEqual([]);
   });
 
-  test("bounded shutdown confirms a real child exit and preserves its worktree", async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shutdown-"));
-    const worktreePath = path.join(tmpDir, ".quack", "worktrees", "TASK-SHUTDOWN");
-    const readyPath = path.join(tmpDir, "child-ready");
-    const scriptPath = path.join(tmpDir, "signal-resistant-child.cjs");
-    fs.mkdirSync(worktreePath, { recursive: true });
-    fs.writeFileSync(path.join(worktreePath, "uncommitted.txt"), "preserve me\n", "utf-8");
-    fs.writeFileSync(
-      scriptPath,
-      [
-        "const fs = require('node:fs');",
-        "const { spawn } = require('node:child_process');",
-        "if (process.platform !== 'win32') process.on('SIGTERM', () => undefined);",
-        "const grandchild = spawn(process.execPath, ['-e', \"setInterval(() => undefined, 1000);\"], { stdio: 'ignore' });",
-        `fs.writeFileSync(${JSON.stringify(readyPath)}, JSON.stringify({ grandchildPid: grandchild.pid }), 'utf-8');`,
-        "setInterval(() => undefined, 1000);",
-      ].join("\n"),
-      "utf-8",
-    );
-
-    const mgr = new DispatchManager(tmpDir, scriptPath, {
-      method: "worktree",
-      dockerCleanup: false,
-    });
-    (
-      mgr as unknown as {
-        createWorktree(taskId: string): string | undefined;
-      }
-    ).createWorktree = () => worktreePath;
-
-    try {
-      const job = mgr.start("TASK-SHUTDOWN", { skipGate: true });
-      await waitForFile(readyPath);
-      const { grandchildPid } = JSON.parse(fs.readFileSync(readyPath, "utf-8")) as {
-        grandchildPid: number;
-      };
-
-      expect(mgr.stop("TASK-SHUTDOWN")).toBe(true);
-      expect(job.status).toBe("running");
-      expect(fs.existsSync(worktreePath)).toBe(true);
-
-      const result = await mgr.shutdownAll({ gracefulTimeoutMs: 50, forceTimeoutMs: 5_000 });
-      await waitForCondition(() => job.status !== "running", "real child exit handling");
-      await waitForCondition(() => !processIsAlive(grandchildPid), "real grandchild exit");
-
-      expect(result.requested).toEqual(["TASK-SHUTDOWN"]);
-      expect(result.exited).toEqual(["TASK-SHUTDOWN"]);
-      expect(result.escalated).toEqual(["TASK-SHUTDOWN"]);
-      expect(result.timedOut).toEqual([]);
-      expect(job.status).toBe("stopped");
-      expect(fs.readFileSync(path.join(worktreePath, "uncommitted.txt"), "utf-8")).toBe(
-        "preserve me\n",
-      );
-      expect(fs.existsSync(worktreePath)).toBe(true);
-    } finally {
-      await mgr.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    }
-  });
-
-  test("a failed stop signal keeps a live child tracked and preserves its worktree", async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-stop-error-"));
-    const worktreePath = path.join(tmpDir, ".quack", "worktrees", "TASK-STOP-ERROR");
-    const scriptPath = path.join(tmpDir, "long-running-child.cjs");
-    fs.mkdirSync(worktreePath, { recursive: true });
-    fs.writeFileSync(path.join(worktreePath, "uncommitted.txt"), "preserve me\n", "utf-8");
-    fs.writeFileSync(scriptPath, "setInterval(() => undefined, 1000);\n", "utf-8");
-
-    const mgr = new DispatchManager(tmpDir, scriptPath, {
-      method: "worktree",
-      dockerCleanup: false,
-    });
-    type TreeSignaler = (
-      taskId: string,
-      child: ChildProcess,
-      signal: NodeJS.Signals,
-      windowsTimeoutMs: number,
-    ) => void;
-    const internals = mgr as unknown as {
-      createWorktree(taskId: string): string | undefined;
-      processes: Map<string, ChildProcess>;
-      signalProcessTree: TreeSignaler;
-      unconfirmedProcessGroups: Map<string, number>;
-    };
-    internals.createWorktree = () => worktreePath;
-    const signalProcessTree = internals.signalProcessTree.bind(mgr);
-    let rejectSignals = true;
-    internals.signalProcessTree = (...args) => {
-      if (rejectSignals) throw new Error("simulated signal delivery failure");
-      signalProcessTree(...args);
-    };
-
-    try {
-      const job = mgr.start("TASK-STOP-ERROR", { skipGate: true });
-      const child = internals.processes.get("TASK-STOP-ERROR");
-      if (!child) throw new Error("Expected tracked child");
-      await waitForCondition(() => processIsAlive(job.pid), "long-running child startup");
-
-      expect(mgr.stop("TASK-STOP-ERROR")).toBe(true);
-      child.emit("error", new Error("simulated signal delivery failure"));
-
-      expect(job.status).toBe("running");
-      expect(internals.processes.get("TASK-STOP-ERROR")).toBe(child);
-      expect(fs.readFileSync(path.join(worktreePath, "uncommitted.txt"), "utf-8")).toBe(
-        "preserve me\n",
-      );
-      expect(fs.existsSync(worktreePath)).toBe(true);
-
-      const firstShutdown = await mgr.shutdownAll({ gracefulTimeoutMs: 10, forceTimeoutMs: 10 });
-      expect(firstShutdown.timedOut).toEqual(["TASK-STOP-ERROR"]);
-      expect(internals.unconfirmedProcessGroups.has("TASK-STOP-ERROR")).toBe(false);
-      const survivorMarker = path.join(
-        tmpDir,
-        ".quack",
-        "logs",
-        "worktree-survivors",
-        "TASK-STOP-ERROR.json",
-      );
-      expect(fs.existsSync(survivorMarker)).toBe(true);
-      const restartedManager = new DispatchManager(tmpDir, scriptPath, {
-        method: "worktree",
-        dockerCleanup: false,
-      });
-      expect(() =>
-        (
-          restartedManager as unknown as {
-            createWorktree(taskId: string): string | undefined;
-          }
-        ).createWorktree("TASK-STOP-ERROR"),
-      ).toThrow("has not been confirmed stopped");
-
-      rejectSignals = false;
-      const result = await mgr.shutdownAll({ gracefulTimeoutMs: 1_000, forceTimeoutMs: 1_000 });
-      expect(result.timedOut).toEqual([]);
-      await waitForCondition(() => job.status === "stopped", "failed-stop child exit handling");
-      expect(fs.existsSync(worktreePath)).toBe(true);
-      expect(fs.existsSync(survivorMarker)).toBe(false);
-    } finally {
-      rejectSignals = false;
-      await mgr.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    }
-  });
-
-  test("shutdown retains a stopped root's unconfirmed process group for reconciliation", async () => {
-    if (process.platform === "win32") return;
-
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-stop-tree-"));
-    const worktreePath = path.join(tmpDir, ".quack", "worktrees", "TASK-STOP-TREE");
-    const readyPath = path.join(tmpDir, "child-ready");
-    const scriptPath = path.join(tmpDir, "cooperative-root.cjs");
-    fs.mkdirSync(worktreePath, { recursive: true });
-    fs.writeFileSync(path.join(worktreePath, "uncommitted.txt"), "preserve me\n", "utf-8");
-    const descendantCode = [
-      "const fs = require('node:fs');",
-      "process.on('SIGTERM', () => undefined);",
-      `fs.writeFileSync(${JSON.stringify(readyPath)}, JSON.stringify({ grandchildPid: process.pid }), 'utf-8');`,
-      "setInterval(() => undefined, 1000);",
-    ].join("\n");
-    fs.writeFileSync(
-      scriptPath,
-      [
-        "const { spawn } = require('node:child_process');",
-        "process.on('SIGTERM', () => process.exit(0));",
-        `spawn(process.execPath, ['-e', ${JSON.stringify(descendantCode)}], { stdio: 'ignore' });`,
-        "setInterval(() => undefined, 1000);",
-      ].join("\n"),
-      "utf-8",
-    );
-
-    const mgr = new DispatchManager(tmpDir, scriptPath, {
-      method: "worktree",
-      dockerCleanup: false,
-    });
-    (
-      mgr as unknown as {
-        createWorktree(taskId: string): string | undefined;
-      }
-    ).createWorktree = () => worktreePath;
-
-    let grandchildPid: number | undefined;
-    try {
-      const job = mgr.start("TASK-STOP-TREE", { skipGate: true });
-      await waitForFile(readyPath);
-      grandchildPid = (JSON.parse(fs.readFileSync(readyPath, "utf-8")) as { grandchildPid: number })
-        .grandchildPid;
-      const trackedProcesses = (mgr as unknown as { processes: Map<string, ChildProcess> })
-        .processes;
-
-      expect(mgr.stop("TASK-STOP-TREE")).toBe(true);
-      await waitForCondition(
-        () => !trackedProcesses.has("TASK-STOP-TREE"),
-        "cooperative root exit",
-      );
-      expect(job.status).toBe("running");
-      expect(processIsAlive(grandchildPid)).toBe(true);
-      const shutdown = await mgr.shutdownAll({ gracefulTimeoutMs: 50, forceTimeoutMs: 2_000 });
-
-      expect(shutdown.requested).toContain("TASK-STOP-TREE");
-      expect(shutdown.escalated).not.toContain("TASK-STOP-TREE");
-      expect(shutdown.timedOut).toEqual(["TASK-STOP-TREE"]);
-      expect(job.status).toBe("running");
-      expect(mgr.canResumeAfterShutdown()).toBe(false);
-      expect(fs.existsSync(worktreePath)).toBe(true);
-      expect(fs.readFileSync(path.join(worktreePath, "uncommitted.txt"), "utf-8")).toBe(
-        "preserve me\n",
-      );
-
-      const [survivor] = mgr.getWorktreeShutdownSurvivors();
-      if (!survivor) throw new Error("Expected durable process-group survivor evidence");
-      expect(survivor).toEqual(
-        expect.objectContaining({
-          taskId: "TASK-STOP-TREE",
-          processId: job.pid,
-          strategy: "posix-process-group",
-        }),
-      );
-      expect(survivor.reconciliationToken).toEqual(expect.any(String));
-      process.kill(grandchildPid, "SIGKILL");
-      await waitForCondition(
-        () => !processIsAlive(grandchildPid as number),
-        "operator-confirmed descendant exit",
-        3_000,
-      );
-      expect(
-        mgr.reconcileWorktreeShutdownSurvivor(
-          survivor.taskId,
-          survivor.sessionId,
-          survivor.ownershipId!,
-          survivor.reconciliationToken!,
-          true,
-        ),
-      ).toBe(true);
-      expect(job.status).toBe("stopped");
-      expect(mgr.canResumeAfterShutdown()).toBe(true);
-    } finally {
-      await mgr.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
-      if (grandchildPid && processIsAlive(grandchildPid)) {
-        try {
-          process.kill(grandchildPid, "SIGKILL");
-        } catch {
-          // Already exited.
+  describe("worktree initialization isolation", () => {
+    const initializationActive = (subject: DispatchManager): boolean =>
+      (
+        subject as unknown as {
+          worktreeInitializationActive(): boolean;
         }
-      }
-      fs.rmSync(tmpDir, { recursive: true, force: true });
+      ).worktreeInitializationActive.call(subject);
+
+    function writeAdapter(adapter: unknown): void {
+      const quackDirectory = path.join(managerRoot, ".quack");
+      fs.mkdirSync(quackDirectory, { recursive: true });
+      fs.writeFileSync(path.join(quackDirectory, "adapter.json"), JSON.stringify(adapter));
     }
+
+    test("treats omitted or configured initialization as active and [] as disabled", () => {
+      expect(initializationActive(manager)).toBe(false);
+
+      writeAdapter({ dispatch: {} });
+      expect(initializationActive(manager)).toBe(true);
+
+      writeAdapter({ dispatch: { worktreeInit: ["npm ci"] } });
+      expect(initializationActive(manager)).toBe(true);
+
+      writeAdapter({ dispatch: { worktreeInit: [] } });
+      expect(initializationActive(manager)).toBe(false);
+
+      fs.writeFileSync(path.join(managerRoot, ".quack", "adapter.json"), "{truncated");
+      expect(initializationActive(manager)).toBe(true);
+    });
+
+    test("fails closed before spawning when worktree creation falls back to the shared checkout", () => {
+      writeAdapter({ dispatch: { worktreeInit: ["npm ci"] } });
+      const createWorktree = jest.fn(
+        (_taskId: string, _options?: { ownershipId?: string }) => undefined,
+      );
+      (
+        manager as unknown as {
+          createWorktree: (
+            taskId: string,
+            options?: { ownershipId?: string },
+          ) => string | undefined;
+        }
+      ).createWorktree = createWorktree;
+
+      expect(() => manager.start("TASK-INIT-ISOLATION", { skipGate: true })).toThrow(
+        "refusing to run initialization in the shared project checkout",
+      );
+      expect(createWorktree).toHaveBeenCalledTimes(1);
+      expect(createWorktree.mock.calls[0]?.[0]).toBe("TASK-INIT-ISOLATION");
+      expect(typeof createWorktree.mock.calls[0]?.[1]?.ownershipId).toBe("string");
+      expect(manager.getJob("TASK-INIT-ISOLATION")).toBeUndefined();
+    });
   });
 
   describe("isolation method branching", () => {
@@ -428,6 +301,421 @@ describe("DispatchManager", () => {
       // getActiveContainers delegates to DockerManager — should be empty but not crash
       expect(mgr.getActiveContainers()).toEqual([]);
       mgr.killAll();
+    });
+
+    test("rejects an untrusted mutable Docker image before publishing admission", () => {
+      const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "quack-docker-image-trust-"));
+      const mgr = new DispatchManager(projectRoot, "/fake/bin.js", {
+        method: "docker",
+        docker: {
+          image: "node:20-slim",
+          volumes: [],
+          envPassthrough: [],
+          resourceLimits: { memoryMb: 2048, cpus: 1 },
+          networkMode: "bridge",
+          cleanupPolicy: "remove",
+        },
+      });
+      const startDocker = (
+        mgr as unknown as {
+          startDocker(taskId: string, options: { admittedTaskContentHash: string }): DispatchJob;
+        }
+      ).startDocker.bind(mgr);
+
+      try {
+        expect(() =>
+          startDocker("TASK-IMAGE-TRUST", {
+            admittedTaskContentHash: "f".repeat(64),
+          }),
+        ).toThrow("immutable sha256 digest-pinned image");
+        expect(fs.existsSync(path.join(projectRoot, ".quack", "decomposition-admissions"))).toBe(
+          false,
+        );
+        expect(mgr.getJob("TASK-IMAGE-TRUST")).toBeUndefined();
+      } finally {
+        mgr.killAll();
+        fs.rmSync(projectRoot, { recursive: true, force: true });
+      }
+    });
+
+    test("stop during Docker creation cancels launch and keeps admission blocked", async () => {
+      const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "quack-docker-cancel-"));
+      const mgr = new DispatchManager(projectRoot, "/fake/bin.js", {
+        method: "docker",
+        docker: {
+          image: "node:20-slim",
+          volumes: [],
+          envPassthrough: [],
+          resourceLimits: { memoryMb: 2048, cpus: 1 },
+          networkMode: "bridge",
+          cleanupPolicy: "remove",
+        },
+      });
+      type ContainerInfo = {
+        containerId: string;
+        taskId: string;
+        image: string;
+        workDir: string;
+        logsVolume: string;
+        worktreePath: string;
+        runtimeLogDir: string;
+        startedAt: string;
+        status: "running";
+      };
+      const dockerPaths = stubDockerWorktree(mgr, projectRoot, "TASK-DOCKER-CANCEL");
+      let resolveCreate!: (container: ContainerInfo) => void;
+      const createPromise = new Promise<ContainerInfo>((resolve) => {
+        resolveCreate = resolve;
+      });
+      const fakeDockerManager = {
+        ...dockerManagerLifecycleStubs(),
+        createContainer: jest.fn(() => createPromise),
+        stopContainer: jest.fn(() => Promise.resolve({ removed: true, retained: false })),
+        forceRemoveContainer: jest.fn(() => Promise.resolve(true)),
+        execAgent: jest.fn(),
+      };
+      (
+        mgr as unknown as {
+          dockerManager: typeof fakeDockerManager;
+        }
+      ).dockerManager = fakeDockerManager;
+
+      try {
+        const job = mgr.start("TASK-DOCKER-CANCEL", { skipGate: true });
+        await waitForCondition(
+          () => fakeDockerManager.createContainer.mock.calls.length === 1,
+          "Docker create request",
+        );
+        expect(mgr.stop(job.taskId)).toBe(false);
+        expect(job.status).toBe("stopped");
+        expect(() => mgr.start(job.taskId, { skipGate: true })).toThrow(
+          "still completing operator-stop cleanup",
+        );
+
+        resolveCreate({
+          containerId: "container-cancelled-before-exec",
+          taskId: job.taskId,
+          image: "node:20-slim",
+          workDir: "/workspace",
+          logsVolume: "/workspace/.quack/logs",
+          worktreePath: dockerPaths.worktreePath,
+          runtimeLogDir: dockerPaths.runtimeLogDir,
+          startedAt: new Date().toISOString(),
+          status: "running",
+        });
+        await waitForCondition(
+          () => fakeDockerManager.forceRemoveContainer.mock.calls.length === 1,
+          "Docker cancellation cleanup",
+        );
+
+        expect(fakeDockerManager.forceRemoveContainer).toHaveBeenCalledWith(
+          "container-cancelled-before-exec",
+        );
+        expect(fakeDockerManager.execAgent).not.toHaveBeenCalled();
+        expect(job.status).toBe("stopped");
+        expect(job.operatorStopCleanupPending).toBe(true);
+      } finally {
+        mgr.killAll();
+        fs.rmSync(projectRoot, { recursive: true, force: true });
+      }
+    });
+
+    test("cleans a created container when key selection fails before agent exec", async () => {
+      const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "quack-docker-no-key-"));
+      const keyManager = { getNextKey: jest.fn(() => null) };
+      const mgr = new DispatchManager(
+        projectRoot,
+        "/fake/bin.js",
+        {
+          method: "docker",
+          docker: {
+            image: "node:20-slim",
+            volumes: [],
+            envPassthrough: [],
+            resourceLimits: { memoryMb: 2048, cpus: 1 },
+            networkMode: "bridge",
+            cleanupPolicy: "remove",
+          },
+        },
+        keyManager as never,
+      );
+      const dockerPaths = stubDockerWorktree(mgr, projectRoot, "TASK-308");
+      const fakeDockerManager = {
+        ...dockerManagerLifecycleStubs(),
+        createContainer: jest.fn(() =>
+          Promise.resolve({
+            containerId: "container-no-key",
+            taskId: "TASK-308",
+            image: "node:20-slim",
+            workDir: "/workspace",
+            logsVolume: "/workspace/.quack/logs",
+            worktreePath: dockerPaths.worktreePath,
+            runtimeLogDir: dockerPaths.runtimeLogDir,
+            startedAt: new Date().toISOString(),
+            status: "running" as const,
+          }),
+        ),
+        stopContainer: jest.fn(() => Promise.resolve({ removed: true, retained: false })),
+        forceRemoveContainer: jest.fn(() => Promise.resolve(true)),
+        execAgent: jest.fn(),
+      };
+      (mgr as unknown as { dockerManager: typeof fakeDockerManager }).dockerManager =
+        fakeDockerManager;
+
+      try {
+        const job = mgr.start("TASK-308", { skipGate: true });
+        await waitForCondition(
+          () => fakeDockerManager.forceRemoveContainer.mock.calls.length === 1,
+          "Docker cleanup after key-selection refusal",
+        );
+
+        expect(fakeDockerManager.execAgent).not.toHaveBeenCalled();
+        expect(fakeDockerManager.forceRemoveContainer).toHaveBeenCalledWith("container-no-key");
+        expect(job.status).toBe("failed");
+        expect(job.output.join("\n")).toContain(
+          "The configured Claude API-key pool has no available key",
+        );
+        expect(job.operatorStopCleanupPending).not.toBe(true);
+      } finally {
+        mgr.killAll();
+        fs.rmSync(projectRoot, { recursive: true, force: true });
+      }
+    });
+
+    test("contains synchronous exec failure even when lifecycle observers throw", async () => {
+      const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "quack-docker-exec-throw-"));
+      const mgr = new DispatchManager(projectRoot, "/fake/bin.js", {
+        method: "docker",
+        docker: {
+          image: "node:20-slim",
+          volumes: [],
+          envPassthrough: [],
+          resourceLimits: { memoryMb: 2048, cpus: 1 },
+          networkMode: "bridge",
+          cleanupPolicy: "remove",
+        },
+      });
+      const dockerPaths = stubDockerWorktree(mgr, projectRoot, "TASK-309");
+      const fakeDockerManager = {
+        ...dockerManagerLifecycleStubs(),
+        createContainer: jest.fn(() =>
+          Promise.resolve({
+            containerId: "container-exec-throw",
+            taskId: "TASK-309",
+            image: "node:20-slim",
+            workDir: "/workspace",
+            logsVolume: "/workspace/.quack/logs",
+            worktreePath: dockerPaths.worktreePath,
+            runtimeLogDir: dockerPaths.runtimeLogDir,
+            startedAt: new Date().toISOString(),
+            status: "running" as const,
+          }),
+        ),
+        stopContainer: jest.fn(() => Promise.resolve({ removed: true, retained: false })),
+        forceRemoveContainer: jest.fn(() => Promise.resolve(true)),
+        execAgent: jest.fn(() => {
+          throw new Error("synthetic exec failure");
+        }),
+      };
+      (mgr as unknown as { dockerManager: typeof fakeDockerManager }).dockerManager =
+        fakeDockerManager;
+      mgr.setEventCallback(() => {
+        throw new Error("synthetic observer failure");
+      });
+
+      try {
+        const job = mgr.start("TASK-309", { skipGate: true });
+        await waitForCondition(
+          () => fakeDockerManager.forceRemoveContainer.mock.calls.length === 1,
+          "Docker cleanup after exec failure",
+        );
+
+        expect(fakeDockerManager.forceRemoveContainer).toHaveBeenCalledWith("container-exec-throw");
+        expect(job.status).toBe("failed");
+        expect(job.output.join("\n")).toContain("synthetic exec failure");
+        expect(job.output.join("\n")).toContain("callback failed");
+      } finally {
+        mgr.killAll();
+        fs.rmSync(projectRoot, { recursive: true, force: true });
+      }
+    });
+
+    test("keeps a durable barrier when startup cleanup cannot be confirmed", async () => {
+      const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "quack-docker-startup-barrier-"));
+      const mgr = new DispatchManager(projectRoot, "/fake/bin.js", {
+        method: "docker",
+        docker: {
+          image: "node:20-slim",
+          volumes: [],
+          envPassthrough: [],
+          resourceLimits: { memoryMb: 2048, cpus: 1 },
+          networkMode: "bridge",
+          cleanupPolicy: "remove",
+        },
+      });
+      const dockerPaths = stubDockerWorktree(mgr, projectRoot, "TASK-310");
+      const fakeDockerManager = {
+        ...dockerManagerLifecycleStubs(),
+        createContainer: jest.fn(() =>
+          Promise.resolve({
+            containerId: "container-cleanup-uncertain",
+            taskId: "TASK-310",
+            image: "node:20-slim",
+            workDir: "/workspace",
+            logsVolume: "/workspace/.quack/logs",
+            worktreePath: dockerPaths.worktreePath,
+            runtimeLogDir: dockerPaths.runtimeLogDir,
+            startedAt: new Date().toISOString(),
+            status: "running" as const,
+          }),
+        ),
+        stopContainer: jest.fn(() => Promise.reject(new Error("daemon unavailable"))),
+        forceRemoveContainer: jest.fn(() => Promise.reject(new Error("daemon unavailable"))),
+        execAgent: jest.fn(() => {
+          throw new Error("synthetic exec failure");
+        }),
+      };
+      (mgr as unknown as { dockerManager: typeof fakeDockerManager }).dockerManager =
+        fakeDockerManager;
+
+      try {
+        const job = mgr.start("TASK-310", { skipGate: true });
+        await waitForCondition(
+          () => job.output.some((line) => line.includes("Could not confirm cleanup")),
+          "durable Docker startup cleanup barrier",
+        );
+
+        expect(job.status).toBe("failed");
+        expect(job.output.join("\n")).toContain("daemon unavailable");
+        expect(mgr.getWorktreeShutdownSurvivors()).toEqual([
+          expect.objectContaining({ taskId: "TASK-310", state: "survivor" }),
+        ]);
+        expect(() => mgr.start("TASK-310", { skipGate: true })).toThrow(
+          "prior worktree ownership has not been reconciled",
+        );
+      } finally {
+        mgr.killAll();
+        fs.rmSync(projectRoot, { recursive: true, force: true });
+      }
+    });
+
+    test("waitForIdle tracks Docker result extraction and exposes cleanup failure", async () => {
+      const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "quack-docker-drain-"));
+      const previousTrustedImages = process.env[TRUSTED_MANAGED_DOCKER_IMAGES_ENV];
+      process.env[TRUSTED_MANAGED_DOCKER_IMAGES_ENV] = JSON.stringify([TRUSTED_MANAGED_IMAGE]);
+      const mgr = new DispatchManager(projectRoot, "/fake/bin.js", {
+        method: "docker",
+        docker: {
+          image: TRUSTED_MANAGED_IMAGE,
+          volumes: [],
+          envPassthrough: [],
+          resourceLimits: { memoryMb: 2048, cpus: 1 },
+          networkMode: "bridge",
+          cleanupPolicy: "remove",
+        },
+      });
+      const child = Object.assign(new EventEmitter(), {
+        pid: 4242,
+        stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
+        kill: jest.fn(),
+      });
+      const dockerPaths = stubDockerWorktree(mgr, projectRoot, "TASK-307");
+      let failCleanup!: (error: Error) => void;
+      const fakeDockerManager = {
+        ...dockerManagerLifecycleStubs(),
+        createContainer: jest.fn(() =>
+          Promise.resolve({
+            containerId: "container-delayed-cleanup",
+            taskId: "TASK-307",
+            image: "node:20-slim",
+            workDir: "/workspace",
+            logsVolume: "/workspace/.quack/logs",
+            worktreePath: dockerPaths.worktreePath,
+            runtimeLogDir: dockerPaths.runtimeLogDir,
+            startedAt: new Date().toISOString(),
+            status: "running" as const,
+          }),
+        ),
+        execAgent: jest.fn(() => child),
+        extractResults: jest.fn(),
+        stopContainer: jest.fn(
+          () =>
+            new Promise<void>((_resolve, reject) => {
+              failCleanup = reject;
+            }),
+        ),
+        forceRemoveContainer: jest.fn(() => Promise.resolve(true)),
+      };
+      (
+        mgr as unknown as {
+          dockerManager: typeof fakeDockerManager;
+        }
+      ).dockerManager = fakeDockerManager;
+
+      try {
+        const job = mgr.start("TASK-307", {
+          skipGate: true,
+          admittedTaskContentHash: "a".repeat(64),
+        });
+        await waitForCondition(
+          () => fakeDockerManager.execAgent.mock.calls.length === 1,
+          "Docker exec child launch",
+        );
+        const execCall = fakeDockerManager.execAgent.mock.calls[0] as unknown as [
+          string,
+          string[],
+          Record<string, string>,
+        ];
+        expect(execCall[2][DECOMPOSITION_ADMISSION_HASH_ENV]).toBe("a".repeat(64));
+        expect(execCall[2][DECOMPOSITION_ADMISSION_MARKER_ENV]).toBe("marker.json");
+        expect(execCall[2][DECOMPOSITION_ADMISSION_TOKEN_ENV]).toMatch(/^[0-9a-f-]{36}$/);
+        const createCall = fakeDockerManager.createContainer.mock.calls[0] as unknown as [
+          string,
+          string,
+          { admissionScopeDirectory?: string },
+        ];
+        expect(createCall[1]).toBe(dockerPaths.worktreePath);
+        expect(createCall[2].admissionScopeDirectory).toMatch(
+          new RegExp(`decomposition-admissions[\\\\/]dispatch-TASK-307-[0-9a-f-]{36}$`),
+        );
+        expect(
+          fs.existsSync(
+            path.join(
+              createCall[2].admissionScopeDirectory!,
+              execCall[2][DECOMPOSITION_ADMISSION_MARKER_ENV],
+            ),
+          ),
+        ).toBe(true);
+        child.emit("exit", 0, null);
+        child.emit("close", 0, null);
+        await waitForCondition(
+          () => fakeDockerManager.stopContainer.mock.calls.length === 1,
+          "Docker container cleanup",
+        );
+
+        let idleSettled = false;
+        const idle = mgr.waitForIdle(5_000).then((value) => {
+          idleSettled = true;
+          return value;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        expect(idleSettled).toBe(false);
+
+        failCleanup(new Error("synthetic cleanup failure"));
+        await expect(idle).resolves.toBe(true);
+        expect(fakeDockerManager.extractResults).not.toHaveBeenCalled();
+        expect(job.status).toBe("failed");
+        expect(job.output.join("\n")).toContain("synthetic cleanup failure");
+      } finally {
+        mgr.killAll();
+        if (previousTrustedImages === undefined) {
+          delete process.env[TRUSTED_MANAGED_DOCKER_IMAGES_ENV];
+        } else {
+          process.env[TRUSTED_MANAGED_DOCKER_IMAGES_ENV] = previousTrustedImages;
+        }
+        fs.rmSync(projectRoot, { recursive: true, force: true });
+      }
     });
 
     test("does not create DockerManager when docker config is missing", () => {
@@ -585,6 +873,948 @@ describe("DispatchManager", () => {
     });
   });
 
+  describe("operator stop lifecycle", () => {
+    let tmpDir: string;
+    const windowsTest = process.platform === "win32" ? test : test.skip;
+
+    function git(cwd: string, args: string[]): void {
+      execFileSync("git", args, { cwd, stdio: "ignore" });
+    }
+
+    function initRepoWithOrigin(rootDir: string): string {
+      const originDir = path.join(rootDir, "origin.git");
+      const repoDir = path.join(rootDir, "repo");
+      execFileSync("git", ["init", "--bare", originDir], { stdio: "ignore" });
+      fs.mkdirSync(repoDir, { recursive: true });
+      git(repoDir, ["init"]);
+      git(repoDir, ["config", "user.email", "quack@example.test"]);
+      git(repoDir, ["config", "user.name", "Quack Test"]);
+      fs.writeFileSync(path.join(repoDir, "tracked.txt"), "fresh\n");
+      fs.mkdirSync(path.join(repoDir, ".quack"), { recursive: true });
+      fs.writeFileSync(
+        path.join(repoDir, ".quack", "adapter.json"),
+        JSON.stringify({ git: { baseBranch: "dev", branchPrefix: "quack/" } }),
+      );
+      git(repoDir, ["add", "tracked.txt"]);
+      git(repoDir, ["commit", "-m", "initial"]);
+      git(repoDir, ["branch", "-M", "dev"]);
+      git(repoDir, ["remote", "add", "origin", originDir]);
+      git(repoDir, ["push", "-u", "origin", "dev"]);
+      return repoDir;
+    }
+
+    function createDeniedPathQuarantine(
+      projectRoot: string,
+      suffix: string,
+      lockPid?: number,
+    ): string {
+      const protectedRoot = path.join(projectRoot, ".quack");
+      const entries: Record<string, { kind: "file" | "directory" | "symlink"; digest: string }> =
+        Object.create(null) as Record<
+          string,
+          { kind: "file" | "directory" | "symlink"; digest: string }
+        >;
+      const digest = (value: Buffer | string): string =>
+        createHash("sha256").update(value).digest("hex");
+      const walk = (absolute: string, relative: string): void => {
+        const stat = fs.lstatSync(absolute);
+        const key = relative.split(path.sep).join("/");
+        if (stat.isSymbolicLink()) {
+          entries[key] = { kind: "symlink", digest: digest(fs.readlinkSync(absolute)) };
+          return;
+        }
+        if (stat.isDirectory()) {
+          entries[key] = { kind: "directory", digest: "directory" };
+          for (const child of fs.readdirSync(absolute).sort()) {
+            walk(path.join(absolute, child), path.join(relative, child));
+          }
+          return;
+        }
+        entries[key] = { kind: "file", digest: digest(fs.readFileSync(absolute)) };
+      };
+      walk(protectedRoot, ".quack");
+
+      const quarantineRoot = path.join(path.dirname(projectRoot), `.quack-codex-denied-${suffix}`);
+      fs.mkdirSync(quarantineRoot);
+      fs.writeFileSync(
+        path.join(quarantineRoot, "manifest.json"),
+        JSON.stringify({
+          version: 2,
+          projectRoot: fs.realpathSync(projectRoot),
+          policy: { writablePaths: ["src/"], deniedPaths: [".quack/"] },
+          before: { entries },
+          items: [{ relativePath: ".quack", backupName: "0", mode: "move" }],
+        }),
+        "utf-8",
+      );
+      fs.renameSync(protectedRoot, path.join(quarantineRoot, "0"));
+      if (lockPid !== undefined) {
+        fs.writeFileSync(
+          path.join(quarantineRoot, "recovery.lock"),
+          JSON.stringify({ pid: lockPid }),
+          "utf-8",
+        );
+      }
+      return quarantineRoot;
+    }
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-manual-stop-"));
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    test("uses a durable sibling barrier when the primary barrier directory is unavailable", () => {
+      const repoDir = initRepoWithOrigin(tmpDir);
+      const primaryBarrierPath = path.join(repoDir, ".quack", "operator-stop-barriers");
+      fs.writeFileSync(primaryBarrierPath, "primary path obstruction", "utf8");
+      const mgr = createLocalOriginFixtureManager(repoDir, process.execPath);
+      const job: DispatchJob = {
+        taskId: "TASK-BARRIER-FALLBACK",
+        sessionId: "barrier-fallback",
+        pid: 42,
+        startedAt: new Date().toISOString(),
+        status: "stopped",
+        output: [],
+        executionRoot: path.join(repoDir, ".quack", "worktrees", "TASK-BARRIER-FALLBACK"),
+        operatorStopRequestedAt: new Date().toISOString(),
+        operatorStopCleanupPending: true,
+      };
+      const internals = mgr as unknown as {
+        persistOperatorStopBarrier: (candidate: DispatchJob) => boolean;
+        clearOperatorStopBarrier: (candidate: DispatchJob) => boolean;
+        operatorStopFallbackBarrierDirectory: () => string;
+      };
+
+      expect(internals.persistOperatorStopBarrier.call(mgr, job)).toBe(true);
+      expect(job.output.join("\n")).toContain("using durable fallback");
+      const fallbackDirectory = internals.operatorStopFallbackBarrierDirectory.call(mgr);
+      expect(
+        fs.readdirSync(fallbackDirectory).filter((entry) => entry.endsWith(".json")),
+      ).toHaveLength(1);
+
+      fs.rmSync(primaryBarrierPath);
+      const restartedManager = createLocalOriginFixtureManager(repoDir, process.execPath);
+      expect(() => restartedManager.start(job.taskId, { skipGate: true })).toThrow(
+        "operator-stop cleanup remains unconfirmed",
+      );
+
+      expect(internals.clearOperatorStopBarrier.call(mgr, job)).toBe(true);
+      restartedManager.killAll();
+      mgr.killAll();
+    });
+
+    test("refuses to terminate a child when no durable stop barrier can be written", () => {
+      const projectRoot = path.join(tmpDir, "barrier-write-failure");
+      fs.mkdirSync(projectRoot);
+      const mgr = new DispatchManager(projectRoot, process.execPath);
+      const taskId = "TASK-BARRIER-WRITE-FAILURE";
+      const job: DispatchJob = {
+        taskId,
+        sessionId: "barrier-write-failure",
+        pid: 42,
+        startedAt: new Date().toISOString(),
+        status: "running",
+        output: [],
+        executionRoot: projectRoot,
+      };
+      const kill = jest.fn();
+      const internals = mgr as unknown as {
+        jobs: Map<string, DispatchJob>;
+        processes: Map<string, { pid: number; kill: typeof kill }>;
+        operatorStopCleanupPending: Map<string, DispatchJob>;
+        persistOperatorStopBarrier: (candidate: DispatchJob) => boolean;
+      };
+      internals.jobs.set(taskId, job);
+      internals.processes.set(taskId, { pid: job.pid, kill });
+      jest.spyOn(internals, "persistOperatorStopBarrier").mockReturnValue(false);
+
+      expect(mgr.stop(taskId)).toBe(false);
+      expect(kill).not.toHaveBeenCalled();
+      expect(job.status).toBe("running");
+      expect(job.operatorStopRequestedAt).toBeUndefined();
+      expect(job.operatorStopCleanupPending).toBe(false);
+      expect(internals.operatorStopCleanupPending.has(taskId)).toBe(false);
+      expect(mgr.killAll()).toBe(false);
+      expect(kill).not.toHaveBeenCalled();
+    });
+
+    test("returns false and retains the barrier when native tree termination is unconfirmed", () => {
+      const projectRoot = path.join(tmpDir, "unconfirmed-native-stop");
+      fs.mkdirSync(projectRoot);
+      const mgr = new DispatchManager(projectRoot, process.execPath);
+      const taskId = "TASK-UNCONFIRMED-NATIVE";
+      const job: DispatchJob = {
+        taskId,
+        sessionId: "unconfirmed-native-stop",
+        pid: 4242,
+        startedAt: new Date().toISOString(),
+        status: "running",
+        output: [],
+        executionRoot: path.join(projectRoot, ".quack", "worktrees", taskId),
+      };
+      const child = { pid: job.pid, kill: jest.fn() };
+      const internals = mgr as unknown as {
+        jobs: Map<string, DispatchJob>;
+        processes: Map<string, typeof child>;
+        operatorStopCleanupPending: Map<string, DispatchJob>;
+        terminateOperatorProcessTree: () => {
+          confirmed: boolean;
+          warning?: string;
+        };
+      };
+      internals.jobs.set(taskId, job);
+      internals.processes.set(taskId, child);
+      jest.spyOn(internals, "terminateOperatorProcessTree").mockReturnValue({
+        confirmed: false,
+        warning: "synthetic unconfirmed process tree",
+      });
+
+      expect(mgr.stop(taskId)).toBe(false);
+      expect(job.status).toBe("stopped");
+      expect(job.operatorStopTreeTerminated).toBe(false);
+      expect(job.operatorStopCleanupPending).toBe(true);
+      expect(internals.operatorStopCleanupPending.get(taskId)).toBe(job);
+      expect(fs.existsSync(job.operatorStopBarrierPath!)).toBe(true);
+      expect(job.output.join("\n")).toContain("synthetic unconfirmed process tree");
+      expect(mgr.killAll()).toBe(false);
+    });
+
+    (process.platform === "win32" ? test.skip : test)(
+      "re-probes a cached POSIX stop and completes recovery after the child handle closes",
+      async () => {
+        const projectRoot = path.join(tmpDir, "cached-posix-stop");
+        const worktreePath = path.join(projectRoot, ".quack", "worktrees", "TASK-CACHED-STOP");
+        fs.mkdirSync(worktreePath, { recursive: true });
+        const mgr = new DispatchManager(projectRoot, process.execPath);
+        const job: DispatchJob = {
+          taskId: "TASK-CACHED-STOP",
+          sessionId: "cached-posix-stop",
+          pid: 4242,
+          startedAt: new Date().toISOString(),
+          status: "running",
+          output: [],
+          worktreePath,
+          executionRoot: worktreePath,
+        };
+        const child = { pid: job.pid, kill: jest.fn() };
+        const internals = mgr as unknown as {
+          jobs: Map<string, DispatchJob>;
+          processes: Map<string, typeof child>;
+          terminateOperatorProcessTree: () => {
+            confirmed: boolean;
+            processGroupId?: number;
+            warning?: string;
+          };
+          posixProcessGroupIsAbsent: (processGroupId: number) => boolean;
+          shouldCleanupDockerForWorktree: () => boolean;
+        };
+        internals.jobs.set(job.taskId, job);
+        internals.processes.set(job.taskId, child);
+        jest.spyOn(internals, "terminateOperatorProcessTree").mockReturnValue({
+          confirmed: false,
+          processGroupId: job.pid,
+          warning: "awaiting close",
+        });
+        jest.spyOn(internals, "posixProcessGroupIsAbsent").mockReturnValue(true);
+        jest.spyOn(internals, "shouldCleanupDockerForWorktree").mockReturnValue(true);
+
+        expect(mgr.stop(job.taskId)).toBe(false);
+        internals.processes.delete(job.taskId);
+        expect(mgr.stop(job.taskId)).toBe(true);
+        await expect(mgr.waitForIdle()).resolves.toBe(true);
+
+        expect(job.operatorStopTreeTerminated).toBe(true);
+        expect(job.operatorStopCleanupPending).toBe(false);
+        expect(mgr.hasPendingOperatorStopCleanup(job.taskId)).toBe(false);
+        expect(fs.existsSync(job.operatorStopBarrierPath ?? "")).toBe(false);
+      },
+    );
+
+    test("killAll fails closed when a native child has no matching job record", () => {
+      const mgr = new DispatchManager(path.join(tmpDir, "missing-job"), process.execPath);
+      const child = { pid: 4243, kill: jest.fn(() => true) };
+      const internals = mgr as unknown as {
+        processes: Map<string, typeof child>;
+      };
+      internals.processes.set("TASK-MISSING-JOB", child);
+
+      expect(mgr.killAll()).toBe(false);
+      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    });
+
+    test("stores shared-root barriers only in the sibling authoritative directory", () => {
+      const projectRoot = path.join(tmpDir, "shared-barrier-project");
+      fs.mkdirSync(projectRoot);
+      const mgr = new DispatchManager(projectRoot, process.execPath);
+      const job: DispatchJob = {
+        taskId: "TASK-SHARED-BARRIER",
+        sessionId: "shared-barrier",
+        pid: 42,
+        startedAt: new Date().toISOString(),
+        status: "stopped",
+        output: [],
+        executionRoot: projectRoot,
+        operatorStopRequestedAt: new Date().toISOString(),
+        operatorStopCleanupPending: true,
+      };
+      const internals = mgr as unknown as {
+        persistOperatorStopBarrier: (candidate: DispatchJob) => boolean;
+        clearOperatorStopBarrier: (candidate: DispatchJob) => boolean;
+        operatorStopBarrierDirectory: () => string;
+        operatorStopFallbackBarrierDirectory: () => string;
+      };
+
+      expect(internals.persistOperatorStopBarrier.call(mgr, job)).toBe(true);
+      expect(path.dirname(job.operatorStopBarrierPath!)).toBe(
+        internals.operatorStopFallbackBarrierDirectory.call(mgr),
+      );
+      expect(fs.existsSync(internals.operatorStopBarrierDirectory.call(mgr))).toBe(false);
+      expect(job.output.join("\n")).toContain("outside the worker-writable project");
+
+      expect(internals.clearOperatorStopBarrier.call(mgr, job)).toBe(true);
+      mgr.killAll();
+    });
+
+    test("fails closed on malformed durable stop evidence", () => {
+      const projectRoot = path.join(tmpDir, "malformed-stop-evidence");
+      const barrierDirectory = path.join(projectRoot, ".quack", "operator-stop-barriers");
+      fs.mkdirSync(barrierDirectory, { recursive: true });
+      fs.writeFileSync(path.join(barrierDirectory, "damaged.json"), "not-json", "utf8");
+      const mgr = new DispatchManager(projectRoot, process.execPath);
+
+      expect(() => mgr.start("TASK-MALFORMED-BARRIER", { skipGate: true })).toThrow(
+        "invalid operator-stop recovery evidence",
+      );
+      mgr.killAll();
+    });
+
+    test("remains stopped after real process-tree termination and preserves its worktree", async () => {
+      const repoDir = initRepoWithOrigin(tmpDir);
+      const readyFile = path.join(tmpDir, "child-ready");
+      const scriptPath = path.join(tmpDir, "long-running-child.cjs");
+      fs.writeFileSync(
+        scriptPath,
+        [
+          "const fs = require('node:fs');",
+          `fs.writeFileSync(${JSON.stringify(readyFile)}, 'ready', 'utf-8');`,
+          "setInterval(() => {}, 1000);",
+        ].join("\n"),
+        "utf-8",
+      );
+
+      const mgr = createLocalOriginFixtureManager(repoDir, scriptPath);
+      try {
+        const job = mgr.start("TASK-MANUAL-STOP", { skipGate: true });
+        await waitForFile(readyFile);
+
+        expect(job.worktreePath).toBeDefined();
+        expect(fs.existsSync(job.worktreePath!)).toBe(true);
+        expect(typeof mgr.stop(job.taskId)).toBe("boolean");
+        expect(job.status).toBe("stopped");
+        expect(job.operatorStopRequestedAt).toBeDefined();
+
+        await waitForCondition(
+          () => job.output.some((line) => line.includes("Operator-requested stop confirmed")),
+          "the child exit callback",
+        );
+
+        expect(job.status).toBe("stopped");
+        expect(job.exitCode).toBeUndefined();
+        expect(job.killedBySignal).toBe(process.platform === "win32" ? undefined : "SIGKILL");
+        expect(job.operatorStopTreeTerminated).toBe(true);
+        expect(fs.existsSync(job.worktreePath!)).toBe(true);
+        expect(job.output.join("\n")).toContain("branch retained for recovery");
+        expect(job.output.join("\n")).not.toContain("suspect the OOM killer");
+        expect(job.output.join("\n")).not.toContain("dispatch failed");
+        await waitForCondition(
+          () => job.output.some((line) => line.includes("Operator-stop cleanup complete")),
+          "the durable stop barrier to clear",
+        );
+        const barrierDir = path.join(repoDir, ".quack", "operator-stop-barriers");
+        expect(
+          fs.existsSync(barrierDir)
+            ? fs.readdirSync(barrierDir).filter((entry) => entry.endsWith(".json"))
+            : [],
+        ).toEqual([]);
+        const restartedManager = createLocalOriginFixtureManager(repoDir, scriptPath);
+        const assertNoBarrier = (
+          restartedManager as unknown as {
+            assertNoDurableOperatorStopBarrier: (taskId: string) => void;
+          }
+        ).assertNoDurableOperatorStopBarrier;
+        expect(() => assertNoBarrier.call(restartedManager, job.taskId)).not.toThrow();
+        restartedManager.killAll();
+
+        const eventsFile = path.join(repoDir, ".quack", "logs", `events-${job.sessionId}.jsonl`);
+        await waitForFile(eventsFile);
+        const exitEvent = fs
+          .readFileSync(eventsFile, "utf-8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line) as { stage: string; payload: Record<string, unknown> })
+          .find((event) => event.stage === "dispatch_child_exit");
+        expect(exitEvent?.payload).toMatchObject({
+          exitCode: process.platform === "win32" ? 1 : null,
+          signal: process.platform === "win32" ? null : "SIGKILL",
+          killed: process.platform !== "win32",
+          operatorRequested: true,
+          worktreePath: job.worktreePath,
+        });
+      } finally {
+        mgr.killAll();
+      }
+    });
+
+    test("rebinds operator local-read authorization to the managed worktree child", async () => {
+      const repoDir = initRepoWithOrigin(tmpDir);
+      const originDir = path.join(tmpDir, "origin.git");
+      const sessionFile = path.join(tmpDir, "child-event-session.txt");
+      const environmentFile = path.join(tmpDir, "child-local-read-authorization.json");
+      const scriptPath = path.join(tmpDir, "capture-local-read-authorization.cjs");
+      fs.writeFileSync(
+        scriptPath,
+        [
+          "const fs = require('node:fs');",
+          `fs.writeFileSync(${JSON.stringify(sessionFile)}, process.env.QUACK_MONITOR_EVENT_SESSION_ID || '', 'utf8');`,
+          `fs.writeFileSync(${JSON.stringify(environmentFile)}, process.env.QUACK_TRUSTED_LOCAL_READ_REMOTES || '', 'utf8');`,
+        ].join("\n"),
+        "utf8",
+      );
+      const mgr = createLocalOriginFixtureManager(repoDir, scriptPath, originDir);
+      const previousAuthorization = process.env.QUACK_TRUSTED_LOCAL_READ_REMOTES;
+      process.env.QUACK_TRUSTED_LOCAL_READ_REMOTES = JSON.stringify({
+        projectRoot: fs.realpathSync(repoDir),
+        paths: [originDir],
+      });
+
+      try {
+        const job = mgr.start("TASK-LOCAL-READ-CHILD", { skipGate: true });
+        await waitForFile(environmentFile);
+        expect(fs.readFileSync(sessionFile, "utf8")).toBe(job.sessionId);
+        const authorization = JSON.parse(fs.readFileSync(environmentFile, "utf8")) as {
+          projectRoot: string;
+          paths: string[];
+        };
+
+        expect(authorization).toEqual({
+          projectRoot: fs.realpathSync(job.worktreePath!),
+          paths: [originDir],
+        });
+      } finally {
+        mgr.killAll();
+        if (previousAuthorization === undefined) {
+          delete process.env.QUACK_TRUSTED_LOCAL_READ_REMOTES;
+        } else {
+          process.env.QUACK_TRUSTED_LOCAL_READ_REMOTES = previousAuthorization;
+        }
+      }
+    });
+
+    test("does not leak a parent local-read grant when the manager received none", async () => {
+      const projectRoot = path.join(tmpDir, "no-local-read-grant");
+      fs.mkdirSync(projectRoot);
+      const environmentFile = path.join(tmpDir, "child-without-local-read-authorization.txt");
+      const scriptPath = path.join(tmpDir, "capture-missing-local-read-authorization.cjs");
+      fs.writeFileSync(
+        scriptPath,
+        [
+          "const fs = require('node:fs');",
+          `fs.writeFileSync(${JSON.stringify(environmentFile)}, process.env.QUACK_TRUSTED_LOCAL_READ_REMOTES || 'absent', 'utf8');`,
+        ].join("\n"),
+        "utf8",
+      );
+      const previousAuthorization = process.env.QUACK_TRUSTED_LOCAL_READ_REMOTES;
+      process.env.QUACK_TRUSTED_LOCAL_READ_REMOTES = "parent-grant-must-not-leak";
+      const mgr = new DispatchManager(projectRoot, scriptPath);
+
+      try {
+        mgr.start("TASK-NO-LOCAL-READ-GRANT", { skipGate: true });
+        await waitForFile(environmentFile);
+        expect(fs.readFileSync(environmentFile, "utf8")).toBe("absent");
+      } finally {
+        mgr.killAll();
+        if (previousAuthorization === undefined) {
+          delete process.env.QUACK_TRUSTED_LOCAL_READ_REMOTES;
+        } else {
+          process.env.QUACK_TRUSTED_LOCAL_READ_REMOTES = previousAuthorization;
+        }
+      }
+    });
+
+    test("does not expose the operator managed-Docker image allowlist to a worktree child", async () => {
+      const repoDir = initRepoWithOrigin(tmpDir);
+      const environmentFile = path.join(tmpDir, "child-managed-docker-policy.json");
+      const scriptPath = path.join(tmpDir, "capture-managed-docker-policy.cjs");
+      fs.writeFileSync(
+        scriptPath,
+        [
+          "const fs = require('node:fs');",
+          `fs.writeFileSync(${JSON.stringify(environmentFile)}, JSON.stringify({`,
+          "  leaked: Object.keys(process.env).some((key) => key.toUpperCase() === 'QUACK_TRUSTED_MANAGED_DOCKER_IMAGES'),",
+          "  sentinel: process.env.QUACK_AGENT_ENV_SENTINEL",
+          "}), 'utf8');",
+        ].join("\n"),
+        "utf8",
+      );
+      const mgr = createLocalOriginFixtureManager(repoDir, scriptPath);
+      const previousAllowlist = process.env[TRUSTED_MANAGED_DOCKER_IMAGES_ENV];
+      const previousSentinel = process.env.QUACK_AGENT_ENV_SENTINEL;
+      process.env[TRUSTED_MANAGED_DOCKER_IMAGES_ENV] = JSON.stringify([TRUSTED_MANAGED_IMAGE]);
+      process.env.QUACK_AGENT_ENV_SENTINEL = "visible";
+
+      try {
+        mgr.start("TASK-NO-DOCKER-POLICY", { skipGate: true });
+        await waitForFile(environmentFile);
+        expect(JSON.parse(fs.readFileSync(environmentFile, "utf8"))).toEqual({
+          leaked: false,
+          sentinel: "visible",
+        });
+      } finally {
+        mgr.killAll();
+        if (previousAllowlist === undefined) {
+          delete process.env[TRUSTED_MANAGED_DOCKER_IMAGES_ENV];
+        } else {
+          process.env[TRUSTED_MANAGED_DOCKER_IMAGES_ENV] = previousAllowlist;
+        }
+        if (previousSentinel === undefined) delete process.env.QUACK_AGENT_ENV_SENTINEL;
+        else process.env.QUACK_AGENT_ENV_SENTINEL = previousSentinel;
+      }
+    });
+
+    windowsTest(
+      "keeps restart blocked when worktree container cleanup is unconfirmed",
+      async () => {
+        const repoDir = initRepoWithOrigin(tmpDir);
+        const readyFile = path.join(tmpDir, "docker-cleanup-child-ready");
+        const scriptPath = path.join(tmpDir, "docker-cleanup-child.cjs");
+        fs.writeFileSync(
+          scriptPath,
+          [
+            "const fs = require('node:fs');",
+            `fs.writeFileSync(${JSON.stringify(readyFile)}, 'ready', 'utf-8');`,
+            "setInterval(() => {}, 1000);",
+          ].join("\n"),
+          "utf-8",
+        );
+        mockCleanupWorktreeContainers.mockReturnValue(false);
+
+        const mgr = createLocalOriginFixtureManager(repoDir, scriptPath);
+        try {
+          const job = mgr.start("TASK-DOCKER-STOP-BARRIER", { skipGate: true });
+          await waitForFile(readyFile);
+          expect(mgr.stop(job.taskId)).toBe(true);
+          await waitForCondition(
+            () =>
+              job.output.some((line) =>
+                line.includes("worktree container cleanup was disabled or could not be confirmed"),
+              ),
+            "the failed container-cleanup barrier",
+          );
+
+          expect(job.operatorStopCleanupPending).toBe(true);
+          expect(() => mgr.start(job.taskId, { skipGate: true })).toThrow(
+            "still completing operator-stop cleanup",
+          );
+          const barrierDir = path.join(repoDir, ".quack", "operator-stop-barriers");
+          expect(
+            fs.readdirSync(barrierDir).filter((entry) => entry.endsWith(".json")),
+          ).toHaveLength(1);
+
+          const restartedManager = createLocalOriginFixtureManager(repoDir, scriptPath);
+          expect(() => restartedManager.start(job.taskId, { skipGate: true })).toThrow(
+            "operator-stop cleanup remains unconfirmed",
+          );
+          restartedManager.killAll();
+        } finally {
+          mgr.killAll();
+        }
+      },
+    );
+
+    windowsTest(
+      "kills descendants but preserves all generations when sibling evidence is ambiguous",
+      async () => {
+        const repoDir = initRepoWithOrigin(tmpDir);
+        const originalFixture = Buffer.from([0, 1, 2, 3, 250, 251, 252, 253, 10]);
+        fs.writeFileSync(path.join(repoDir, ".quack", "guard-fixture.bin"), originalFixture);
+        git(repoDir, ["add", "-f", ".quack/guard-fixture.bin"]);
+        git(repoDir, ["commit", "-m", "add denied-path fixture"]);
+        git(repoDir, ["push", "origin", "dev"]);
+
+        const ownerReadyFile = path.join(tmpDir, "quarantine-owner-ready.json");
+        const descendantReadyFile = path.join(tmpDir, "quarantine-descendant-ready");
+        const descendantScript = path.join(tmpDir, "quarantine-descendant.cjs");
+        const ownerScript = path.join(tmpDir, "quarantine-owner.cjs");
+
+        fs.writeFileSync(
+          descendantScript,
+          [
+            "const fs = require('node:fs');",
+            "const path = require('node:path');",
+            "const [target, ready] = process.argv.slice(2);",
+            "fs.writeFileSync(ready, String(process.pid), 'utf-8');",
+            "setInterval(() => {",
+            "  try {",
+            "    fs.mkdirSync(path.dirname(target), { recursive: true });",
+            "    fs.writeFileSync(target, 'descendant-was-still-writing', 'utf-8');",
+            "  } catch {}",
+            "}, 10);",
+          ].join("\n"),
+          "utf-8",
+        );
+
+        fs.writeFileSync(
+          ownerScript,
+          [
+            "const crypto = require('node:crypto');",
+            "const fs = require('node:fs');",
+            "const path = require('node:path');",
+            "const { spawn } = require('node:child_process');",
+            `const ownerReady = ${JSON.stringify(ownerReadyFile)};`,
+            `const descendantReady = ${JSON.stringify(descendantReadyFile)};`,
+            `const descendantScript = ${JSON.stringify(descendantScript)};`,
+            "const projectRoot = fs.realpathSync(process.cwd());",
+            "const protectedRoot = path.join(projectRoot, '.quack');",
+            "const entries = Object.create(null);",
+            "function digest(value) { return crypto.createHash('sha256').update(value).digest('hex'); }",
+            "function walk(absolute, relative) {",
+            "  const stat = fs.lstatSync(absolute);",
+            "  const key = relative.split(path.sep).join('/');",
+            "  if (stat.isSymbolicLink()) {",
+            "    entries[key] = { kind: 'symlink', digest: digest(fs.readlinkSync(absolute)) };",
+            "    return;",
+            "  }",
+            "  if (stat.isDirectory()) {",
+            "    entries[key] = { kind: 'directory', digest: 'directory' };",
+            "    for (const child of fs.readdirSync(absolute).sort()) {",
+            "      walk(path.join(absolute, child), path.join(relative, child));",
+            "    }",
+            "    return;",
+            "  }",
+            "  entries[key] = { kind: 'file', digest: digest(fs.readFileSync(absolute)) };",
+            "}",
+            "walk(protectedRoot, '.quack');",
+            "const quarantineRoot = fs.mkdtempSync(path.join(path.dirname(projectRoot), '.quack-codex-denied-'));",
+            "const manifest = {",
+            "  version: 2,",
+            "  projectRoot,",
+            "  policy: { writablePaths: ['src/'], deniedPaths: ['.quack/'] },",
+            "  before: { entries },",
+            "  items: [{ relativePath: '.quack', backupName: '0', mode: 'move' }],",
+            "};",
+            "fs.writeFileSync(path.join(quarantineRoot, 'manifest.json'), JSON.stringify(manifest), 'utf-8');",
+            "fs.renameSync(protectedRoot, path.join(quarantineRoot, '0'));",
+            "fs.mkdirSync(protectedRoot, { recursive: true });",
+            "fs.writeFileSync(path.join(protectedRoot, 'guard-fixture.bin'), 'model-created replacement', 'utf-8');",
+            "fs.writeFileSync(path.join(quarantineRoot, 'recovery.lock'), JSON.stringify({ pid: process.pid }), 'utf-8');",
+            "const descendantTarget = path.join(protectedRoot, 'descendant-write.txt');",
+            "const descendant = spawn(process.execPath, [descendantScript, descendantTarget, descendantReady], {",
+            "  stdio: 'ignore',",
+            "});",
+            "fs.writeFileSync(ownerReady, JSON.stringify({ quarantineRoot, descendantPid: descendant.pid }), 'utf-8');",
+            "setInterval(() => {}, 1000);",
+          ].join("\n"),
+          "utf-8",
+        );
+
+        const mgr = createLocalOriginFixtureManager(repoDir, ownerScript);
+        try {
+          const job = mgr.start("TASK-QUARANTINE-STOP", { skipGate: true });
+          await waitForFile(ownerReadyFile);
+          await waitForFile(descendantReadyFile);
+
+          const ownerState = JSON.parse(fs.readFileSync(ownerReadyFile, "utf-8")) as {
+            quarantineRoot: string;
+            descendantPid: number;
+          };
+          const validManifest = JSON.parse(
+            fs.readFileSync(path.join(ownerState.quarantineRoot, "manifest.json"), "utf-8"),
+          ) as Record<string, unknown>;
+          expect(
+            JSON.parse(
+              fs.readFileSync(path.join(ownerState.quarantineRoot, "recovery.lock"), "utf-8"),
+            ),
+          ).toEqual({ pid: job.pid });
+          const worktreeParent = path.dirname(job.worktreePath!);
+          const malformedRoot = path.join(worktreeParent, ".quack-codex-denied-malformed");
+          const crossProjectRoot = path.join(worktreeParent, ".quack-codex-denied-cross-project");
+          fs.mkdirSync(malformedRoot);
+          fs.writeFileSync(path.join(malformedRoot, "manifest.json"), "not-json", "utf-8");
+          fs.mkdirSync(crossProjectRoot);
+          fs.writeFileSync(
+            path.join(crossProjectRoot, "manifest.json"),
+            JSON.stringify({ ...validManifest, projectRoot: fs.realpathSync(repoDir) }),
+            "utf-8",
+          );
+
+          expect(mgr.stop(job.taskId)).toBe(true);
+          await waitForCondition(
+            () => job.output.some((line) => line.includes("no generation was recovered")),
+            "the ambiguous quarantine refusal",
+          );
+          await new Promise((resolve) => setTimeout(resolve, 200));
+
+          expect(job.status).toBe("stopped");
+          expect(job.operatorStopTreeTerminated).toBe(true);
+          expect(fs.existsSync(job.worktreePath!)).toBe(true);
+          expect(
+            fs
+              .readFileSync(path.join(job.worktreePath!, ".quack", "guard-fixture.bin"))
+              .equals(Buffer.from("model-created replacement")),
+          ).toBe(true);
+          expect(
+            fs
+              .readFileSync(path.join(ownerState.quarantineRoot, "0", "guard-fixture.bin"))
+              .equals(originalFixture),
+          ).toBe(true);
+          expect(fs.existsSync(ownerState.quarantineRoot)).toBe(true);
+          expect(fs.existsSync(malformedRoot)).toBe(true);
+          expect(fs.existsSync(crossProjectRoot)).toBe(true);
+          expect(job.operatorStopCleanupPending).toBe(true);
+          expect(job.output.join("\n")).toContain("Invalid Codex denied-path quarantine manifest");
+          expect(job.output.join("\n")).toContain(
+            "declares another project but does not validate for that project",
+          );
+
+          let descendantAlive = true;
+          try {
+            process.kill(ownerState.descendantPid, 0);
+          } catch {
+            descendantAlive = false;
+          }
+          expect(descendantAlive).toBe(false);
+        } finally {
+          mgr.killAll();
+        }
+      },
+    );
+
+    test("a fresh manager refuses reuse of a worktree with orphaned quarantine evidence", () => {
+      const repoDir = initRepoWithOrigin(tmpDir);
+      const taskId = "TASK-ORPHAN-RESTART";
+      const worktreePath = path.join(repoDir, ".quack", "worktrees", taskId);
+      fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+      git(repoDir, ["worktree", "add", "-b", `quack/${taskId}`, worktreePath, "origin/dev"]);
+      fs.mkdirSync(path.join(worktreePath, ".quack"));
+      fs.writeFileSync(path.join(worktreePath, ".quack", "fixture.bin"), "original");
+      const quarantineRoot = createDeniedPathQuarantine(worktreePath, "restart-owned");
+
+      // This manager has no in-memory knowledge of the run that created the
+      // quarantine, matching a monitor restart after an abrupt stop.
+      const restartedManager = createLocalOriginFixtureManager(repoDir, process.execPath);
+      expect(() => restartedManager.start(taskId, { skipGate: true, reuseWorktree: true })).toThrow(
+        "unresolved Codex denied-path quarantine evidence",
+      );
+      expect(fs.existsSync(worktreePath)).toBe(true);
+      expect(fs.existsSync(quarantineRoot)).toBe(true);
+      restartedManager.killAll();
+    });
+
+    test("finds quarantine evidence beside a canonical target reached through a directory alias", () => {
+      const repoDir = initRepoWithOrigin(tmpDir);
+      const aliasRoot = path.join(tmpDir, "repo-alias");
+      fs.symlinkSync(repoDir, aliasRoot, "junction");
+      const taskId = "TASK-ALIASED-QUARANTINE";
+      const canonicalWorktree = path.join(repoDir, ".quack", "worktrees", taskId);
+      fs.mkdirSync(path.dirname(canonicalWorktree), { recursive: true });
+      git(repoDir, ["worktree", "add", "-b", `quack/${taskId}`, canonicalWorktree, "origin/dev"]);
+      fs.mkdirSync(path.join(canonicalWorktree, ".quack"));
+      fs.writeFileSync(path.join(canonicalWorktree, ".quack", "fixture.bin"), "original");
+      const quarantineRoot = createDeniedPathQuarantine(canonicalWorktree, "canonical-parent");
+
+      const restartedManager = new DispatchManager(aliasRoot, process.execPath);
+      const assertNoQuarantine = (
+        restartedManager as unknown as {
+          assertNoOrphanedQuarantineBeforeWorktreeMutation: (
+            currentTaskId: string,
+            worktreePath: string,
+          ) => void;
+        }
+      ).assertNoOrphanedQuarantineBeforeWorktreeMutation;
+
+      expect(() =>
+        assertNoQuarantine.call(
+          restartedManager,
+          taskId,
+          path.join(aliasRoot, ".quack", "worktrees", taskId),
+        ),
+      ).toThrow("unresolved Codex denied-path quarantine evidence");
+      expect(fs.existsSync(quarantineRoot)).toBe(true);
+      restartedManager.killAll();
+    });
+
+    test("a missing fresh target ignores a fully validated sibling-worktree quarantine", () => {
+      const repoDir = initRepoWithOrigin(tmpDir);
+      const ownerTaskId = "TASK-OTHER-OWNER";
+      const ownerWorktree = path.join(repoDir, ".quack", "worktrees", ownerTaskId);
+      fs.mkdirSync(path.dirname(ownerWorktree), { recursive: true });
+      git(repoDir, ["worktree", "add", "-b", `quack/${ownerTaskId}`, ownerWorktree, "origin/dev"]);
+      fs.mkdirSync(path.join(ownerWorktree, ".quack"));
+      fs.writeFileSync(path.join(ownerWorktree, ".quack", "fixture.bin"), "owner");
+      const quarantineRoot = createDeniedPathQuarantine(ownerWorktree, "valid-other");
+
+      const mgr = createLocalOriginFixtureManager(repoDir, process.execPath);
+      const createWorktree = (
+        mgr as unknown as {
+          createWorktree: (taskId: string) => string | undefined;
+        }
+      ).createWorktree;
+      const freshTaskId = "TASK-FRESH-BESIDE-OTHER";
+      const freshWorktree = createWorktree.call(mgr, freshTaskId);
+
+      expect(freshWorktree).toBe(path.join(repoDir, ".quack", "worktrees", freshTaskId));
+      expect(fs.existsSync(freshWorktree!)).toBe(true);
+      expect(fs.existsSync(quarantineRoot)).toBe(true);
+      mgr.killAll();
+    });
+
+    windowsTest("preserves two valid generations and keeps restart blocked", async () => {
+      const repoDir = initRepoWithOrigin(tmpDir);
+      const readyFile = path.join(tmpDir, "ambiguous-ready");
+      const scriptPath = path.join(tmpDir, "ambiguous-child.cjs");
+      fs.writeFileSync(
+        scriptPath,
+        [
+          "const fs = require('node:fs');",
+          `fs.writeFileSync(${JSON.stringify(readyFile)}, 'ready', 'utf-8');`,
+          "setInterval(() => {}, 1000);",
+        ].join("\n"),
+        "utf-8",
+      );
+
+      const mgr = createLocalOriginFixtureManager(repoDir, scriptPath);
+      try {
+        const job = mgr.start("TASK-AMBIGUOUS-QUARANTINE", { skipGate: true });
+        await waitForFile(readyFile);
+        const firstRoot = createDeniedPathQuarantine(job.worktreePath!, "generation-one");
+        fs.cpSync(path.join(firstRoot, "0"), path.join(job.worktreePath!, ".quack"), {
+          recursive: true,
+        });
+        const secondRoot = createDeniedPathQuarantine(job.worktreePath!, "generation-two");
+
+        expect(mgr.stop(job.taskId)).toBe(true);
+        await waitForCondition(
+          () => job.output.some((line) => line.includes("multiple valid quarantines")),
+          "the ambiguous quarantine refusal",
+        );
+
+        expect(job.status).toBe("stopped");
+        expect(job.operatorStopCleanupPending).toBe(true);
+        expect(fs.existsSync(firstRoot)).toBe(true);
+        expect(fs.existsSync(secondRoot)).toBe(true);
+        expect(() => mgr.start(job.taskId, { skipGate: true })).toThrow(
+          "still completing operator-stop cleanup",
+        );
+      } finally {
+        mgr.killAll();
+      }
+    });
+
+    windowsTest("a pending shared-directory cleanup blocks a different task", async () => {
+      const readyFile = path.join(tmpDir, "shared-child-ready");
+      const scriptPath = path.join(tmpDir, "shared-child.cjs");
+      fs.writeFileSync(
+        scriptPath,
+        [
+          "const fs = require('node:fs');",
+          `fs.writeFileSync(${JSON.stringify(readyFile)}, 'ready', 'utf-8');`,
+          "setInterval(() => {}, 1000);",
+        ].join("\n"),
+        "utf-8",
+      );
+      const sharedRoot = path.join(tmpDir, "not-a-git-repository");
+      fs.mkdirSync(sharedRoot);
+      const mgr = new DispatchManager(sharedRoot, scriptPath);
+      const cleanupCallsBefore = mockCleanupWorktreeContainers.mock.calls.length;
+      try {
+        const stoppedJob = mgr.start("TASK-SHARED-STOP", { skipGate: true });
+        await waitForFile(readyFile);
+        expect(stoppedJob.worktreePath).toBeUndefined();
+        expect(mgr.stop(stoppedJob.taskId)).toBe(true);
+        await waitForCondition(
+          () =>
+            stoppedJob.output.some((line) =>
+              line.includes("stopped run used the shared project directory"),
+            ),
+          "the shared-directory manual recovery barrier",
+        );
+        expect(mockCleanupWorktreeContainers.mock.calls.length).toBe(cleanupCallsBefore);
+        expect(() => mgr.start("TASK-DIFFERENT", { skipGate: true })).toThrow(
+          "still has unconfirmed cleanup in the shared project directory",
+        );
+
+        const restartedManager = new DispatchManager(sharedRoot, scriptPath);
+        expect(() => restartedManager.start("TASK-DIFFERENT", { skipGate: true })).toThrow(
+          "operator-stop cleanup remains unconfirmed",
+        );
+        restartedManager.killAll();
+      } finally {
+        mgr.killAll();
+      }
+    });
+
+    windowsTest(
+      "refuses same-task restart until stopped-child cleanup completes",
+      async () => {
+        const repoDir = initRepoWithOrigin(tmpDir);
+        const startsFile = path.join(tmpDir, "child-starts");
+        const scriptPath = path.join(tmpDir, "replaceable-child.cjs");
+        fs.writeFileSync(
+          scriptPath,
+          [
+            "const fs = require('node:fs');",
+            `fs.appendFileSync(${JSON.stringify(startsFile)}, process.pid + '\\n', 'utf-8');`,
+            "setInterval(() => {}, 1000);",
+          ].join("\n"),
+          "utf-8",
+        );
+
+        const mgr = createLocalOriginFixtureManager(repoDir, scriptPath);
+        try {
+          const stoppedJob = mgr.start("TASK-REPLACED", { skipGate: true });
+          await waitForCondition(
+            () =>
+              fs.existsSync(startsFile) && fs.readFileSync(startsFile, "utf-8").trim().length > 0,
+            "the original child to start",
+          );
+
+          expect(mgr.stop(stoppedJob.taskId)).toBe(true);
+          expect(() => mgr.start("TASK-REPLACED", { skipGate: true })).toThrow(
+            "still completing operator-stop cleanup",
+          );
+          expect(mgr.getJob("TASK-REPLACED")).toBe(stoppedJob);
+
+          await waitForCondition(
+            () => stoppedJob.output.some((line) => line.includes("Operator-stop cleanup complete")),
+            "the original child's cleanup barrier",
+          );
+
+          const replacement = mgr.start("TASK-REPLACED", { skipGate: true });
+          await waitForCondition(
+            () => fs.readFileSync(startsFile, "utf-8").trim().split(/\r?\n/).length === 2,
+            "the replacement child to start",
+          );
+
+          expect(mgr.getJob("TASK-REPLACED")).toBe(replacement);
+          expect(replacement.status).toBe("running");
+          expect(mgr.stop("TASK-REPLACED")).toBe(true);
+          await waitForCondition(
+            () =>
+              replacement.output.some((line) => line.includes("Operator-stop cleanup complete")),
+            "the replacement child's cleanup barrier",
+          );
+          expect(replacement.status).toBe("stopped");
+        } finally {
+          mgr.killAll();
+        }
+      },
+      45_000,
+    );
+  });
+
   describe("worktree freshness", () => {
     let tmpDir: string;
 
@@ -652,7 +1882,7 @@ describe("DispatchManager", () => {
       git(updaterDir, ["commit", "-am", "remote update"]);
       git(updaterDir, ["push", "origin", "dev"]);
 
-      const mgr = new DispatchManager(repoDir, "/fake/bin.js");
+      const mgr = createLocalOriginFixtureManager(repoDir, "/fake/bin.js", originDir);
       const worktreePath = (
         mgr as unknown as { createWorktree(taskId: string): string | undefined }
       ).createWorktree.call(mgr, "TASK-FRESH");
@@ -665,9 +1895,82 @@ describe("DispatchManager", () => {
       mgr.killAll();
     });
 
+    test("keeps frontend dependencies isolated when worktree initialization is active", () => {
+      const repoDir = initRepoWithOrigin(tmpDir);
+      const parentDependencies = path.join(repoDir, "frontend", "node_modules");
+      fs.mkdirSync(parentDependencies, { recursive: true });
+      fs.writeFileSync(path.join(parentDependencies, "parent-only.txt"), "do not share", "utf8");
+
+      const mgr = createLocalOriginFixtureManager(repoDir, "/fake/bin.js");
+      const worktreePath = (
+        mgr as unknown as { createWorktree(taskId: string): string | undefined }
+      ).createWorktree.call(mgr, "TASK-ISOLATED-DEPS");
+
+      expect(worktreePath).toBeDefined();
+      expect(fs.existsSync(path.join(worktreePath!, "frontend", "node_modules"))).toBe(false);
+      expect(fs.readFileSync(path.join(parentDependencies, "parent-only.txt"), "utf8")).toBe(
+        "do not share",
+      );
+      mgr.killAll();
+    });
+
+    test("also skips dependency junctions when explicit opt-out keeps the path protected", () => {
+      const repoDir = initRepoWithOrigin(tmpDir);
+      const adapterPath = path.join(repoDir, ".quack", "adapter.json");
+      fs.writeFileSync(
+        adapterPath,
+        JSON.stringify({
+          git: { baseBranch: "dev", branchPrefix: "quack/" },
+          dispatch: { worktreeInit: [] },
+          sandbox: {
+            deniedPaths: ["frontend/node_modules/"],
+            disposablePaths: ["frontend/node_modules/"],
+          },
+        }),
+      );
+      const parentDependencies = path.join(repoDir, "frontend", "node_modules");
+      fs.mkdirSync(parentDependencies, { recursive: true });
+
+      const mgr = createLocalOriginFixtureManager(repoDir, "/fake/bin.js");
+      const worktreePath = (
+        mgr as unknown as { createWorktree(taskId: string): string | undefined }
+      ).createWorktree.call(mgr, "TASK-PROTECTED-DEPS");
+
+      expect(worktreePath).toBeDefined();
+      expect(fs.existsSync(path.join(worktreePath!, "frontend", "node_modules"))).toBe(false);
+      mgr.killAll();
+    });
+
+    test("preserves the legacy dependency junction when init is explicitly disabled and unprotected", () => {
+      const repoDir = initRepoWithOrigin(tmpDir);
+      const adapterPath = path.join(repoDir, ".quack", "adapter.json");
+      fs.writeFileSync(
+        adapterPath,
+        JSON.stringify({
+          git: { baseBranch: "dev", branchPrefix: "quack/" },
+          dispatch: { worktreeInit: [] },
+          sandbox: { deniedPaths: [], disposablePaths: [] },
+        }),
+      );
+      const parentDependencies = path.join(repoDir, "frontend", "node_modules");
+      fs.mkdirSync(parentDependencies, { recursive: true });
+      fs.writeFileSync(path.join(parentDependencies, "legacy.txt"), "shared", "utf8");
+
+      const mgr = createLocalOriginFixtureManager(repoDir, "/fake/bin.js");
+      const worktreePath = (
+        mgr as unknown as { createWorktree(taskId: string): string | undefined }
+      ).createWorktree.call(mgr, "TASK-LEGACY-DEPS");
+      const dependencyPath = path.join(worktreePath!, "frontend", "node_modules");
+
+      expect(worktreePath).toBeDefined();
+      expect(fs.lstatSync(dependencyPath).isSymbolicLink()).toBe(true);
+      expect(fs.readFileSync(path.join(dependencyPath, "legacy.txt"), "utf8")).toBe("shared");
+      mgr.killAll();
+    });
+
     test("prep junction failures do not mark worktree creation degraded", () => {
       const repoDir = initRepoWithOrigin(tmpDir);
-      const mgr = new DispatchManager(repoDir, "/fake/bin.js");
+      const mgr = createLocalOriginFixtureManager(repoDir, "/fake/bin.js");
       const realCreateJunction = (
         mgr as unknown as {
           createJunction(targetPath: string, junctionPath: string): void;
@@ -706,7 +2009,7 @@ describe("DispatchManager", () => {
 
     test("successful worktree creation clears degraded mode", () => {
       const repoDir = initRepoWithOrigin(tmpDir);
-      const mgr = new DispatchManager(repoDir, "/fake/bin.js");
+      const mgr = createLocalOriginFixtureManager(repoDir, "/fake/bin.js");
       (mgr as unknown as { worktreeDegraded: boolean }).worktreeDegraded = true;
 
       const worktreePath = (
@@ -722,7 +2025,7 @@ describe("DispatchManager", () => {
       const repoDir = initRepoWithOrigin(tmpDir);
       git(repoDir, ["branch", "quack/TASK-STALE"]);
 
-      const mgr = new DispatchManager(repoDir, "/fake/bin.js");
+      const mgr = createLocalOriginFixtureManager(repoDir, "/fake/bin.js");
       const worktreePath = (
         mgr as unknown as { createWorktree(taskId: string): string | undefined }
       ).createWorktree.call(mgr, "TASK-STALE");
@@ -737,7 +2040,49 @@ describe("DispatchManager", () => {
       mgr.killAll();
     });
 
-    test("stale-branch cleanup refuses protected branches (TASK-1312 guard)", () => {
+    test("resume recreation preserves and checks out the existing task branch", () => {
+      const repoDir = initRepoWithOrigin(tmpDir);
+      git(repoDir, ["checkout", "-b", "quack/TASK-RESUME"]);
+      fs.writeFileSync(path.join(repoDir, "resumed.txt"), "preserved\n");
+      git(repoDir, ["add", "resumed.txt"]);
+      git(repoDir, ["commit", "-m", "preserved work"]);
+      git(repoDir, ["checkout", "dev"]);
+
+      const preservedSha = execFileSync("git", ["rev-parse", "quack/TASK-RESUME"], {
+        cwd: repoDir,
+        encoding: "utf-8",
+      }).trim();
+      const mgr = createLocalOriginFixtureManager(repoDir, "/fake/bin.js");
+      const worktreePath = (
+        mgr as unknown as {
+          createWorktree(
+            taskId: string,
+            options?: { preserveTaskBranch?: boolean },
+          ): string | undefined;
+        }
+      ).createWorktree.call(mgr, "TASK-RESUME", { preserveTaskBranch: true });
+
+      expect(worktreePath).toBeDefined();
+      expect(
+        execFileSync("git", ["branch", "--show-current"], {
+          cwd: worktreePath!,
+          encoding: "utf-8",
+        }).trim(),
+      ).toBe("quack/TASK-RESUME");
+      expect(
+        execFileSync("git", ["rev-parse", "HEAD"], {
+          cwd: worktreePath!,
+          encoding: "utf-8",
+        }).trim(),
+      ).toBe(preservedSha);
+      expect(
+        fs.readFileSync(path.join(worktreePath!, "resumed.txt"), "utf-8").replace(/\r\n/g, "\n"),
+      ).toBe("preserved\n");
+
+      mgr.killAll();
+    });
+
+    test("task-branch collision refuses admission before worktree, child, or ref mutation", () => {
       const repoDir = initRepoWithOrigin(tmpDir);
       // Empty prefix makes the stale-branch name collide with the base
       // branch itself: staleBranch = "" + "dev" = "dev" (protected).
@@ -746,7 +2091,7 @@ describe("DispatchManager", () => {
         JSON.stringify({ git: { baseBranch: "dev", branchPrefix: "" } }),
       );
 
-      const mgr = new DispatchManager(repoDir, "/fake/bin.js");
+      const mgr = createLocalOriginFixtureManager(repoDir, "/fake/bin.js");
       // TASK-1313 S5 (round-2 F7): the pre-session refusal reports
       // through the typed lifecycle callback.
       const lifecycleEvents: Array<{
@@ -757,23 +2102,38 @@ describe("DispatchManager", () => {
       mgr.setEventCallback((stage, taskId, payload) => {
         lifecycleEvents.push({ stage, taskId, payload });
       });
-      (
-        mgr as unknown as { createWorktree(taskId: string): string | undefined }
-      ).createWorktree.call(mgr, "dev");
+      const localBefore = execFileSync("git", ["rev-parse", "refs/heads/dev"], {
+        cwd: repoDir,
+        encoding: "utf8",
+      }).trim();
+      const remoteBefore = execFileSync("git", ["rev-parse", "refs/remotes/origin/dev"], {
+        cwd: repoDir,
+        encoding: "utf8",
+      }).trim();
 
-      // The essential invariant: the protected branch SURVIVES the
-      // stale-cleanup path regardless of what worktree creation does.
-      expect(() =>
-        execFileSync("git", ["rev-parse", "--verify", "dev"], {
+      expect(() => mgr.start("dev", { skipGate: true })).toThrow(
+        "collides with a protected/base branch",
+      );
+
+      expect(mgr.getJob("dev")).toBeUndefined();
+      expect(fs.existsSync(path.join(repoDir, ".quack", "worktrees", "dev"))).toBe(false);
+      expect(
+        execFileSync("git", ["rev-parse", "refs/heads/dev"], {
           cwd: repoDir,
-          stdio: "pipe",
-        }),
-      ).not.toThrow();
+          encoding: "utf8",
+        }).trim(),
+      ).toBe(localBefore);
+      expect(
+        execFileSync("git", ["rev-parse", "refs/remotes/origin/dev"], {
+          cwd: repoDir,
+          encoding: "utf8",
+        }).trim(),
+      ).toBe(remoteBefore);
       const refusal = lifecycleEvents.find((event) => event.stage === "branch_guard_refusal");
       expect(refusal).toBeDefined();
       expect(refusal?.taskId).toBe("dev");
       expect(refusal?.payload.branch).toBe("dev");
-      expect(refusal?.payload.site).toBe("stale_branch_cleanup");
+      expect(refusal?.payload.site).toBe("task_branch_admission");
       mgr.killAll();
     });
 
@@ -824,7 +2184,7 @@ describe("DispatchManager", () => {
 
       // Local repo's origin/dev still points at A (no fetch since push)
       // createWorktree must fetch and update refs/remotes/origin/dev to B
-      const mgr = new DispatchManager(repoDir, "/fake/bin.js");
+      const mgr = createLocalOriginFixtureManager(repoDir, "/fake/bin.js", originDir);
       const worktreePath = (
         mgr as unknown as { createWorktree(taskId: string): string | undefined }
       ).createWorktree.call(mgr, "TASK-REFSPEC");
@@ -838,9 +2198,42 @@ describe("DispatchManager", () => {
       mgr.killAll();
     });
 
-    test("refreshes a stale worktree adapter bundle before reuse", () => {
+    test("rejects unsafe adapter branch refs before mutating worktree state", () => {
+      const repoDir = initRepoWithOrigin(tmpDir);
+      fs.writeFileSync(
+        path.join(repoDir, ".quack", "adapter.json"),
+        JSON.stringify({ git: { baseBranch: "-c", branchPrefix: "quack/" } }),
+        "utf8",
+      );
+      const mgr = createLocalOriginFixtureManager(repoDir, "/fake/bin.js");
+      const createWorktree = (
+        mgr as unknown as { createWorktree(taskId: string): string | undefined }
+      ).createWorktree.bind(mgr);
+
+      expect(() => createWorktree("TASK-INVALID-REF")).toThrow(
+        "adapter git.baseBranch is not a safe Git branch name",
+      );
+      expect(fs.existsSync(path.join(repoDir, ".quack", "worktrees", "TASK-INVALID-REF"))).toBe(
+        false,
+      );
+      mgr.killAll();
+    });
+
+    test("rejects a task id that could escape the managed worktree directory", () => {
       const repoDir = initRepoWithOrigin(tmpDir);
       const mgr = new DispatchManager(repoDir, "/fake/bin.js");
+      const createWorktree = (
+        mgr as unknown as { createWorktree(taskId: string): string | undefined }
+      ).createWorktree.bind(mgr);
+
+      expect(() => createWorktree("../outside")).toThrow("is not a safe worktree path segment");
+      expect(fs.existsSync(path.join(repoDir, ".quack", "outside"))).toBe(false);
+      mgr.killAll();
+    });
+
+    test("refreshes a stale worktree adapter bundle before reuse", () => {
+      const repoDir = initRepoWithOrigin(tmpDir);
+      const mgr = createLocalOriginFixtureManager(repoDir, "/fake/bin.js");
       const worktreePath = (
         mgr as unknown as { createWorktree(taskId: string): string | undefined }
       ).createWorktree.call(mgr, "TASK-ADAPTER");
@@ -891,7 +2284,7 @@ describe("DispatchManager", () => {
 
     test("TASK-1313 F10: conventions-only drift re-copies ONLY for opted-in safetyFloor adapters; bundle-hash comparison unchanged", () => {
       const repoDir = initRepoWithOrigin(tmpDir);
-      const mgr = new DispatchManager(repoDir, "/fake/bin.js");
+      const mgr = createLocalOriginFixtureManager(repoDir, "/fake/bin.js");
       const worktreePath = (
         mgr as unknown as { createWorktree(taskId: string): string | undefined }
       ).createWorktree.call(mgr, "TASK-MACH");
@@ -1079,6 +2472,94 @@ describe("DispatchManager", () => {
 
       mgr.killAll();
     });
+
+    test("retains a worktree fenced by a durable operator-stop barrier", () => {
+      writeAdapter();
+      const taskId = "TASK-1401";
+      const worktreePath = path.join(tmpDir, ".quack", "worktrees", taskId);
+      makeOldDirectory(worktreePath);
+      const mgr = new DispatchManager(tmpDir, "/fake/bin.js");
+      const job: DispatchJob = {
+        taskId,
+        sessionId: "janitor-barrier",
+        pid: 42,
+        startedAt: new Date().toISOString(),
+        status: "stopped",
+        output: [],
+        executionRoot: worktreePath,
+        operatorStopRequestedAt: new Date().toISOString(),
+        operatorStopCleanupPending: true,
+      };
+      const internals = mgr as unknown as {
+        persistOperatorStopBarrier: (candidate: DispatchJob) => boolean;
+        clearOperatorStopBarrier: (candidate: DispatchJob) => boolean;
+      };
+      const cleanupCallsBefore = mockCleanupWorktreeContainers.mock.calls.length;
+
+      expect(internals.persistOperatorStopBarrier.call(mgr, job)).toBe(true);
+      const [record] = mgr.listManagedWorktrees(24 * 60 * 60 * 1000);
+      expect(record.skipReasons).toContain("operator_stop_barrier");
+      expect(record.pruneEligible).toBe(false);
+
+      const result = mgr.pruneManagedWorktrees({
+        dryRun: false,
+        maxAgeMs: 24 * 60 * 60 * 1000,
+      });
+      expect(result.pruned).toEqual([]);
+      expect(fs.existsSync(worktreePath)).toBe(true);
+      expect(mockCleanupWorktreeContainers.mock.calls.length).toBe(cleanupCallsBefore);
+
+      expect(internals.clearOperatorStopBarrier.call(mgr, job)).toBe(true);
+      mgr.killAll();
+    });
+
+    test("retains a worktree while denied-path quarantine evidence exists", () => {
+      writeAdapter();
+      const taskId = "TASK-1402";
+      const worktreePath = path.join(tmpDir, ".quack", "worktrees", taskId);
+      makeOldDirectory(worktreePath);
+      fs.writeFileSync(
+        path.join(path.dirname(worktreePath), ".quack-codex-denied-janitor"),
+        "unresolved recovery evidence",
+        "utf8",
+      );
+      const mgr = new DispatchManager(tmpDir, "/fake/bin.js");
+      const cleanupCallsBefore = mockCleanupWorktreeContainers.mock.calls.length;
+
+      const [record] = mgr.listManagedWorktrees(24 * 60 * 60 * 1000);
+      expect(record.skipReasons).toContain("denied_path_quarantine");
+      expect(record.pruneEligible).toBe(false);
+
+      const result = mgr.pruneManagedWorktrees({
+        dryRun: false,
+        maxAgeMs: 24 * 60 * 60 * 1000,
+      });
+      expect(result.pruned).toEqual([]);
+      expect(fs.existsSync(worktreePath)).toBe(true);
+      expect(mockCleanupWorktreeContainers.mock.calls.length).toBe(cleanupCallsBefore);
+      mgr.killAll();
+    });
+
+    test("retains a worktree when Docker absence cannot be verified", () => {
+      writeAdapter();
+      const taskId = "TASK-1403";
+      const worktreePath = path.join(tmpDir, ".quack", "worktrees", taskId);
+      makeOldDirectory(worktreePath);
+      mockCleanupWorktreeContainers.mockReturnValue(false);
+      const mgr = new DispatchManager(tmpDir, "/fake/bin.js");
+
+      const result = mgr.pruneManagedWorktrees({
+        dryRun: false,
+        maxAgeMs: 24 * 60 * 60 * 1000,
+      });
+
+      expect(mockCleanupWorktreeContainers).toHaveBeenCalledWith(worktreePath, expect.any(Object));
+      expect(result.pruned).toEqual([]);
+      expect(fs.existsSync(worktreePath)).toBe(true);
+      expect(result.retained[0].skipReasons).toContain("docker_cleanup_unverified");
+      expect(result.retained[0].pruneEligible).toBe(false);
+      mgr.killAll();
+    });
   });
 
   describe("awaiting_approval lifecycle (TASK-107)", () => {
@@ -1097,6 +2578,26 @@ describe("DispatchManager", () => {
         output: [],
         ...overrides,
       };
+    }
+
+    function writeBlueprintDecision(
+      taskId: string,
+      state: "pending" | "approved" | "rejected",
+      createdAt: string,
+    ): void {
+      const approvalDir = path.join(managerRoot, ".quack", "logs", "approvals");
+      fs.mkdirSync(approvalDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(approvalDir, `${taskId}.json`),
+        JSON.stringify({
+          taskId,
+          state,
+          createdAt,
+          ...(state === "pending" ? {} : { decidedAt: new Date().toISOString() }),
+          blueprint: {},
+        }),
+        "utf-8",
+      );
     }
 
     test("getActiveJob returns awaiting_approval jobs", () => {
@@ -1587,7 +3088,7 @@ describe("DispatchManager", () => {
       }
     });
 
-    test("blocks shared-checkout resume when a Windows wrapper exits before its descendant", async () => {
+    test("contains a Windows descendant when its wrapper exits and keeps restart fail-closed", async () => {
       if (process.platform !== "win32") return;
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-win-descendant-"));
       const descendantPidPath = path.join(tmpDir, "descendant.pid");
@@ -1599,7 +3100,7 @@ describe("DispatchManager", () => {
           "const fs = require('node:fs');",
           "const { spawn } = require('node:child_process');",
           `const touchPath = ${JSON.stringify(touchedPath)};`,
-          "const code = `const fs = require('node:fs'); const p = ${JSON.stringify(touchPath)}; setInterval(() => fs.appendFileSync(p, 'x'), 25);`;",
+          "const code = `const fs = require('node:fs'); const p = ${JSON.stringify(touchPath)}; fs.appendFileSync(p, 'x'); setInterval(() => fs.appendFileSync(p, 'x'), 25);`;",
           "const child = spawn(process.execPath, ['-e', code], { detached: true, stdio: 'ignore', windowsHide: true });",
           `fs.writeFileSync(${JSON.stringify(descendantPidPath)}, String(child.pid));`,
           "child.unref();",
@@ -1619,7 +3120,10 @@ describe("DispatchManager", () => {
         await waitForCondition(() => job.status === "completed", "wrapper exit");
         await waitForFile(touchedPath);
 
-        expect(processIsAlive(descendantPid)).toBe(true);
+        await waitForCondition(
+          () => !processIsAlive(descendantPid),
+          "trusted Windows Job Object descendant containment",
+        );
         expect(() =>
           restarted.start("TASK-WINDOWS-DESCENDANT", { skipGate: true, resume: true }),
         ).toThrow(DegradedSharedCheckoutBusyError);
@@ -1824,7 +3328,10 @@ describe("DispatchManager", () => {
 
     test("restores shared-checkout pause ownership after restart before fallback spawn", async () => {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-pause-"));
-      const approvalDir = path.join(tmpDir, ".quack", "logs", "approvals");
+      const logDir = path.join(tmpDir, ".quack", "logs");
+      const approvalDir = path.join(logDir, "approvals");
+      const approvalPath = path.join(approvalDir, "TASK-PAUSED.json");
+      const markerPath = path.join(logDir, "shared-checkout-pause.json");
       const firstScript = path.join(tmpDir, "pause-child.cjs");
       const nextStarted = path.join(tmpDir, "unsafe-next-started");
       const nextScript = path.join(tmpDir, "next-child.cjs");
@@ -1854,15 +3361,111 @@ describe("DispatchManager", () => {
 
       const firstManager = new DispatchManager(tmpDir, firstScript);
       const restartedManager = new DispatchManager(tmpDir, nextScript);
+      const diagnosticRoot = process.env.QUACK_SHARED_PAUSE_DIAGNOSTIC_DIR;
+      const diagnosticPath = diagnosticRoot
+        ? path.join(diagnosticRoot, `shared-pause-${process.pid}.json`)
+        : undefined;
+      const appendCalls: Array<Record<string, unknown>> = [];
+      const callbacks: Array<Record<string, unknown>> = [];
+      const snapshots: Array<Record<string, unknown>> = [];
+      const shutdown: Array<Record<string, unknown>> = [];
+      const errorFacts = (error: unknown) =>
+        error instanceof Error
+          ? { name: error.name, message: error.message, stack: error.stack }
+          : { message: String(error) };
+      let observedJob: DispatchJob | undefined;
+      let passed = false;
+      let shutdownError: unknown;
+      const captureEvidence = (phase: string, error?: unknown): void => {
+        const files = [approvalPath, markerPath];
+        if (observedJob) files.push(path.join(logDir, `events-${observedJob.sessionId}.jsonl`));
+        snapshots.push({
+          phase,
+          at: new Date().toISOString(),
+          nowMs: Date.now(),
+          job: observedJob && { ...observedJob, output: [...observedJob.output] },
+          liveProcesses: firstManager.hasLiveProcesses(),
+          ...(error === undefined ? {} : { error: errorFacts(error) }),
+          files: files.map((filePath) => {
+            try {
+              const bytes = fs.readFileSync(filePath);
+              return {
+                filePath,
+                sha256: createHash("sha256").update(bytes).digest("hex"),
+                base64: bytes.toString("base64"),
+                text: bytes.toString("utf8"),
+              };
+            } catch (readError) {
+              return { filePath, error: errorFacts(readError) };
+            }
+          }),
+        });
+        if (diagnosticPath) {
+          fs.mkdirSync(path.dirname(diagnosticPath), { recursive: true });
+          fs.writeFileSync(
+            diagnosticPath,
+            `${JSON.stringify({ tmpDir, diagnosticPath, passed, appendCalls, callbacks, snapshots, shutdown }, null, 2)}\n`,
+          );
+        }
+      };
+      const realAppend = childExitLog.appendDispatchChildExit;
+      const appendSpy = jest
+        .spyOn(childExitLog, "appendDispatchChildExit")
+        .mockImplementation((options) => {
+          const call: Record<string, unknown> = { options, at: new Date().toISOString() };
+          appendCalls.push(call);
+          try {
+            const result = realAppend(options);
+            call.result = result;
+            return result;
+          } catch (error) {
+            call.error = errorFacts(error);
+            throw error;
+          }
+        });
+      firstManager.setEventCallback((stage, taskId, payload) => {
+        callbacks.push({ stage, taskId, payload, at: new Date().toISOString() });
+      });
       try {
         const pausedJob = firstManager.start("TASK-PAUSED", { skipGate: true });
+        observedJob = pausedJob;
         await waitForCondition(
           () => pausedJob.status === "awaiting_approval",
           "shared-checkout approval pause",
         );
 
-        const markerPath = path.join(tmpDir, ".quack", "logs", "shared-checkout-pause.json");
+        captureEvidence("before-marker-deletion");
         expect(fs.existsSync(markerPath)).toBe(true);
+        const approval = JSON.parse(fs.readFileSync(approvalPath, "utf8")) as {
+          taskId: string;
+          state: string;
+          createdAt: string;
+        };
+        const exitEvents = fs
+          .readFileSync(path.join(logDir, `events-${pausedJob.sessionId}.jsonl`), "utf8")
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as { stage: string; payload: { at: string } })
+          .filter((event) => event.stage === "dispatch_child_exit");
+        expect(approval).toMatchObject({ taskId: "TASK-PAUSED", state: "pending" });
+        expect(exitEvents).toHaveLength(1);
+        expect(exitEvents[0]).toMatchObject({
+          taskId: "TASK-PAUSED",
+          sessionId: pausedJob.sessionId,
+          payload: {
+            taskId: "TASK-PAUSED",
+            exitCode: 1,
+            signal: null,
+            killed: false,
+            worktreePath: null,
+            operatorRequested: false,
+            sessionResolution: "job-fallback",
+          },
+        });
+        expect(Date.parse(exitEvents[0].payload.at)).toBeGreaterThanOrEqual(
+          Date.parse(approval.createdAt),
+        );
+        expect(callbacks.filter((event) => event.stage === "dispatch_child_exit")).toEqual([]);
 
         // Simulate upgrading a pause created before durable markers existed,
         // or a crash after the durable exit event but before marker creation.
@@ -1873,7 +3476,9 @@ describe("DispatchManager", () => {
           recursive: true,
         });
         expect(restartedManager.getAllJobs()).toEqual([]);
-        expect(restartedManager.getSharedCheckoutOccupants()).toEqual([
+        const recoveredOccupants = restartedManager.getSharedCheckoutOccupants();
+        captureEvidence("after-recovery");
+        expect(recoveredOccupants).toEqual([
           expect.objectContaining({
             taskId: "TASK-PAUSED",
             status: "awaiting_approval",
@@ -1915,11 +3520,41 @@ describe("DispatchManager", () => {
         await waitForFile(nextStarted);
         await waitForCondition(() => resumed.status === "completed", "shared-checkout resume");
         expect(fs.existsSync(markerPath)).toBe(false);
+        passed = true;
+        captureEvidence("successful-resume");
+      } catch (error) {
+        captureEvidence("failure-before-shutdown", error);
+        throw error;
       } finally {
-        await firstManager.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
-        await restartedManager.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+        for (const [name, instance] of [
+          ["first", firstManager],
+          ["restarted", restartedManager],
+        ] as const) {
+          try {
+            const result = await instance.shutdownAll({
+              gracefulTimeoutMs: 0,
+              forceTimeoutMs: 1_000,
+            });
+            const liveProcesses = instance.hasLiveProcesses();
+            shutdown.push({ manager: name, result, liveProcesses });
+            expect(result.timedOut).toEqual([]);
+            expect(liveProcesses).toBe(false);
+          } catch (error) {
+            shutdown.push({ manager: name, error: errorFacts(error) });
+            shutdownError ??= error;
+          }
+        }
+        appendSpy.mockRestore();
+        captureEvidence("after-shutdown", shutdownError);
+        if (passed && shutdownError === undefined) {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        } else {
+          console.error(
+            `Shared-checkout pause evidence preserved at ${tmpDir}; diagnostic=${diagnosticPath ?? "not configured"}`,
+          );
+        }
       }
+      expect(shutdownError).toBeUndefined();
     });
 
     test("restores the original branch from durable shared-checkout evidence after restart", async () => {
@@ -2288,17 +3923,360 @@ describe("DispatchManager", () => {
       expect(threwAwaitingError).toBe(false);
     });
 
-    test("stop handles awaiting_approval jobs (no process to kill)", () => {
+    test("a rejected run-scoped blueprint decision releases only the exited pause", async () => {
+      const taskId = "TASK-204-REJECT";
+      const worktreePath = path.join(managerRoot, ".quack", "worktrees", taskId);
+      fs.mkdirSync(worktreePath, { recursive: true });
+      const job = makeJob({
+        taskId,
+        status: "awaiting_approval",
+        exitCode: 1,
+        startedAt: new Date(Date.now() - 60_000).toISOString(),
+        worktreePath,
+        executionRoot: worktreePath,
+      });
+      injectJob(manager, job);
+      const approvalCreatedAt = new Date().toISOString();
+      writeBlueprintDecision(taskId, "pending", approvalCreatedAt);
+      const persistDecision = jest.fn(() => {
+        expect(manager.stop(taskId)).toBe(false);
+        expect(() => manager.start(taskId, { resume: true })).toThrow(
+          "an approval decision is being persisted",
+        );
+        writeBlueprintDecision(taskId, "rejected", approvalCreatedAt);
+        return Promise.resolve("persisted");
+      });
+
+      await expect(
+        manager.resolveApprovalPauseDecision(taskId, "blueprint", "rejected", persistDecision),
+      ).resolves.toEqual({ decision: "persisted", released: true });
+      expect(persistDecision).toHaveBeenCalledTimes(1);
+      expect(manager.getJob(taskId)).toBeUndefined();
+      expect(manager.getActiveJob(taskId)).toBeUndefined();
+      expect(fs.existsSync(worktreePath)).toBe(true);
+      expect(fs.existsSync(path.join(managerRoot, ".quack", "operator-stop-barriers"))).toBe(false);
+    });
+
+    test("resolution fails before mutation when the pending blueprint predates this run", async () => {
+      const taskId = "TASK-204-STALE";
+      const startedAt = new Date().toISOString();
+      const job = makeJob({
+        taskId,
+        status: "awaiting_approval",
+        exitCode: 1,
+        startedAt,
+      });
+      injectJob(manager, job);
+      writeBlueprintDecision(taskId, "pending", new Date(Date.now() - 60_000).toISOString());
+      const persistDecision = jest.fn(() => Promise.resolve(undefined));
+
+      await expect(
+        manager.resolveApprovalPauseDecision(taskId, "blueprint", "rejected", persistDecision),
+      ).rejects.toThrow("pending record does not match this run");
+      expect(persistDecision).not.toHaveBeenCalled();
+      expect(manager.getActiveJob(taskId)).toBe(job);
+    });
+
+    test("resolution refuses a blueprint decision when this run is paused at judge", async () => {
+      const taskId = "TASK-204-WRONG-GATE";
+      const startedAt = new Date(Date.now() - 60_000).toISOString();
+      const job = makeJob({
+        taskId,
+        status: "awaiting_approval",
+        exitCode: 1,
+        startedAt,
+      });
+      injectJob(manager, job);
+      writeBlueprintDecision(taskId, "pending", new Date().toISOString());
+      fs.writeFileSync(
+        path.join(managerRoot, ".quack", "logs", "approvals", `${taskId}-judge.json`),
+        JSON.stringify({
+          taskId,
+          state: "pending",
+          createdAt: new Date().toISOString(),
+        }),
+        "utf-8",
+      );
+      const persistDecision = jest.fn(() => Promise.resolve(undefined));
+
+      await expect(
+        manager.resolveApprovalPauseDecision(taskId, "blueprint", "rejected", persistDecision),
+      ).rejects.toThrow("other human gate remains pending for this run");
+      expect(persistDecision).not.toHaveBeenCalled();
+      expect(manager.getActiveJob(taskId)).toBe(job);
+    });
+
+    test("resolution refuses before mutation while a child handle is still owned", async () => {
+      const taskId = "TASK-204-LIVE";
+      const job = makeJob({
+        taskId,
+        status: "awaiting_approval",
+        exitCode: 1,
+        startedAt: new Date(Date.now() - 60_000).toISOString(),
+      });
+      injectJob(manager, job);
+      writeBlueprintDecision(taskId, "pending", new Date().toISOString());
+      const processes = (manager as unknown as { processes: Map<string, { pid: number }> })
+        .processes;
+      processes.set(taskId, { pid: 1234 });
+      const persistDecision = jest.fn(() => Promise.resolve(undefined));
+
+      try {
+        await expect(
+          manager.resolveApprovalPauseDecision(taskId, "blueprint", "rejected", persistDecision),
+        ).rejects.toThrow("dispatch process or cleanup state remains live");
+        expect(persistDecision).not.toHaveBeenCalled();
+        expect(manager.getActiveJob(taskId)).toBe(job);
+      } finally {
+        processes.delete(taskId);
+      }
+    });
+
+    test("a failed durable write releases the reservation but retains the pause", async () => {
+      const taskId = "TASK-204-WRITE-FAIL";
+      const approvalCreatedAt = new Date().toISOString();
+      const job = makeJob({
+        taskId,
+        status: "awaiting_approval",
+        exitCode: 1,
+        startedAt: new Date(Date.now() - 60_000).toISOString(),
+      });
+      injectJob(manager, job);
+      writeBlueprintDecision(taskId, "pending", approvalCreatedAt);
+
+      await expect(
+        manager.resolveApprovalPauseDecision(taskId, "blueprint", "rejected", () =>
+          Promise.reject(new Error("disk full")),
+        ),
+      ).rejects.toThrow("disk full");
+      expect(manager.getActiveJob(taskId)).toBe(job);
+
+      await expect(
+        manager.resolveApprovalPauseDecision(taskId, "blueprint", "rejected", () => {
+          writeBlueprintDecision(taskId, "rejected", approvalCreatedAt);
+          return Promise.resolve();
+        }),
+      ).resolves.toEqual({ decision: undefined, released: true });
+    });
+
+    test("one reservation arbitrates simultaneous approve and reject decisions after restart", async () => {
+      const taskId = "TASK-204-DECISION-RACE";
+      const approvalCreatedAt = new Date().toISOString();
+      writeBlueprintDecision(taskId, "pending", approvalCreatedAt);
+      let finishApproval!: () => void;
+      const approvalHeld = new Promise<void>((resolve) => {
+        finishApproval = resolve;
+      });
+      const persistApproval = jest.fn(async () => {
+        await approvalHeld;
+        writeBlueprintDecision(taskId, "approved", approvalCreatedAt);
+        return "approved";
+      });
+      const persistRejection = jest.fn(() => {
+        writeBlueprintDecision(taskId, "rejected", approvalCreatedAt);
+        return Promise.resolve("rejected");
+      });
+
+      const approval = manager.resolveApprovalPauseDecision(
+        taskId,
+        "blueprint",
+        "approved",
+        persistApproval,
+      );
+      await expect(
+        manager.resolveApprovalPauseDecision(taskId, "blueprint", "rejected", persistRejection),
+      ).rejects.toThrow("a decision is already in flight");
+      expect(persistRejection).not.toHaveBeenCalled();
+
+      finishApproval();
+      await expect(approval).resolves.toEqual({ decision: "approved", released: false });
+
+      await expect(
+        manager.resolveApprovalPauseDecision(taskId, "blueprint", "rejected", persistRejection),
+      ).rejects.toThrow("approval record is not pending");
+      expect(persistRejection).not.toHaveBeenCalled();
+      expect(
+        JSON.parse(
+          fs.readFileSync(
+            path.join(managerRoot, ".quack", "logs", "approvals", `${taskId}.json`),
+            "utf-8",
+          ),
+        ),
+      ).toMatchObject({ taskId, state: "approved" });
+    });
+
+    test("refuses to decide a pending gate before the running child becomes a pause", async () => {
+      const taskId = "TASK-204-STILL-RUNNING";
+      const approvalCreatedAt = new Date().toISOString();
+      const job = makeJob({
+        taskId,
+        status: "running",
+        pid: process.pid,
+        startedAt: new Date(Date.now() - 60_000).toISOString(),
+      });
+      injectJob(manager, job);
+      writeBlueprintDecision(taskId, "pending", approvalCreatedAt);
+      const persistDecision = jest.fn(() => {
+        writeBlueprintDecision(taskId, "approved", approvalCreatedAt);
+        return Promise.resolve(undefined);
+      });
+
+      await expect(
+        manager.resolveApprovalPauseDecision(taskId, "blueprint", "approved", persistDecision),
+      ).rejects.toThrow("dispatch process is still running");
+      expect(persistDecision).not.toHaveBeenCalled();
+      expect(
+        JSON.parse(
+          fs.readFileSync(
+            path.join(managerRoot, ".quack", "logs", "approvals", `${taskId}.json`),
+            "utf-8",
+          ),
+        ),
+      ).toMatchObject({ state: "pending" });
+
+      // The failed attempt must not leak its reservation. Once the same exact
+      // job has completed the ordinary non-zero pause transition, retry works.
+      job.status = "awaiting_approval";
+      job.exitCode = 1;
+      await expect(
+        manager.resolveApprovalPauseDecision(taskId, "blueprint", "approved", persistDecision),
+      ).resolves.toEqual({ decision: undefined, released: true });
+      expect(persistDecision).toHaveBeenCalledTimes(1);
+      expect(manager.getJob(taskId)).toBeUndefined();
+    });
+
+    test("refuses a decision while an operator-stop cleanup barrier is active", async () => {
+      const taskId = "TASK-204-STOPPED";
+      const job = makeJob({
+        taskId,
+        status: "stopped",
+        operatorStopCleanupPending: true,
+      });
+      injectJob(manager, job);
+      writeBlueprintDecision(taskId, "pending", new Date().toISOString());
+      const persistDecision = jest.fn(() => Promise.resolve(undefined));
+
+      await expect(
+        manager.resolveApprovalPauseDecision(taskId, "blueprint", "approved", persistDecision),
+      ).rejects.toThrow("cleanup state remains live");
+      expect(persistDecision).not.toHaveBeenCalled();
+      (manager as unknown as { jobs: Map<string, DispatchJob> }).jobs.delete(taskId);
+    });
+
+    test("allows replan to repeat an already rejected durable decision", async () => {
+      const taskId = "TASK-204-REPLAN-REJECTED";
+      const approvalCreatedAt = new Date().toISOString();
+      writeBlueprintDecision(taskId, "rejected", approvalCreatedAt);
+      const persistReplan = jest.fn(() => Promise.resolve("replanned"));
+
+      await expect(
+        manager.resolveApprovalPauseDecision(
+          taskId,
+          "blueprint",
+          "rejected",
+          persistReplan,
+          path.join(managerRoot, ".quack", "logs"),
+          { allowAlreadyRejected: true },
+        ),
+      ).resolves.toEqual({ decision: "replanned", released: false });
+      expect(persistReplan).toHaveBeenCalledTimes(1);
+    });
+
+    test("refuses an ambiguous gate decision after restart when the other gate is pending", async () => {
+      const taskId = "TASK-204-AMBIGUOUS-GATE";
+      writeBlueprintDecision(taskId, "pending", new Date().toISOString());
+      const approvalDir = path.join(managerRoot, ".quack", "logs", "approvals");
+      fs.writeFileSync(
+        path.join(approvalDir, `${taskId}-judge.json`),
+        JSON.stringify({
+          taskId,
+          state: "pending",
+          createdAt: new Date().toISOString(),
+        }),
+        "utf-8",
+      );
+      const persistDecision = jest.fn(() => Promise.resolve(undefined));
+
+      await expect(
+        manager.resolveApprovalPauseDecision(taskId, "blueprint", "approved", persistDecision),
+      ).rejects.toThrow("other human gate remains pending");
+      expect(persistDecision).not.toHaveBeenCalled();
+    });
+
+    test("stop durably fences an awaiting_approval job before changing its state", () => {
+      const worktreePath = path.join(managerRoot, ".quack", "worktrees", "TASK-205");
+      fs.mkdirSync(worktreePath, { recursive: true });
       const job = makeJob({
         taskId: "TASK-205",
         status: "awaiting_approval",
-        worktreePath: "/fake/wt",
+        pid: 4242,
+        worktreePath,
+        executionRoot: worktreePath,
       });
       injectJob(manager, job);
 
       const result = manager.stop("TASK-205");
-      expect(result).toBe(true);
+      expect(result).toBe(false);
       expect(job.status).toBe("stopped");
+      expect(job.operatorStopRequestedAt).toBeDefined();
+      expect(job.operatorStopCleanupPending).toBe(true);
+      expect(job.operatorStopTreeTerminated).toBe(false);
+      expect(job.operatorStopBarrierPath).toBeDefined();
+      expect(fs.existsSync(job.operatorStopBarrierPath!)).toBe(true);
+      expect(mockCleanupWorktreeContainers).toHaveBeenCalledWith(worktreePath, expect.any(Object));
+      expect(job.output.join("\n")).toContain("detached descendants cannot be excluded");
+      expect(() => manager.start(job.taskId, { skipGate: true })).toThrow(
+        "still completing operator-stop cleanup",
+      );
+      expect(fs.existsSync(worktreePath)).toBe(true);
+    });
+
+    test("killAll propagates barrier refusal for an awaiting_approval job", () => {
+      const worktreePath = path.join(managerRoot, ".quack", "worktrees", "TASK-205-REFUSED");
+      fs.mkdirSync(worktreePath, { recursive: true });
+      const job = makeJob({
+        taskId: "TASK-205-REFUSED",
+        status: "awaiting_approval",
+        pid: 4243,
+        worktreePath,
+        executionRoot: worktreePath,
+      });
+      injectJob(manager, job);
+      const internals = manager as unknown as {
+        persistOperatorStopBarrier: (candidate: DispatchJob) => boolean;
+        operatorStopCleanupPending: Map<string, DispatchJob>;
+      };
+      jest.spyOn(internals, "persistOperatorStopBarrier").mockReturnValue(false);
+      const cleanupCallsBefore = mockCleanupWorktreeContainers.mock.calls.length;
+
+      expect(manager.killAll()).toBe(false);
+      expect(job.status).toBe("awaiting_approval");
+      expect(job.operatorStopRequestedAt).toBeUndefined();
+      expect(job.operatorStopCleanupPending).toBe(false);
+      expect(internals.operatorStopCleanupPending.has(job.taskId)).toBe(false);
+      expect(mockCleanupWorktreeContainers.mock.calls.length).toBe(cleanupCallsBefore);
+    });
+
+    test("awaiting_approval stop preserves its barrier when Docker cleanup is unverified", () => {
+      const worktreePath = path.join(managerRoot, ".quack", "worktrees", "TASK-205-DOCKER");
+      fs.mkdirSync(worktreePath, { recursive: true });
+      const job = makeJob({
+        taskId: "TASK-205-DOCKER",
+        status: "awaiting_approval",
+        pid: 4244,
+        worktreePath,
+        executionRoot: worktreePath,
+      });
+      injectJob(manager, job);
+      mockCleanupWorktreeContainers.mockReturnValueOnce(false);
+
+      expect(manager.stop(job.taskId)).toBe(false);
+      expect(job.status).toBe("stopped");
+      expect(job.operatorStopCleanupPending).toBe(true);
+      expect(fs.existsSync(job.operatorStopBarrierPath!)).toBe(true);
+      expect(job.output.join("\n")).toContain(
+        "worktree container cleanup was disabled or could not be confirmed",
+      );
     });
 
     test("cleanup preserves awaiting_approval jobs", () => {
@@ -2317,6 +4295,35 @@ describe("DispatchManager", () => {
       // Both jobs still own a degraded shared checkout and are preserved.
       expect(manager.getJob("TASK-206")).toBeDefined();
       expect(manager.getJob("TASK-207")).toBeDefined();
+    });
+
+    test("cleanup preserves stopped jobs with unresolved operator-stop recovery", () => {
+      const oldDate = new Date(Date.now() - 7200000).toISOString();
+      const flaggedJob = makeJob({
+        taskId: "TASK-208",
+        status: "stopped",
+        startedAt: oldDate,
+        operatorStopCleanupPending: true,
+      });
+      const mappedJob = makeJob({
+        taskId: "TASK-209",
+        status: "stopped",
+        startedAt: oldDate,
+        operatorStopCleanupPending: false,
+      });
+      injectJob(manager, flaggedJob);
+      injectJob(manager, mappedJob);
+      const pendingStops = (
+        manager as unknown as { operatorStopCleanupPending: Map<string, DispatchJob> }
+      ).operatorStopCleanupPending;
+      pendingStops.set(mappedJob.taskId, mappedJob);
+
+      manager.cleanup(3600000);
+
+      expect(manager.getJob(flaggedJob.taskId)).toBe(flaggedJob);
+      expect(manager.getJob(mappedJob.taskId)).toBe(mappedJob);
+      expect(manager.hasPendingOperatorStopCleanup(flaggedJob.taskId)).toBe(true);
+      expect(manager.hasPendingOperatorStopCleanup(mappedJob.taskId)).toBe(true);
     });
 
     describe("isApprovalPending", () => {
@@ -2464,7 +4471,64 @@ describe("DispatchManager", () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     });
 
-    test("threads --skip-depth-only into the child process args", async () => {
+    test("terminal drain fences public and internal dispatch admission", () => {
+      const scriptPath = path.join(tmpDir, "must-not-run.js");
+      const markerPath = path.join(tmpDir, "unexpected-launch.txt");
+      fs.writeFileSync(
+        scriptPath,
+        `require("node:fs").writeFileSync(${JSON.stringify(markerPath)}, "ran", "utf8");`,
+        "utf8",
+      );
+      const mgr = new DispatchManager(tmpDir, scriptPath);
+      const internals = mgr as unknown as {
+        startWorktree(taskId: string): DispatchJob;
+        startDocker(taskId: string): DispatchJob;
+      };
+
+      mgr.beginTerminalDrain();
+
+      expect(() => mgr.start("TASK-DRAINED", { skipGate: true })).toThrow(
+        "Dispatch admission is closed because the monitor is shutting down.",
+      );
+      expect(() => internals.startWorktree.call(mgr, "TASK-DRAINED-WORKTREE")).toThrow(
+        "Dispatch admission is closed because the monitor is shutting down.",
+      );
+      expect(() => internals.startDocker.call(mgr, "TASK-DRAINED-DOCKER")).toThrow(
+        "Dispatch admission is closed because the monitor is shutting down.",
+      );
+      expect(fs.existsSync(markerPath)).toBe(false);
+      expect(mgr.getActiveJobs()).toEqual([]);
+    });
+
+    test("uses canonical Node and threads --skip-depth-only into the child args", async () => {
+      const projectRoot = path.join(tmpDir, "project");
+      fs.mkdirSync(projectRoot);
+      const gitShadowMarker = path.join(tmpDir, "git-shadow-ran.txt");
+      if (process.platform === "win32") {
+        const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
+        if (!systemRoot) throw new Error("SystemRoot is required for this Windows test");
+        fs.copyFileSync(
+          path.join(systemRoot, "System32", "cmd.exe"),
+          path.join(projectRoot, "node.exe"),
+        );
+        fs.copyFileSync(
+          path.join(systemRoot, "System32", "cmd.exe"),
+          path.join(projectRoot, "powershell.exe"),
+        );
+        fs.writeFileSync(
+          path.join(projectRoot, "git.cmd"),
+          `@echo shadow>"${gitShadowMarker}"\r\n@exit /b 1\r\n`,
+          "utf8",
+        );
+      } else {
+        const gitShadow = path.join(projectRoot, "git");
+        fs.writeFileSync(
+          gitShadow,
+          `#!/bin/sh\necho shadow > '${gitShadowMarker}'\nexit 1\n`,
+          "utf8",
+        );
+        fs.chmodSync(gitShadow, 0o755);
+      }
       const argsFile = path.join(tmpDir, "args.json");
       const scriptPath = path.join(tmpDir, "fake-quack.js");
       fs.writeFileSync(
@@ -2477,9 +4541,12 @@ describe("DispatchManager", () => {
         "utf-8",
       );
 
-      const mgr = new DispatchManager(tmpDir, scriptPath);
+      const mgr = new DispatchManager(projectRoot, scriptPath);
+      const originalPath = process.env.PATH;
       try {
+        process.env.PATH = `${projectRoot}${path.delimiter}${originalPath ?? ""}`;
         mgr.start("TASK-FLAGS", { skipGate: true, skipDepthOnly: true });
+        process.env.PATH = originalPath;
         await waitForFile(argsFile);
 
         const args = JSON.parse(fs.readFileSync(argsFile, "utf-8")) as string[];
@@ -2487,22 +4554,31 @@ describe("DispatchManager", () => {
         expect(args).toContain("TASK-FLAGS");
         expect(args).toContain("--skip-gate");
         expect(args).toContain("--skip-depth-only");
+        expect(fs.existsSync(gitShadowMarker)).toBe(false);
       } finally {
+        process.env.PATH = originalPath;
         mgr.killAll();
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
     });
 
     test("writes durable dispatch_child_exit facts into the events jsonl on child exit (QPI-043)", async () => {
+      const projectRoot = path.join(tmpDir, "project");
+      fs.mkdirSync(projectRoot);
       const scriptPath = path.join(tmpDir, "fake-quack.js");
       fs.writeFileSync(scriptPath, "setTimeout(() => process.exit(3), 50);", "utf-8");
 
-      const mgr = new DispatchManager(tmpDir, scriptPath);
+      const mgr = new DispatchManager(projectRoot, scriptPath);
       try {
         const job = mgr.start("TASK-EXIT-FACTS", { skipGate: true });
         // The fake child records no session, so the facts land durably
         // under the monitor job's own session id (the fallback path).
-        const eventsFile = path.join(tmpDir, ".quack", "logs", `events-${job.sessionId}.jsonl`);
+        const eventsFile = path.join(
+          projectRoot,
+          ".quack",
+          "logs",
+          `events-${job.sessionId}.jsonl`,
+        );
         await waitForFile(eventsFile);
 
         const lines = fs.readFileSync(eventsFile, "utf-8").trim().split("\n");

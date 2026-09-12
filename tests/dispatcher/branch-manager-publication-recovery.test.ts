@@ -18,10 +18,101 @@ import {
   type GitOriginIdentity,
 } from "../../src/dispatcher/github-repository";
 
+import * as trustedGit from "../../src/worker/trusted-executable";
+
 const execFileAsync = promisify(execFile);
+const actualTrustedGitResult = trustedGit.runTrustedGitResult;
+const fixtureTransports = new Map<
+  string,
+  { projectRoot: string; remoteRoot: string; remoteUrl: string }
+>();
+
+function localFixtureTransport(cwd: string, args: readonly string[]): readonly string[] {
+  if (!["push", "fetch", "ls-remote"].includes(args[0] ?? "")) return args;
+  const fixture = fixtureTransports.get(path.resolve(cwd));
+  if (!fixture) return args;
+  let destinations = 0;
+  const mapped = args.map((arg) => {
+    if (arg !== "origin" && arg !== fixture.remoteUrl) return arg;
+    destinations += 1;
+    return fixture.remoteRoot;
+  });
+  if (destinations !== 1)
+    throw new Error("Fixture transport requires one exact origin destination");
+  return mapped;
+}
+
+// Only the final transport is substituted with this test's disposable bare repo.
+// Production repository selection, local Git, source/target refs, prepared journal
+// and recovery locks remain real. Trusted transport refusal has separate tests.
+async function fixtureTrustedTransport(
+  cwd: string,
+  args: readonly string[],
+  options: trustedGit.TrustedGitExecutionOptions,
+): Promise<trustedGit.TrustedGitResult> {
+  if (!["push", "fetch", "ls-remote"].includes(args[0] ?? ""))
+    return actualTrustedGitResult(cwd, args, options);
+  const common = await actualTrustedGitResult(cwd, ["rev-parse", "--git-common-dir"], options);
+  if (common.exitCode !== 0) throw new Error("Fixture Git common directory is unavailable");
+  const commonDirectory = fs.realpathSync(path.resolve(cwd, common.stdout.trim()));
+  const fixture = [...fixtureTransports.values()].find(
+    (entry) => fs.realpathSync(path.join(entry.projectRoot, ".git")) === commonDirectory,
+  );
+  if (!fixture) throw new Error("Refusing transport outside an owned publication fixture");
+  const origin = await actualTrustedGitResult(
+    cwd,
+    ["remote", "get-url", "--push", "--all", "origin"],
+    options,
+  );
+  if (origin.exitCode !== 0 || origin.stdout.trim() !== fixture.remoteUrl)
+    throw new Error("Refusing a changed fixture origin identity");
+  const repository = trustedGit.parseTrustedGitHubRepository(fixture.remoteUrl);
+  if (args[0] === "push" && !options.expectedRepository)
+    throw new Error("Refusing an unbound publication push in the fixture");
+  if (
+    options.expectedRepository &&
+    (options.expectedRepository.host !== repository.host ||
+      options.expectedRepository.owner !== repository.owner ||
+      options.expectedRepository.repo !== repository.repo)
+  )
+    throw new Error("Refusing a mismatched publication repository in the fixture");
+  let destinations = 0;
+  const mapped = args.map((arg) => {
+    if (arg !== "origin" && arg !== fixture.remoteUrl) return arg;
+    destinations += 1;
+    return fixture.remoteRoot;
+  });
+  if (destinations !== 1) throw new Error("Refusing an unexpected publication transport operand");
+  let result: trustedGit.TrustedGitResult;
+  try {
+    const output = await execFileAsync("git", mapped, {
+      cwd,
+      encoding: "utf-8",
+      windowsHide: true,
+      timeout: options.timeoutMs,
+      maxBuffer: options.maxBuffer,
+    });
+    result = { exitCode: 0, stdout: String(output.stdout), stderr: String(output.stderr) };
+  } catch (error: unknown) {
+    const failed = error as { code?: unknown; stdout?: string; stderr?: string };
+    result = {
+      exitCode: typeof failed.code === "number" ? failed.code : 1,
+      stdout: failed.stdout ?? "",
+      stderr: failed.stderr ?? String(error),
+    };
+  }
+  const after = await actualTrustedGitResult(
+    cwd,
+    ["remote", "get-url", "--push", "--all", "origin"],
+    options,
+  );
+  if (after.exitCode !== 0 || after.stdout.trim() !== fixture.remoteUrl)
+    throw new Error("Fixture origin changed during publication transport");
+  return result;
+}
 
 async function git(cwd: string, args: readonly string[], env?: NodeJS.ProcessEnv): Promise<string> {
-  const result = await execFileAsync("git", [...args], {
+  const result = await execFileAsync("git", [...localFixtureTransport(cwd, args)], {
     cwd,
     encoding: "utf-8",
     ...(env ? { env: { ...process.env, ...env } } : {}),
@@ -92,6 +183,9 @@ async function fixture(strategy: "merge" | "rebase" | "squash"): Promise<{
   await git(projectRoot, ["commit", "-m", "advance target"]);
   const targetHead = await git(projectRoot, ["rev-parse", "HEAD"]);
   await git(projectRoot, ["push", "origin", "main"]);
+  const remoteUrl = `https://${process.env.GH_HOST ?? "github.com"}/example-fixtures/${path.basename(root)}.git`;
+  fixtureTransports.set(path.resolve(projectRoot), { projectRoot, remoteRoot, remoteUrl });
+  await git(projectRoot, ["remote", "set-url", "origin", remoteUrl]);
   const repository = await resolveOriginRepository(projectRoot);
   return {
     root,
@@ -109,6 +203,14 @@ async function fixture(strategy: "merge" | "rebase" | "squash"): Promise<{
 describe("candidate-bound no-PR publication recovery with real Git", () => {
   jest.setTimeout(60_000);
 
+  beforeEach(() => {
+    jest.spyOn(trustedGit, "runTrustedGitResult").mockImplementation(fixtureTrustedTransport);
+  });
+  afterEach(() => {
+    jest.restoreAllMocks();
+    fixtureTransports.clear();
+  });
+
   test.each(["merge", "squash", "rebase"] as const)(
     "%s persists a prepared identity, replays an accepted target push, and cleans the exact source",
     async (strategy) => {
@@ -123,7 +225,9 @@ describe("candidate-bound no-PR publication recovery with real Git", () => {
             "main",
             undefined,
             state.branch,
+            undefined,
             state.candidateHead,
+            trustedGit.parseTrustedGitHubRepository(state.repository.pushUrl),
             {
               preparedRef: state.preparedRef,
               onPrepared: (value) => {
@@ -178,7 +282,9 @@ describe("candidate-bound no-PR publication recovery with real Git", () => {
           "main",
           undefined,
           state.branch,
+          undefined,
           state.candidateHead,
+          trustedGit.parseTrustedGitHubRepository(state.repository.pushUrl),
           {
             prepared: evidence,
             preparedRef: state.preparedRef,
@@ -239,7 +345,9 @@ describe("candidate-bound no-PR publication recovery with real Git", () => {
           "main",
           undefined,
           state.branch,
+          undefined,
           state.candidateHead,
+          trustedGit.parseTrustedGitHubRepository(state.repository.pushUrl),
           { preparedRef: state.preparedRef, onPrepared },
           state.repository,
         );
@@ -288,7 +396,9 @@ describe("candidate-bound no-PR publication recovery with real Git", () => {
           "main",
           undefined,
           state.branch,
+          undefined,
           state.candidateHead,
+          trustedGit.parseTrustedGitHubRepository(state.repository.pushUrl),
           { preparedRef: state.preparedRef, onPrepared },
           state.repository,
         );
@@ -319,7 +429,9 @@ describe("candidate-bound no-PR publication recovery with real Git", () => {
         "main",
         undefined,
         state.branch,
+        undefined,
         state.candidateHead,
+        trustedGit.parseTrustedGitHubRepository(state.repository.pushUrl),
         {
           preparedRef: state.preparedRef,
           onPrepared: (value) => {
@@ -352,7 +464,9 @@ describe("candidate-bound no-PR publication recovery with real Git", () => {
           "main",
           undefined,
           state.branch,
+          undefined,
           state.candidateHead,
+          trustedGit.parseTrustedGitHubRepository(state.repository.pushUrl),
           {
             preparedRef: state.preparedRef,
             onPrepared: (value) => {
@@ -390,7 +504,9 @@ describe("candidate-bound no-PR publication recovery with real Git", () => {
         "main",
         undefined,
         state.branch,
+        undefined,
         state.candidateHead,
+        trustedGit.parseTrustedGitHubRepository(state.repository.pushUrl),
         {
           prepared: evidence,
           preparedRef: state.preparedRef,
@@ -434,7 +550,9 @@ describe("candidate-bound no-PR publication recovery with real Git", () => {
         "main",
         undefined,
         state.branch,
+        undefined,
         state.candidateHead,
+        trustedGit.parseTrustedGitHubRepository(state.repository.pushUrl),
         {
           preparedRef: state.preparedRef,
           onPrepared: (value) => {
@@ -481,7 +599,9 @@ describe("candidate-bound no-PR publication recovery with real Git", () => {
         "main",
         undefined,
         state.branch,
+        undefined,
         state.candidateHead,
+        trustedGit.parseTrustedGitHubRepository(state.repository.pushUrl),
         {
           preparedRef: state.preparedRef,
           onPrepared: (value) => {
@@ -552,7 +672,9 @@ describe("candidate-bound no-PR publication recovery with real Git", () => {
         "main",
         undefined,
         state.branch,
+        undefined,
         state.candidateHead,
+        trustedGit.parseTrustedGitHubRepository(state.repository.pushUrl),
         {
           preparedRef: state.preparedRef,
           onPrepared: (value) => {

@@ -9,3 +9,5 @@ export * from "./peer-config.js";
 export * from "./scheduling.js";
 export * from "./orchestration.js";
 export * from "./verified-sync.js";
+export * from "./pause-resume.js";
+export * from "./offline-lock-recovery.js";

@@ -100,11 +100,14 @@ export async function queueCommand(taskIds: string[], options: QueueCommandOptio
 
       console.log("\nQueue Status");
       console.log("=".repeat(40));
-      console.log(`State: ${Number(result.stats.running) > 0 ? "Running" : "Idle"}`);
+      const awaitingApproval = Number(result.stats.awaitingApproval ?? 0);
+      const activeCount = Number(result.stats.running ?? 0) + awaitingApproval;
+      console.log(`State: ${activeCount > 0 ? "Running" : "Idle"}`);
       console.log(`Total items: ${String(result.stats.total)}`);
       console.log(`  Queued: ${String(result.stats.queued)}`);
       console.log(`  Ready: ${String(result.stats.ready)}`);
       console.log(`  Running: ${String(result.stats.running)}`);
+      console.log(`  Awaiting approval: ${awaitingApproval}`);
       console.log(`  Completed: ${String(result.stats.completed)}`);
       console.log(`  Failed: ${String(result.stats.failed)}`);
       console.log(`  Blocked: ${String(result.stats.blocked)}`);

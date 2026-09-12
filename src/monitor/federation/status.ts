@@ -5,7 +5,7 @@
 
 import type { EventStage } from "../event-types.js";
 import type { WorkflowState } from "../../workflow/workflow-state-types.js";
-import type { FederatedRuntimeStatus } from "./types.js";
+import type { FederatedJobRecord, FederatedRuntimeStatus } from "./types.js";
 
 /** The SCHEDULER's notion of assignable/in-flight work.
  *
@@ -30,8 +30,9 @@ export const activeFederatedStatuses: ReadonlySet<FederatedRuntimeStatus> = new 
  *  recovery must therefore keep seeing it, or a paused job falls outside recovery
  *  and can never be reclaimed when its host genuinely dies.
  *
- *  Round-1 R1-6 caught the inverse framing ("a pause holds no worker") before it
- *  shipped. Releasing the attachment is TASK-1330, not this. */
+ *  The status-only helper deliberately preserves that legacy answer. Use the
+ *  record-aware helper below when a durable TASK-1330 release generation is
+ *  available. */
 export const workerAttachedFederatedStatuses: ReadonlySet<FederatedRuntimeStatus> = new Set([
   "assigned",
   "queued",
@@ -43,6 +44,18 @@ export const workerAttachedFederatedStatuses: ReadonlySet<FederatedRuntimeStatus
 
 export function holdsWorkerAttachment(status: FederatedRuntimeStatus): boolean {
   return workerAttachedFederatedStatuses.has(status);
+}
+
+/** Record-aware attachment check. Released pauses remain awaiting_approval but
+ * no longer consume execution capacity until their resume is claimed. */
+export function federatedJobHoldsWorkerAttachment(job: FederatedJobRecord): boolean {
+  if (job.status !== "awaiting_approval") return holdsWorkerAttachment(job.status);
+  if (!job.pause) return true; // legacy/unknown identity: preserve the safe old behaviour
+  return (
+    job.pause.state === "attached" ||
+    job.pause.state === "resume_claimed" ||
+    job.pause.state === "approved_but_not_started"
+  );
 }
 
 /** TASK-1329: a run paused at a human gate. Neither a failure nor a completion:

@@ -13,6 +13,9 @@ import type { VerifiedRow } from "../../src/db/types";
 import type { DuplicateClaimantIndex } from "../../src/core/duplicate-claimants";
 
 class FakeDb {
+  getHealth() {
+    return { mode: "sqlite" as const, available: true as const };
+  }
   private verified = new Map<string, VerifiedRow>();
   public statusCalls: Array<{ taskId: string; status: string; source: string }> = [];
 
@@ -78,7 +81,7 @@ describe("recordVerification", () => {
     await recordVerification(project, {
       taskId: "TASK-001",
       verdict: "VERIFIED",
-      commitSha: "abc",
+      commitSha: "abc0000",
       method: "api",
       criteriaChecked: 1,
       criteriaPassed: 1,
@@ -113,7 +116,7 @@ describe("recordVerification", () => {
     await recordVerification(project, {
       taskId: "TASK-001",
       verdict: "VERIFIED",
-      commitSha: "abc",
+      commitSha: "abc0000",
       method: "/verify-task",
       criteriaChecked: 5,
       criteriaPassed: 5,
@@ -195,7 +198,7 @@ describe("recordVerification", () => {
     await recordVerification(project, {
       taskId: "TASK-003",
       verdict: "VERIFIED",
-      commitSha: "abc",
+      commitSha: "abc0000",
       method: "federated-orchestrator",
       criteriaChecked: 3,
       criteriaPassed: 3,
@@ -214,7 +217,7 @@ describe("recordVerification", () => {
     await recordVerification(project, {
       taskId: "TASK-001",
       verdict: "VERIFIED",
-      commitSha: "a",
+      commitSha: "aaaaaaa",
       method: "api",
       criteriaChecked: 1,
       criteriaPassed: 1,
@@ -222,7 +225,7 @@ describe("recordVerification", () => {
     await recordVerification(project, {
       taskId: "TASK-002",
       verdict: "VERIFIED",
-      commitSha: "b",
+      commitSha: "bbbbbbb",
       method: "api",
       criteriaChecked: 1,
       criteriaPassed: 1,
@@ -232,13 +235,146 @@ describe("recordVerification", () => {
     expect(Object.keys(json.tasks).sort()).toEqual(["TASK-001", "TASK-002"]);
   });
 
+  test("reports only projection durability stages completed by the current platform", async () => {
+    const { project } = makeProject();
+    const observed: string[] = [];
+
+    await recordVerification(
+      project,
+      {
+        taskId: "TASK-DURABLE-PROJECTION",
+        verdict: "VERIFIED",
+        commitSha: "d0ab1e0",
+        method: "federated-orchestrator",
+        criteriaChecked: 1,
+        criteriaPassed: 1,
+      },
+      {
+        afterProjectionPersistenceStageForTest: (stage) => {
+          observed.push(stage);
+        },
+      },
+    );
+
+    expect(observed).toEqual([
+      "projection_temp_file_synced",
+      "projection_published",
+      "projection_published_file_synced",
+      ...(process.platform === "win32" ? [] : ["projection_directory_synced"]),
+      "projection_durability_acknowledged",
+    ]);
+  });
+
+  test("serializes concurrent projections from different verification owners", async () => {
+    const { project, root } = makeProject();
+    let announceFirstRead!: () => void;
+    let releaseFirstRead!: () => void;
+    const firstRead = new Promise<void>((resolve) => {
+      announceFirstRead = resolve;
+    });
+    const mayWriteFirst = new Promise<void>((resolve) => {
+      releaseFirstRead = resolve;
+    });
+    let secondRead = false;
+
+    const first = recordVerification(
+      project,
+      {
+        taskId: "TASK-CONCURRENT-A",
+        verdict: "VERIFIED",
+        commitSha: "aaaaaaa",
+        method: "federated-orchestrator",
+        criteriaChecked: 1,
+        criteriaPassed: 1,
+      },
+      {
+        afterProjectionReadForTest: async () => {
+          announceFirstRead();
+          await mayWriteFirst;
+        },
+      },
+    );
+    await firstRead;
+    const second = recordVerification(
+      project,
+      {
+        taskId: "TASK-CONCURRENT-B",
+        verdict: "VERIFIED",
+        commitSha: "bbbbbbb",
+        method: "federated-orchestrator",
+        criteriaChecked: 1,
+        criteriaPassed: 1,
+      },
+      {
+        afterProjectionReadForTest: () => {
+          secondRead = true;
+        },
+      },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const secondReadBeforeRelease = secondRead;
+    releaseFirstRead();
+    await Promise.all([first, second]);
+
+    expect(secondReadBeforeRelease).toBe(false);
+    expect(Object.keys(readJson(root).tasks).sort()).toEqual([
+      "TASK-CONCURRENT-A",
+      "TASK-CONCURRENT-B",
+    ]);
+  });
+
+  test("serializes full projection regeneration behind an in-flight entry update", async () => {
+    const { project, db, root } = makeProject();
+    let announceRead!: () => void;
+    let releaseRead!: () => void;
+    const readStarted = new Promise<void>((resolve) => {
+      announceRead = resolve;
+    });
+    const mayPublish = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+    const originalGetAllVerified = db.getAllVerified.bind(db);
+    let regenerationRead = false;
+    const getAllVerified = jest.spyOn(db, "getAllVerified").mockImplementation(() => {
+      regenerationRead = true;
+      return originalGetAllVerified();
+    });
+
+    const update = recordVerification(
+      project,
+      {
+        taskId: "TASK-CONCURRENT-REGENERATE",
+        verdict: "VERIFIED",
+        commitSha: "0e9e0e0",
+        method: "federated-orchestrator",
+        criteriaChecked: 1,
+        criteriaPassed: 1,
+      },
+      {
+        afterProjectionReadForTest: async () => {
+          announceRead();
+          await mayPublish;
+        },
+      },
+    );
+    await readStarted;
+    const regeneration = regenerateProjection(project);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(regenerationRead).toBe(false);
+    releaseRead();
+    await Promise.all([update, regeneration]);
+    expect(getAllVerified).toHaveBeenCalledTimes(1);
+    expect(readJson(root).tasks["TASK-CONCURRENT-REGENERATE"]).toBeDefined();
+  });
+
   test("emits deterministic byte output (same input -> identical bytes)", async () => {
     const { project: a } = makeProject();
     const { project: b } = makeProject();
     const entry = {
       taskId: "TASK-001",
       verdict: "VERIFIED" as const,
-      commitSha: "abc",
+      commitSha: "abc0000",
       method: "api",
       criteriaChecked: 5,
       criteriaPassed: 5,
@@ -258,7 +394,7 @@ describe("recordVerification", () => {
       {
         taskId: "TASK-001",
         verdict: "VERIFIED",
-        commitSha: "abc",
+        commitSha: "abc0000",
         method: "api",
         criteriaChecked: 1,
         criteriaPassed: 1,
@@ -306,7 +442,7 @@ describe("regenerateProjection", () => {
     db.setVerified({
       task_id: "TASK-002",
       verified_at: "2026-04-29",
-      commit_sha: "b",
+      commit_sha: "bbbbbbb",
       method: "api",
       verdict: "VERIFIED",
       criteria_checked: 1,
@@ -316,7 +452,7 @@ describe("regenerateProjection", () => {
     db.setVerified({
       task_id: "TASK-001",
       verified_at: "2026-04-29",
-      commit_sha: "a",
+      commit_sha: "aaaaaaa",
       method: "api",
       verdict: "VERIFIED",
       criteria_checked: 1,
@@ -335,7 +471,7 @@ describe("regenerateProjection", () => {
     db.setVerified({
       task_id: "TASK-001",
       verified_at: "2026-04-29",
-      commit_sha: "a",
+      commit_sha: "aaaaaaa",
       method: "api",
       verdict: "VERIFIED",
       criteria_checked: 1,
@@ -379,7 +515,7 @@ describe("findDbJsonDrift", () => {
         tasks: {
           "TASK-JSONONLY": {
             verified: "2026-04-29",
-            commit: "abc",
+            commit: "abc0000",
             method: "pipeline",
             verdict: "VERIFIED",
             criteriaChecked: 5,
@@ -467,7 +603,7 @@ describe("reconcileVerifiedDrift — production 2026-04-29 scenario", () => {
     db.setVerified({
       task_id: "TASK-001",
       verified_at: "2026-04-29",
-      commit_sha: "abc",
+      commit_sha: "abc0000",
       method: "api",
       verdict: "VERIFIED",
       criteria_checked: 1,
@@ -479,7 +615,7 @@ describe("reconcileVerifiedDrift — production 2026-04-29 scenario", () => {
     const result = await reconcileVerifiedDrift(project);
     expect(result.dbToJson).toEqual(["TASK-001"]);
     const json = readJson(root);
-    expect(json.tasks["TASK-001"]?.commit).toBe("abc");
+    expect(json.tasks["TASK-001"]?.commit).toBe("abc0000");
   });
 
   test("idempotent: running twice does not duplicate or churn", async () => {
@@ -487,7 +623,7 @@ describe("reconcileVerifiedDrift — production 2026-04-29 scenario", () => {
     db.setVerified({
       task_id: "TASK-001",
       verified_at: "2026-04-29",
-      commit_sha: "abc",
+      commit_sha: "abc0000",
       method: "api",
       verdict: "VERIFIED",
       criteria_checked: 1,
@@ -530,7 +666,7 @@ describe("recordVerification skipIfExistingVerdict", () => {
   const onMergeEntry = {
     taskId: "TASK-100",
     verdict: "SOFT-VERIFIED" as const,
-    commitSha: "merge99",
+    commitSha: "ae09e99",
     method: "on-merge",
     criteriaChecked: 0,
     criteriaPassed: 0,
@@ -563,12 +699,12 @@ describe("recordVerification skipIfExistingVerdict", () => {
 
   test("skips when the existing verdict is SOFT-VERIFIED (idempotent re-scan)", async () => {
     const { project, db } = makeProject();
-    await recordVerification(project, { ...onMergeEntry, commitSha: "first" });
+    await recordVerification(project, { ...onMergeEntry, commitSha: "f100001" });
     const before = db.getVerified("TASK-100");
 
     const result = await recordVerification(
       project,
-      { ...onMergeEntry, commitSha: "second" },
+      { ...onMergeEntry, commitSha: "5ec0002" },
       {
         skipIfExistingVerdict: ["VERIFIED", "SOFT-VERIFIED"],
       },
@@ -597,7 +733,7 @@ describe("recordVerification skipIfExistingVerdict", () => {
     expect(result.applied).toBe(true);
     expect(db.getVerified("TASK-100")).toMatchObject({
       verdict: "SOFT-VERIFIED",
-      commit_sha: "merge99",
+      commit_sha: "ae09e99",
     });
   });
 
@@ -651,7 +787,7 @@ describe("TASK-1338-F positive-token claimant guard", () => {
   const verifiedEntry = {
     taskId: "TASK-100",
     verdict: "VERIFIED" as const,
-    commitSha: "new-commit",
+    commitSha: "cea0001",
     method: "api",
     criteriaChecked: 2,
     criteriaPassed: 2,
@@ -701,7 +837,7 @@ describe("TASK-1338-F positive-token claimant guard", () => {
     const { project, db, root } = makeProject();
     const first = {
       ...verifiedEntry,
-      commitSha: "existing",
+      commitSha: "e115710",
       updatedAt: "2026-08-18T11:00:00.000Z",
     };
     await recordVerification(project, first);
@@ -732,7 +868,7 @@ describe("TASK-1338-F positive-token claimant guard", () => {
         tasks: {
           "TASK-100": {
             verified: "2026-08-18",
-            commit: "positive",
+            commit: "905171e",
             method: "api",
             verdict: "VERIFIED",
             criteriaChecked: 1,
@@ -778,7 +914,7 @@ describe("TASK-1338-F positive-token claimant guard", () => {
         tasks: {
           "TASK-100": {
             verified: "2026-08-18",
-            commit: "positive",
+            commit: "905171e",
             method: "api",
             verdict: "VERIFIED",
             criteriaChecked: 1,

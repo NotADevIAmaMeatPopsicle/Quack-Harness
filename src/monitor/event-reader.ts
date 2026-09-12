@@ -226,11 +226,13 @@ export class EventReader {
    * Calls onEvent for each new event line appended to any events-*.jsonl file.
    * Returns a stop function.
    */
-  async watch(onEvent: (event: QuackEvent) => void): Promise<() => void> {
+  async watch(onEvent: (event: QuackEvent) => void | Promise<void>): Promise<() => Promise<void>> {
     // Dynamic import chokidar (ESM-compatible)
     const chokidar = await import("chokidar");
 
     const fileSizes = new Map<string, number>();
+    const inFlightCallbacks = new Set<Promise<void>>();
+    let closing = false;
 
     const watcher = chokidar.watch(
       [
@@ -282,7 +284,25 @@ export class EventReader {
           if (!trimmed) continue;
           try {
             const event = JSON.parse(trimmed) as QuackEvent;
-            onEvent(event);
+            if (closing) continue;
+            try {
+              const result = onEvent(event);
+              if (result) {
+                const pending = Promise.resolve(result).catch((err: unknown) => {
+                  console.error(
+                    "[event-reader] event callback error (non-fatal):",
+                    err instanceof Error ? err.message : err,
+                  );
+                });
+                inFlightCallbacks.add(pending);
+                void pending.then(() => inFlightCallbacks.delete(pending));
+              }
+            } catch (err: unknown) {
+              console.error(
+                "[event-reader] event callback error (non-fatal):",
+                err instanceof Error ? err.message : err,
+              );
+            }
           } catch {
             // skip malformed lines
           }
@@ -308,8 +328,10 @@ export class EventReader {
       processNewContent(filePath);
     });
 
-    return () => {
-      void watcher.close();
+    return async () => {
+      closing = true;
+      await watcher.close();
+      await Promise.allSettled([...inFlightCallbacks]);
     };
   }
 }

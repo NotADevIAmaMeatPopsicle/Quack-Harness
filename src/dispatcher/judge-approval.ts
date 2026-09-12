@@ -8,7 +8,14 @@ import * as path from "node:path";
 import type { ReviewRunResult } from "../review/reviewer-types.js";
 import type { LoopReviewGateFacts } from "../review/loop-gate.js";
 import type { IntentJudgmentAction } from "../judgment/judgment-types.js";
-import { SPEC_IDENTITY_VERSION, type SpecIdentity } from "../core/spec-identity.js";
+import {
+  compareResolvedSpecIdentity,
+  mayConsume,
+  SPEC_IDENTITY_VERSION,
+  type ResolvedSpecIdentity,
+  type SpecIdentity,
+  type SpecIdentityComparison,
+} from "../core/spec-identity.js";
 import {
   buildDirectWriteOverride,
   resolveApprovalDecision,
@@ -78,11 +85,8 @@ export interface JudgeApproval {
    * TASK-1332 / QPI-045: which spec contract this diff was judged
    * against. Optional because pre-1332 records lack it and absence
    * must read as UNKNOWN.
-   *
-   * Binding the TASK-1316 hold release to this is TASK-1333, not this
-   * task: refusing at the judge gate without a recovery action strands
-   * the run (1332 S10), so the stamp lands first and the enforcement
-   * follows with the recycle that makes it safe.
+   * TASK-1333 binds both gate consumption and TASK-1316 hold release to
+   * this identity, paired with the archive-and-restart recovery action.
    */
   specIdentity?: SpecIdentity;
   /**
@@ -98,6 +102,42 @@ export interface JudgeAutoApproveRules {
   requireVerificationPass: boolean;
   maxFilesChanged: number;
   maxDiffLines: number;
+}
+
+/**
+ * The one operator action that can recover a stale judge clearance without
+ * deleting the paid-for worker state. Kept here with the refusal so every
+ * writer/consumer gives the same instruction.
+ */
+export function judgeRecycleAction(taskId: string): string {
+  return `POST /api/tasks/${taskId}/judge/recycle`;
+}
+
+export function compareJudgeApprovalSpecIdentity(
+  approval: JudgeApproval,
+  current: ResolvedSpecIdentity,
+): SpecIdentityComparison {
+  return compareResolvedSpecIdentity(approval.specIdentity, current, approval);
+}
+
+/** Typed refusal shared by the state writer and dispatch consumption seams. */
+export class StaleJudgeApprovalError extends Error {
+  readonly code = "judge_spec_identity_stale";
+
+  constructor(
+    readonly taskId: string,
+    readonly surface: string,
+    readonly comparison: SpecIdentityComparison,
+  ) {
+    super(
+      `Task ${taskId}: refusing at ${surface} because ${comparison.reason}. ` +
+        `Nothing has been deleted or rejected: the branch, checkpoint, approval ` +
+        `record and intent hold remain intact. Approving again cannot clear this ` +
+        `contract mismatch. Use ${judgeRecycleAction(taskId)} to archive the old ` +
+        `run and restart from the authoritative current spec.`,
+    );
+    this.name = "StaleJudgeApprovalError";
+  }
 }
 
 export function evaluateJudgeAutoApprove(
@@ -317,10 +357,22 @@ export async function updateJudgeApprovalState(
   approvedBy?: string,
   rejectionReason?: string,
   decision?: ApprovalDecisionOptions,
+  currentSpecIdentity?: ResolvedSpecIdentity,
 ): Promise<{ override?: AdvisoryOverride; unexplained: boolean }> {
   const approval = await loadJudgeApproval(taskId, logDir);
   if (!approval) {
     throw new Error(`No pending judge approval found for task ${taskId}`);
+  }
+
+  // TASK-1333: bind a clearance at the WRITER boundary, not just the
+  // dashboard route. A direct caller is just as capable of releasing the
+  // TASK-1316 hold. The comparison runs before advisory resolution and before
+  // any mutation, so a refusal leaves the entire record byte-for-byte live.
+  if (state === "approved" || state === "auto-approved") {
+    const comparison = compareJudgeApprovalSpecIdentity(approval, currentSpecIdentity);
+    if (!mayConsume(comparison.verdict)) {
+      throw new StaleJudgeApprovalError(taskId, "judge approval write", comparison);
+    }
   }
 
   // `auto-approved` counts (R1-4): `evaluateJudgeAutoApprove` reads only

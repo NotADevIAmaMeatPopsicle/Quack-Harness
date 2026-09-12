@@ -75,28 +75,32 @@ describe("Monitor UI serving", () => {
       "utf-8",
     );
 
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port, uiBuildDir });
-    const { stop } = await serverObj.start();
+    const serverObj = createMonitorServer({
+      logDir,
+      port: 0,
+      host: "127.0.0.1",
+      uiBuildDir,
+    });
+    const { port, stop } = await serverObj.start();
     stopServer = stop;
 
-    const root = await httpGet(`http://localhost:${port}/`, { Accept: "text/html" });
+    const root = await httpGet(`http://127.0.0.1:${port}/`, { Accept: "text/html" });
     expect(root.status).toBe(200);
     expect(root.body).toContain("Modern UI Marker");
 
-    const spaRoute = await httpGet(`http://localhost:${port}/tasks`, { Accept: "text/html" });
+    const spaRoute = await httpGet(`http://127.0.0.1:${port}/tasks`, { Accept: "text/html" });
     expect(spaRoute.status).toBe(200);
     expect(spaRoute.body).toContain("Modern UI Marker");
 
-    const asset = await httpGet(`http://localhost:${port}/assets/app.js`);
+    const asset = await httpGet(`http://127.0.0.1:${port}/assets/app.js`);
     expect(asset.status).toBe(200);
     expect(asset.body).toContain("modern-ui-asset");
 
-    const legacy = await httpGet(`http://localhost:${port}/legacy`, { Accept: "text/html" });
+    const legacy = await httpGet(`http://127.0.0.1:${port}/legacy`, { Accept: "text/html" });
     expect(legacy.status).toBe(200);
     expect(legacy.body).toContain("<title>Quack Monitor</title>");
 
-    const health = await httpGet(`http://localhost:${port}/api/health`);
+    const health = await httpGet(`http://127.0.0.1:${port}/api/health`);
     expect(health.status).toBe(200);
     const parsed = JSON.parse(health.body) as { uiMode?: string; legacyUiPath?: string };
     expect(parsed.uiMode).toBe("modern");
@@ -112,55 +116,58 @@ describe("Monitor UI serving", () => {
       "utf-8",
     );
 
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port, uiBuildDir });
-    const { stop } = await serverObj.start();
+    const serverObj = createMonitorServer({
+      logDir,
+      port: 0,
+      host: "127.0.0.1",
+      uiBuildDir,
+    });
+    const { port, stop } = await serverObj.start();
     stopServer = stop;
 
-    const missing = await httpGet(`http://localhost:${port}/assets/missing.js`, {
+    const missing = await httpGet(`http://127.0.0.1:${port}/assets/missing.js`, {
       Accept: "text/javascript",
     });
     expect(missing.status).toBe(404);
   });
 
   it("falls back to the legacy dashboard when no UI 2.0 build is present", async () => {
-    const port = 30000 + Math.floor(Math.random() * 10000);
     const serverObj = createMonitorServer({
       logDir,
-      port,
+      port: 0,
+      host: "127.0.0.1",
       uiBuildDir: path.join(os.tmpdir(), "quack-ui-serving-missing"),
     });
-    const { stop } = await serverObj.start();
+    const { port, stop } = await serverObj.start();
     stopServer = stop;
 
-    const root = await httpGet(`http://localhost:${port}/`, { Accept: "text/html" });
+    const root = await httpGet(`http://127.0.0.1:${port}/`, { Accept: "text/html" });
     expect(root.status).toBe(200);
     expect(root.body).toContain("<title>Quack Monitor</title>");
 
-    const health = await httpGet(`http://localhost:${port}/api/health`);
+    const health = await httpGet(`http://127.0.0.1:${port}/api/health`);
     expect(health.status).toBe(200);
     const parsed = JSON.parse(health.body) as { uiMode?: string };
     expect(parsed.uiMode).toBe("legacy");
   });
 
   it("does not serve UI assets when started in worker runtime mode", async () => {
-    const port = 30000 + Math.floor(Math.random() * 10000);
     const serverObj = createMonitorServer({
       logDir,
-      port,
+      port: 0,
       runtimeRole: "worker",
       host: "127.0.0.1",
     });
-    const { stop } = await serverObj.start();
+    const { port, stop } = await serverObj.start();
     stopServer = stop;
 
-    const root = await httpGet(`http://localhost:${port}/`, { Accept: "text/html" });
+    const root = await httpGet(`http://127.0.0.1:${port}/`, { Accept: "text/html" });
     expect(root.status).toBe(404);
 
-    const legacy = await httpGet(`http://localhost:${port}/legacy`, { Accept: "text/html" });
+    const legacy = await httpGet(`http://127.0.0.1:${port}/legacy`, { Accept: "text/html" });
     expect(legacy.status).toBe(404);
 
-    const health = await httpGet(`http://localhost:${port}/api/health`);
+    const health = await httpGet(`http://127.0.0.1:${port}/api/health`);
     expect(health.status).toBe(200);
     const parsed = JSON.parse(health.body) as { uiMode?: string; runtimeRole?: string };
     expect(parsed.uiMode).toBe("headless");

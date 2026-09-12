@@ -149,6 +149,18 @@ ${criteria.map((c) => `- [ ] ${c}`).join("\n")}${allCriterion}
 `;
 }
 
+function makeDraft(id: string, title: string): ChildDraft {
+  return {
+    subtaskId: id,
+    title,
+    markdown: makeChildDraftMarkdown({ id, title }),
+    sectionsPresent: [],
+    prepScore: 5,
+    prepReady: true,
+    deficiencies: [],
+  };
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────
 
 describe("subtask-writer", () => {
@@ -341,6 +353,51 @@ describe("subtask-writer", () => {
     });
   });
 
+  test("TASK-1345: refuses a differently named declared-id owner without partial writes", async () => {
+    const taskDir = path.join(tempDir, "docs", "tasks");
+    const ownerName = "TASK-999-existing-child.md";
+    await fs.writeFile(
+      path.join(taskDir, ownerName),
+      makeChildDraftMarkdown({ id: "TASK-042-B", title: "Existing B" }),
+      "utf-8",
+    );
+
+    await expect(
+      writeSubtaskSpecs(
+        [makeDraft("TASK-042-A", "Fresh A"), makeDraft("TASK-042-B", "New B")],
+        adapter,
+      ),
+    ).rejects.toMatchObject({
+      name: "TaskCreationIdentityConflictError",
+      conflicts: [{ taskId: "TASK-042-B", claimants: [ownerName] }],
+    });
+    expect(await fs.readdir(taskDir)).toEqual([ownerName]);
+  });
+
+  test("TASK-1345: exact second destination refuses before the fresh first child is written", async () => {
+    const taskDir = path.join(tempDir, "docs", "tasks");
+    const existing = makeDraft("TASK-042-B", "Existing B");
+    const existingPath = path.join(taskDir, "TASK-042-B-existing-b.md");
+    await fs.writeFile(existingPath, existing.markdown, "utf-8");
+    const before = await fs.readFile(existingPath, "utf-8");
+
+    await expect(
+      writeSubtaskSpecs([makeDraft("TASK-042-A", "Fresh A"), existing], adapter),
+    ).rejects.toThrow("already exists");
+    expect(await fs.readdir(taskDir)).toEqual([path.basename(existingPath)]);
+    expect(await fs.readFile(existingPath, "utf-8")).toBe(before);
+  });
+
+  test("TASK-1345: intra-batch duplicate declarations refuse the whole batch", async () => {
+    await expect(
+      writeSubtaskSpecs(
+        [makeDraft("TASK-042-A", "First A"), makeDraft("TASK-042-A", "Second A")],
+        adapter,
+      ),
+    ).rejects.toThrow("duplicate ids: TASK-042-A");
+    expect(await fs.readdir(path.join(tempDir, "docs", "tasks"))).toEqual([]);
+  });
+
   describe("commitSubtaskSpecs (TASK-900)", () => {
     function initGitRepo(repoRoot: string): void {
       execSync("git init -q -b main", { cwd: repoRoot });
@@ -400,6 +457,38 @@ describe("subtask-writer", () => {
       // The unrelated dirty file should still be uncommitted.
       const status = execSync("git status --porcelain src.ts", { cwd: tempDir, encoding: "utf-8" });
       expect(status).toMatch(/src\.ts/);
+    });
+
+    test("preserves unrelated pre-staged changes outside the path-limited commit", async () => {
+      const readmePath = path.join(tempDir, "README.md");
+      await fs.writeFile(readmePath, "# operator staged change\n", "utf-8");
+      execSync("git add README.md", { cwd: tempDir });
+
+      const specPath = path.join(tempDir, "docs", "tasks", "TASK-104-A-qux.md");
+      await fs.writeFile(specPath, "# TASK-104-A: Qux\n", "utf-8");
+
+      const result = await commitSubtaskSpecs(adapter, [specPath], "TASK-104");
+      expect(result.committed).toBe(true);
+
+      const committedPaths = execSync("git show --pretty=format: --name-only HEAD", {
+        cwd: tempDir,
+        encoding: "utf-8",
+      })
+        .trim()
+        .split(/\r?\n/);
+      expect(committedPaths).toEqual(["docs/tasks/TASK-104-A-qux.md"]);
+      expect(
+        execSync("git diff --cached --name-only", {
+          cwd: tempDir,
+          encoding: "utf-8",
+        }).trim(),
+      ).toBe("README.md");
+      expect(
+        execSync("git show HEAD:README.md", {
+          cwd: tempDir,
+          encoding: "utf-8",
+        }),
+      ).toBe("# test\n");
     });
 
     test("returns committed=false when spec is already committed (idempotent)", async () => {

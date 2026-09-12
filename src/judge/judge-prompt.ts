@@ -24,6 +24,12 @@ export interface JudgePromptInput {
   gitDiff: string;
   /** Verification results from the deterministic checks */
   verificationResults: VerificationResult;
+  /**
+   * Current adapter requirement flags keyed by command name. This lets a
+   * resumed judge safely interpret legacy checkpoints that predate explicit
+   * `required` and `status` result metadata.
+   */
+  verificationCommandRequirements?: Readonly<Record<string, boolean>>;
   /** Project-specific judge criteria (empty string if not present) */
   judgeCriteria: string;
   /** Pre-judge compliance check results (optional) */
@@ -52,7 +58,10 @@ export interface JudgePromptInput {
  * @param verification - The verification results from adapter verifiers
  * @returns Formatted string showing pass/fail status of each check
  */
-function formatVerificationResults(verification: VerificationResult): string {
+function formatVerificationResults(
+  verification: VerificationResult,
+  commandRequirements: Readonly<Record<string, boolean>> = {},
+): string {
   const lines: string[] = [];
 
   lines.push(`Overall: ${verification.allPassed ? "ALL PASSED" : "SOME FAILED"}`);
@@ -60,10 +69,28 @@ function formatVerificationResults(verification: VerificationResult): string {
 
   if (verification.commands.length > 0) {
     lines.push("### Verification Commands");
+    lines.push(
+      "Only entries marked FAIL (REQUIRED; BLOCKING) are deterministic verification failures. " +
+        "SKIPPED and OPTIONAL UNAVAILABLE entries are non-blocking evidence.",
+    );
     for (const cmd of verification.commands) {
-      const status = cmd.passed ? "PASS" : "FAIL";
-      lines.push(`- **${cmd.name}**: ${status}`);
-      if (!cmd.passed && cmd.output) {
+      const required = cmd.required ?? commandRequirements[cmd.name] ?? true;
+      const status =
+        cmd.status ?? (cmd.passed ? "passed" : required ? "failed" : "optional-unavailable");
+      const label =
+        status === "skipped"
+          ? required
+            ? "SKIPPED (REQUIRED; BLOCKING)"
+            : "SKIPPED (OPTIONAL; NON-BLOCKING)"
+          : status === "optional-unavailable" || (!cmd.passed && !required)
+            ? "OPTIONAL UNAVAILABLE (NON-BLOCKING)"
+            : cmd.passed
+              ? required
+                ? "PASS"
+                : "PASS (OPTIONAL)"
+              : "FAIL (REQUIRED; BLOCKING)";
+      lines.push(`- **${cmd.name}**: ${label}`);
+      if (status !== "passed" && cmd.output) {
         lines.push(`  Output: ${cmd.output}`);
       }
     }
@@ -248,6 +275,19 @@ dependencies as "not implemented" or "incomplete". Evaluate test coverage by whe
 the actual success criteria, not by mock fidelity. A test that mocks a database call to verify
 business logic is valid — the mock is not a deficiency.
 
+## Deterministic Verification Semantics
+
+The Verification Results section distinguishes required blocking checks from optional evidence.
+
+- FAIL (REQUIRED; BLOCKING) is a real deterministic failure and may block approval.
+- SKIPPED (OPTIONAL; NON-BLOCKING) means the check was deliberately not run.
+- OPTIONAL UNAVAILABLE (NON-BLOCKING) means an optional verifier could not produce a passing result.
+- Optional skipped or unavailable checks are NOT failed success criteria and MUST NOT be the sole basis
+  for REVISE or REJECT. Evaluate the task contract and diff normally; mention such checks only as
+  non-blocking context when useful.
+- The overall result is the aggregate of required checks. ALL PASSED can therefore coexist with
+  optional skipped or unavailable evidence without contradiction.
+
 ## Response Format
 
 You have read-only access to the codebase via Read, Glob, and Grep tools. Use them to verify claims.
@@ -384,6 +424,7 @@ export function buildJudgePrompt(input: JudgePromptInput): string {
     taskSpec,
     gitDiff,
     verificationResults,
+    verificationCommandRequirements,
     judgeCriteria,
     complianceChecks,
     parsedTask,
@@ -392,7 +433,10 @@ export function buildJudgePrompt(input: JudgePromptInput): string {
     specReview,
   } = input;
 
-  const formattedVerification = formatVerificationResults(verificationResults);
+  const formattedVerification = formatVerificationResults(
+    verificationResults,
+    verificationCommandRequirements,
+  );
   const successCriteria = extractSuccessCriteria(parsedTask, taskSpec);
 
   const complianceSection =

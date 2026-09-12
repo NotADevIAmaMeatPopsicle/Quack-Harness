@@ -203,7 +203,7 @@ export function createAuthMiddleware(auth: AuthService) {
     }
 
     // Allow unauthenticated access to specific paths
-    // SSE stream + dispatch jobs are open because internal services (notification bridge) consume them
+    // SSE stream + dispatch jobs are open because internal services (Quack-Quack) consume them
     // Task/settings/projects APIs are open because CLI tools (curl) need them
     const openPaths = [
       "/api/auth/login",

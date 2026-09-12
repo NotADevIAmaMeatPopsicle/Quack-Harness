@@ -9,8 +9,10 @@
 //
 // Scope honesty (the whole design): the typed directive surface
 // (importsToUse / entryPoints) gets full export resolution; every file
-// reference gets an existence check; free-text prose gets NOTHING here —
-// the cross-model reviewer remains the semantic backstop.
+// reference gets an existence check; mandated verification forms get
+// exact string/structural preservation checks. Free-text prose gets
+// NOTHING here — the cross-model reviewer remains the semantic backstop.
+// A preserved mandate is not proof the check or mutation/bite was run.
 //
 // Placement contract (round-1 F1, refined at build time): the stamp runs
 // inside generateBlueprint at every return path (success + all four
@@ -88,7 +90,7 @@ function resolveExport(source: string, symbol: string): "value" | "type" | "ambi
  * brief over ordinary sentences.
  */
 const PROSE_PATH_RE =
-  /(?:^|[\s(`'"])([A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|py|css|html))(?::\d+(?:-\d+)?)?(?=$|[\s)`'",;:])/g;
+  /(?:^|[\s(`'"])([A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|py|css|html))(?::\d+(?:-\d+)?)?(?=$|[\s)`'",;:.])/g;
 
 function extractProsePaths(text: string): string[] {
   const found = new Set<string>();
@@ -104,11 +106,54 @@ function extractProsePaths(text: string): string[] {
 }
 
 /**
+ * Resolve a path-shaped prose reference in the same way a TypeScript
+ * Node16/NodeNext source file resolves an ESM import. Blueprint prose often
+ * spells `./module.js` because that is the runtime import specifier even
+ * though the repository contains (or the task will create) `module.ts`.
+ *
+ * Return the repo-relative anchor used for diagnostics plus every legitimate
+ * source candidate. The caller still performs the existence/create-target
+ * checks, keeping this helper deterministic and filesystem-independent.
+ */
+function prosePathCandidates(
+  prosePath: string,
+  containingFile: string,
+): { anchor: string; candidates: string[] } {
+  const normalizedReference = prosePath.replace(/\\/g, "/");
+  const containingPath = containingFile
+    .trim()
+    .replace(/:\d+(?:-\d+)?$/, "")
+    .replace(/\\/g, "/");
+  const anchor =
+    normalizedReference.startsWith("./") || normalizedReference.startsWith("../")
+      ? path.posix.normalize(
+          path.posix.join(path.posix.dirname(containingPath), normalizedReference),
+        )
+      : path.posix.normalize(normalizedReference);
+  const candidates = [anchor];
+  const extension = path.posix.extname(anchor);
+  const sourceExtensions: Record<string, string[]> = {
+    ".js": [".ts", ".tsx"],
+    ".jsx": [".tsx", ".ts"],
+    ".mjs": [".mts"],
+    ".cjs": [".cts"],
+  };
+  for (const sourceExtension of sourceExtensions[extension] ?? []) {
+    candidates.push(anchor.slice(0, -extension.length) + sourceExtension);
+  }
+  return { anchor, candidates };
+}
+
+/**
  * Run the Tier D audit. Total function: never throws — unreadable
  * targets are violations, not crashes (a crashing auditor that silently
  * passed briefs would be QPI-046 all over again).
  */
-export function auditBriefFidelity(brief: Blueprint, projectRoot: string): BriefFidelityResult {
+export function auditBriefFidelity(
+  brief: Blueprint,
+  projectRoot: string,
+  mandatedChecks: readonly string[] = [],
+): BriefFidelityResult {
   const violations: BriefFidelityViolation[] = [];
   const imports = brief.importsToUse ?? [];
   const entryPoints = brief.entryPoints ?? [];
@@ -118,19 +163,47 @@ export function auditBriefFidelity(brief: Blueprint, projectRoot: string): Brief
   // is a FAILED brief, never a vacuous pass. Before this rule the stub
   // was cached as clean structured success and auto-approved.
   if (brief.fileAnalyses.length === 0 && imports.length === 0 && entryPoints.length === 0) {
-    return {
-      status: "failed",
-      violations: [
-        {
-          kind: "empty_brief",
-          detail:
-            "Brief has zero fileAnalyses and zero typed directives — the " +
-            "agent-failure stub shape. Re-synthesize; do not approve.",
-        },
-      ],
-      checkedAt: new Date().toISOString(),
-      scope: "typed-surface+file-existence",
-    };
+    violations.push({
+      kind: "empty_brief",
+      detail:
+        "Brief has zero fileAnalyses and zero typed directives — the " +
+        "agent-failure stub shape. Re-synthesize; do not approve.",
+    });
+  }
+
+  // TASK-1325: compare against the AUTHORITATIVE parsed task entries,
+  // never merely against the LLM-authored echo. Each source mandate must
+  // survive exactly on both brief surfaces: the top-level readable echo
+  // and a verificationPattern link. Equality is deliberately byte-for-byte
+  // after the task parser's ordinary bullet trim: no fuzzy matching, command
+  // rewriting, or expectation-strength inference, and zero LLM calls.
+  // Thus `expect: exactly-0` rewritten as `expect: 0+` is simply absent and
+  // fails. Extra brief checks/patterns remain allowed.
+  const authoritativeMandates = [
+    ...new Set(
+      mandatedChecks.filter((check) => typeof check === "string" && check.trim().length > 0),
+    ),
+  ];
+  const echoedMandates = brief.mandatedChecks ?? [];
+  const linkedMandates = brief.verificationPatterns
+    .map((pattern) => pattern.mandatedCheck)
+    .filter((check): check is string => typeof check === "string");
+  for (const mandate of authoritativeMandates) {
+    const missingSurfaces: string[] = [];
+    if (!echoedMandates.includes(mandate)) {
+      missingSurfaces.push("mandatedChecks echo");
+    }
+    if (!linkedMandates.includes(mandate)) {
+      missingSurfaces.push("verificationPatterns[].mandatedCheck");
+    }
+    if (missingSurfaces.length > 0) {
+      violations.push({
+        kind: "mandated_check_softened",
+        detail:
+          `Mandated check was omitted, rewritten, or softened on ${missingSurfaces.join(" and ")}: ` +
+          `"${mandate}". Preserve the exact task-authored form.`,
+      });
+    }
   }
 
   // File existence for every referenced file. Create-action analyses are
@@ -189,11 +262,18 @@ export function auditBriefFidelity(brief: Blueprint, projectRoot: string): Brief
       .filter(Boolean)
       .join("\n");
     for (const prosePath of extractProsePaths(prose)) {
-      if (createTargets.has(prosePath)) continue;
-      if (!anchorFileExists(prosePath, projectRoot)) {
+      const resolved = prosePathCandidates(prosePath, analysis.filePath);
+      const isDeclaredCreate = resolved.candidates.some((candidate) =>
+        createTargets.has(candidate),
+      );
+      const exists = resolved.candidates.some((candidate) =>
+        anchorFileExists(candidate, projectRoot),
+      );
+      if (isDeclaredCreate || exists) continue;
+      if (!anchorFileExists(resolved.anchor, projectRoot)) {
         flagMissing(
-          prosePath,
-          `fileAnalyses prose for ${analysis.filePath} references a nonexistent file: ${prosePath}`,
+          resolved.anchor,
+          `fileAnalyses prose for ${analysis.filePath} references a nonexistent file: ${resolved.anchor}`,
         );
       }
     }
@@ -259,7 +339,7 @@ export function auditBriefFidelity(brief: Blueprint, projectRoot: string): Brief
     status: violations.length > 0 ? "failed" : "ok",
     violations,
     checkedAt: new Date().toISOString(),
-    scope: "typed-surface+file-existence",
+    scope: "typed-surface+file-existence+mandated-checks",
   };
 }
 
@@ -268,6 +348,13 @@ export function auditBriefFidelity(brief: Blueprint, projectRoot: string): Brief
  * result, OVERWRITING any prior value (LLM-authored fidelity can never
  * survive a fresh synthesis — the stampBriefProvenance pattern).
  */
-export function stampBriefFidelity(brief: Blueprint, projectRoot: string): Blueprint {
-  return { ...brief, fidelity: auditBriefFidelity(brief, projectRoot) };
+export function stampBriefFidelity(
+  brief: Blueprint,
+  projectRoot: string,
+  mandatedChecks: readonly string[] = [],
+): Blueprint {
+  return {
+    ...brief,
+    fidelity: auditBriefFidelity(brief, projectRoot, mandatedChecks),
+  };
 }

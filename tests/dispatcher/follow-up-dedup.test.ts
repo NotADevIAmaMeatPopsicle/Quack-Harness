@@ -9,16 +9,52 @@ import {
   appendLinkedFromComment,
 } from "../../src/dispatcher/follow-up-dedup.js";
 import type { BacklogEntry } from "../../src/dispatcher/follow-up-dedup.js";
+import type { ProjectAdapter } from "../../src/core/adapter-loader.js";
+import { withCanonicalTaskSpecMutationFence } from "../../src/preflight/canonical-task-spec-mutation.js";
 import * as fsPromises from "node:fs/promises";
 
 jest.mock("node:fs/promises");
+jest.mock("../../src/preflight/canonical-task-spec-mutation.js");
 
 const mockFs = fsPromises as jest.Mocked<typeof fsPromises>;
+const mockMutationFence = withCanonicalTaskSpecMutationFence as jest.MockedFunction<
+  typeof withCanonicalTaskSpecMutationFence
+>;
+const TEST_ADAPTER = { projectRoot: "/project" } as ProjectAdapter;
+
+function taskSpec(
+  taskId: string,
+  title: string,
+  status: "BACKLOG" | "READY" | "COMPLETE" = "BACKLOG",
+  tags: readonly string[] = [],
+): string {
+  return [
+    `# ${taskId}: ${title}`,
+    "",
+    "## Metadata",
+    "- **Priority:** P2-MEDIUM",
+    "- **Effort:** 1-2 hours",
+    `- **Status:** ${status}`,
+    "- **Blocked By:** []",
+    "- **Blocks:** []",
+    `- **Tags:** ${tags.join(", ")}`,
+    "",
+    "## Problem Statement",
+    "Exercise follow-up de-duplication with a parser-valid canonical task spec.",
+    "",
+    "## Success Criteria",
+    "- [ ] The duplicate is identified.",
+    "",
+    "## Testing Requirements",
+    "- [ ] The de-duplication test passes.",
+    "",
+  ].join("\n");
+}
 
 const BACKLOG: BacklogEntry[] = [
   {
     taskId: "TASK-100",
-    title: "Add retry logic to external-provider sync",
+    title: "Add retry logic to phorest sync",
     tags: ["sync", "retry"],
     filePath: "/tasks/TASK-100-add-retry.md",
   },
@@ -47,19 +83,13 @@ describe("levenshteinSimilarity", () => {
 
   it("returns high similarity for near-identical strings", () => {
     expect(
-      levenshteinSimilarity(
-        "Add retry logic to external-provider",
-        "Add retry logic to external-provider sync",
-      ),
+      levenshteinSimilarity("Add retry logic to phorest", "Add retry logic to phorest sync"),
     ).toBeGreaterThan(0.7);
   });
 
   it("returns low similarity for completely different strings", () => {
     expect(
-      levenshteinSimilarity(
-        "Refactor unrelated module",
-        "Add retry logic to external-provider sync",
-      ),
+      levenshteinSimilarity("Refactor unrelated module", "Add retry logic to phorest sync"),
     ).toBeLessThan(0.5);
   });
 });
@@ -75,24 +105,21 @@ describe("tokenOverlap", () => {
 
   it("returns high overlap for strings with shared tokens", () => {
     expect(
-      tokenOverlap(
-        "Add retry logic to external-provider sync",
-        "Add retry logic to external-provider",
-      ),
+      tokenOverlap("Add retry logic to phorest sync", "Add retry logic to phorest"),
     ).toBeGreaterThan(0.7);
   });
 
   it("returns low overlap for unrelated strings", () => {
     expect(
-      tokenOverlap("Refactor unrelated module", "Add retry logic to external-provider sync"),
+      tokenOverlap("Refactor unrelated module", "Add retry logic to phorest sync"),
     ).toBeLessThan(0.3);
   });
 });
 
 describe("combinedSimilarity", () => {
   it("returns max of levenshtein and token overlap", () => {
-    const a = "Add retry logic to external-provider sync";
-    const b = "Add retry logic to external-provider";
+    const a = "Add retry logic to phorest sync";
+    const b = "Add retry logic to phorest";
     const lev = levenshteinSimilarity(a, b);
     const tok = tokenOverlap(a, b);
     expect(combinedSimilarity(a, b)).toBe(Math.max(lev, tok));
@@ -105,12 +132,12 @@ describe("combinedSimilarity", () => {
 
 describe("findSimilarTask", () => {
   it("returns existing task for exact title match", () => {
-    const result = findSimilarTask("Add retry logic to external-provider sync", BACKLOG);
+    const result = findSimilarTask("Add retry logic to phorest sync", BACKLOG);
     expect(result?.taskId).toBe("TASK-100");
   });
 
   it("returns existing task for near-match title (>= 70% similarity)", () => {
-    const result = findSimilarTask("Add retry logic to external-provider", BACKLOG);
+    const result = findSimilarTask("Add retry logic to phorest", BACKLOG);
     expect(result?.taskId).toBe("TASK-100");
   });
 
@@ -125,29 +152,20 @@ describe("findSimilarTask", () => {
   });
 
   it("returns null when ignored patterns match the title", () => {
-    const ignoredPatterns = ["Add retry logic to external-provider sync"];
+    const ignoredPatterns = ["Add retry logic to phorest sync"];
     // Title matches ignore list → returns null (suppressed)
-    const result = findSimilarTask(
-      "Add retry logic to external-provider sync",
-      BACKLOG,
-      ignoredPatterns,
-    );
+    const result = findSimilarTask("Add retry logic to phorest sync", BACKLOG, ignoredPatterns);
     expect(result).toBeNull();
   });
 
   it("respects custom threshold", () => {
     // With threshold 0.99, near-match should NOT return a result
-    const result = findSimilarTask(
-      "Add retry logic to external-provider",
-      BACKLOG,
-      undefined,
-      0.99,
-    );
+    const result = findSimilarTask("Add retry logic to phorest", BACKLOG, undefined, 0.99);
     expect(result).toBeNull();
   });
 
   it("uses default threshold of 0.7", () => {
-    // "Add retry logic" has decent overlap with "Add retry logic to external-provider sync"
+    // "Add retry logic" has decent overlap with "Add retry logic to phorest sync"
     const result = findSimilarTask("Add retry logic", BACKLOG);
     // With 0.7 threshold this might or might not match depending on exact scores
     // The important thing is it doesn't throw
@@ -174,10 +192,10 @@ describe("loadBacklogEntries", () => {
     // readdir sorts descending, so TASK-101 is read first then TASK-100
     mockFs.readFile
       .mockResolvedValueOnce(
-        `# TASK-101: Refactor analytics module\n\n## Metadata\n- **Status:** READY\n- **Tags:** analytics, refactoring\n`,
+        taskSpec("TASK-101", "Refactor analytics module", "READY", ["analytics", "refactoring"]),
       )
       .mockResolvedValueOnce(
-        `# TASK-100: Add retry logic to external-provider sync\n\n## Metadata\n- **Status:** BACKLOG\n- **Tags:** sync, retry\n`,
+        taskSpec("TASK-100", "Add retry logic to phorest sync", "BACKLOG", ["sync", "retry"]),
       );
 
     const result = await loadBacklogEntries("/tasks");
@@ -185,7 +203,7 @@ describe("loadBacklogEntries", () => {
     // First entry after desc sort is TASK-101
     expect(result[0].title).toBe("Refactor analytics module");
     expect(result[0].tags).toContain("analytics");
-    expect(result[1].title).toBe("Add retry logic to external-provider sync");
+    expect(result[1].title).toBe("Add retry logic to phorest sync");
     expect(result[1].tags).toContain("sync");
   });
 
@@ -194,7 +212,7 @@ describe("loadBacklogEntries", () => {
       ReturnType<typeof fsPromises.readdir>
     >);
     mockFs.readFile.mockResolvedValue(
-      `# TASK-200: Some completed task\n\n## Metadata\n- **Status:** COMPLETE\n- **Tags:** foo\n`,
+      taskSpec("TASK-200", "Some completed task", "COMPLETE", ["foo"]),
     );
 
     const result = await loadBacklogEntries("/tasks");
@@ -219,12 +237,15 @@ describe("loadBacklogEntries", () => {
     mockFs.readdir.mockResolvedValue(
       files as unknown as Awaited<ReturnType<typeof fsPromises.readdir>>,
     );
-    mockFs.readFile.mockResolvedValue(
-      `# TASK-001: Some backlog task\n\n## Metadata\n- **Status:** BACKLOG\n- **Tags:** foo\n`,
-    );
+    mockFs.readFile.mockImplementation(((filePath: string | Buffer | URL) => {
+      const match = filePath.toString().match(/TASK-(\d+)/);
+      return Promise.resolve(
+        taskSpec(`TASK-${match?.[1] ?? "001"}`, "Some backlog task", "BACKLOG", ["foo"]),
+      );
+    }) as typeof fsPromises.readFile);
 
     const result = await loadBacklogEntries("/tasks");
-    expect(result.length).toBeLessThanOrEqual(30);
+    expect(result).toHaveLength(30);
   });
 });
 
@@ -263,13 +284,18 @@ describe("loadIgnoreList", () => {
 describe("appendLinkedFromComment", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockMutationFence.mockImplementation((async (input) => {
+      if (input.authorize && !(await input.authorize())) return undefined;
+      await mockFs.writeFile(input.taskFilePath, input.replacementContent, "utf-8");
+      return input.afterWrite?.();
+    }) as typeof withCanonicalTaskSpecMutationFence);
   });
 
   it("appends comment to existing file", async () => {
     mockFs.readFile.mockResolvedValue("# TASK-100: Some task\n\nContent here.\n");
     mockFs.writeFile.mockResolvedValue(undefined);
 
-    await appendLinkedFromComment("/tasks/TASK-100.md", "TASK-200");
+    await appendLinkedFromComment("/tasks/TASK-100.md", "TASK-100", "TASK-200", TEST_ADAPTER);
 
     expect(mockFs.writeFile).toHaveBeenCalledWith(
       "/tasks/TASK-100.md",
@@ -283,7 +309,7 @@ describe("appendLinkedFromComment", () => {
       "# TASK-100: Some task\n\n<!-- Also flagged by judge run for TASK-200 -->\n",
     );
 
-    await appendLinkedFromComment("/tasks/TASK-100.md", "TASK-200");
+    await appendLinkedFromComment("/tasks/TASK-100.md", "TASK-100", "TASK-200", TEST_ADAPTER);
 
     expect(mockFs.writeFile).not.toHaveBeenCalled();
   });
@@ -293,7 +319,7 @@ describe("appendLinkedFromComment", () => {
 
     // Should not throw
     await expect(
-      appendLinkedFromComment("/tasks/TASK-100.md", "TASK-200"),
+      appendLinkedFromComment("/tasks/TASK-100.md", "TASK-100", "TASK-200", TEST_ADAPTER),
     ).resolves.toBeUndefined();
     expect(mockFs.writeFile).not.toHaveBeenCalled();
   });
@@ -305,10 +331,10 @@ describe("integration: duplicate follow-ups across two task runs", () => {
   });
 
   it("creates spec on first run, appends linked-from comment on second run (no duplicate)", async () => {
-    const followUpTitle = "Add retry logic to external-provider sync";
+    const followUpTitle = "Add retry logic to phorest sync";
     const taskDir = "/project/docs/tasks";
-    const parentTaskId1 = "TASK-200";
     const parentTaskId2 = "TASK-201";
+    const followUpTaskId = "TASK-0200";
 
     // --- First run: no backlog match exists yet ---
     // loadBacklogEntries returns empty (no existing follow-ups)
@@ -325,7 +351,7 @@ describe("integration: duplicate follow-ups across two task runs", () => {
 
     // Simulate creating the spec file (this is what createFollowUpTasks does)
     mockFs.writeFile.mockResolvedValueOnce(undefined);
-    const specPath = `${taskDir}/${parentTaskId1}-FU1-add-retry-logic-to-external-provider-sync.md`;
+    const specPath = `${taskDir}/${followUpTaskId}-add-retry-logic-to-phorest-sync.md`;
     await fsPromises.writeFile(specPath, "# Spec content", "utf-8");
     expect(mockFs.writeFile).toHaveBeenCalledTimes(1);
     expect(mockFs.writeFile).toHaveBeenCalledWith(specPath, "# Spec content", "utf-8");
@@ -335,27 +361,36 @@ describe("integration: duplicate follow-ups across two task runs", () => {
 
     // loadBacklogEntries returns the spec created in run 1
     mockFs.readdir.mockResolvedValueOnce([
-      `${parentTaskId1}-FU1-add-retry-logic-to-external-provider-sync.md`,
+      `${followUpTaskId}-add-retry-logic-to-phorest-sync.md`,
     ] as unknown as Awaited<ReturnType<typeof fsPromises.readdir>>);
     mockFs.readFile.mockResolvedValueOnce(
-      `# ${parentTaskId1}-FU1: Add retry logic to external-provider sync\n\n## Metadata\n- **Status:** BACKLOG\n- **Tags:** follow-up, optimization, auto-generated\n`,
+      taskSpec(followUpTaskId, "Add retry logic to phorest sync", "BACKLOG", [
+        "follow-up",
+        "optimization",
+        "auto-generated",
+      ]),
     );
 
     const backlogBeforeSecondRun = await loadBacklogEntries(taskDir);
     expect(backlogBeforeSecondRun).toHaveLength(1);
-    expect(backlogBeforeSecondRun[0].title).toBe("Add retry logic to external-provider sync");
+    expect(backlogBeforeSecondRun[0].title).toBe("Add retry logic to phorest sync");
 
     // findSimilarTask finds the existing spec → caller should NOT create a new spec
     const matchSecond = findSimilarTask(followUpTitle, backlogBeforeSecondRun);
     expect(matchSecond).not.toBeNull();
-    expect(matchSecond?.taskId).toContain(parentTaskId1);
+    expect(matchSecond?.taskId).toBe(followUpTaskId);
 
     // Append linked-from comment to existing spec instead of creating new one
     mockFs.readFile.mockResolvedValueOnce(
-      `# ${parentTaskId1}-FU1: Add retry logic to external-provider sync\n\nContent.\n`,
+      taskSpec(followUpTaskId, "Add retry logic to phorest sync", "BACKLOG", ["follow-up"]),
     );
     mockFs.writeFile.mockResolvedValueOnce(undefined);
-    await appendLinkedFromComment(matchSecond!.filePath, parentTaskId2);
+    await appendLinkedFromComment(
+      matchSecond!.filePath,
+      matchSecond!.taskId,
+      parentTaskId2,
+      TEST_ADAPTER,
+    );
 
     // writeFile was called for the append, but NOT for creating a new spec
     expect(mockFs.writeFile).toHaveBeenCalledTimes(1);

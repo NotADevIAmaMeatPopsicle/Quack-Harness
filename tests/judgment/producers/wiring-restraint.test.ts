@@ -21,10 +21,12 @@ const PRODUCER_FREE_FILES = [
 // dispatcher's snapshot re-derivation closures were extracted to
 // snapshot-signals.ts (which wraps signal-injection), so the dispatcher
 // no longer imports signal-injection directly — its producer surface
-// NARROWED to the two modules below.
+// NARROWED to the three modules below. branch-mutation is the single
+// fail-closed producer for protected/base branch collision evidence.
 const DISPATCHER_ALLOWED_PRODUCER_IMPORTS = [
   "../judgment/producers/snapshot-signals.js",
   "../judgment/producers/machinery-integrity.js",
+  "../judgment/producers/branch-mutation.js",
 ];
 
 describe("TASK-1312/1313 wiring restraint", () => {

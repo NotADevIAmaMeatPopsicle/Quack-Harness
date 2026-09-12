@@ -226,34 +226,3 @@ describe.each<FixtureCreationOrder>(["child-first", "parent-first"])(
     });
   },
 );
-
-describe("TASK-1339-A: adjacent sync-map concurrency defect", () => {
-  // DEFECT: Manual HTTP sync and the periodic poller can overlap writes to the
-  // same non-atomic sync-map file, producing transient JSON parse failures.
-  it.skip("serializes manual sync with the periodic poller", async () => {
-    const fixture = createDivergentTaskFixture("child-first", { prefix: "quack-sync-race-" });
-    writeTestAdapter(fixture.root, {
-      reportBack: false,
-      pollEnabled: true,
-      pollIntervalMs: 1_000_000,
-      statusSyncIntervalMs: 20,
-    });
-    writeLegacySyncMap(fixture);
-    const adapter = await loadAdapter(fixture.root);
-    const port = await freePort();
-    const monitor = createMonitorServer({
-      port,
-      quackRoot: fixture.root,
-      projectAdapters: [adapter],
-    });
-    const started = await monitor.start();
-
-    try {
-      const responses = await Promise.all(Array.from({ length: 10 }, () => postSync(port)));
-      expect(responses.every((response) => response.status === 200)).toBe(true);
-    } finally {
-      await started.stop();
-      fixture.cleanup();
-    }
-  });
-});

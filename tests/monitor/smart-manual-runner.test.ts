@@ -7,6 +7,7 @@ jest.mock("node:child_process", () => ({
   spawn: jest.fn(),
   exec: jest.fn(),
   execSync: jest.fn(),
+  execFileSync: jest.fn(),
   execFile: jest.fn(),
 }));
 
@@ -34,7 +35,7 @@ jest.mock("../../src/testing/test-formatter", () => ({
   },
 }));
 
-import { spawn, execSync } from "node:child_process";
+import { spawn, execSync, execFileSync } from "node:child_process";
 import { TestRunner } from "../../src/monitor/server";
 
 class FakeChildProcess extends EventEmitter {
@@ -46,6 +47,7 @@ class FakeChildProcess extends EventEmitter {
 
 const mockSpawn = spawn as jest.MockedFunction<typeof spawn>;
 const mockExecSync = execSync as jest.MockedFunction<typeof execSync>;
+const mockExecFileSync = execFileSync as jest.MockedFunction<typeof execFileSync>;
 
 function makeProjectRoot(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-smart-manual-"));
@@ -64,6 +66,12 @@ describe("TestRunner smart manual runs", () => {
       if (text.includes("git status --porcelain")) return "" as ReturnType<typeof execSync>;
       if (text.includes("git rev-parse HEAD")) return "abc123\n" as ReturnType<typeof execSync>;
       return "" as ReturnType<typeof execSync>;
+    });
+    mockExecFileSync.mockImplementation((_file: string, args?: readonly string[]) => {
+      const text = (args ?? []).join(" ");
+      if (text.includes("status --porcelain")) return "";
+      if (text.includes("rev-parse HEAD")) return "abc123\n";
+      return "";
     });
   });
 

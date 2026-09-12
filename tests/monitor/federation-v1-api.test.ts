@@ -6,6 +6,21 @@ import * as http from "node:http";
 import { execFileSync } from "node:child_process";
 
 import { createMonitorServer } from "../../src/monitor/server";
+import { QuackDB } from "../../src/db";
+import {
+  loadFederatedJob,
+  saveFederatedJob,
+  setFederatedJobLockOptionsForTests,
+  updateFederatedJob,
+} from "../../src/monitor/federation/store";
+import { broadcastWorkerRefreshCommand } from "../../src/monitor/federation/host";
+import type { FederatedJobRecord, FederatedMergeBinding } from "../../src/monitor/federation/types";
+import type {
+  FederatedMergeBoundary,
+  FederatedMergeBoundaryInput,
+  FederatedMergeExecutionInput,
+  FederatedMergeResult,
+} from "../../src/monitor/federation/orchestration";
 
 function parseJson<T>(raw: string): T {
   return JSON.parse(raw) as T;
@@ -31,6 +46,17 @@ function writeAuthConfig(quackRoot: string): void {
           {
             id: "fed-test",
             tokenHash: sha256("fed-token"),
+            scopes: [
+              "federation:write",
+              "listener:admin",
+              "listener:read",
+              "listener:register",
+              "listener:heartbeat",
+            ],
+          },
+          {
+            id: "other-worker",
+            tokenHash: sha256("other-token"),
             scopes: [
               "federation:write",
               "listener:admin",
@@ -255,7 +281,105 @@ function initGitMergeFixture(projectRoot: string): void {
   git(projectRoot, ["checkout", "dev"]);
 }
 
-function writeMergeReadyReview(projectRoot: string, taskId: string, reviewId: string): void {
+function optionalGit(projectRoot: string, args: string[]): string[] {
+  try {
+    return git(projectRoot, args)
+      .split(/\r?\n/u)
+      .map((value) => value.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function fixtureRepository(projectRoot: string): FederatedMergeBinding["repository"] {
+  const origin = git(projectRoot, ["remote", "get-url", "origin"]);
+  const repo = path
+    .basename(origin)
+    .replace(/\.git$/iu, "")
+    .replace(/[^A-Za-z0-9_.-]/gu, "-");
+  return { host: "github.test", owner: "federation-fixture", repo };
+}
+
+function assertFixturePushDestination(projectRoot: string): void {
+  const origin = path.resolve(git(projectRoot, ["remote", "get-url", "origin"]));
+  const pushUrls = optionalGit(projectRoot, ["config", "--get-all", "remote.origin.pushurl"]);
+  if (pushUrls.length > 1 || (pushUrls[0] && path.resolve(pushUrls[0]) !== origin)) {
+    throw new Error("fixture push destination changed after repository identity was sealed");
+  }
+}
+
+function sealFixtureFederatedMerge(
+  input: FederatedMergeBoundaryInput,
+): Promise<FederatedMergeBinding> {
+  assertFixturePushDestination(input.projectRoot);
+  const sourceCommitSha = git(input.projectRoot, [
+    "rev-parse",
+    "--verify",
+    `refs/heads/${input.sourceBranch}`,
+  ]);
+  if (sourceCommitSha.toLowerCase() !== input.sourceCommitSha.toLowerCase()) {
+    throw new Error("fixture source branch changed after completion was reported");
+  }
+  return Promise.resolve({
+    version: 1,
+    repository: fixtureRepository(input.projectRoot),
+    sourceBranch: input.sourceBranch,
+    sourceCommitSha: input.sourceCommitSha.toLowerCase(),
+    targetBranch: input.targetBranch,
+    publicationNonce: "00000000-0000-4000-8000-000000000001",
+    sealedAt: new Date().toISOString(),
+  });
+}
+
+function mergeFixtureFederatedBranch(
+  input: FederatedMergeExecutionInput,
+): Promise<FederatedMergeResult> {
+  assertFixturePushDestination(input.projectRoot);
+  const repository = fixtureRepository(input.projectRoot);
+  if (JSON.stringify(repository) !== JSON.stringify(input.binding.repository)) {
+    return Promise.resolve({
+      ok: false,
+      error: "fixture repository identity changed",
+      commands: 0,
+    });
+  }
+  const sourceCommitSha = git(input.projectRoot, [
+    "rev-parse",
+    "--verify",
+    `refs/heads/${input.sourceBranch}`,
+  ]);
+  if (sourceCommitSha.toLowerCase() !== input.binding.sourceCommitSha.toLowerCase()) {
+    return Promise.resolve({ ok: false, error: "fixture source branch changed", commands: 0 });
+  }
+  try {
+    git(input.projectRoot, ["checkout", input.targetBranch]);
+    git(input.projectRoot, ["pull", "--ff-only", "origin", input.targetBranch]);
+    git(input.projectRoot, ["merge", "--squash", input.binding.sourceCommitSha]);
+    git(input.projectRoot, [
+      "commit",
+      "-m",
+      `feat(${input.taskId.toLowerCase()}): merge federated work`,
+    ]);
+    const commitSha = git(input.projectRoot, ["rev-parse", "HEAD"]);
+    assertFixturePushDestination(input.projectRoot);
+    git(input.projectRoot, ["push", "origin", `${commitSha}:refs/heads/${input.targetBranch}`]);
+    return Promise.resolve({ ok: true, commitSha, commands: 5 });
+  } catch (error: unknown) {
+    return Promise.resolve({
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+      commands: 0,
+    });
+  }
+}
+
+function writeMergeReadyReview(
+  projectRoot: string,
+  taskId: string,
+  reviewId: string,
+  commitSha?: string,
+): void {
   const reviewsDir = path.join(projectRoot, ".quack", "reviews");
   fs.mkdirSync(reviewsDir, { recursive: true });
   fs.writeFileSync(
@@ -264,6 +388,7 @@ function writeMergeReadyReview(projectRoot: string, taskId: string, reviewId: st
       {
         taskId,
         reviewId,
+        ...(commitSha ? { commitSha } : {}),
         verdict: "VERIFIED",
         docsImpact: "none",
         wikiArtifacts: [],
@@ -342,7 +467,8 @@ async function httpPost(
   url: string,
   data: Record<string, unknown>,
   token = "fed-token",
-): Promise<{ status: number; body: string }> {
+  timeoutMs?: number,
+): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
     const urlObj = new URL(url);
     const postData = JSON.stringify(data);
@@ -364,14 +490,71 @@ async function httpPost(
         res.on("data", (chunk: Buffer | string) => {
           body += typeof chunk === "string" ? chunk : chunk.toString("utf-8");
         });
-        res.on("end", () => resolve({ status: res.statusCode ?? 0, body }));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body, headers: res.headers }));
         res.on("error", reject);
       },
     );
     req.on("error", reject);
+    if (timeoutMs)
+      req.setTimeout(timeoutMs, () =>
+        req.destroy(new Error("Bounded federation request timed out")),
+      );
     req.write(postData);
     req.end();
   });
+}
+
+function createStaleMergeDiagnostic(projectRoot: string, quackRoot: string) {
+  const startedAt = Date.now();
+  const parent = path.join(process.cwd(), ".dev", "stale-merge-diagnostics");
+  let evidenceDir: string | undefined;
+  if (process.env.QUACK_STALE_MERGE_DIAGNOSTICS === "1") {
+    fs.mkdirSync(parent, { recursive: true });
+    evidenceDir = fs.mkdtempSync(path.join(parent, "run-"));
+  }
+  const record = (phase: string, details: Record<string, unknown> = {}): void => {
+    if (!evidenceDir) return;
+    const fd = fs.openSync(path.join(evidenceDir, "phases.jsonl"), "a", 0o600);
+    try {
+      fs.writeSync(
+        fd,
+        JSON.stringify({
+          phase,
+          elapsedMs: Date.now() - startedAt,
+          ...details,
+        }) + "\n",
+      );
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  };
+  let preserved = false;
+  const preserve = (reason: string): void => {
+    if (preserved) return;
+    preserved = true;
+    try {
+      record("fixture.preserved", { reason, projectRoot, quackRoot });
+      if (evidenceDir) {
+        const federation = path.join(projectRoot, ".quack", "federation");
+        if (fs.existsSync(federation))
+          fs.cpSync(federation, path.join(evidenceDir, "federation-before-stop"), {
+            recursive: true,
+          });
+      }
+    } catch (error) {
+      // Evidence I/O must not skip the real server stop after a failed test.
+      console.warn("Stale merge diagnostic capture failed", error);
+    }
+    console.warn("Preserved stale merge fixture", {
+      reason,
+      projectRoot,
+      quackRoot,
+      evidenceDir,
+    });
+  };
+  record("test.started", { projectRoot, quackRoot, timeoutMs: 30_000 });
+  return { projectRoot, passed: false, record, preserve };
 }
 
 describe("v1 federation API", () => {
@@ -379,6 +562,13 @@ describe("v1 federation API", () => {
   let quackRoot: string;
   let stop: (() => Promise<void>) | null = null;
   let baseUrl: string;
+  let federationMergeFailure: string | undefined;
+  let federationMergeFailureAfterPush: string | undefined;
+  let federationMergeCalls: FederatedMergeExecutionInput[];
+  let federationMergeReceipts: Map<string, string>;
+  let federationMergeHook: ((input: FederatedMergeExecutionInput) => Promise<void>) | undefined;
+  let federationRefreshHook: (() => Promise<void>) | undefined;
+  let staleMergeDiagnostic: ReturnType<typeof createStaleMergeDiagnostic> | undefined;
 
   beforeEach(async () => {
     projectRoot = makeTempDir("quack-federation-project-");
@@ -388,29 +578,192 @@ describe("v1 federation API", () => {
     writeCcusageCache(projectRoot);
     writeTaskFile(projectRoot, "TASK-838");
     writePassingPrep(projectRoot, "TASK-838");
+    federationMergeFailure = undefined;
+    federationMergeFailureAfterPush = undefined;
+    federationMergeCalls = [];
+    federationMergeReceipts = new Map();
+    federationMergeHook = undefined;
+    federationRefreshHook = undefined;
+    staleMergeDiagnostic = undefined;
 
-    const port = 47000 + Math.floor(Math.random() * 1000);
+    const federationMergeBoundary: FederatedMergeBoundary = {
+      seal: async (input) => {
+        const diagnostic =
+          staleMergeDiagnostic?.projectRoot === input.projectRoot
+            ? staleMergeDiagnostic
+            : undefined;
+        diagnostic?.record("seal.started");
+        try {
+          const binding = await sealFixtureFederatedMerge(input);
+          diagnostic?.record("seal.completed", { binding });
+          return binding;
+        } catch (error) {
+          diagnostic?.record("seal.failed", { error: String(error) });
+          throw error;
+        }
+      },
+      merge: async (input) => {
+        federationMergeCalls.push(input);
+        await federationMergeHook?.(input);
+        const receipt = federationMergeReceipts.get(input.binding.publicationNonce);
+        if (receipt) return { ok: true, commitSha: receipt, commands: 1 };
+        if (federationMergeFailure) {
+          return { ok: false, error: federationMergeFailure, commands: 0 };
+        }
+        const diagnostic =
+          staleMergeDiagnostic?.projectRoot === input.projectRoot
+            ? staleMergeDiagnostic
+            : undefined;
+        diagnostic?.record("merge.git.started");
+        const result = await mergeFixtureFederatedBranch(input);
+        diagnostic?.record("merge.git.completed", { result });
+        if (result.ok)
+          federationMergeReceipts.set(input.binding.publicationNonce, result.commitSha);
+        if (result.ok && federationMergeFailureAfterPush) {
+          return { ok: false, error: federationMergeFailureAfterPush, commands: result.commands };
+        }
+        return result;
+      },
+    };
+
     const server = createMonitorServer({
       projectRoot,
       taskDir: "docs/tasks",
       logDir: path.join(projectRoot, ".quack", "logs"),
       quackRoot,
-      port,
+      port: 0,
+      host: "127.0.0.1",
+      federationMergeBoundary,
+      federationBroadcastRefresh: async (...args) => {
+        await federationRefreshHook?.();
+        return broadcastWorkerRefreshCommand(...args);
+      },
     });
     const started = await server.start();
     stop = started.stop;
-    baseUrl = `http://127.0.0.1:${port}`;
+    baseUrl = `http://127.0.0.1:${started.port}`;
     await pause(150);
   });
 
   afterEach(async () => {
-    if (stop) {
-      await stop();
-      stop = null;
+    const diagnostic = staleMergeDiagnostic;
+    // Capture this before awaiting real shutdown: a timed-out body can still finish later.
+    const preserveFixture = diagnostic !== undefined && !diagnostic.passed;
+    if (preserveFixture) diagnostic.preserve("test_failed_or_did_not_finish");
+    try {
+      if (stop) {
+        await stop();
+        stop = null;
+      }
+    } catch (error) {
+      diagnostic?.preserve("shutdown_failed");
+      throw error;
     }
     await pause(150);
-    await cleanupDir(projectRoot);
-    await cleanupDir(quackRoot);
+    if (!preserveFixture) {
+      await cleanupDir(projectRoot);
+      await cleanupDir(quackRoot);
+    }
+  });
+
+  async function registerListener(hostId: string, token = "fed-token"): Promise<void> {
+    const registered = await httpPost(
+      `${baseUrl}/v1/listeners/register`,
+      {
+        hostId,
+        capabilities: ["dispatch"],
+        healthy: true,
+        currentLoad: 0,
+        maxConcurrentJobs: 1,
+      },
+      token,
+    );
+    expect(registered.status).toBe(201);
+  }
+
+  it("surfaces each malformed listener while retaining valid workers in listener and queue reads", async () => {
+    await registerListener("healthy-worker");
+    const directory = path.join(projectRoot, ".quack", "federation", "listeners");
+    const malformed = "{not-json";
+    fs.writeFileSync(path.join(directory, "broken-worker.json"), malformed);
+    const listeners = await httpGet(`${baseUrl}/v1/listeners`);
+    expect(listeners.status).toBe(200);
+    expect(JSON.parse(listeners.body)).toMatchObject({
+      listeners: [{ id: "healthy-worker" }],
+      registryHealth: {
+        healthy: false,
+        unavailable: false,
+        issues: [{ file: "broken-worker.json", code: "malformed_json" }],
+      },
+    });
+    const queue = await httpGet(`${baseUrl}/v1/federation/queue`);
+    expect(queue.status).toBe(200);
+    expect(JSON.parse(queue.body)).toMatchObject({
+      summary: {
+        hosts: expect.arrayContaining([
+          expect.objectContaining({ id: "healthy-worker" }),
+        ]) as unknown,
+        listenerRegistry: {
+          healthy: false,
+          issues: [{ file: "broken-worker.json", code: "malformed_json" }],
+        },
+      },
+    });
+    for (const operation of [
+      {
+        route: "/v1/listeners/register",
+        body: { hostId: "broken-worker", capabilities: ["dispatch"] },
+      },
+      { route: "/v1/listeners/broken-worker/heartbeat", body: { healthy: true } },
+      {
+        route: "/v1/listeners/broken-worker/commands/ack",
+        body: { commandIds: ["fixture-command"] },
+      },
+    ]) {
+      const response = await httpPost(
+        `${baseUrl}${operation.route}`,
+        operation.body,
+        "fed-token",
+        2000,
+      );
+      expect(response.status).toBe(503);
+      expect(JSON.parse(response.body)).toMatchObject({
+        error: "listener_registry_unavailable",
+        issue: { code: "malformed_json" },
+      });
+    }
+    expect(fs.readFileSync(path.join(directory, "broken-worker.json"), "utf-8")).toBe(malformed);
+  });
+
+  it("coalesces repeated HTTP enqueue into one job and one queued event", async () => {
+    const requests = await Promise.all([
+      httpPost(`${baseUrl}/v1/federation/queue`, { taskId: "TASK-838", autoSchedule: false }),
+      httpPost(`${baseUrl}/v1/federation/queue`, { taskId: "TASK-838", autoSchedule: false }),
+    ]);
+    expect(requests.map((request) => request.status)).toEqual([202, 202]);
+    const results = requests.map((request) =>
+      parseJson<{ reused: boolean; job: { jobId: string } }>(request.body),
+    );
+    expect(results.filter((result) => result.reused)).toHaveLength(1);
+    expect(results[0].job.jobId).toBe(results[1].job.jobId);
+    const file = path.join(
+      projectRoot,
+      ".quack",
+      "logs",
+      `events-federation-${results[0].job.jobId}.jsonl`,
+    );
+    const queued = fs
+      .readFileSync(file, "utf-8")
+      .split("\n")
+      .filter((line) => line.includes('"status":"queued"'));
+    expect(queued).toHaveLength(1);
+    const conflict = await httpPost(`${baseUrl}/v1/federation/queue`, {
+      taskId: "TASK-838",
+      autoSchedule: false,
+      preferredHostId: "different-worker",
+    });
+    expect(conflict.status).toBe(409);
+    expect(JSON.parse(conflict.body)).toMatchObject({ error: "federated_queue_conflict" });
   });
 
   it("rejects federated writes without a scoped service token", async () => {
@@ -428,6 +781,175 @@ describe("v1 federation API", () => {
       error: "service_token_required",
       requiredScope: "federation:write",
     });
+  });
+
+  it("rejects listener takeover and cross-token resume mutations for a bound host", async () => {
+    await registerListener("laptop");
+
+    const takeover = await httpPost(
+      `${baseUrl}/v1/listeners/register`,
+      {
+        hostId: "laptop",
+        capabilities: ["dispatch"],
+        healthy: true,
+        currentLoad: 0,
+        maxConcurrentJobs: 1,
+      },
+      "other-token",
+    );
+    expect(takeover.status).toBe(409);
+    expect(takeover.body).toContain("listener_token_host_mismatch");
+
+    const forgedHeartbeat = await httpPost(
+      `${baseUrl}/v1/listeners/laptop/heartbeat`,
+      { healthy: false, currentLoad: 99 },
+      "other-token",
+    );
+    expect(forgedHeartbeat.status).toBe(403);
+    expect(forgedHeartbeat.body).toContain("listener_token_host_mismatch");
+
+    const created = await httpPost(`${baseUrl}/v1/federation/jobs`, {
+      taskId: "TASK-838",
+      jobType: "dispatch",
+      hosts: [
+        {
+          id: "laptop",
+          capabilities: ["dispatch"],
+          enabled: true,
+          healthy: true,
+        },
+      ],
+    });
+    const job = parseJson<{ job: FederatedJobRecord }>(created.body).job;
+    const running = await httpPost(`${baseUrl}/v1/federation/jobs/${job.jobId}/events`, {
+      hostId: "laptop",
+      status: "running",
+      remoteSessionId: "bound-session",
+    });
+    expect(running.status).toBe(202);
+
+    const pauseMutation = {
+      hostId: "laptop",
+      status: "awaiting_approval",
+      leaseId: job.lease!.leaseId,
+      pendingGate: { stage: "judge", since: new Date().toISOString() },
+      pauseIdentity: {
+        jobId: job.jobId,
+        taskId: job.taskId,
+        jobType: "dispatch",
+        hostId: "laptop",
+        sessionId: "bound-session",
+      },
+    };
+    const forgedPause = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${job.jobId}/events`,
+      pauseMutation,
+      "other-token",
+    );
+    expect(forgedPause.status).toBe(403);
+    expect(forgedPause.body).toContain("listener_token_host_mismatch");
+
+    const acceptedPause = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${job.jobId}/events`,
+      pauseMutation,
+    );
+    expect(acceptedPause.status).toBe(202);
+    const paused = parseJson<{ job: FederatedJobRecord }>(acceptedPause.body).job;
+    const forgedRelease = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${job.jobId}/pause/release`,
+      {
+        hostId: "laptop",
+        generation: paused.pause!.generation,
+        releaseNonce: paused.pause!.releaseNonce,
+        localStateArmed: true,
+      },
+      "other-token",
+    );
+    expect(forgedRelease.status).toBe(403);
+    expect(forgedRelease.body).toContain("listener_token_host_mismatch");
+
+    const commandAck = await httpPost(
+      `${baseUrl}/v1/listeners/laptop/commands/ack`,
+      { commandId: "forged-command" },
+      "other-token",
+    );
+    expect(commandAck.status).toBe(403);
+    expect(commandAck.body).toContain("listener_token_host_mismatch");
+
+    const released = await httpPost(`${baseUrl}/v1/federation/jobs/${job.jobId}/pause/release`, {
+      hostId: "laptop",
+      generation: paused.pause!.generation,
+      releaseNonce: paused.pause!.releaseNonce,
+      localStateArmed: true,
+    });
+    expect(released.status).toBe(200);
+    const releasedJob = parseJson<{ job: FederatedJobRecord }>(released.body).job;
+
+    const forgedRequest = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${job.jobId}/resume/request`,
+      {
+        hostId: "laptop",
+        generation: releasedJob.pause!.generation,
+        releaseNonce: releasedJob.pause!.releaseNonce,
+        decision: { action: "approved" },
+      },
+      "other-token",
+    );
+    expect(forgedRequest.status).toBe(403);
+
+    const requested = await httpPost(`${baseUrl}/v1/federation/jobs/${job.jobId}/resume/request`, {
+      hostId: "laptop",
+      generation: releasedJob.pause!.generation,
+      releaseNonce: releasedJob.pause!.releaseNonce,
+      decision: { action: "approved" },
+    });
+    expect(requested.status).toBe(200);
+    const requestedJob = parseJson<{ job: FederatedJobRecord }>(requested.body).job;
+
+    const forgedClaim = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${job.jobId}/resume/claim`,
+      {
+        hostId: "laptop",
+        generation: requestedJob.pause!.generation,
+        releaseNonce: requestedJob.pause!.releaseNonce,
+      },
+      "other-token",
+    );
+    expect(forgedClaim.status).toBe(403);
+
+    const claimed = await httpPost(`${baseUrl}/v1/federation/jobs/${job.jobId}/resume/claim`, {
+      hostId: "laptop",
+      generation: requestedJob.pause!.generation,
+      releaseNonce: requestedJob.pause!.releaseNonce,
+    });
+    expect(claimed.status).toBe(200);
+    const claimedJob = parseJson<{ job: FederatedJobRecord }>(claimed.body).job;
+
+    const forgedAck = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${job.jobId}/resume/ack`,
+      {
+        projectId: claimedJob.projectId,
+        taskId: claimedJob.taskId,
+        jobType: claimedJob.jobType,
+        hostId: "laptop",
+        originalSessionId: claimedJob.pause!.sessionId,
+        generation: claimedJob.pause!.generation,
+        releaseNonce: claimedJob.pause!.releaseNonce,
+        claimToken: claimedJob.pause!.claim!.token,
+        leaseId: claimedJob.lease!.leaseId,
+        phase: "approved_but_not_started",
+      },
+      "other-token",
+    );
+    expect(forgedAck.status).toBe(403);
+
+    const forgedRenewal = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${job.jobId}/lease/renew`,
+      { hostId: "laptop", leaseId: job.lease!.leaseId },
+      "other-token",
+    );
+    expect(forgedRenewal.status).toBe(403);
+    expect(forgedRenewal.body).toContain("listener_token_host_mismatch");
   });
 
   it("submits, reads, and cancels a job assigned to a healthy host", async () => {
@@ -511,14 +1033,74 @@ describe("v1 federation API", () => {
     );
   });
 
-  it("requires a scoped token for federation queue and job reads", async () => {
-    const queue = await httpGet(`${baseUrl}/v1/federation/queue`, "");
-    expect(queue.status).toBe(401);
-    expect(JSON.parse(queue.body)).toMatchObject({ error: "service_token_required" });
+  it("returns a retryable locked response without overwriting a contended cancellation", async () => {
+    const queued = await httpPost(`${baseUrl}/v1/federation/jobs`, {
+      taskId: "TASK-838",
+      jobType: "dispatch",
+      hosts: [
+        {
+          id: "headnode",
+          capabilities: ["dispatch"],
+          enabled: true,
+          healthy: true,
+        },
+      ],
+    });
+    expect(queued.status).toBe(202);
+    const jobId = parseJson<{ job: { jobId: string } }>(queued.body).job.jobId;
+    const lockPath = path.join(projectRoot, ".quack", "federation", "jobs", `${jobId}.lock`);
+    fs.writeFileSync(lockPath, "unverifiable owner", "utf-8");
+    setFederatedJobLockOptionsForTests({
+      retryMs: 2,
+      waitTimeoutMs: 25,
+      staleMs: 10,
+      heartbeatMs: 2,
+    });
 
-    const job = await httpGet(`${baseUrl}/v1/federation/jobs/example-job`, "");
-    expect(job.status).toBe(401);
-    expect(JSON.parse(job.body)).toMatchObject({ error: "service_token_required" });
+    try {
+      const canceled = await httpPost(`${baseUrl}/v1/federation/jobs/${jobId}/cancel`, {});
+      expect(canceled.status).toBe(423);
+      expect(canceled.headers["retry-after"]).toBe("1");
+      expect(parseJson<Record<string, unknown>>(canceled.body)).toMatchObject({
+        error: "federated_job_lock_busy",
+        retryable: true,
+        jobId,
+      });
+      expect(await loadFederatedJob(projectRoot, jobId)).not.toMatchObject({ status: "canceled" });
+      expect(fs.readFileSync(lockPath, "utf-8")).toBe("unverifiable owner");
+    } finally {
+      setFederatedJobLockOptionsForTests(undefined);
+      fs.rmSync(lockPath, { force: true });
+    }
+  });
+
+  it("refuses explicit reconciliation of a canceled job without reviving it", async () => {
+    const queued = await httpPost(`${baseUrl}/v1/federation/queue`, {
+      taskId: "TASK-838",
+      jobType: "dispatch",
+      autoVerify: true,
+      autoMerge: true,
+    });
+    expect(queued.status).toBe(202);
+    const jobId = parseJson<{ job: { jobId: string } }>(queued.body).job.jobId;
+
+    const canceled = await httpPost(`${baseUrl}/v1/federation/jobs/${jobId}/cancel`, {});
+    expect(canceled.status).toBe(200);
+
+    const reconciled = await httpPost(`${baseUrl}/v1/federation/jobs/${jobId}/reconcile`, {
+      autoVerify: true,
+      autoMerge: true,
+      branchName: "quack/TASK-838",
+      commitSha: "1234567890abcdef1234567890abcdef12345678",
+      targetBranch: "dev",
+    });
+    expect(reconciled.status).toBe(409);
+    expect(parseJson<{ error: string; status: string }>(reconciled.body)).toMatchObject({
+      error: "federated_reconcile_terminal",
+      status: "canceled",
+    });
+    expect(await loadFederatedJob(projectRoot, jobId)).toMatchObject({ status: "canceled" });
+    expect(federationMergeCalls).toHaveLength(0);
   });
 
   it("releases the lease and marks nextAction when a worker reports a terminal failure", async () => {
@@ -606,11 +1188,89 @@ describe("v1 federation API", () => {
     );
   });
 
+  it("keeps active progress monotonic and treats an exact terminal duplicate as immutable", async () => {
+    const created = await httpPost(`${baseUrl}/v1/federation/jobs`, {
+      taskId: "TASK-838",
+      jobType: "dispatch",
+      hosts: [{ id: "laptop", capabilities: ["dispatch"], enabled: true, healthy: true }],
+    });
+    const original = parseJson<{ job: FederatedJobRecord }>(created.body).job;
+
+    expect(
+      (
+        await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+          hostId: "laptop",
+          status: "running",
+          remoteSessionId: "monotonic-session",
+        })
+      ).status,
+    ).toBe(202);
+    expect(
+      (
+        await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+          hostId: "laptop",
+          status: "verifying",
+          remoteSessionId: "monotonic-session",
+        })
+      ).status,
+    ).toBe(202);
+
+    for (const staleStatus of ["running", "assigned", "queued"] as const) {
+      const stale = await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+        hostId: "laptop",
+        status: staleStatus,
+        remoteSessionId: "monotonic-session",
+      });
+      expect(stale.status).toBe(409);
+      expect(stale.body).toContain("federated_status_regression");
+    }
+
+    const completed = await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+      hostId: "laptop",
+      status: "completed",
+      remoteSessionId: "monotonic-session",
+      autoVerify: false,
+      evidence: [{ type: "initial-terminal-evidence" }],
+    });
+    expect(completed.status).toBe(202);
+    const closed = parseJson<{ job: FederatedJobRecord }>(completed.body).job;
+
+    const duplicate = await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+      hostId: "laptop",
+      status: "completed",
+      remoteSessionId: "different-session",
+      message: "must not overwrite terminal state",
+      evidence: [{ type: "must-not-append" }],
+    });
+    expect(duplicate.status).toBe(202);
+    expect(
+      parseJson<{ duplicate: boolean; job: FederatedJobRecord }>(duplicate.body),
+    ).toMatchObject({
+      duplicate: true,
+      job: {
+        status: "completed",
+        remoteSessionId: "monotonic-session",
+        updatedAt: closed.updatedAt,
+        eventCount: closed.eventCount,
+        evidence: closed.evidence,
+      },
+    });
+
+    const revive = await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+      hostId: "laptop",
+      status: "running",
+      remoteSessionId: "different-session",
+    });
+    expect(revive.status).toBe(409);
+    expect(revive.body).toContain("federated_status_regression");
+  });
+
   // ─── TASK-1329 round-2 R2-5 ───────────────────────────────────────
   // `awaiting_approval` is a CLAIM about disk state and has to be earned. If the
   // wire accepts it bare, nextAction degrades to a gate it cannot name and the
   // operator is told to decide something the record does not identify.
   it("refuses awaiting_approval without a pendingGate, and accepts it with one", async () => {
+    await registerListener("headnode");
     const created = await httpPost(`${baseUrl}/v1/federation/jobs`, {
       taskId: "TASK-1329-relay",
       jobType: "dispatch",
@@ -618,7 +1278,18 @@ describe("v1 federation API", () => {
       requiredCapabilities: ["dispatch"],
     });
     expect(created.status).toBe(202);
-    const jobId = (JSON.parse(created.body) as { job: { jobId: string } }).job.jobId;
+    const createdJob = (
+      JSON.parse(created.body) as {
+        job: FederatedJobRecord;
+      }
+    ).job;
+    const jobId = createdJob.jobId;
+    const running = await httpPost(`${baseUrl}/v1/federation/jobs/${jobId}/events`, {
+      hostId: "headnode",
+      status: "running",
+      remoteSessionId: "worker-session-1329",
+    });
+    expect(running.status).toBe(202);
 
     const bare = await httpPost(`${baseUrl}/v1/federation/jobs/${jobId}/events`, {
       hostId: "headnode",
@@ -633,6 +1304,14 @@ describe("v1 federation API", () => {
       status: "awaiting_approval",
       message: "paused at the brief gate",
       pendingGate: { stage: "blueprint", since: "2026-08-14T00:00:00.000Z" },
+      leaseId: createdJob.lease!.leaseId,
+      pauseIdentity: {
+        jobId,
+        taskId: "TASK-1329-relay",
+        jobType: "dispatch",
+        hostId: "headnode",
+        sessionId: "worker-session-1329",
+      },
     });
     expect(earned.status).toBe(202);
     // The queue must now name the decision rather than send anyone hunting a crash.
@@ -642,6 +1321,788 @@ describe("v1 federation API", () => {
     expect(body.job.status).toBe("awaiting_approval");
     expect(body.job.nextAction).toContain("blueprint");
     expect(body.job.error).toBeUndefined();
+  });
+
+  it("prepares, releases, and atomically reclaims a pause without changing job identity", async () => {
+    const registered = await httpPost(`${baseUrl}/v1/listeners/register`, {
+      hostId: "laptop",
+      capabilities: ["dispatch"],
+      healthy: true,
+      currentLoad: 0,
+      maxConcurrentJobs: 1,
+    });
+    expect(registered.status).toBe(201);
+    const created = await httpPost(`${baseUrl}/v1/federation/jobs`, {
+      taskId: "TASK-838",
+      jobType: "dispatch",
+      hosts: [
+        {
+          id: "laptop",
+          capabilities: ["dispatch"],
+          enabled: true,
+          healthy: true,
+          currentLoad: 0,
+          maxConcurrentJobs: 1,
+        },
+      ],
+    });
+    const original = parseJson<{ job: FederatedJobRecord }>(created.body).job;
+    await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+      hostId: "laptop",
+      status: "running",
+      remoteSessionId: "worker-session-1330",
+    });
+    const forgedIdentity = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/events`,
+      {
+        hostId: "laptop",
+        status: "awaiting_approval",
+        pendingGate: { stage: "judge", since: "2026-08-14T00:04:00.000Z" },
+        pauseIdentity: {
+          jobId: "different-job",
+          taskId: "TASK-838",
+          jobType: "dispatch",
+          hostId: "laptop",
+          sessionId: "worker-session-1330",
+        },
+        leaseId: original.lease!.leaseId,
+      },
+    );
+    expect(forgedIdentity.status).toBe(409);
+    expect(forgedIdentity.body).toContain("federated_pause_identity_mismatch");
+
+    const preparedResponse = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/events`,
+      {
+        hostId: "laptop",
+        status: "awaiting_approval",
+        pendingGate: { stage: "judge", since: "2026-08-14T00:05:00.000Z" },
+        pauseIdentity: {
+          jobId: original.jobId,
+          taskId: "TASK-838",
+          jobType: "dispatch",
+          hostId: "laptop",
+          sessionId: "worker-session-1330",
+        },
+        leaseId: original.lease!.leaseId,
+      },
+    );
+    expect(preparedResponse.status).toBe(202);
+    const prepared = parseJson<{ job: FederatedJobRecord }>(preparedResponse.body).job;
+    expect(prepared.pause?.state).toBe("attached");
+    expect(prepared.lease).toBeDefined();
+
+    const staleAttachedStatus = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/events`,
+      { hostId: "laptop", status: "verifying" },
+    );
+    expect(staleAttachedStatus.status).toBe(409);
+    expect(staleAttachedStatus.body).toContain("federated_resume_grant_required");
+
+    const releasedResponse = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/pause/release`,
+      {
+        hostId: "laptop",
+        generation: prepared.pause!.generation,
+        releaseNonce: prepared.pause!.releaseNonce,
+        localStateArmed: true,
+      },
+    );
+    expect(releasedResponse.status).toBe(200);
+    const released = parseJson<{ job: FederatedJobRecord }>(releasedResponse.body).job;
+    expect(released).toMatchObject({
+      jobId: original.jobId,
+      status: "awaiting_approval",
+      pause: { state: "released", originalHostId: "laptop" },
+    });
+    expect(released.lease).toBeUndefined();
+
+    const releasedReceipt = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/events`,
+      {
+        hostId: "laptop",
+        status: "awaiting_approval",
+        pendingGate: { stage: "judge", since: "2026-08-14T00:05:00.000Z" },
+        pauseIdentity: {
+          jobId: original.jobId,
+          taskId: "TASK-838",
+          jobType: "dispatch",
+          hostId: "laptop",
+          sessionId: "worker-session-1330",
+        },
+        leaseId: prepared.lease!.leaseId,
+      },
+    );
+    expect(releasedReceipt.status).toBe(202);
+    expect(
+      parseJson<{ duplicate: boolean; job: FederatedJobRecord }>(releasedReceipt.body),
+    ).toMatchObject({
+      duplicate: true,
+      job: {
+        status: "awaiting_approval",
+        updatedAt: released.updatedAt,
+        pause: { state: "released", generation: released.pause!.generation },
+      },
+    });
+
+    const queue = parseJson<{
+      summary: { activeDispatchJobs: number; activeDispatchByHost: Record<string, number> };
+    }>((await httpGet(`${baseUrl}/v1/federation/queue`)).body);
+    expect(queue.summary.activeDispatchJobs).toBe(0);
+    expect(queue.summary.activeDispatchByHost.laptop).toBeUndefined();
+
+    const staleReleasedStatus = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/events`,
+      { hostId: "laptop", status: "running" },
+    );
+    expect(staleReleasedStatus.status).toBe(409);
+    expect(staleReleasedStatus.body).toContain("federated_resume_grant_required");
+
+    const staleRenewal = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/lease/renew`,
+      { hostId: "laptop", leaseId: prepared.lease!.leaseId },
+    );
+    expect(staleRenewal.status).toBe(409);
+    expect(staleRenewal.body).toContain("federated_pause_released");
+
+    const requestedResponse = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/resume/request`,
+      {
+        hostId: "laptop",
+        generation: released.pause!.generation,
+        releaseNonce: released.pause!.releaseNonce,
+        decision: { action: "approved" },
+      },
+    );
+    expect(requestedResponse.status).toBe(200);
+    const attempts = await Promise.all([
+      httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/resume/claim`, {
+        hostId: "laptop",
+        generation: released.pause!.generation,
+        releaseNonce: released.pause!.releaseNonce,
+      }),
+      httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/resume/claim`, {
+        hostId: "laptop",
+        generation: released.pause!.generation,
+        releaseNonce: released.pause!.releaseNonce,
+      }),
+    ]);
+    expect(attempts.map((attempt) => attempt.status).sort()).toEqual([200, 409]);
+    const claimed = parseJson<{ job: FederatedJobRecord }>(
+      attempts.find((attempt) => attempt.status === 200)!.body,
+    ).job;
+    expect(claimed.jobId).toBe(original.jobId);
+    expect(claimed.pause?.state).toBe("resume_claimed");
+
+    const incompleteAck = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/resume/ack`,
+      {
+        hostId: "laptop",
+        generation: claimed.pause!.generation,
+        claimToken: claimed.pause!.claim!.token,
+        phase: "approved_but_not_started",
+      },
+    );
+    expect(incompleteAck.status).toBe(400);
+
+    const ack = await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/resume/ack`, {
+      projectId: claimed.projectId,
+      taskId: claimed.taskId,
+      jobType: claimed.jobType,
+      hostId: "laptop",
+      originalSessionId: claimed.pause!.sessionId,
+      generation: claimed.pause!.generation,
+      releaseNonce: claimed.pause!.releaseNonce,
+      claimToken: claimed.pause!.claim!.token,
+      leaseId: claimed.lease!.leaseId,
+      phase: "approved_but_not_started",
+    });
+    expect(ack.status).toBe(200);
+    const acknowledged = parseJson<{
+      job: FederatedJobRecord;
+      startGrant: NonNullable<NonNullable<FederatedJobRecord["pause"]>["startGrant"]>;
+    }>(ack.body);
+
+    for (const status of ["assigned", "running", "verifying", "fixing"] as const) {
+      const genericRevival = await httpPost(
+        `${baseUrl}/v1/federation/jobs/${original.jobId}/events`,
+        { hostId: "laptop", status, remoteSessionId: "resume-session" },
+      );
+      expect(genericRevival.status).toBe(409);
+      expect(genericRevival.body).toContain(
+        status === "assigned" ? "federated_status_regression" : "federated_resume_grant_required",
+      );
+    }
+
+    const resumed = await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+      hostId: "laptop",
+      status: "running",
+      remoteSessionId: "resume-session",
+      resumeSessionId: "resume-session",
+      resumeGrant: acknowledged.startGrant,
+    });
+    expect(resumed.status).toBe(202);
+    expect(parseJson<{ job: FederatedJobRecord }>(resumed.body).job).toMatchObject({
+      status: "running",
+      remoteSessionId: "resume-session",
+      pause: {
+        startGrant: {
+          token: acknowledged.startGrant.token,
+          resumedSessionId: "resume-session",
+        },
+      },
+    });
+
+    const verifying = await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+      hostId: "laptop",
+      status: "verifying",
+      resumeSessionId: "resume-session",
+      resumeGrant: acknowledged.startGrant,
+    });
+    expect(verifying.status).toBe(202);
+    const verifyingJob = parseJson<{ job: FederatedJobRecord }>(verifying.body).job;
+
+    await saveFederatedJob(projectRoot, {
+      ...verifyingJob,
+      lease: {
+        ...verifyingJob.lease!,
+        expiresAt: new Date(Date.now() - 1_000).toISOString(),
+      },
+    });
+    const expiredReplay = await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+      hostId: "laptop",
+      status: "verifying",
+      resumeSessionId: "resume-session",
+      resumeGrant: acknowledged.startGrant,
+    });
+    expect(expiredReplay.status).toBe(409);
+    expect(expiredReplay.body).toContain("federated_resume_grant_expired");
+
+    await saveFederatedJob(projectRoot, {
+      ...verifyingJob,
+      lease: { ...verifyingJob.lease!, leaseId: "reassigned-lease" },
+    });
+    const reassignedReplay = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/events`,
+      {
+        hostId: "laptop",
+        status: "verifying",
+        resumeSessionId: "resume-session",
+        resumeGrant: acknowledged.startGrant,
+      },
+    );
+    expect(reassignedReplay.status).toBe(409);
+    expect(reassignedReplay.body).toContain("federated_resume_grant_mismatch");
+    await saveFederatedJob(projectRoot, verifyingJob);
+
+    const staleRunning = await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+      hostId: "laptop",
+      status: "running",
+      resumeSessionId: "resume-session",
+      resumeGrant: acknowledged.startGrant,
+    });
+    expect(staleRunning.status).toBe(409);
+    expect(staleRunning.body).toContain("federated_status_regression");
+
+    const staleDaemonCloseout = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/events`,
+      {
+        hostId: "laptop",
+        status: "completed",
+        resumeSessionId: "stale-session",
+        resumeGrant: acknowledged.startGrant,
+        autoVerify: false,
+      },
+    );
+    expect(staleDaemonCloseout.status).toBe(409);
+    expect(staleDaemonCloseout.body).toContain("federated_resume_grant_replayed");
+
+    const completed = await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+      hostId: "laptop",
+      status: "completed",
+      resumeSessionId: "resume-session",
+      remoteSessionId: "stale-reported-session",
+      resumeGrant: acknowledged.startGrant,
+      autoVerify: false,
+    });
+    expect(completed.status).toBe(202);
+    const completedJob = parseJson<{ job: FederatedJobRecord }>(completed.body).job;
+    expect(completedJob).toMatchObject({
+      status: "completed",
+      remoteSessionId: "resume-session",
+    });
+
+    const terminalRegression = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/events`,
+      {
+        hostId: "laptop",
+        status: "running",
+        resumeSessionId: "resume-session",
+        resumeGrant: acknowledged.startGrant,
+      },
+    );
+    expect(terminalRegression.status).toBe(409);
+    expect(terminalRegression.body).toContain("federated_status_regression");
+
+    const completedReplay = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/events`,
+      {
+        hostId: "laptop",
+        status: "completed",
+        resumeSessionId: "resume-session",
+        resumeGrant: acknowledged.startGrant,
+        autoVerify: false,
+        evidence: [{ type: "must-not-append" }],
+      },
+    );
+    expect(completedReplay.status).toBe(202);
+    const completedReceipt = parseJson<{ duplicate: boolean; job: FederatedJobRecord }>(
+      completedReplay.body,
+    );
+    expect(completedReceipt).toMatchObject({
+      duplicate: true,
+      job: {
+        status: "completed",
+        updatedAt: completedJob.updatedAt,
+        eventCount: completedJob.eventCount,
+      },
+    });
+    expect(completedReceipt.job.evidence).toEqual(completedJob.evidence);
+  });
+
+  it("consumes and idempotently closes an exact rejected-blueprint grant without a child", async () => {
+    await registerListener("laptop");
+    const created = await httpPost(`${baseUrl}/v1/federation/jobs`, {
+      taskId: "TASK-838",
+      jobType: "dispatch",
+      hosts: [
+        {
+          id: "laptop",
+          capabilities: ["dispatch"],
+          enabled: true,
+          healthy: true,
+        },
+      ],
+    });
+    expect(created.status).toBe(202);
+    const original = parseJson<{ job: FederatedJobRecord }>(created.body).job;
+    const nowMs = Date.now();
+    const now = new Date(nowMs - 120_000).toISOString();
+    const resumeStartedAt = new Date(nowMs - 90_000).toISOString();
+    const expiresAt = new Date(nowMs - 60_000).toISOString();
+    const liveLeaseExpiresAt = new Date(nowMs + 120_000).toISOString();
+    const leaseId = original.lease!.leaseId;
+    const startGrant = {
+      token: "blueprint-rejection-grant",
+      projectId: original.projectId!,
+      jobId: original.jobId,
+      taskId: original.taskId,
+      jobType: "dispatch" as const,
+      hostId: "laptop",
+      originalSessionId: "blueprint-session-original",
+      generation: 1,
+      releaseNonce: "blueprint-nonce",
+      claimToken: "blueprint-claim",
+      leaseId,
+      issuedAt: now,
+      expiresAt,
+    };
+    await saveFederatedJob(projectRoot, {
+      ...original,
+      status: "awaiting_approval",
+      hostId: "laptop",
+      pendingGate: { stage: "blueprint", since: now },
+      lease: {
+        ...original.lease!,
+        hostId: "laptop",
+        expiresAt: liveLeaseExpiresAt,
+      },
+      pause: {
+        generation: 1,
+        state: "approved_but_not_started",
+        gate: "blueprint",
+        sessionId: "blueprint-session-original",
+        originalHostId: "laptop",
+        releaseNonce: "blueprint-nonce",
+        openedAt: now,
+        preparedAt: now,
+        decision: { action: "rejected", recordedAt: now },
+        claim: {
+          token: "blueprint-claim",
+          hostId: "laptop",
+          claimedAt: now,
+          expiresAt,
+        },
+        approvedButNotStartedAt: now,
+        startGrant,
+      },
+    });
+
+    const forged = await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+      hostId: "laptop",
+      status: "rejected",
+      resumeGrant: { ...startGrant, leaseId: "stale-lease" },
+      resumeStartedAt,
+    });
+    expect(forged.status).toBe(409);
+
+    const forgedLate = await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+      hostId: "laptop",
+      status: "rejected",
+      resumeGrant: startGrant,
+      resumeStartedAt: new Date(nowMs - 30_000).toISOString(),
+    });
+    expect(forgedLate.status).toBe(409);
+    expect(forgedLate.body).toContain("federated_resume_reservation_mismatch");
+
+    const acknowledged = (await loadFederatedJob(projectRoot, original.jobId))!;
+    await saveFederatedJob(projectRoot, {
+      ...acknowledged,
+      lease: { ...acknowledged.lease!, leaseId: "reassigned-live-lease" },
+    });
+    const reassigned = await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+      hostId: "laptop",
+      status: "rejected",
+      resumeGrant: startGrant,
+      resumeStartedAt,
+    });
+    expect(reassigned.status).toBe(409);
+    expect(reassigned.body).toContain("federated_resume_grant_mismatch");
+
+    await saveFederatedJob(projectRoot, {
+      ...acknowledged,
+      lease: { ...acknowledged.lease!, expiresAt },
+    });
+    const expiredLease = await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+      hostId: "laptop",
+      status: "rejected",
+      resumeGrant: startGrant,
+      resumeStartedAt,
+    });
+    expect(expiredLease.status).toBe(409);
+    expect(expiredLease.body).toContain("federated_resume_terminal_not_startable");
+
+    await saveFederatedJob(projectRoot, acknowledged);
+
+    const rejected = await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+      hostId: "laptop",
+      status: "rejected",
+      resumeGrant: startGrant,
+      resumeStartedAt,
+    });
+    expect(rejected.status).toBe(202);
+    const rejectedJob = parseJson<{ job: FederatedJobRecord }>(rejected.body).job;
+    expect(rejectedJob).toMatchObject({
+      status: "rejected",
+      pause: {
+        state: "approved_but_not_started",
+        startGrant: {
+          token: "blueprint-rejection-grant",
+          consumedAt: resumeStartedAt,
+        },
+      },
+    });
+
+    const replay = await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+      hostId: "laptop",
+      status: "rejected",
+      resumeGrant: startGrant,
+    });
+    expect(replay.status).toBe(202);
+
+    const terminalJob = rejectedJob;
+    await saveFederatedJob(projectRoot, {
+      ...terminalJob,
+      status: "blocked",
+      pause: {
+        ...terminalJob.pause!,
+        state: "manual_recovery",
+        recoveryReason: "operator owns this recovery",
+      },
+    });
+    const staleManualRecoveryStatus = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/events`,
+      { hostId: "laptop", status: "running" },
+    );
+    expect(staleManualRecoveryStatus.status).toBe(409);
+    expect(staleManualRecoveryStatus.body).toContain("federated_pause_manual_recovery");
+    const staleManualRecoveryPause = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/events`,
+      {
+        hostId: "laptop",
+        status: "awaiting_approval",
+        pendingGate: { stage: "blueprint", since: now },
+        leaseId,
+        pauseIdentity: {
+          jobId: original.jobId,
+          taskId: original.taskId,
+          jobType: "dispatch",
+          hostId: "laptop",
+          sessionId: "blueprint-session-original",
+        },
+      },
+    );
+    expect(staleManualRecoveryPause.status).toBe(409);
+    expect(staleManualRecoveryPause.body).toContain("federated_pause_manual_recovery");
+    expect(
+      parseJson<{ job: FederatedJobRecord }>(
+        (await httpGet(`${baseUrl}/v1/federation/jobs/${original.jobId}`)).body,
+      ).job.status,
+    ).toBe("blocked");
+  });
+
+  it("opens a new generation for a later same-session same-gate pause and deduplicates its replay", async () => {
+    await registerListener("laptop");
+    const created = await httpPost(`${baseUrl}/v1/federation/jobs`, {
+      taskId: "TASK-838",
+      jobType: "dispatch",
+      hosts: [
+        {
+          id: "laptop",
+          capabilities: ["dispatch"],
+          enabled: true,
+          healthy: true,
+        },
+      ],
+    });
+    expect(created.status).toBe(202);
+    const original = parseJson<{ job: FederatedJobRecord }>(created.body).job;
+    const openedAt = new Date(Date.now() - 180_000).toISOString();
+    const resumedAt = new Date(Date.now() - 120_000).toISOString();
+    const laterOpenedAt = new Date(Date.now() - 60_000).toISOString();
+    await saveFederatedJob(projectRoot, {
+      ...original,
+      status: "running",
+      remoteSessionId: "same-dispatcher-session",
+      pause: {
+        generation: 1,
+        state: "approved_but_not_started",
+        gate: "judge",
+        sessionId: "old-dispatcher-session",
+        originalHostId: "laptop",
+        releaseNonce: "old-release-nonce",
+        openedAt,
+        preparedAt: openedAt,
+        resumedAt,
+        decision: { action: "rejected", recordedAt: openedAt },
+        claim: {
+          token: "old-claim",
+          hostId: "laptop",
+          claimedAt: openedAt,
+          expiresAt: resumedAt,
+        },
+        startGrant: {
+          token: "old-grant",
+          projectId: original.projectId!,
+          jobId: original.jobId,
+          taskId: original.taskId,
+          jobType: "dispatch",
+          hostId: "laptop",
+          originalSessionId: "old-dispatcher-session",
+          generation: 1,
+          releaseNonce: "old-release-nonce",
+          claimToken: "old-claim",
+          leaseId: original.lease!.leaseId,
+          issuedAt: openedAt,
+          expiresAt: resumedAt,
+          consumedAt: resumedAt,
+          resumedSessionId: "same-dispatcher-session",
+        },
+      },
+    });
+    const report = {
+      hostId: "laptop",
+      status: "awaiting_approval",
+      pendingGate: { stage: "judge", since: laterOpenedAt },
+      pauseIdentity: {
+        jobId: original.jobId,
+        taskId: original.taskId,
+        jobType: "dispatch",
+        hostId: "laptop",
+        sessionId: "same-dispatcher-session",
+      },
+      leaseId: original.lease!.leaseId,
+    };
+
+    const later = await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, report);
+    expect(later.status).toBe(202);
+    const laterPause = parseJson<{ job: FederatedJobRecord }>(later.body).job.pause!;
+    expect(laterPause).toMatchObject({
+      generation: 2,
+      state: "attached",
+      gate: "judge",
+      sessionId: "same-dispatcher-session",
+      openedAt: laterOpenedAt,
+    });
+    expect(laterPause.releaseNonce).not.toBe("old-release-nonce");
+
+    const duplicate = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/events`,
+      report,
+    );
+    expect(duplicate.status).toBe(202);
+    expect(parseJson<{ job: FederatedJobRecord }>(duplicate.body).job.pause).toMatchObject({
+      generation: 2,
+      releaseNonce: laterPause.releaseNonce,
+      openedAt: laterOpenedAt,
+    });
+
+    const staleOccurrence = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/events`,
+      {
+        ...report,
+        pendingGate: { stage: "judge", since: openedAt },
+      },
+    );
+    expect(staleOccurrence.status).toBe(409);
+    expect(staleOccurrence.body).toContain("stale_federated_pause_generation");
+
+    const equalToResume = await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+      ...report,
+      pendingGate: { stage: "judge", since: resumedAt },
+    });
+    expect(equalToResume.status).toBe(409);
+    expect(equalToResume.body).toContain("stale_federated_pause_generation");
+
+    const wrongSession = await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+      ...report,
+      pauseIdentity: { ...report.pauseIdentity, sessionId: "stale-dispatcher-session" },
+    });
+    expect(wrongSession.status).toBe(409);
+    expect(wrongSession.body).toContain("federated_pause_epoch_mismatch");
+
+    const invalidTimestamp = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/events`,
+      {
+        ...report,
+        pendingGate: { stage: "judge", since: "not-a-date" },
+      },
+    );
+    expect(invalidTimestamp.status).toBe(400);
+  });
+
+  it("accepts a delayed first resume observation only with an in-window local reservation and the live exact lease", async () => {
+    await registerListener("laptop");
+    const created = await httpPost(`${baseUrl}/v1/federation/jobs`, {
+      taskId: "TASK-838",
+      jobType: "dispatch",
+      hosts: [
+        {
+          id: "laptop",
+          capabilities: ["dispatch"],
+          enabled: true,
+          healthy: true,
+        },
+      ],
+    });
+    expect(created.status).toBe(202);
+    const original = parseJson<{ job: FederatedJobRecord }>(created.body).job;
+    const nowMs = Date.now();
+    const issuedAt = new Date(nowMs - 120_000).toISOString();
+    const resumeStartedAt = new Date(nowMs - 90_000).toISOString();
+    const expiresAt = new Date(nowMs - 60_000).toISOString();
+    const liveLeaseExpiresAt = new Date(nowMs + 120_000).toISOString();
+    const startGrant = {
+      token: "delayed-observation-grant",
+      projectId: original.projectId!,
+      jobId: original.jobId,
+      taskId: original.taskId,
+      jobType: "dispatch" as const,
+      hostId: "laptop",
+      originalSessionId: "original-delayed-session",
+      generation: 1,
+      releaseNonce: "delayed-release-nonce",
+      claimToken: "delayed-claim-token",
+      leaseId: "delayed-lease-id",
+      issuedAt,
+      expiresAt,
+    };
+    const acknowledged: FederatedJobRecord = {
+      ...original,
+      status: "awaiting_approval",
+      hostId: "laptop",
+      pendingGate: { stage: "judge", since: issuedAt },
+      lease: {
+        leaseId: startGrant.leaseId,
+        hostId: "laptop",
+        acquiredAt: issuedAt,
+        expiresAt: liveLeaseExpiresAt,
+      },
+      pause: {
+        generation: 1,
+        state: "approved_but_not_started",
+        gate: "judge",
+        sessionId: startGrant.originalSessionId,
+        originalHostId: "laptop",
+        releaseNonce: startGrant.releaseNonce,
+        openedAt: issuedAt,
+        preparedAt: issuedAt,
+        decision: { action: "approved", recordedAt: issuedAt },
+        claim: {
+          token: startGrant.claimToken,
+          hostId: "laptop",
+          claimedAt: issuedAt,
+          expiresAt,
+        },
+        approvedButNotStartedAt: issuedAt,
+        startGrant,
+      },
+    };
+    const report = {
+      hostId: "laptop",
+      status: "running",
+      resumeGrant: startGrant,
+      resumeSessionId: "delayed-resumed-session",
+      remoteSessionId: "delayed-resumed-session",
+      resumeStartedAt,
+    };
+
+    await saveFederatedJob(projectRoot, acknowledged);
+    const forgedLate = await httpPost(`${baseUrl}/v1/federation/jobs/${original.jobId}/events`, {
+      ...report,
+      resumeStartedAt: new Date(nowMs - 30_000).toISOString(),
+    });
+    expect(forgedLate.status).toBe(409);
+    expect(forgedLate.body).toContain("federated_resume_reservation_mismatch");
+
+    await saveFederatedJob(projectRoot, {
+      ...acknowledged,
+      lease: { ...acknowledged.lease!, leaseId: "reassigned-live-lease" },
+    });
+    const reassigned = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/events`,
+      report,
+    );
+    expect(reassigned.status).toBe(409);
+    expect(reassigned.body).toContain("federated_resume_grant_mismatch");
+
+    await saveFederatedJob(projectRoot, {
+      ...acknowledged,
+      lease: { ...acknowledged.lease!, expiresAt: new Date(nowMs - 1_000).toISOString() },
+    });
+    const expiredLease = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/events`,
+      report,
+    );
+    expect(expiredLease.status).toBe(409);
+    expect(expiredLease.body).toContain("federated_resume_grant_expired");
+
+    await saveFederatedJob(projectRoot, acknowledged);
+    const delayed = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${original.jobId}/events`,
+      report,
+    );
+    expect(delayed.status).toBe(202);
+    expect(parseJson<{ job: FederatedJobRecord }>(delayed.body).job).toMatchObject({
+      status: "running",
+      remoteSessionId: "delayed-resumed-session",
+      pause: {
+        startGrant: {
+          consumedAt: resumeStartedAt,
+          resumedSessionId: "delayed-resumed-session",
+        },
+      },
+    });
   });
 
   it("accepts remote worker status, relays Slack-friendly events, and persists evidence", async () => {
@@ -787,7 +2248,7 @@ describe("v1 federation API", () => {
     const registered = await httpPost(`${baseUrl}/v1/listeners/register`, {
       hostId: "contributor-laptop",
       alias: "Contributor Laptop",
-      baseUrl: "http://192.0.2.30:3333",
+      baseUrl: "http://100.1.2.3:3333",
       capabilities: ["dispatch", "verify", "staging-db", "auth"],
       maxConcurrentJobs: 1,
       repoCommit: "abc123",
@@ -911,7 +2372,7 @@ describe("v1 federation API", () => {
         jobId: string;
         status: string;
         hostId: string;
-        lease: { hostId: string; expiresAt: string };
+        lease: { leaseId: string; hostId: string; acquiredAt: string; expiresAt: string };
       };
       scheduler: { assigned: Array<{ jobId: string }> };
     };
@@ -924,10 +2385,22 @@ describe("v1 federation API", () => {
       expect.objectContaining({ jobId: queuedBody.job.jobId }),
     ]);
 
+    const staleEpoch = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${queuedBody.job.jobId}/lease/renew`,
+      {
+        hostId: "worker-b",
+        leaseId: "stale-lease-id",
+        leaseTtlMs: 120_000,
+      },
+    );
+    expect(staleEpoch.status).toBe(409);
+    expect(staleEpoch.body).toContain("federated_lease_epoch_mismatch");
+
     const renewed = await httpPost(
       `${baseUrl}/v1/federation/jobs/${queuedBody.job.jobId}/lease/renew`,
       {
         hostId: "worker-b",
+        leaseId: queuedBody.job.lease.leaseId,
         leaseTtlMs: 120_000,
       },
     );
@@ -935,9 +2408,11 @@ describe("v1 federation API", () => {
     expect(renewed.status).toBe(200);
     const renewedBody = JSON.parse(renewed.body) as {
       job: { status: string; hostId: string };
-      lease: { expiresAt: string };
+      lease: { leaseId: string; acquiredAt: string; expiresAt: string };
     };
     expect(renewedBody.job).toMatchObject({ status: "assigned", hostId: "worker-b" });
+    expect(renewedBody.lease.leaseId).toBe(queuedBody.job.lease.leaseId);
+    expect(renewedBody.lease.acquiredAt).toBe(queuedBody.job.lease.acquiredAt);
     expect(Date.parse(renewedBody.lease.expiresAt)).toBeGreaterThan(
       Date.parse(queuedBody.job.lease.expiresAt),
     );
@@ -976,6 +2451,8 @@ describe("v1 federation API", () => {
   });
 
   it("keeps dispatch jobs queued when all capable hosts are at capacity", async () => {
+    writeTaskFile(projectRoot, "TASK-839");
+    writePassingPrep(projectRoot, "TASK-839");
     await httpPost(`${baseUrl}/v1/listeners/register`, {
       hostId: "worker-b",
       capabilities: ["dispatch", "capacity-exclusive"],
@@ -994,7 +2471,7 @@ describe("v1 federation API", () => {
     });
 
     const second = await httpPost(`${baseUrl}/v1/federation/queue`, {
-      taskId: "TASK-838",
+      taskId: "TASK-839",
       jobType: "dispatch",
       priority: 9,
       requiredCapabilities: ["dispatch", "capacity-exclusive"],
@@ -1551,7 +3028,7 @@ describe("v1 federation API", () => {
     });
   });
 
-  it("reconciles a worker-reported verified and merged completion without a review-linkage blocker", async () => {
+  it("fails closed when a worker claims it already merged directly to the target", async () => {
     await httpPost(`${baseUrl}/v1/listeners/register`, {
       hostId: "worker-b",
       capabilities: ["dispatch"],
@@ -1596,38 +3073,29 @@ describe("v1 federation API", () => {
         status: string;
         blockReasonCode?: string;
         mergeStatus: string;
-        mergeCommitSha: string;
+        mergeCommitSha?: string;
+        error?: string;
         nextAction: string;
         remoteSessionId: string;
-        verificationWorkflowId: string;
       };
       orchestration: {
-        verification: { verdict: string };
-        merge: { ok: boolean; commitSha: string; commands: number };
+        verification?: { verdict: string };
+        merge: { ok: boolean; error: string; commands: number };
       };
     };
     expect(body.job).toMatchObject({
-      status: "completed",
-      mergeStatus: "merged",
-      mergeCommitSha: "1234567890abcdef1234567890abcdef12345678",
-      nextAction: "hosts_pull_dev",
+      status: "blocked",
+      blockReasonCode: "pending_manual_handoff",
+      mergeStatus: "failed",
+      error: "worker_side_auto_merge_requires_manual_reconciliation",
+      nextAction: "manual_merge_recovery",
       remoteSessionId: "quack-TASK-838-20260505-123000",
-      verificationWorkflowId: "workflow-task-838-worker",
     });
-    expect(body.job.blockReasonCode).toBeUndefined();
-    expect(body.orchestration.verification.verdict).toBe("VERIFIED");
+    expect(body.job.mergeCommitSha).toBeUndefined();
+    expect(body.orchestration.verification).toBeUndefined();
     expect(body.orchestration.merge).toMatchObject({
-      ok: true,
-      commitSha: "1234567890abcdef1234567890abcdef12345678",
-    });
-
-    const verified = JSON.parse(
-      fs.readFileSync(path.join(projectRoot, ".quack", "verified.json"), "utf-8"),
-    ) as { tasks: Record<string, { workflowId: string; verdict: string; method: string }> };
-    expect(verified.tasks["TASK-838"]).toMatchObject({
-      workflowId: "workflow-task-838-worker",
-      verdict: "VERIFIED",
-      method: "federated-orchestrator",
+      ok: false,
+      error: "worker_side_auto_merge_requires_manual_reconciliation",
     });
 
     const commands = await httpGet(`${baseUrl}/v1/listeners/worker-b/commands`);
@@ -1641,16 +3109,108 @@ describe("v1 federation API", () => {
       }>;
     }>(commands.body);
     expect(commandBody.ok).toBe(true);
-    expect(commandBody.commands[0]).toMatchObject({
-      kind: "worker.refresh",
+    expect(commandBody.commands).toEqual([]);
+  });
+
+  it.each([
+    ["events", "missing"],
+    ["events", "invalid"],
+    ["events", "corrupt-projection"],
+    ["reconcile", "missing"],
+    ["reconcile", "invalid"],
+    ["reconcile", "corrupt-projection"],
+  ] as const)("returns a bounded %s refusal for %s verification evidence", async (route, proof) => {
+    await registerListener("worker-b");
+    const commitSha =
+      proof === "missing"
+        ? undefined
+        : proof === "invalid"
+          ? "probe"
+          : "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const queued = await httpPost(`${baseUrl}/v1/federation/queue`, {
       taskId: "TASK-838",
+      jobType: "dispatch",
+      autoMerge: false,
+      ...(commitSha ? { commitSha } : {}),
     });
-    expect(commandBody.commands[0]?.payload).toMatchObject({
-      reason: "post-merge",
+    expect(queued.status).toBe(202);
+    const { job } = parseJson<{ job: FederatedJobRecord }>(queued.body);
+    const eventsBody = {
+      hostId: "worker-b",
+      status: "completed",
+      verification: {
+        requireReview: route === "reconcile",
+        criteriaChecked: 1,
+        criteriaPassed: 1,
+        phaseResults: [{ name: "tests", status: "passed", summary: "fixture" }],
+      },
+    };
+    if (route === "reconcile") {
+      const blocked = await httpPost(
+        `${baseUrl}/v1/federation/jobs/${job.jobId}/events`,
+        eventsBody,
+        "fed-token",
+        2_000,
+      );
+      expect(blocked.status).toBe(202);
+      writeMergeReadyReview(projectRoot, "TASK-838", "review-invalid-proof");
+    }
+    const projectionPath = path.join(projectRoot, ".quack", "verified.json");
+    if (proof === "corrupt-projection") fs.writeFileSync(projectionPath, "{broken projection");
+    const projectionBefore = fs.readFileSync(projectionPath);
+    const expectedStatus = proof === "corrupt-projection" ? 500 : 409;
+    const refusal = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${job.jobId}/${route}`,
+      route === "events" ? eventsBody : {},
+      "fed-token",
+      2_000,
+    );
+    expect(refusal.status).toBe(expectedStatus);
+    expect(
+      parseJson<{ ok: boolean; error: string; jobId: string; taskId: string }>(refusal.body),
+    ).toMatchObject({
+      ok: false,
+      jobId: job.jobId,
+      taskId: job.taskId,
+      error:
+        proof === "corrupt-projection"
+          ? "federated_orchestration_failed"
+          : "federated_verification_conflict",
     });
+    const intentPath = path.join(
+      projectRoot,
+      ".quack",
+      "federation",
+      "jobs",
+      `.completion-effect-${sha256(job.jobId)}.intent`,
+    );
+    const intentBefore = fs.readFileSync(intentPath);
+    const parentBefore = await loadFederatedJob(projectRoot, job.jobId);
+    const replay = await httpPost(
+      `${baseUrl}/v1/federation/jobs/${job.jobId}/reconcile`,
+      {},
+      "fed-token",
+      2_000,
+    );
+    expect(replay.status).toBe(expectedStatus);
+    const tick = await httpPost(`${baseUrl}/v1/federation/scheduler/tick`, {}, "fed-token", 2_000);
+    expect(tick.status).toBe(proof === "corrupt-projection" ? 500 : 200);
+    if (proof !== "corrupt-projection")
+      expect(parseJson<{ reconciled: unknown[] }>(tick.body).reconciled).toEqual([]);
+    expect(fs.readFileSync(intentPath)).toEqual(intentBefore);
+    expect(await loadFederatedJob(projectRoot, job.jobId)).toEqual(parentBefore);
+    expect(fs.readFileSync(projectionPath)).toEqual(projectionBefore);
+    const database = new QuackDB(path.join(projectRoot, ".quack", "quack.db"));
+    try {
+      expect(database.getVerified(job.taskId)).toBeUndefined();
+      expect(database.getVerifiedHistory(job.taskId)).toEqual([]);
+    } finally {
+      database.close();
+    }
   });
 
   it("reconciles a stale review-linkage blocker when a merge-ready review appears", async () => {
+    const commitSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     await httpPost(`${baseUrl}/v1/listeners/register`, {
       hostId: "worker-b",
       capabilities: ["dispatch"],
@@ -1661,6 +3221,7 @@ describe("v1 federation API", () => {
       taskId: "TASK-838",
       jobType: "dispatch",
       autoMerge: false,
+      commitSha,
     });
 
     expect(queued.status).toBe(202);
@@ -1688,7 +3249,7 @@ describe("v1 federation API", () => {
       blockReasonCode: "review_linkage_required",
     });
 
-    writeMergeReadyReview(projectRoot, "TASK-838", "review-task-838");
+    writeMergeReadyReview(projectRoot, "TASK-838", "review-task-838", commitSha);
 
     const reconciled = await httpPost(
       `${baseUrl}/v1/federation/jobs/${queuedBody.job.jobId}/reconcile`,
@@ -1724,6 +3285,7 @@ describe("v1 federation API", () => {
   });
 
   it("scheduler tick reconciles stale review-linkage blockers", async () => {
+    const commitSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     await httpPost(`${baseUrl}/v1/listeners/register`, {
       hostId: "worker-b",
       capabilities: ["dispatch"],
@@ -1734,6 +3296,7 @@ describe("v1 federation API", () => {
       taskId: "TASK-838",
       jobType: "dispatch",
       autoMerge: false,
+      commitSha,
     });
 
     const queuedBody = JSON.parse(queued.body) as { job: { jobId: string } };
@@ -1746,7 +3309,7 @@ describe("v1 federation API", () => {
         criteriaPassed: 1,
       },
     });
-    writeMergeReadyReview(projectRoot, "TASK-838", "review-task-838");
+    writeMergeReadyReview(projectRoot, "TASK-838", "review-task-838", commitSha);
 
     const tick = await httpPost(`${baseUrl}/v1/federation/scheduler/tick`, {});
 
@@ -1771,6 +3334,7 @@ describe("v1 federation API", () => {
 
   it("auto-merges verified worker branches and records listener pull commands", async () => {
     initGitMergeFixture(projectRoot);
+    const commitSha = git(projectRoot, ["rev-parse", "quack/TASK-838"]);
     writeMergeReadyReview(projectRoot, "TASK-838", "review-task-838");
     await httpPost(`${baseUrl}/v1/listeners/register`, {
       hostId: "worker-b",
@@ -1796,6 +3360,7 @@ describe("v1 federation API", () => {
         status: "completed",
         autoMerge: true,
         branchName: "quack/TASK-838",
+        commitSha,
         targetBranch: "dev",
         reviewId: "review-task-838",
         verification: {
@@ -1827,6 +3392,22 @@ describe("v1 federation API", () => {
     expect(body.job.mergeCommitSha).toMatch(/^[0-9a-f]{40}$/);
     expect(body.orchestration.verification.verdict).toBe("VERIFIED");
     expect(body.orchestration.merge.ok).toBe(true);
+    expect(body.job).toMatchObject({
+      mergeBinding: {
+        version: 1,
+        repository: {
+          host: "github.test",
+          owner: "federation-fixture",
+          repo: "origin",
+        },
+        sourceBranch: "quack/TASK-838",
+        sourceCommitSha: commitSha,
+        targetBranch: "dev",
+        publicationNonce: "00000000-0000-4000-8000-000000000001",
+      },
+    });
+    expect(federationMergeCalls).toHaveLength(1);
+    expect(federationMergeCalls[0]?.binding.sourceCommitSha).toBe(commitSha);
     expect(git(projectRoot, ["show", "dev:src/fixture.txt"])).toBe("worker change");
     const verified = JSON.parse(
       fs.readFileSync(path.join(projectRoot, ".quack", "verified.json"), "utf-8"),
@@ -1882,8 +3463,124 @@ describe("v1 federation API", () => {
     });
   });
 
-  it("blocks auto-merge when the global merge lock is already held", async () => {
+  it("refuses cancellation after exact publication admission and records the eventual receipt", async () => {
     initGitMergeFixture(projectRoot);
+    const commitSha = git(projectRoot, ["rev-parse", "quack/TASK-838"]);
+    writeMergeReadyReview(projectRoot, "TASK-838", "review-task-838");
+    let enteredMerge!: () => void;
+    let releaseMerge!: () => void;
+    const mergeEntered = new Promise<void>((resolve) => {
+      enteredMerge = resolve;
+    });
+    const mergeReleased = new Promise<void>((resolve) => {
+      releaseMerge = resolve;
+    });
+    federationMergeHook = async () => {
+      enteredMerge();
+      await mergeReleased;
+    };
+    await httpPost(`${baseUrl}/v1/listeners/register`, {
+      hostId: "worker-b",
+      capabilities: ["dispatch"],
+      maxConcurrentJobs: 1,
+    });
+    const queued = await httpPost(`${baseUrl}/v1/federation/queue`, {
+      taskId: "TASK-838",
+      jobType: "dispatch",
+      branchName: "quack/TASK-838",
+      commitSha,
+      targetBranch: "dev",
+      reviewId: "review-task-838",
+      autoMerge: true,
+    });
+    const jobId = parseJson<{ job: { jobId: string } }>(queued.body).job.jobId;
+
+    const completion = httpPost(`${baseUrl}/v1/federation/jobs/${jobId}/events`, {
+      hostId: "worker-b",
+      status: "completed",
+      autoMerge: true,
+      branchName: "quack/TASK-838",
+      commitSha,
+      targetBranch: "dev",
+      reviewId: "review-task-838",
+      verification: { requireReview: true, criteriaChecked: 1, criteriaPassed: 1 },
+    });
+    await mergeEntered;
+    expect(await loadFederatedJob(projectRoot, jobId)).toMatchObject({
+      status: "completed",
+      mergeStatus: "publishing",
+      nextAction: "merge_gate",
+      mergeBinding: { sourceCommitSha: commitSha },
+    });
+
+    const canceled = await httpPost(`${baseUrl}/v1/federation/jobs/${jobId}/cancel`, {});
+    expect(canceled.status).toBe(409);
+    expect(parseJson<{ error: string }>(canceled.body).error).toBe(
+      "federated_publication_in_progress",
+    );
+    releaseMerge();
+    expect((await completion).status).toBe(202);
+    expect(await loadFederatedJob(projectRoot, jobId)).toMatchObject({
+      status: "completed",
+      mergeStatus: "merged",
+    });
+  });
+
+  it("preserves a concurrent durable winner while recording post-merge refresh", async () => {
+    initGitMergeFixture(projectRoot);
+    const commitSha = git(projectRoot, ["rev-parse", "quack/TASK-838"]);
+    writeMergeReadyReview(projectRoot, "TASK-838", "review-task-838");
+    await httpPost(`${baseUrl}/v1/listeners/register`, {
+      hostId: "worker-b",
+      capabilities: ["dispatch"],
+      maxConcurrentJobs: 1,
+    });
+    const queued = await httpPost(`${baseUrl}/v1/federation/queue`, {
+      taskId: "TASK-838",
+      jobType: "dispatch",
+      branchName: "quack/TASK-838",
+      commitSha,
+      targetBranch: "dev",
+      reviewId: "review-task-838",
+      autoMerge: true,
+    });
+    const jobId = parseJson<{ job: { jobId: string } }>(queued.body).job.jobId;
+    federationRefreshHook = async () => {
+      await updateFederatedJob(projectRoot, jobId, (current) => ({
+        ...current,
+        error: "operator_owned_refresh_state",
+        nextAction: "operator_review_refresh",
+        updatedAt: new Date().toISOString(),
+      }));
+    };
+
+    const completed = await httpPost(`${baseUrl}/v1/federation/jobs/${jobId}/events`, {
+      hostId: "worker-b",
+      status: "completed",
+      autoMerge: true,
+      branchName: "quack/TASK-838",
+      commitSha,
+      targetBranch: "dev",
+      reviewId: "review-task-838",
+      verification: { requireReview: true, criteriaChecked: 1, criteriaPassed: 1 },
+    });
+
+    expect(completed.status).toBe(202);
+    expect(parseJson<{ job: FederatedJobRecord }>(completed.body).job).toMatchObject({
+      status: "completed",
+      mergeStatus: "merged",
+      error: "operator_owned_refresh_state",
+      nextAction: "operator_review_refresh",
+    });
+    expect(await loadFederatedJob(projectRoot, jobId)).toMatchObject({
+      error: "operator_owned_refresh_state",
+      nextAction: "operator_review_refresh",
+    });
+  });
+
+  it("persists a restartable prepublication checkpoint when the merge lane is busy", async () => {
+    initGitMergeFixture(projectRoot);
+    const commitSha = git(projectRoot, ["rev-parse", "quack/TASK-838"]);
     writeMergeReadyReview(projectRoot, "TASK-838", "review-task-838");
     fs.mkdirSync(path.join(projectRoot, ".quack", "federation"), { recursive: true });
     fs.writeFileSync(
@@ -1915,6 +3612,7 @@ describe("v1 federation API", () => {
         status: "completed",
         autoMerge: true,
         branchName: "quack/TASK-838",
+        commitSha,
         targetBranch: "dev",
         reviewId: "review-task-838",
         verification: {
@@ -1926,17 +3624,346 @@ describe("v1 federation API", () => {
     );
 
     expect(completed.status).toBe(202);
-    expect(JSON.parse(completed.body)).toMatchObject({
-      job: {
-        status: "blocked",
-        mergeStatus: "blocked",
-        mergeError: "merge_lane_busy",
-        nextAction: "retry_merge_after_lane_idle",
-      },
+    const blocked = parseJson<{ job: FederatedJobRecord; orchestration: unknown }>(completed.body);
+    expect(blocked).toMatchObject({
       orchestration: {
         merge: { ok: false, error: "merge_lane_busy" },
       },
     });
+    expect(blocked.job.mergeError).toBeUndefined();
+    expect(blocked.job.mergeBinding).toBeUndefined();
+    expect(blocked.job).toMatchObject({
+      status: "completed",
+      autoMerge: true,
+      branchName: "quack/TASK-838",
+      commitSha,
+      targetBranch: "dev",
+      nextAction: "merge_gate",
+    });
+    expect(federationMergeCalls).toHaveLength(0);
+
+    fs.unlinkSync(path.join(projectRoot, ".quack", "federation", "merge.lock"));
+    const tick = await httpPost(`${baseUrl}/v1/federation/scheduler/tick`, {});
+    expect(tick.status).toBe(200);
+    expect(await loadFederatedJob(projectRoot, queuedBody.job.jobId)).toMatchObject({
+      status: "completed",
+      mergeStatus: "merged",
+    });
+    expect(federationMergeCalls).toHaveLength(1);
+  });
+
+  it("reclaims a stale federation merge lock and completes the sealed merge", async () => {
+    const diagnostic = createStaleMergeDiagnostic(projectRoot, quackRoot);
+    staleMergeDiagnostic = diagnostic;
+    try {
+      diagnostic.record("fixture.git.started");
+      initGitMergeFixture(projectRoot);
+      diagnostic.record("fixture.git.completed");
+      const commitSha = git(projectRoot, ["rev-parse", "quack/TASK-838"]);
+      diagnostic.record("review.started", { commitSha });
+      writeMergeReadyReview(projectRoot, "TASK-838", "review-task-838");
+      diagnostic.record("review.completed");
+      const lockPath = path.join(projectRoot, ".quack", "federation", "merge.lock");
+      fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+      fs.writeFileSync(
+        lockPath,
+        JSON.stringify({
+          version: 1,
+          jobId: "interrupted-job",
+          taskId: "TASK-000",
+          ownerToken: "00000000-0000-4000-8000-000000000099",
+          processId: 999999,
+          acquiredAt: "2020-01-01T00:00:00.000Z",
+        }),
+        "utf-8",
+      );
+      const staleTime = new Date("2020-01-01T00:00:00.000Z");
+      fs.utimesSync(lockPath, staleTime, staleTime);
+      diagnostic.record("stale-lock.created", { lockPath });
+      diagnostic.record("listener.register.started");
+      const registered = await httpPost(`${baseUrl}/v1/listeners/register`, {
+        hostId: "worker-b",
+        capabilities: ["dispatch"],
+        maxConcurrentJobs: 1,
+      });
+      diagnostic.record("listener.register.completed", {
+        status: registered.status,
+        body: registered.body,
+      });
+      diagnostic.record("queue.started");
+      const queued = await httpPost(`${baseUrl}/v1/federation/queue`, {
+        taskId: "TASK-838",
+        jobType: "dispatch",
+        branchName: "quack/TASK-838",
+        commitSha,
+        targetBranch: "dev",
+        reviewId: "review-task-838",
+        autoMerge: true,
+      });
+      diagnostic.record("queue.completed", {
+        status: queued.status,
+        body: queued.body,
+      });
+      const jobId = parseJson<{ job: { jobId: string } }>(queued.body).job.jobId;
+
+      diagnostic.record("completion.started", { jobId });
+      const completed = await httpPost(`${baseUrl}/v1/federation/jobs/${jobId}/events`, {
+        hostId: "worker-b",
+        status: "completed",
+        autoMerge: true,
+        branchName: "quack/TASK-838",
+        commitSha,
+        targetBranch: "dev",
+        reviewId: "review-task-838",
+        verification: {
+          requireReview: true,
+          criteriaChecked: 1,
+          criteriaPassed: 1,
+        },
+      });
+
+      diagnostic.record("completion.response", {
+        status: completed.status,
+        body: completed.body,
+      });
+      diagnostic.record("assertions.started");
+      expect(completed.status).toBe(202);
+      expect(parseJson<{ job: FederatedJobRecord }>(completed.body).job).toMatchObject({
+        status: "completed",
+        mergeStatus: "merged",
+        commitSha,
+      });
+      expect(fs.existsSync(lockPath)).toBe(false);
+      diagnostic.record("assertions.completed");
+      diagnostic.passed = true;
+    } catch (error) {
+      diagnostic.record("test.failed", { error: String(error) });
+      throw error;
+    }
+  }, 30_000);
+
+  it.each([
+    ["branchName", "quack/TASK-OTHER"],
+    ["branchName", "Quack/TASK-838"],
+    ["commitSha", "2222222222222222222222222222222222222222"],
+    ["targetBranch", "main"],
+    ["targetBranch", "DEV"],
+  ] as const)("rejects a worker attempt to replace recorded %s", async (field, replacement) => {
+    const recordedCommit = "1111111111111111111111111111111111111111";
+    await httpPost(`${baseUrl}/v1/listeners/register`, {
+      hostId: "worker-b",
+      capabilities: ["dispatch"],
+      maxConcurrentJobs: 1,
+    });
+    const queued = await httpPost(`${baseUrl}/v1/federation/queue`, {
+      taskId: "TASK-838",
+      jobType: "dispatch",
+      branchName: "quack/TASK-838",
+      commitSha: recordedCommit,
+      targetBranch: "dev",
+      autoMerge: false,
+    });
+    const jobId = parseJson<{ job: { jobId: string } }>(queued.body).job.jobId;
+    const completed = await httpPost(`${baseUrl}/v1/federation/jobs/${jobId}/events`, {
+      hostId: "worker-b",
+      status: "completed",
+      autoMerge: false,
+      branchName: "quack/TASK-838",
+      commitSha: recordedCommit,
+      targetBranch: "dev",
+      [field]: replacement,
+      verification: { requireReview: false, criteriaChecked: 1, criteriaPassed: 1 },
+    });
+
+    expect(completed.status).toBe(409);
+    expect(parseJson<{ error: string }>(completed.body).error).toBe(
+      "federated_publication_identity_mismatch",
+    );
+    const persisted = await loadFederatedJob(projectRoot, jobId);
+    expect(persisted?.branchName).toBe("quack/TASK-838");
+    expect(persisted?.commitSha).toBe(recordedCommit);
+    expect(persisted?.targetBranch).toBe("dev");
+    expect(federationMergeCalls).toHaveLength(0);
+  });
+
+  it("refuses a moved source branch before federation auto-merge", async () => {
+    initGitMergeFixture(projectRoot);
+    const reportedCommit = git(projectRoot, ["rev-parse", "quack/TASK-838"]);
+    writeMergeReadyReview(projectRoot, "TASK-838", "review-task-838");
+    git(projectRoot, ["checkout", "quack/TASK-838"]);
+    fs.appendFileSync(path.join(projectRoot, "src", "fixture.txt"), "moved branch\n", "utf-8");
+    git(projectRoot, ["add", "src/fixture.txt"]);
+    git(projectRoot, ["commit", "-m", "advance task branch after completion"]);
+    git(projectRoot, ["checkout", "dev"]);
+
+    await httpPost(`${baseUrl}/v1/listeners/register`, {
+      hostId: "worker-b",
+      capabilities: ["dispatch"],
+      maxConcurrentJobs: 1,
+    });
+    const queued = await httpPost(`${baseUrl}/v1/federation/queue`, {
+      taskId: "TASK-838",
+      jobType: "dispatch",
+      branchName: "quack/TASK-838",
+      commitSha: reportedCommit,
+      targetBranch: "dev",
+      reviewId: "review-task-838",
+      autoMerge: true,
+    });
+    const jobId = parseJson<{ job: { jobId: string } }>(queued.body).job.jobId;
+
+    const completed = await httpPost(`${baseUrl}/v1/federation/jobs/${jobId}/events`, {
+      hostId: "worker-b",
+      status: "completed",
+      autoMerge: true,
+      branchName: "quack/TASK-838",
+      commitSha: reportedCommit,
+      targetBranch: "dev",
+      reviewId: "review-task-838",
+      verification: {
+        requireReview: true,
+        criteriaChecked: 1,
+        criteriaPassed: 1,
+      },
+    });
+
+    expect(completed.status).toBe(202);
+    expect(parseJson<{ job: FederatedJobRecord }>(completed.body).job).toMatchObject({
+      status: "blocked",
+      mergeStatus: "failed",
+      nextAction: "manual_merge_recovery",
+    });
+    expect(parseJson<{ job: FederatedJobRecord }>(completed.body).job.mergeError).toContain(
+      "source branch changed",
+    );
+    expect(federationMergeCalls).toHaveLength(0);
+    expect(fs.existsSync(path.join(projectRoot, ".quack", "federation", "merge.lock"))).toBe(false);
+    expect(git(projectRoot, ["show", "dev:src/fixture.txt"])).toBe("base");
+  });
+
+  it("refuses an ambiguous or changed federation push destination", async () => {
+    initGitMergeFixture(projectRoot);
+    const reportedCommit = git(projectRoot, ["rev-parse", "quack/TASK-838"]);
+    writeMergeReadyReview(projectRoot, "TASK-838", "review-task-838");
+    git(projectRoot, [
+      "config",
+      "--add",
+      "remote.origin.pushurl",
+      "https://github.test/attacker/redirect.git",
+    ]);
+
+    await httpPost(`${baseUrl}/v1/listeners/register`, {
+      hostId: "worker-b",
+      capabilities: ["dispatch"],
+      maxConcurrentJobs: 1,
+    });
+    const queued = await httpPost(`${baseUrl}/v1/federation/queue`, {
+      taskId: "TASK-838",
+      jobType: "dispatch",
+      branchName: "quack/TASK-838",
+      commitSha: reportedCommit,
+      targetBranch: "dev",
+      reviewId: "review-task-838",
+      autoMerge: true,
+    });
+    const jobId = parseJson<{ job: { jobId: string } }>(queued.body).job.jobId;
+
+    const completed = await httpPost(`${baseUrl}/v1/federation/jobs/${jobId}/events`, {
+      hostId: "worker-b",
+      status: "completed",
+      autoMerge: true,
+      branchName: "quack/TASK-838",
+      commitSha: reportedCommit,
+      targetBranch: "dev",
+      reviewId: "review-task-838",
+      verification: {
+        requireReview: true,
+        criteriaChecked: 1,
+        criteriaPassed: 1,
+      },
+    });
+
+    expect(completed.status).toBe(202);
+    expect(parseJson<{ job: FederatedJobRecord }>(completed.body).job.mergeError).toContain(
+      "push destination changed",
+    );
+    expect(federationMergeCalls).toHaveLength(0);
+    expect(git(projectRoot, ["show", "dev:src/fixture.txt"])).toBe("base");
+  });
+
+  it("recovers a post-push interruption before re-running mutable verification", async () => {
+    initGitMergeFixture(projectRoot);
+    const commitSha = git(projectRoot, ["rev-parse", "quack/TASK-838"]);
+    writeMergeReadyReview(projectRoot, "TASK-838", "review-task-838");
+    federationMergeFailureAfterPush = "trusted_git_post_execution_attestation_failed";
+
+    await httpPost(`${baseUrl}/v1/listeners/register`, {
+      hostId: "worker-b",
+      capabilities: ["dispatch"],
+      maxConcurrentJobs: 1,
+    });
+    const queued = await httpPost(`${baseUrl}/v1/federation/queue`, {
+      taskId: "TASK-838",
+      jobType: "dispatch",
+      branchName: "quack/TASK-838",
+      commitSha,
+      targetBranch: "dev",
+      reviewId: "review-task-838",
+      autoMerge: true,
+    });
+    const jobId = parseJson<{ job: { jobId: string } }>(queued.body).job.jobId;
+    const failed = await httpPost(`${baseUrl}/v1/federation/jobs/${jobId}/events`, {
+      hostId: "worker-b",
+      status: "completed",
+      autoMerge: true,
+      branchName: "quack/TASK-838",
+      commitSha,
+      targetBranch: "dev",
+      reviewId: "review-task-838",
+      verification: {
+        requireReview: true,
+        criteriaChecked: 1,
+        criteriaPassed: 1,
+      },
+    });
+
+    expect(failed.status).toBe(202);
+    const failedJob = parseJson<{ job: FederatedJobRecord }>(failed.body).job;
+    expect(failedJob.mergeBinding).toMatchObject({
+      sourceBranch: "quack/TASK-838",
+      sourceCommitSha: commitSha,
+      targetBranch: "dev",
+    });
+    expect(failedJob).toMatchObject({
+      status: "completed",
+      mergeStatus: "publishing",
+      nextAction: "merge_gate",
+    });
+    expect(failedJob.error).toContain("publication_recovery_pending");
+    expect(fs.existsSync(path.join(projectRoot, ".quack", "federation", "merge.lock"))).toBe(false);
+    expect(git(projectRoot, ["show", "dev:src/fixture.txt"])).toBe("worker change");
+
+    const canceled = await httpPost(`${baseUrl}/v1/federation/jobs/${jobId}/cancel`, {});
+    expect(canceled.status).toBe(409);
+    expect(parseJson<{ error: string }>(canceled.body).error).toBe(
+      "federated_publication_in_progress",
+    );
+
+    federationMergeFailureAfterPush = undefined;
+    fs.rmSync(path.join(projectRoot, ".quack", "reviews"), { recursive: true, force: true });
+    const tick = await httpPost(`${baseUrl}/v1/federation/scheduler/tick`, {});
+    expect(tick.status).toBe(200);
+    const recovered = await loadFederatedJob(projectRoot, jobId);
+    expect(recovered).toMatchObject({
+      status: "completed",
+      mergeStatus: "merged",
+      mergeBinding: {
+        sealedAt: failedJob.mergeBinding?.sealedAt,
+        sourceCommitSha: commitSha,
+      },
+    });
+    expect(federationMergeCalls).toHaveLength(2);
+    expect(federationMergeCalls[1]?.binding.sealedAt).toBe(failedJob.mergeBinding?.sealedAt);
   });
 
   it("accepts an external Hermes completion and records canonical verified state", async () => {
@@ -1951,7 +3978,8 @@ describe("v1 federation API", () => {
       commitSha,
       baseBranch: "dev",
       targetBranch: "dev",
-      worktreePath: "C:/workspace/example-service/.hermes-worktrees/TASK-838",
+      worktreePath:
+        "C:/Users/Example/Desktop/GitHub/example-org/example-service/.hermes-worktrees/TASK-838",
       verificationClass: "fast-required",
       autoVerify: true,
       autoMerge: false,
@@ -2274,7 +4302,7 @@ describe("v1 federation API", () => {
     });
   });
 
-  it("routes completed job with workerCompletion to merged state without review-linkage blocker", async () => {
+  it("never treats worker completion booleans as a trusted merge receipt", async () => {
     await httpPost(`${baseUrl}/v1/listeners/register`, {
       hostId: "worker-b",
       capabilities: ["dispatch"],
@@ -2320,23 +4348,27 @@ describe("v1 federation API", () => {
         nextAction: string;
         mergeStatus: string;
         blockReasonCode?: string;
-        mergeCommitSha: string;
+        mergeCommitSha?: string;
+        error?: string;
       };
       orchestration: {
-        verification: { verdict: string };
-        merge: { ok: boolean; commitSha: string };
+        verification?: { verdict: string };
+        merge: { ok: boolean; error: string };
       };
     };
-    // workerCompletion.autoMerged + workerCompletion.verified → skip review cycle,
-    // go straight to merged/completed
-    expect(body.job.status).toBe("completed");
-    expect(body.job.mergeStatus).toBe("merged");
-    expect(body.job.mergeCommitSha).toBe("aabbccddeeff00112233445566778899aabbccdd");
-    expect(body.job.nextAction).not.toBe("record_merge_ready_review");
-    expect(body.job.blockReasonCode).toBeUndefined();
-    expect(body.orchestration.verification.verdict).toBe("VERIFIED");
-    expect(body.orchestration.merge.ok).toBe(true);
-    expect(body.orchestration.merge.commitSha).toBe("aabbccddeeff00112233445566778899aabbccdd");
+    expect(body.job).toMatchObject({
+      status: "blocked",
+      blockReasonCode: "pending_manual_handoff",
+      mergeStatus: "failed",
+      error: "worker_side_auto_merge_requires_manual_reconciliation",
+      nextAction: "manual_merge_recovery",
+    });
+    expect(body.job.mergeCommitSha).toBeUndefined();
+    expect(body.orchestration.verification).toBeUndefined();
+    expect(body.orchestration.merge).toMatchObject({
+      ok: false,
+      error: "worker_side_auto_merge_requires_manual_reconciliation",
+    });
   });
 
   it("routes completed job without workerCompletion to a verification pass, not immediate merged state", async () => {

@@ -203,17 +203,17 @@ describe("federation verified sync", () => {
     writeTaskFile(projectRoot, "TASK-838");
     writeTaskFile(projectRoot, "TASK-839");
 
-    const port = 48000 + Math.floor(Math.random() * 1000);
     const server = createMonitorServer({
       projectRoot,
       taskDir: "docs/tasks",
       logDir: path.join(projectRoot, ".quack", "logs"),
       quackRoot,
-      port,
+      port: 0,
+      host: "127.0.0.1",
     });
     const started = await server.start();
     stop = started.stop;
-    baseUrl = `http://127.0.0.1:${port}`;
+    baseUrl = `http://127.0.0.1:${started.port}`;
     await pause(150);
   });
 
@@ -291,7 +291,7 @@ describe("federation verified sync", () => {
         {
           taskId: "TASK-838",
           verdict: "VERIFIED",
-          commitSha: "contested123",
+          commitSha: "c07e57e123",
           method: "federation-sync",
           criteriaChecked: 1,
           criteriaPassed: 1,
@@ -299,7 +299,7 @@ describe("federation verified sync", () => {
         {
           taskId: "TASK-839",
           verdict: "VERIFIED",
-          commitSha: "clean123",
+          commitSha: "c1ea0123",
           method: "federation-sync",
           criteriaChecked: 1,
           criteriaPassed: 1,
@@ -328,7 +328,7 @@ describe("federation verified sync", () => {
       (JSON.parse(clean.body) as { row: { task_id: string; commit_sha: string } }).row,
     ).toMatchObject({
       task_id: "TASK-839",
-      commit_sha: "clean123",
+      commit_sha: "c1ea0123",
     });
     const projection = JSON.parse(
       fs.readFileSync(path.join(projectRoot, ".quack", "verified.json"), "utf-8"),
@@ -345,7 +345,7 @@ describe("federation verified sync", () => {
         {
           taskId: "TASK-838",
           verdict: "VERIFIED",
-          commitSha: "unavailable123",
+          commitSha: "00a7a1ab1e123",
           method: "federation-sync",
           criteriaChecked: 1,
           criteriaPassed: 1,
@@ -379,7 +379,7 @@ describe("federation verified sync", () => {
         {
           taskId: "TASK-838",
           verdict: "VERIFIED",
-          commitSha: "zzz9999",
+          commitSha: "fff9999",
           method: "federation-sync",
           criteriaChecked: 3,
           criteriaPassed: 3,
@@ -416,7 +416,7 @@ describe("federation verified sync", () => {
       row: { commit_sha: string; updated_at: string };
     };
     expect(singleBody.row).toMatchObject({
-      commit_sha: "zzz9999",
+      commit_sha: "fff9999",
       updated_at: "2026-05-02T12:30:00.000Z",
     });
   });
@@ -468,7 +468,7 @@ describe("federation verified sync", () => {
         {
           taskId: "TASK-838",
           verdict: "VERIFIED",
-          commitSha: "peer1234",
+          commitSha: "9ee01234",
           method: "federation-sync",
           criteriaChecked: 2,
           criteriaPassed: 2,
@@ -504,19 +504,208 @@ describe("federation verified sync", () => {
       expect(result).toMatchObject({ fetched: 1, applied: 1, skipped: 0 });
       expect(targetDb.getVerified("TASK-838")).toMatchObject({
         task_id: "TASK-838",
-        commit_sha: "peer1234",
+        commit_sha: "9ee01234",
       });
 
       const verified = JSON.parse(
         fs.readFileSync(path.join(targetRoot, ".quack", "verified.json"), "utf-8"),
       ) as { tasks: Record<string, { commit: string; reviewId?: string }> };
       expect(verified.tasks["TASK-838"]).toMatchObject({
-        commit: "peer1234",
+        commit: "9ee01234",
         reviewId: "review-task-838",
       });
     } finally {
       targetDb.close();
       await cleanupDir(targetRoot);
     }
+  });
+  it("QPI-025 rejects invalid verified writes before row/history/status/projection changes", async () => {
+    const entry = {
+      taskId: "TASK-838",
+      verdict: "VERIFIED",
+      commitSha: "abc1234",
+      method: "api",
+      criteriaChecked: 2,
+      criteriaPassed: 2,
+      verifiedAt: "2026-05-02",
+      updatedAt: "2026-05-02T12:00:00.000Z",
+    };
+    expect((await httpPost(`${baseUrl}/v1/federation/verified`, { entries: [entry] })).status).toBe(
+      200,
+    );
+    const db = new QuackDB(path.join(projectRoot, ".quack", "quack.db"));
+    const jsonPath = path.join(projectRoot, ".quack", "verified.json");
+    const before = fs.readFileSync(jsonPath, "utf8");
+    const beforeMtime = fs.statSync(jsonPath).mtimeMs;
+    const rows = db.getAllVerified();
+    const history = db.getVerifiedHistory("TASK-838");
+    const status = db.getAllStatuses();
+    const canonical = {
+      verdict: "VERIFIED",
+      commit: "def5678",
+      method: "api",
+      criteria_checked: 2,
+      criteria_passed: 2,
+    };
+    try {
+      for (const override of [
+        { verdict: "PROBE" },
+        { commit: "probe", method: "probe" },
+        { commit: "x" },
+        { commit: null },
+        { method: 17 },
+        { criteria_checked: "2" },
+        { criteria_passed: 3 },
+        { criteria_checked: -1 },
+        { criteria_passed: 0.5 },
+        { verified: "2026-02-30" },
+        { reviewId: "../outside" },
+        { extraProbeField: true },
+      ]) {
+        const response = await httpPost(
+          `${baseUrl}/api/tasks/TASK-838/verified`,
+          { ...canonical, ...override },
+          "",
+        );
+        expect({
+          override,
+          status: response.status,
+          body: JSON.parse(response.body) as unknown,
+        }).toMatchObject({ status: 400, body: { error: "invalid_verification_payload" } });
+      }
+      for (const override of [
+        { commitSha: "probe" },
+        { verdict: "PROBE" },
+        { criteriaPassed: 3 },
+        { verifiedAt: "2026-02-30" },
+        { updatedAt: "2999-01-01T00:00:00.000Z" },
+        { extraProbeField: true },
+      ]) {
+        const response = await httpPost(`${baseUrl}/v1/federation/verified`, {
+          entries: [
+            { ...entry, taskId: "TASK-839" },
+            { ...entry, ...override },
+          ],
+        });
+        expect(response.status).toBe(400);
+      }
+      for (const method of [" validation-intake ", " /verify-task ", " verify-task "]) {
+        const response = await httpPost(
+          `${baseUrl}/api/tasks/TASK-838/verified`,
+          { ...canonical, method },
+          "",
+        );
+        expect(response.status).toBe(409);
+        expect(JSON.parse(response.body)).toMatchObject({
+          error: "review_required",
+          method: method.trim(),
+        });
+      }
+      expect(db.getAllVerified()).toEqual(rows);
+      expect(db.getVerifiedHistory("TASK-838")).toEqual(history);
+      expect(db.getVerifiedHistory("TASK-839")).toEqual([]);
+      expect(db.getAllStatuses()).toEqual(status);
+      expect(fs.readFileSync(jsonPath, "utf8")).toBe(before);
+      expect(fs.statSync(jsonPath).mtimeMs).toBe(beforeMtime);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("QPI-025 existing authenticated verified GETs never mutate verification evidence", async () => {
+    expect(
+      (
+        await httpPost(`${baseUrl}/v1/federation/verified`, {
+          entries: [
+            {
+              taskId: "TASK-838",
+              verdict: "VERIFIED",
+              commitSha: "abc1234",
+              method: "api",
+              criteriaChecked: 1,
+              criteriaPassed: 1,
+            },
+          ],
+        })
+      ).status,
+    ).toBe(200);
+    const db = new QuackDB(path.join(projectRoot, ".quack", "quack.db"));
+    const jsonPath = path.join(projectRoot, ".quack", "verified.json");
+    const before = fs.readFileSync(jsonPath, "utf8");
+    const beforeMtime = fs.statSync(jsonPath).mtimeMs;
+    const rows = db.getAllVerified();
+    const history = db.getVerifiedHistory("TASK-838");
+    const status = db.getAllStatuses();
+    try {
+      for (let read = 0; read < 3; read += 1) {
+        const list = await httpGet(`${baseUrl}/v1/federation/verified?limit=10`);
+        const single = await httpGet(`${baseUrl}/v1/federation/verified/TASK-838`);
+        const missing = await httpGet(`${baseUrl}/v1/federation/verified/TASK-839`);
+        expect(list.status).toBe(200);
+        expect(JSON.parse(list.body)).toMatchObject({
+          rows: [expect.objectContaining({ task_id: "TASK-838" })],
+        });
+        expect(single.status).toBe(200);
+        expect(JSON.parse(single.body)).toMatchObject({
+          row: { task_id: "TASK-838", commit_sha: "abc1234" },
+        });
+        expect(JSON.parse(missing.body)).toMatchObject({ row: null });
+      }
+      expect(db.getAllVerified()).toEqual(rows);
+      expect(db.getVerifiedHistory("TASK-838")).toEqual(history);
+      expect(db.getAllStatuses()).toEqual(status);
+      expect(fs.readFileSync(jsonPath, "utf8")).toBe(before);
+      expect(fs.statSync(jsonPath).mtimeMs).toBe(beforeMtime);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("QPI-013 returns an unavailable response when the real verification table cannot be read", async () => {
+    expect(
+      (
+        await httpPost(`${baseUrl}/v1/federation/verified`, {
+          entries: [
+            {
+              taskId: "TASK-838",
+              verdict: "VERIFIED",
+              commitSha: "abc1234",
+              method: "api",
+              criteriaChecked: 1,
+              criteriaPassed: 1,
+            },
+          ],
+        })
+      ).status,
+    ).toBe(200);
+    const jsonPath = path.join(projectRoot, ".quack", "verified.json");
+    const before = fs.readFileSync(jsonPath, "utf8");
+    const db = new QuackDB(path.join(projectRoot, ".quack", "quack.db"));
+    try {
+      (db.raw() as { exec(sql: string): void }).exec("DROP TABLE verified");
+    } finally {
+      db.close();
+    }
+    for (const route of ["/v1/federation/verified", "/v1/federation/verified/TASK-838"]) {
+      const response = await httpGet(`${baseUrl}${route}`);
+      expect(response.status).toBe(503);
+      expect(JSON.parse(response.body)).toMatchObject({
+        error: "verification_database_unavailable",
+      });
+    }
+    const write = await httpPost(`${baseUrl}/v1/federation/verified`, {
+      entries: [
+        {
+          taskId: "TASK-839",
+          verdict: "VERIFIED",
+          commitSha: "def5678",
+          method: "api",
+          criteriaChecked: 1,
+          criteriaPassed: 1,
+        },
+      ],
+    });
+    expect(write.status).toBe(503);
+    expect(fs.readFileSync(jsonPath, "utf8")).toBe(before);
   });
 });

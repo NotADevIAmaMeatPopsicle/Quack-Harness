@@ -22,6 +22,12 @@ describe("machinery integrity", () => {
     fs.writeFileSync(filePath, content);
   };
 
+  const writeBytes = (root: string, rel: string, content: Buffer): void => {
+    const filePath = path.join(root, rel);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, content);
+  };
+
   beforeEach(() => {
     authoritative = fs.mkdtempSync(path.join(os.tmpdir(), "quack-auth-"));
     worktree = fs.mkdtempSync(path.join(os.tmpdir(), "quack-wt-"));
@@ -40,6 +46,54 @@ describe("machinery integrity", () => {
     const result = await checkMachineryIntegrity(worktree, authoritative);
     expect(result.clean).toBe(true);
     expect(result.selfCompare).toBe(false);
+  });
+
+  it("treats CRLF and LF as equivalent for valid UTF-8 text", async () => {
+    write(authoritative, ".quack/conventions.md", "caf\u00e9 \ufffd\r\nline two\r\n");
+    write(worktree, ".quack/conventions.md", "caf\u00e9 \ufffd\nline two\n");
+
+    const result = await checkMachineryIntegrity(worktree, authoritative);
+
+    expect(result.clean).toBe(true);
+    expect(result.mismatches).toEqual([]);
+  });
+
+  it.each([
+    [
+      "NUL-containing binary data",
+      Buffer.from([0x00, 0x61, 0x0d, 0x0a]),
+      Buffer.from([0x00, 0x61, 0x0a]),
+    ],
+    ["invalid UTF-8 data", Buffer.from([0xc3, 0x28, 0x0d, 0x0a]), Buffer.from([0xc3, 0x28, 0x0a])],
+  ])("keeps raw-byte hashing for %s", async (_label, authoritativeBytes, worktreeBytes) => {
+    writeBytes(authoritative, ".quack/conventions.md", authoritativeBytes);
+    writeBytes(worktree, ".quack/conventions.md", worktreeBytes);
+
+    const result = await checkMachineryIntegrity(worktree, authoritative);
+
+    expect(result.mismatches).toEqual([{ path: ".quack/conventions.md", reason: "hash_mismatch" }]);
+  });
+
+  it("preserves a UTF-8 BOM as content", async () => {
+    writeBytes(
+      authoritative,
+      ".quack/conventions.md",
+      Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from("line\n")]),
+    );
+    write(worktree, ".quack/conventions.md", "line\n");
+
+    const result = await checkMachineryIntegrity(worktree, authoritative);
+
+    expect(result.mismatches).toEqual([{ path: ".quack/conventions.md", reason: "hash_mismatch" }]);
+  });
+
+  it("does not normalize lone carriage returns", async () => {
+    write(authoritative, ".quack/conventions.md", "line one\rline two\r");
+    write(worktree, ".quack/conventions.md", "line one\nline two\n");
+
+    const result = await checkMachineryIntegrity(worktree, authoritative);
+
+    expect(result.mismatches).toEqual([{ path: ".quack/conventions.md", reason: "hash_mismatch" }]);
   });
 
   it("self-compare is a structural no-op", async () => {

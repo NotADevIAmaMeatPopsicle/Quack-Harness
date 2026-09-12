@@ -93,6 +93,39 @@ async function httpGet(
   });
 }
 
+async function httpPost(
+  url: string,
+  body: unknown,
+  serviceToken?: string,
+): Promise<{ status: number; body: string }> {
+  const payload = JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(url);
+    const req = http.request(
+      {
+        hostname: urlObj.hostname,
+        port: urlObj.port,
+        path: `${urlObj.pathname}${urlObj.search}`,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+          ...(serviceToken ? { "X-Quack-Service-Token": serviceToken } : {}),
+        },
+      },
+      (res) => {
+        let responseBody = "";
+        res.on("data", (chunk) => (responseBody += chunk));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body: responseBody }));
+        res.on("error", reject);
+      },
+    );
+    req.on("error", reject);
+    req.write(payload);
+    req.end();
+  });
+}
+
 describe("admin run read auth", () => {
   let logDir: string;
   let quackRoot: string;
@@ -114,17 +147,21 @@ describe("admin run read auth", () => {
   });
 
   async function startServer(): Promise<number> {
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port, quackRoot });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
-    return port;
+    const serverObj = createMonitorServer({
+      logDir,
+      port: 0,
+      host: "127.0.0.1",
+      quackRoot,
+    });
+    const started = await serverObj.start();
+    stopServer = started.stop;
+    return started.port;
   }
 
   it("allows federation:write tokens to list admin runs", async () => {
     const port = await startServer();
 
-    const { status, body } = await httpGet(`http://localhost:${port}/api/admin/runs`, "fed-token");
+    const { status, body } = await httpGet(`http://127.0.0.1:${port}/api/admin/runs`, "fed-token");
 
     expect(status).toBe(200);
     expect(JSON.parse(body)).toEqual({ runs: [] });
@@ -133,12 +170,12 @@ describe("admin run read auth", () => {
   it("allows admin-scoped tokens to read admin run status endpoints", async () => {
     const port = await startServer();
 
-    const readResult = await httpGet(`http://localhost:${port}/api/admin/runs`, "admin-read-token");
+    const readResult = await httpGet(`http://127.0.0.1:${port}/api/admin/runs`, "admin-read-token");
     expect(readResult.status).toBe(200);
     expect(JSON.parse(readResult.body)).toEqual({ runs: [] });
 
     const writeResult = await httpGet(
-      `http://localhost:${port}/api/admin/runs/missing`,
+      `http://127.0.0.1:${port}/api/admin/runs/missing`,
       "admin-write-token",
     );
     expect(writeResult.status).toBe(404);
@@ -149,7 +186,7 @@ describe("admin run read auth", () => {
     const port = await startServer();
 
     const { status, body } = await httpGet(
-      `http://localhost:${port}/api/admin/runs`,
+      `http://127.0.0.1:${port}/api/admin/runs`,
       "listener-read-token",
     );
 
@@ -158,6 +195,47 @@ describe("admin run read auth", () => {
       error: "service_token_scope_denied",
       message: "Service token listener-read lacks required scope admin:read.",
       requiredScopes: ["admin:read", "admin:write", "federation:write"],
+    });
+  });
+
+  it("enforces read/write scopes on the drain API without mutating state on rejection", async () => {
+    const port = await startServer();
+    const baseUrl = `http://127.0.0.1:${port}/api/admin/drain`;
+
+    const missingRead = await httpGet(baseUrl);
+    expect(missingRead.status).toBe(401);
+
+    const wrongRead = await httpGet(baseUrl, "listener-read-token");
+    expect(wrongRead.status).toBe(403);
+
+    const initial = await httpGet(baseUrl, "admin-read-token");
+    expect(initial.status).toBe(200);
+    expect(JSON.parse(initial.body)).toMatchObject({ active: false, acceptingWork: true });
+
+    const missingWrite = await httpPost(baseUrl, { reason: "must not apply" });
+    expect(missingWrite.status).toBe(401);
+
+    const readOnlyWrite = await httpPost(baseUrl, { reason: "must not apply" }, "admin-read-token");
+    expect(readOnlyWrite.status).toBe(403);
+
+    const afterRejectedWrites = await httpGet(baseUrl, "admin-read-token");
+    expect(afterRejectedWrites.status).toBe(200);
+    expect(JSON.parse(afterRejectedWrites.body)).toMatchObject({
+      active: false,
+      acceptingWork: true,
+    });
+
+    const accepted = await httpPost(
+      baseUrl,
+      { reason: "authorized test drain" },
+      "admin-write-token",
+    );
+    expect(accepted.status).toBe(200);
+    expect(JSON.parse(accepted.body)).toMatchObject({
+      active: true,
+      acceptingWork: false,
+      safeToTerminate: true,
+      state: { reason: "authorized test drain" },
     });
   });
 });

@@ -1,12 +1,23 @@
 import { describe, test, expect, beforeEach, afterEach, jest } from "@jest/globals";
 import type { ProjectAdapter } from "../../src/core/adapter-loader.js";
-import type { ParsedTask } from "../../src/core/types.js";
+import type {
+  AgentOutputSnapshot,
+  AgentResult,
+  ParsedTask,
+  TaskContext,
+} from "../../src/core/types.js";
 import type { IEventWriter } from "../../src/monitor/event-emitter.js";
+import type { RunAgentOptions } from "../../src/worker/agent-worker.js";
 
 // ─── Mocks ─────────────────────────────────────────────────────────
 
 jest.mock("node:child_process", () => ({
   execSync: jest.fn().mockReturnValue("abc1234"),
+}));
+
+const mockRunTrustedGitSync = jest.fn().mockReturnValue("abc1234");
+jest.mock("../../src/dispatcher/trusted-git", () => ({
+  runTrustedGitSync: (...args: unknown[]) => mockRunTrustedGitSync(...args),
 }));
 
 jest.mock("node:fs", () => ({
@@ -41,41 +52,77 @@ jest.mock("node:fs", () => ({
 // `tests/dispatcher/lifecycle-task-selection.test.ts`. Mocking it here would
 // otherwise be the false-green this task exists to remove, which is why that
 // companion suite is not optional.
+const mockResolveTaskFile = jest.fn(async (taskDir: string, taskId: string) => {
+  const filePath = [taskDir, `${taskId}.md`].join("/");
+  // Round 2 (R2-1): production now CARRIES the resolver's content instead
+  // of re-reading, so this stub hands back whatever the suite's `node:fs`
+  // mock holds for the same path; an empty string here would blank every
+  // status arm's input. Importing inside the stub goes through jest's
+  // module registry, so this IS the mocked module, with real typings.
+  const { promises: mockedPromises } = await import("node:fs");
+  let content = "";
+  try {
+    const raw: unknown = await mockedPromises.readFile(filePath, "utf-8");
+    content = typeof raw === "string" ? raw : "";
+  } catch {
+    content = "";
+  }
+  return { fileName: `${taskId}.md`, filePath, content, task: null };
+});
 jest.mock("../../src/core/task-file-resolver", () => ({
+  // This orchestration fixture has no parsed directory; exercise its existing
+  // exact-path fallback. Real declaration lookup is proved by the disk suites.
+  listTaskClaimantDeclarations: jest.fn(() => Promise.resolve([])),
   listDuplicateClaimants: jest.fn(() => Promise.resolve([])),
-  resolveTaskFile: jest.fn(async (taskDir: string, taskId: string) => {
-    const filePath = [taskDir, `${taskId}.md`].join("/");
-    // Round 2 (R2-1): production now CARRIES the resolver's content instead
-    // of re-reading, so this stub hands back whatever the suite's `node:fs`
-    // mock holds for the same path; an empty string here would blank every
-    // status arm's input. Importing inside the stub goes through jest's
-    // module registry, so this IS the mocked module, with real typings.
-    const { promises: mockedPromises } = await import("node:fs");
-    let content = "";
-    try {
-      const raw: unknown = await mockedPromises.readFile(filePath, "utf-8");
-      content = typeof raw === "string" ? raw : "";
-    } catch {
-      content = "";
-    }
-    return { fileName: `${taskId}.md`, filePath, content, task: null };
-  }),
+  resolveTaskFile: (...args: [string, string]) => mockResolveTaskFile(...args),
 }));
 
 jest.mock("../../src/core/task-parser", () => ({
   parseTaskFile: jest.fn(),
 }));
 
-jest.mock("../../src/core/task-state-overlay.js", () => ({
-  ...jest.requireActual<object>("../../src/core/task-state-overlay"),
-  loadTaskStateOverlay: jest.fn(() => ({
-    overlay: new Map<string, string>(),
-    degraded: false,
-    source: "absent",
-    viaWorktree: false,
-    resolvedRoot: "C:\\tmp\\lifecycle-test",
-    requestedRoot: "C:\\tmp\\lifecycle-test",
-  })),
+const mockWithCanonicalTaskSpecMutationFence = jest.fn(
+  async (input: {
+    taskFilePath: string;
+    replacementContent: string;
+    afterWrite?: () => unknown;
+  }) => {
+    const { promises: mockedPromises } = await import("node:fs");
+    await mockedPromises.writeFile(input.taskFilePath, input.replacementContent, "utf-8");
+    return input.afterWrite?.();
+  },
+);
+class MockCanonicalTaskSpecMutationError extends Error {
+  claimants: string[] = [];
+}
+jest.mock("../../src/preflight/canonical-task-spec-mutation", () => ({
+  CanonicalTaskSpecMutationError: MockCanonicalTaskSpecMutationError,
+  withCanonicalTaskSpecMutationFence: (input: {
+    taskFilePath: string;
+    replacementContent: string;
+    afterWrite?: () => unknown;
+  }) => mockWithCanonicalTaskSpecMutationFence(input),
+}));
+
+const mockRunAgent =
+  jest.fn<
+    (
+      taskId: string,
+      context: TaskContext,
+      adapter: ProjectAdapter,
+      options?: RunAgentOptions,
+      events?: IEventWriter,
+    ) => Promise<AgentResult>
+  >();
+jest.mock("../../src/worker/agent-worker", () => ({
+  runAgent: (...args: [string, TaskContext, ProjectAdapter, RunAgentOptions?, IEventWriter?]) =>
+    mockRunAgent(...args),
+}));
+
+const mockSealAgentOutputAttempt =
+  jest.fn<(input: Record<string, unknown>) => Promise<AgentOutputSnapshot>>();
+jest.mock("../../src/dispatcher/output-snapshot", () => ({
+  sealAgentOutputAttempt: (input: Record<string, unknown>) => mockSealAgentOutputAttempt(input),
 }));
 
 // ─── Imports (after mocks) ─────────────────────────────────────────
@@ -156,6 +203,25 @@ function makeTask(overrides?: Partial<ParsedTask>): ParsedTask {
     rawContent: "# TASK-100: Test Task\n## Metadata\n- **Status:** READY\n",
     ...overrides,
   } as ParsedTask;
+}
+
+function makeAgentResult(overrides?: Partial<AgentResult>): AgentResult {
+  return {
+    taskId: "TASK-100",
+    outcome: "success",
+    filesModified: ["src/game.ts"],
+    filesCreated: [],
+    verification: {
+      allPassed: true,
+      commands: [],
+      conventionChecks: [],
+    },
+    turnsUsed: 1,
+    totalCostUsd: 0,
+    messages: [],
+    claudeSessionId: "codex-thread-1",
+    ...overrides,
+  };
 }
 
 function makeEvents(): IEventWriter {
@@ -278,6 +344,9 @@ describe("runPostApprovalLifecycle", () => {
       return Promise.resolve(undefined);
     });
     mockAppendFile.mockResolvedValue(undefined);
+    mockRunAgent.mockReset();
+    mockRunAgent.mockResolvedValue(makeAgentResult());
+    mockSealAgentOutputAttempt.mockResolvedValue({} as AgentOutputSnapshot);
   });
 
   afterEach(() => {
@@ -311,13 +380,13 @@ describe("runPostApprovalLifecycle", () => {
 
   // ── Test 2: Adversarial verification finds issues, fix cycle succeeds ─
 
-  test("adversarial verification finds issues, fix cycle succeeds", async () => {
+  test("Claude lifecycle repair uses the guarded worker, deterministic verification, and sealing", async () => {
     const task = makeTask();
     let callCount = 0;
 
     // First call: verify fails (2 failures)
-    // Second call: fix agent runs (consumed, no result needed)
-    // Third call: verify passes
+    // Second call: post-seal verification passes. The repair itself must run
+    // through runAgent, not a direct SDK query.
     // eslint-disable-next-line @typescript-eslint/require-await
     const mockQuery = jest.fn().mockImplementation(async function* () {
       callCount++;
@@ -328,11 +397,8 @@ describe("runPostApprovalLifecycle", () => {
           subtype: "success",
           result: mixedResponse(task.successCriteria, [0, 1]),
         };
-      } else if (callCount === 2) {
-        // Fix agent — just complete
-        yield { type: "result", subtype: "success", result: "Fixed the issues" };
       } else {
-        // Second adversarial verification — all pass
+        // Adversarial re-verification — all pass
         yield {
           type: "result",
           subtype: "success",
@@ -354,14 +420,388 @@ describe("runPostApprovalLifecycle", () => {
 
     expect(result.verified).toBe(true);
     expect(result.fixAttemptsUsed).toBe(1);
-    expect(mockQuery).toHaveBeenCalledTimes(3); // verify + fix + re-verify
+    expect(mockQuery).toHaveBeenCalledTimes(2); // initial verify + post-seal re-verify
+    expect(mockRunAgent).toHaveBeenCalledTimes(1);
+    const [, context, repairAdapter, options, workerEvents] = mockRunAgent.mock.calls[0];
+    expect(context.taskSpecPath?.replace(/\\/g, "/")).toMatch(
+      /\/tmp\/lifecycle-test\/docs\/tasks\/TASK-100\.md$/,
+    );
+    expect(context.blueprint).toContain("Do not run git write commands");
+    expect(context.blueprint).not.toContain("commit them");
+    expect(repairAdapter.projectRoot).toBe(tmpDir);
+    expect(options).toEqual({
+      model: "claude-sonnet-4-6",
+      maxTurns: 30,
+      maxBudgetUsd: 2,
+    });
+    expect(workerEvents).toBe(events);
+    expect(mockSealAgentOutputAttempt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        taskId: "TASK-100",
+        adapter: repairAdapter,
+        events,
+        attempt: 1,
+        kind: "lifecycle_fix",
+        claudeSessionId: "codex-thread-1",
+      }),
+    );
+    expect(mockSealAgentOutputAttempt.mock.invocationCallOrder[0]).toBeLessThan(
+      mockQuery.mock.invocationCallOrder[1],
+    );
+  });
+
+  test("Codex lifecycle repair uses the mutable worker and seals its output", async () => {
+    const task = makeTask({
+      filesToModify: [
+        {
+          path: "src/game.ts",
+          action: "Modify",
+          notes: "repair behavior",
+        },
+      ],
+      testingRequirements: ["npm test -- game"],
+    });
+    adapter = makeAdapter({
+      projectRoot: "/configured/root-that-must-not-be-used",
+      config: {
+        ...adapter.config,
+        agent: {
+          ...adapter.config.agent,
+          runner: "codex-cli",
+          codex: {
+            binaryPath: "codex",
+            sandbox: "workspace-write",
+            timeoutMs: 120_000,
+          },
+        },
+      },
+    });
+    let verifyCall = 0;
+    // eslint-disable-next-line @typescript-eslint/require-await
+    const mockQuery = jest.fn().mockImplementation(async function* () {
+      verifyCall += 1;
+      yield {
+        type: "result",
+        subtype: "success",
+        result:
+          verifyCall === 1
+            ? mixedResponse(task.successCriteria, [0])
+            : allPassResponse(task.successCriteria),
+      };
+    });
+    _setQueryFn(mockQuery as unknown as Parameters<typeof _setQueryFn>[0]);
+    mockRunAgent.mockResolvedValue(makeAgentResult());
+    mockReadFile.mockImplementation((filePath: string) => {
+      if (writtenFiles.has(filePath)) {
+        return Promise.resolve(writtenFiles.get(filePath)!);
+      }
+      return Promise.resolve(taskFileContent("TASK-100", "READY"));
+    });
+
+    const result = await runPostApprovalLifecycle("TASK-100", task, adapter, tmpDir, events);
+
+    expect(result.verified).toBe(true);
+    expect(result.fixAttemptsUsed).toBe(1);
+    expect(mockQuery).toHaveBeenCalledTimes(2);
+    expect(mockRunAgent).toHaveBeenCalledTimes(1);
+    const [calledTaskId, context, repairAdapter, options, workerEvents] =
+      mockRunAgent.mock.calls[0];
+    expect(calledTaskId).toBe("TASK-100");
+    expect(context).toMatchObject({
+      taskSpec: expect.stringContaining("# TASK-100"),
+      relevantFiles: ["src/game.ts"],
+      existingTests: ["npm test -- game"],
+    });
+    expect(context.taskSpecPath?.replace(/\\/g, "/")).toMatch(
+      /\/tmp\/lifecycle-test\/docs\/tasks\/TASK-100\.md$/,
+    );
+    expect(context.blueprint).toContain("Not implemented correctly");
+    expect(context.blueprint).toContain("Do not run git write commands");
+    expect(context.blueprint).not.toContain("commit them");
+    expect(repairAdapter.projectRoot).toBe(tmpDir);
+    expect(options).toEqual({
+      model: "claude-sonnet-4-6",
+      maxTurns: 30,
+      maxBudgetUsd: 2,
+    });
+    expect(workerEvents).toBe(events);
+    expect(mockSealAgentOutputAttempt).toHaveBeenCalledWith({
+      taskId: "TASK-100",
+      adapter: repairAdapter,
+      events,
+      attempt: 1,
+      kind: "lifecycle_fix",
+      claudeSessionId: "codex-thread-1",
+    });
+  });
+
+  test("Codex lifecycle repair resumes the exact worker session", async () => {
+    const task = makeTask();
+    adapter.config.agent.runner = "codex-cli";
+    let verifyCall = 0;
+    // eslint-disable-next-line @typescript-eslint/require-await
+    const mockQuery = jest.fn().mockImplementation(async function* () {
+      verifyCall += 1;
+      yield {
+        type: "result",
+        subtype: "success",
+        result:
+          verifyCall < 3
+            ? mixedResponse(task.successCriteria, [verifyCall - 1])
+            : allPassResponse(task.successCriteria),
+      };
+    });
+    _setQueryFn(mockQuery as unknown as Parameters<typeof _setQueryFn>[0]);
+    mockRunAgent
+      .mockResolvedValueOnce(makeAgentResult({ claudeSessionId: "codex-thread-1" }))
+      .mockResolvedValueOnce(makeAgentResult({ claudeSessionId: "codex-thread-2" }));
+    mockReadFile.mockImplementation((filePath: string) => {
+      if (writtenFiles.has(filePath)) {
+        return Promise.resolve(writtenFiles.get(filePath)!);
+      }
+      return Promise.resolve(taskFileContent("TASK-100", "READY"));
+    });
+
+    const result = await runPostApprovalLifecycle("TASK-100", task, adapter, tmpDir, events);
+
+    expect(result.verified).toBe(true);
+    expect(result.fixAttemptsUsed).toBe(2);
+    expect(mockRunAgent).toHaveBeenCalledTimes(2);
+    expect(mockRunAgent.mock.calls[0][3]).not.toHaveProperty("resumeSessionId");
+    expect(mockRunAgent.mock.calls[1][3]).toMatchObject({
+      resumeSessionId: "codex-thread-1",
+    });
+    expect(mockRunAgent.mock.calls[1][3]?.retryFeedback).toContain("Not implemented correctly");
+    expect(mockSealAgentOutputAttempt).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        attempt: 2,
+        claudeSessionId: "codex-thread-2",
+      }),
+    );
+  });
+
+  test("Codex lifecycle repair contains invalid worker output and fails closed", async () => {
+    const task = makeTask();
+    adapter.config.agent.runner = "codex-cli";
+    const mockQuery = makeMockQueryFn(mixedResponse(task.successCriteria, [0]));
+    _setQueryFn(mockQuery as unknown as Parameters<typeof _setQueryFn>[0]);
+    mockRunAgent
+      .mockResolvedValueOnce(
+        makeAgentResult({
+          outcome: "failure",
+          verification: null,
+          error: "Codex --json emitted a malformed JSONL event",
+          claudeSessionId: "codex-thread-1",
+        }),
+      )
+      .mockResolvedValueOnce(
+        makeAgentResult({
+          outcome: "failure",
+          verification: null,
+          error: "Codex repair retry failed",
+          claudeSessionId: "codex-thread-1",
+        }),
+      );
+    mockReadFile.mockResolvedValue(taskFileContent("TASK-100", "READY"));
+
+    const result = await runPostApprovalLifecycle("TASK-100", task, adapter, tmpDir, events);
+
+    expect(result).toMatchObject({
+      verified: false,
+      statusUpdated: false,
+      fixAttemptsUsed: 2,
+    });
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+    expect(mockRunAgent).toHaveBeenCalledTimes(2);
+    expect(mockRunAgent.mock.calls[1][3]).toMatchObject({
+      resumeSessionId: "codex-thread-1",
+    });
+    expect(mockSealAgentOutputAttempt).not.toHaveBeenCalled();
+    const sessionErrors = (events.emit as ReturnType<typeof jest.fn>).mock.calls
+      .filter((call: unknown[]) => call[0] === "session_error")
+      .map((call: unknown[]) => call[1]);
+    expect(sessionErrors).toContainEqual({
+      error: expect.stringContaining("malformed JSONL"),
+      failedStage: "lifecycle_fix",
+      runner: "codex-cli",
+      sessionId: "codex-thread-1",
+    });
+  });
+
+  test("Claude lifecycle repair resumes its returned session and reports provider evidence", async () => {
+    const task = makeTask();
+    let verifyCall = 0;
+    // eslint-disable-next-line @typescript-eslint/require-await
+    const mockQuery = jest.fn().mockImplementation(async function* () {
+      verifyCall += 1;
+      yield {
+        type: "result",
+        subtype: "success",
+        result:
+          verifyCall < 3
+            ? mixedResponse(task.successCriteria, [0])
+            : allPassResponse(task.successCriteria),
+      };
+    });
+    _setQueryFn(mockQuery as unknown as Parameters<typeof _setQueryFn>[0]);
+    mockRunAgent
+      .mockResolvedValueOnce(makeAgentResult({ claudeSessionId: "claude-session-1" }))
+      .mockResolvedValueOnce(makeAgentResult({ claudeSessionId: "claude-session-2" }));
+    mockReadFile.mockImplementation((filePath: string) => {
+      if (writtenFiles.has(filePath)) return Promise.resolve(writtenFiles.get(filePath)!);
+      return Promise.resolve(taskFileContent("TASK-100", "READY"));
+    });
+
+    const result = await runPostApprovalLifecycle("TASK-100", task, adapter, tmpDir, events);
+
+    expect(result).toMatchObject({ verified: true, fixAttemptsUsed: 2 });
+    expect(mockRunAgent.mock.calls[1][3]).toMatchObject({
+      resumeSessionId: "claude-session-1",
+      retryFeedback: expect.stringContaining("Not implemented correctly"),
+    });
+    expect(mockRunAgent.mock.calls[1][4]).toBe(events);
+    const completions = (events.emit as ReturnType<typeof jest.fn>).mock.calls.filter(
+      (call: unknown[]) => call[0] === "lifecycle_fix_complete",
+    );
+    expect(completions).toEqual([
+      [
+        "lifecycle_fix_complete",
+        expect.objectContaining({
+          runner: "claude-sdk",
+          sessionId: "claude-session-1",
+          outcome: "success",
+        }),
+      ],
+      [
+        "lifecycle_fix_complete",
+        expect.objectContaining({
+          runner: "claude-sdk",
+          sessionId: "claude-session-2",
+          outcome: "success",
+        }),
+      ],
+    ]);
+  });
+
+  test("repair fails closed when worker verification is absent", async () => {
+    const task = makeTask();
+    const mockQuery = makeMockQueryFn(mixedResponse(task.successCriteria, [0]));
+    _setQueryFn(mockQuery as unknown as Parameters<typeof _setQueryFn>[0]);
+    mockRunAgent.mockResolvedValue(
+      makeAgentResult({ verification: null, claudeSessionId: "claude-unverified" }),
+    );
+    mockReadFile.mockResolvedValue(taskFileContent("TASK-100", "READY"));
+
+    const result = await runPostApprovalLifecycle("TASK-100", task, adapter, tmpDir, events);
+
+    expect(result).toMatchObject({
+      verified: false,
+      statusUpdated: false,
+      fixAttemptsUsed: 2,
+    });
+    expect(mockSealAgentOutputAttempt).not.toHaveBeenCalled();
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+    expect((events.emit as ReturnType<typeof jest.fn>).mock.calls).toContainEqual([
+      "session_error",
+      expect.objectContaining({
+        error: expect.stringContaining("without passing deterministic verification"),
+        runner: "claude-sdk",
+        sessionId: "claude-unverified",
+      }),
+    ]);
+  });
+
+  test("repair contains thrown Claude worker errors and never re-verifies or seals", async () => {
+    const task = makeTask();
+    const mockQuery = makeMockQueryFn(mixedResponse(task.successCriteria, [0]));
+    _setQueryFn(mockQuery as unknown as Parameters<typeof _setQueryFn>[0]);
+    mockRunAgent.mockRejectedValue(new Error("Claude provider unavailable"));
+    mockReadFile.mockResolvedValue(taskFileContent("TASK-100", "READY"));
+
+    const result = await runPostApprovalLifecycle("TASK-100", task, adapter, tmpDir, events);
+
+    expect(result).toMatchObject({
+      verified: false,
+      statusUpdated: false,
+      fixAttemptsUsed: 2,
+    });
+    expect(mockRunAgent).toHaveBeenCalledTimes(2);
+    expect(mockSealAgentOutputAttempt).not.toHaveBeenCalled();
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+    expect((events.emit as ReturnType<typeof jest.fn>).mock.calls).toContainEqual([
+      "session_error",
+      expect.objectContaining({
+        error: expect.stringContaining("Claude provider unavailable"),
+        failedStage: "lifecycle_fix",
+        runner: "claude-sdk",
+      }),
+    ]);
+  });
+
+  test.each(["claude-sdk", "codex-cli"] as const)(
+    "%s repair refuses to run without a canonically resolved task spec",
+    async (runner) => {
+      const task = makeTask();
+      adapter.config.agent.runner = runner;
+      const mockQuery = makeMockQueryFn(mixedResponse(task.successCriteria, [0]));
+      _setQueryFn(mockQuery as unknown as Parameters<typeof _setQueryFn>[0]);
+      mockResolveTaskFile.mockImplementationOnce(() => Promise.resolve(null as never));
+
+      const result = await runPostApprovalLifecycle("TASK-100", task, adapter, tmpDir, events);
+
+      expect(result).toMatchObject({
+        verified: false,
+        statusUpdated: false,
+        fixAttemptsUsed: 0,
+      });
+      expect(mockRunAgent).not.toHaveBeenCalled();
+      expect(mockSealAgentOutputAttempt).not.toHaveBeenCalled();
+      expect((events.emit as ReturnType<typeof jest.fn>).mock.calls).toContainEqual([
+        "session_error",
+        expect.objectContaining({
+          error: expect.stringContaining("could not resolve the active task spec"),
+          runner,
+        }),
+      ]);
+    },
+  );
+
+  test("repair fails closed when sealing fails before adversarial re-verification", async () => {
+    const task = makeTask();
+    const mockQuery = makeMockQueryFn(mixedResponse(task.successCriteria, [0]));
+    _setQueryFn(mockQuery as unknown as Parameters<typeof _setQueryFn>[0]);
+    mockRunAgent.mockResolvedValue(makeAgentResult({ claudeSessionId: "claude-seal" }));
+    mockSealAgentOutputAttempt.mockRejectedValue(new Error("seal rejected protected output"));
+    mockReadFile.mockResolvedValue(taskFileContent("TASK-100", "READY"));
+
+    const result = await runPostApprovalLifecycle("TASK-100", task, adapter, tmpDir, events);
+
+    expect(result).toMatchObject({
+      verified: false,
+      statusUpdated: false,
+      fixAttemptsUsed: 2,
+    });
+    expect(mockRunAgent.mock.calls[1][3]).toMatchObject({
+      resumeSessionId: "claude-seal",
+    });
+    expect(mockSealAgentOutputAttempt).toHaveBeenCalledTimes(2);
+    expect(mockQuery).toHaveBeenCalledTimes(1);
+    expect((events.emit as ReturnType<typeof jest.fn>).mock.calls).toContainEqual([
+      "session_error",
+      expect.objectContaining({
+        error: expect.stringContaining("seal rejected protected output"),
+        runner: "claude-sdk",
+        sessionId: "claude-seal",
+      }),
+    ]);
   });
 
   // ── Test 3: Fix cycle exhausted (both attempts fail) ─────────────────
 
   test("fix cycle exhausted, both attempts fail", async () => {
     const task = makeTask();
-    // All calls return failures — verification never passes
+    // All verifier calls return failures — verification never passes
     const failResponse = mixedResponse(task.successCriteria, [0, 1]);
     // eslint-disable-next-line @typescript-eslint/require-await
     const mockQuery = jest.fn().mockImplementation(async function* () {
@@ -380,8 +820,10 @@ describe("runPostApprovalLifecycle", () => {
     expect(result.verified).toBe(false);
     expect(result.fixAttemptsUsed).toBe(2);
     expect(result.statusUpdated).toBe(false);
-    // 5 calls: initial verify + (fix1 + verify1) + (fix2 + verify2)
-    expect(mockQuery).toHaveBeenCalledTimes(5);
+    // 3 calls: initial verify + one post-seal re-verification per worker attempt.
+    expect(mockQuery).toHaveBeenCalledTimes(3);
+    expect(mockRunAgent).toHaveBeenCalledTimes(2);
+    expect(mockSealAgentOutputAttempt).toHaveBeenCalledTimes(2);
     const verificationNeededCalls = (events.emit as ReturnType<typeof jest.fn>).mock.calls.filter(
       (call: unknown[]) => call[0] === "task_verification_needed",
     );
@@ -723,25 +1165,21 @@ describe("runPostApprovalLifecycle", () => {
 
   // ── Test 11: Post-write verification detects stale status ───────────
 
-  test("updateTaskStatus returns false when post-write re-read shows stale status", async () => {
-    const task = makeTask();
-    const response = allPassResponse(task.successCriteria);
-    const mockQuery = makeMockQueryFn(response);
-    _setQueryFn(mockQuery as unknown as Parameters<typeof _setQueryFn>[0]);
-
-    // writeFile succeeds but does NOT update writtenFiles, so the re-read
-    // still returns the original content with the old status.
-    mockWriteFile.mockResolvedValue(undefined);
-
-    // readFile always returns original content (simulating a write that
-    // didn't actually persist — e.g., filesystem corruption or race).
+  test("updateTaskStatus returns false when the canonical mutation fence refuses stale bytes", async () => {
     mockReadFile.mockResolvedValue(taskFileContent("TASK-100", "READY"));
+    mockWithCanonicalTaskSpecMutationFence.mockRejectedValueOnce(
+      new Error("Task TASK-100 changed before its canonical mutation could be published."),
+    );
 
-    const result = await runPostApprovalLifecycle("TASK-100", task, adapter, tmpDir, events);
+    const updated = await updateTaskStatus(
+      "TASK-100",
+      "/tmp/lifecycle-test/docs/tasks",
+      "COMPLETE",
+      events,
+      adapter,
+    );
 
-    // Verification passed but status update should have failed
-    expect(result.verified).toBe(true);
-    expect(result.statusUpdated).toBe(false);
+    expect(updated).toBe(false);
 
     // Verify lifecycle_status_update_failed event was emitted
     const failedCalls = (events.emit as ReturnType<typeof jest.fn>).mock.calls.filter(

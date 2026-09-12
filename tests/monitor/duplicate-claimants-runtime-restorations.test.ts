@@ -143,17 +143,17 @@ describe("TASK-1338-F recovery writes remain usable but mint no admission token"
   }
 
   async function startServer(): Promise<void> {
-    const port = 49100 + Math.floor(Math.random() * 500);
     const monitor = createMonitorServer({
       projectRoot: root,
       taskDir: "docs/tasks",
       logDir,
       quackRoot,
-      port,
+      port: 0,
+      host: "127.0.0.1",
     });
     const started = await monitor.start();
     stopServer = started.stop;
-    baseUrl = `http://127.0.0.1:${port}`;
+    baseUrl = `http://127.0.0.1:${started.port}`;
     await pause(125);
   }
 
@@ -498,4 +498,74 @@ describe("TASK-1338-F recovery writes remain usable but mint no admission token"
     expect(db.getVerified("TASK-510")).toBeUndefined();
     db.close();
   });
+  it.each(["valid", "probe", "missing"])(
+    "QPI-025 lifecycle_complete %s evidence uses the canonical writer",
+    async (kind) => {
+      await startServer();
+      const db = database();
+      const projectionPath = path.join(root, ".quack", "verified.json");
+      const before = fs.readFileSync(projectionPath, "utf8");
+      const status = db.getStatus("TASK-510");
+      const sessionId = `session-qpi-lifecycle-${kind}`;
+      const eventPath = path.join(logDir, `events-${sessionId}.jsonl`);
+      // Real JSONL input also represents the invalid/untyped producer cases.
+      fs.writeFileSync(
+        eventPath,
+        JSON.stringify({
+          sessionId,
+          taskId: "TASK-510",
+          project: "fixture",
+          timestamp: new Date().toISOString(),
+          stage: "lifecycle_complete",
+          payload: {
+            taskId: "TASK-510",
+            verdict: "VERIFIED",
+            criteriaChecked: 1,
+            criteriaPassed: 1,
+            ...(kind === "missing" ? {} : { commitSha: kind === "valid" ? "abc1234" : "probe" }),
+          },
+        }) + "\n",
+      );
+      try {
+        let errors: Array<{ stage?: string; payload?: { error?: string } }> = [];
+        for (let attempt = 0; attempt < 40; attempt += 1) {
+          errors = fs
+            .readFileSync(eventPath, "utf8")
+            .trim()
+            .split("\n")
+            .map((line) => JSON.parse(line) as { stage?: string; payload?: { error?: string } });
+          const projection = JSON.parse(fs.readFileSync(projectionPath, "utf8")) as {
+            tasks: Record<string, unknown>;
+          };
+          if (
+            projection.tasks["TASK-510"] ||
+            errors.some((event) => event.stage === "loop_finalize_record_failed")
+          )
+            break;
+          await pause(75);
+        }
+        expect(db.getStatus("TASK-510")).toEqual(status);
+        if (kind === "valid") {
+          expect(db.getVerified("TASK-510")).toMatchObject({
+            verdict: "VERIFIED",
+            commit_sha: "abc1234",
+            method: "pipeline",
+          });
+          expect(db.getVerifiedHistory("TASK-510")).toHaveLength(1);
+          expect(JSON.parse(fs.readFileSync(projectionPath, "utf8"))).toMatchObject({
+            tasks: { "TASK-510": { verdict: "VERIFIED", commit: "abc1234" } },
+          });
+        } else {
+          expect(
+            errors.find((event) => event.stage === "loop_finalize_record_failed")?.payload?.error,
+          ).toContain("Positive verification requires");
+          expect(db.getVerified("TASK-510")).toBeUndefined();
+          expect(db.getVerifiedHistory("TASK-510")).toEqual([]);
+          expect(fs.readFileSync(projectionPath, "utf8")).toBe(before);
+        }
+      } finally {
+        db.close();
+      }
+    },
+  );
 });

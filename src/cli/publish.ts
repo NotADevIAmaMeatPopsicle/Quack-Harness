@@ -23,7 +23,7 @@ export async function handlePublish(argv: {
     process.exit(1);
   }
 
-  const syncMap = await getSyncMap(adapter.config);
+  const syncMap = await getSyncMap(adapter.projectRoot);
 
   try {
     if (argv.allBacklog) {

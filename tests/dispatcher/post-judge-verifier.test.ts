@@ -1,10 +1,23 @@
 import { describe, it, expect, beforeEach, jest } from "@jest/globals";
 import { runPostJudgeVerification } from "../../src/dispatcher/post-judge-verifier.js";
 import type { ProjectAdapter } from "../../src/core/adapter-loader.js";
+import { AdapterAgentConfigSchema } from "../../src/core/adapter-schema.js";
 import type { ParsedTask } from "../../src/core/types.js";
 import type { IEventWriter } from "../../src/monitor/event-emitter.js";
 import * as childProcess from "node:child_process";
 import * as fs from "node:fs";
+
+const mockTrustedGitSync = jest.fn();
+
+// Keep this suite focused on post-judge policy. Trusted Git executable
+// resolution and contained file reads have their own boundary-level tests.
+jest.mock("../../src/dispatcher/trusted-git", () => ({
+  runTrustedGitSync: (...args: unknown[]) => mockTrustedGitSync(...args),
+}));
+
+jest.mock("../../src/dispatcher/safe-semantic-file-reader", () => ({
+  readContainedRegularFile: () => Promise.resolve("file content"),
+}));
 
 // Mock child_process
 jest.mock("node:child_process", () => ({
@@ -35,10 +48,15 @@ describe("post-judge-verifier", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockExistsSync.mockReturnValue(false);
+    mockTrustedGitSync.mockImplementation((args: unknown) => {
+      const gitArgs = Array.isArray(args) ? args.map(String).join(" ") : String(args);
+      return mockExecSync(`git ${gitArgs}`);
+    });
 
     mockAdapter = {
       projectRoot: "/test/project",
       config: {
+        agent: AdapterAgentConfigSchema.parse({}),
         verification: {
           commands: [
             { name: "build", command: "npm run build", required: true, timeout: 30000 },
@@ -88,6 +106,27 @@ describe("post-judge-verifier", () => {
       expect(result.buildPassed).toBe(true);
       expect(result.findings.some((f) => f.criterion === "build" && f.status === "pass")).toBe(
         true,
+      );
+    });
+
+    it("normalizes legacy second-based command timeouts before execution", async () => {
+      mockAdapter.config.verification.commands = [
+        { name: "build", command: "npm run build", required: true, timeout: 300 },
+      ];
+      mockAdapter.config.verification.postJudge!.layers = ["deterministic"];
+      mockExecSync.mockReturnValue("Build successful");
+
+      await runPostJudgeVerification(
+        "TASK-065",
+        mockTask,
+        mockAdapter,
+        "/test/worktree",
+        mockEvents,
+      );
+
+      expect(mockExecSync).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ timeout: 300_000 }),
       );
     });
 

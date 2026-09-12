@@ -21,6 +21,11 @@ jest.mock("node:child_process", () => ({
   })),
 }));
 
+jest.mock("../../../src/core/adapter-loader.js", () => ({
+  loadAdapter: jest.fn(),
+  computeAdapterBundleMetadata: jest.fn(() => ({ sharedHash: "sha256:test" })),
+}));
+
 // Mock baseline-manager
 jest.mock("../../../src/testing/baseline-manager.js", () => ({
   saveBaseline: jest.fn(),
@@ -30,9 +35,15 @@ jest.mock("../../../src/testing/baseline-manager.js", () => ({
 
 import { registerTestResultsRoutes } from "../../../src/monitor/routes/test-results.js";
 import * as fs from "node:fs";
+import { spawn } from "node:child_process";
+import { loadAdapter } from "../../../src/core/adapter-loader.js";
+
+type RouteHandler = (req: Request, res: Response) => void;
 
 const mockExistsSync = fs.existsSync as ReturnType<typeof jest.fn>;
 const mockReadFileSync = fs.readFileSync as ReturnType<typeof jest.fn>;
+const mockLoadAdapter = loadAdapter as ReturnType<typeof jest.fn>;
+const mockSpawn = spawn as ReturnType<typeof jest.fn>;
 
 function mockReqRes(params: Record<string, string> = {}) {
   const req = { params } as unknown as Request;
@@ -46,7 +57,7 @@ function mockReqRes(params: Record<string, string> = {}) {
 }
 
 describe("test-results routes", () => {
-  let handlers: Record<string, (req: Request, res: Response) => void>;
+  let handlers: Record<string, RouteHandler>;
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -122,11 +133,93 @@ describe("test-results routes", () => {
     it("registers the route", () => {
       expect(handlers["/api/test/full-suite"]).toBeDefined();
     });
+
+    it("routes the named full suite through the bounded per-project runner", async () => {
+      const startAdapterVerification = jest.fn(() => ({ started: true, taskId: "manual-1" }));
+      const getTestRunner = jest.fn(() => ({
+        isRunning: () => false,
+        startAdapterVerification,
+      }));
+      const fakeApp = {
+        get: jest.fn(),
+        post: jest.fn((route: string, handler: RouteHandler) => {
+          handlers[route] = handler;
+        }),
+      } as unknown as ReturnType<typeof express>;
+      const adapter = {
+        projectRoot: "/test/project",
+        config: {
+          git: { baseBranch: "main" },
+          verification: {
+            hostExecution: "docker-sandbox",
+            tieredTesting: { enabled: true },
+            commands: [
+              {
+                name: "full-suite",
+                command: "malicious-host-command",
+                required: true,
+                timeout: 30_000,
+              },
+            ],
+          },
+        },
+      };
+      mockLoadAdapter.mockResolvedValue(adapter);
+      registerTestResultsRoutes(fakeApp, () => ({ projectRoot: "/test/project" }), {
+        getTestRunner: getTestRunner as never,
+      });
+      const { req, res, jsonFn } = mockReqRes();
+
+      await Promise.resolve(handlers["/api/test/full-suite"](req, res));
+
+      expect(getTestRunner).toHaveBeenCalledWith("/test/project");
+      expect(startAdapterVerification).toHaveBeenCalledWith(
+        adapter,
+        "full-suite",
+        expect.objectContaining({ baseBranch: "main", force: true }),
+      );
+      expect(mockSpawn).not.toHaveBeenCalled();
+      expect(jsonFn).toHaveBeenCalledWith(
+        expect.objectContaining({ hostExecution: "docker-sandbox", taskId: "manual-1" }),
+      );
+    });
+
+    it("fails closed when no named full-suite verifier exists", async () => {
+      const fakeApp = {
+        get: jest.fn(),
+        post: jest.fn((route: string, handler: RouteHandler) => {
+          handlers[route] = handler;
+        }),
+      } as unknown as ReturnType<typeof express>;
+      mockLoadAdapter.mockResolvedValue({
+        projectRoot: "/test/project",
+        config: {
+          git: { baseBranch: "main" },
+          verification: {
+            hostExecution: "docker-sandbox",
+            tieredTesting: { enabled: true },
+            commands: [],
+          },
+        },
+      });
+      registerTestResultsRoutes(fakeApp, () => ({ projectRoot: "/test/project" }), {
+        getTestRunner: jest.fn() as never,
+      });
+      const { req, res, statusFn, jsonFn } = mockReqRes();
+
+      await Promise.resolve(handlers["/api/test/full-suite"](req, res));
+
+      expect(statusFn).toHaveBeenCalledWith(409);
+      expect(jsonFn).toHaveBeenCalledWith(
+        expect.objectContaining({ code: "FULL_SUITE_COMMAND_REQUIRED" }),
+      );
+      expect(mockSpawn).not.toHaveBeenCalled();
+    });
   });
 
   describe("error handling", () => {
     it("returns 400 when no project root configured", () => {
-      const noRootHandlers: Record<string, (req: Request, res: Response) => void> = {};
+      const noRootHandlers: Record<string, RouteHandler> = {};
       const fakeApp = {
         get: jest.fn((path: string, handler: (req: Request, res: Response) => void) => {
           noRootHandlers[path] = handler;

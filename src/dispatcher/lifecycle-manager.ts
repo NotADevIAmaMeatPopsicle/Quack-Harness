@@ -1,3 +1,4 @@
+import { getClaudeSdkEnvironment } from "../sdk/claude-auth.js";
 // ─── Post-Approval Lifecycle Manager ─────────────────────────────
 // Runs after judge APPROVE + post-judge PASS. Handles:
 // 1. Adversarial verification (read-only agent checking success criteria)
@@ -9,21 +10,35 @@
 // 7. Atomic git commit of all changes
 
 import type { ProjectAdapter } from "../core/adapter-loader.js";
-import type { ParsedTask, VerificationFinding, LifecycleResult } from "../core/types.js";
+import type {
+  ParsedTask,
+  TaskContext,
+  VerificationFinding,
+  LifecycleResult,
+} from "../core/types.js";
 import type { IEventWriter } from "../monitor/event-emitter.js";
 import { parseTaskFile } from "../core/task-parser.js";
 import { isCompleteStatus } from "../core/task-status.js";
+import {
+  buildStrictDuplicateClaimantIndex,
+  duplicateClaimantRefusalForIndex,
+} from "../core/duplicate-claimants.js";
 import {
   loadTaskStateOverlay,
   resolveTaskStateWithOverlay,
   type RuntimeStatusOverlay,
 } from "../core/task-state-overlay.js";
-import { execSync } from "node:child_process";
 import { promises as fs } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { getSdkPermissionOptions } from "../sdk/permission-mode.js";
-import { listDuplicateClaimants } from "../core/task-file-resolver.js";
-import { formatDuplicateClaimantsMessage } from "../core/duplicate-claimants.js";
+import { runAgent } from "../worker/agent-worker.js";
+import { sealAgentOutputAttempt } from "./output-snapshot.js";
+import { runCodexStructuredEvaluation } from "../llm/codex-structured-evaluator.js";
+import { runTrustedGitSync } from "./trusted-git.js";
+import {
+  CanonicalTaskSpecMutationError,
+  withCanonicalTaskSpecMutationFence,
+} from "../preflight/canonical-task-spec-mutation.js";
 
 // ─── SDK Query Function (lazy-loaded) ────────────────────────────
 
@@ -69,14 +84,83 @@ interface AdversarialResult {
   }>;
 }
 
-// ─── Git Helpers ─────────────────────────────────────────────────
+const ADVERSARIAL_RESULT_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    passed: { type: "boolean" },
+    issues: { type: "array", items: { type: "string" } },
+    criteriaResults: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          criterion: { type: "string" },
+          passed: { type: "boolean" },
+          evidence: { type: "string" },
+        },
+        required: ["criterion", "passed", "evidence"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["passed", "issues", "criteriaResults"],
+  additionalProperties: false,
+};
 
-function gitExec(cmd: string, cwd: string): string {
-  return execSync(cmd, {
-    cwd,
-    encoding: "utf-8",
-    stdio: ["pipe", "pipe", "pipe"],
-  }).trim();
+function parseStructuredAdversarialResult(
+  rawText: string,
+  task: ParsedTask,
+): AdversarialResult | null {
+  try {
+    const value: unknown = JSON.parse(rawText);
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const record = value as Record<string, unknown>;
+    if (
+      typeof record.passed !== "boolean" ||
+      !Array.isArray(record.issues) ||
+      !record.issues.every((issue) => typeof issue === "string") ||
+      !Array.isArray(record.criteriaResults)
+    ) {
+      return null;
+    }
+
+    const criteriaResults: AdversarialResult["criteriaResults"] = [];
+    for (const item of record.criteriaResults) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+      const result = item as Record<string, unknown>;
+      if (
+        typeof result.criterion !== "string" ||
+        typeof result.passed !== "boolean" ||
+        typeof result.evidence !== "string"
+      ) {
+        return null;
+      }
+      criteriaResults.push({
+        criterion: result.criterion,
+        passed: result.passed,
+        evidence: result.evidence,
+      });
+    }
+
+    const expected = new Set(task.successCriteria);
+    const observed = new Set(criteriaResults.map((result) => result.criterion));
+    if (
+      criteriaResults.length !== task.successCriteria.length ||
+      observed.size !== expected.size ||
+      [...expected].some((criterion) => !observed.has(criterion))
+    ) {
+      return null;
+    }
+
+    const criteriaPassed = criteriaResults.every((result) => result.passed);
+    return {
+      passed: record.passed && criteriaPassed,
+      issues: record.issues,
+      criteriaResults,
+    };
+  } catch {
+    return null;
+  }
 }
 
 // ─── Task Directory Helper ───────────────────────────────────────
@@ -225,7 +309,19 @@ async function findTaskFile(
   taskDir: string,
 ): Promise<{ filePath: string; content: string } | null> {
   try {
-    const { resolveTaskFile } = await import("../core/task-file-resolver.js");
+    const { listTaskClaimantDeclarations, resolveTaskFile } =
+      await import("../core/task-file-resolver.js");
+    const declared = (await listTaskClaimantDeclarations(taskDir)).find(
+      (candidate) => candidate.declaredId === taskId,
+    );
+    if (declared) {
+      const filePath = join(taskDir, declared.fileName);
+      const content = await fs.readFile(filePath, "utf-8");
+      // Revalidate the bytes carried to the mutation fence, since the inventory
+      // read preceded this read. The fence rechecks exact bytes and every owner.
+      if (parseTaskFile(content, filePath).id !== taskId) return null;
+      return { filePath, content };
+    }
     const resolved = await resolveTaskFile(taskDir, taskId);
     // Round 2 (R2-1): carry the resolution's content too, so no caller
     // re-reads between certifying WHICH file is the task and using it.
@@ -238,7 +334,7 @@ async function findTaskFile(
 
 // ─── Step 1: Adversarial Verification ────────────────────────────
 
-async function runAdversarialVerification(
+export async function runAdversarialVerification(
   taskId: string,
   task: ParsedTask,
   adapter: ProjectAdapter,
@@ -269,6 +365,34 @@ OVERALL: PASS or FAIL`;
   const TIMEOUT_MS = 180_000; // 3 minutes
 
   try {
+    const evaluator = adapter.config.evaluationProviders?.lifecycleVerify;
+    if (evaluator?.runner === "codex-cli") {
+      const result = await runCodexStructuredEvaluation(
+        {
+          projectRoot: workDir,
+          model: evaluator.model ?? adapter.config.agent.model,
+          prompt: `${prompt}\n\nReturn one strict JSON object with passed, issues, and exactly one criteriaResults entry for every criterion. Preserve every criterion string exactly.`,
+          outputSchema: ADVERSARIAL_RESULT_SCHEMA,
+          parse: (rawText) => parseStructuredAdversarialResult(rawText, task),
+        },
+        evaluator,
+      );
+      if (result.status === "runner_error") {
+        throw new Error(`Codex lifecycle evaluator ${result.errorKind}: ${result.message}`);
+      }
+
+      events.emit("lifecycle_verify_result", {
+        taskId,
+        verified: result.value.passed,
+        findings: result.value.criteriaResults.map((criterion) => ({
+          criterion: criterion.criterion,
+          status: criterion.passed ? ("pass" as const) : ("fail" as const),
+          evidence: criterion.evidence,
+        })),
+      });
+      return result.value;
+    }
+
     const query = await getQueryFn();
     const stream = query({
       prompt,
@@ -277,6 +401,7 @@ OVERALL: PASS or FAIL`;
         maxTurns: 15,
         tools: ["Read", "Glob", "Grep"],
         ...getSdkPermissionOptions(),
+        env: getClaudeSdkEnvironment(adapter.config.agent.apiKeys),
         cwd: workDir,
       },
     });
@@ -497,6 +622,33 @@ async function runFixCycle(
   const model = adapter.config.agent.model || "claude-sonnet-4-6";
   const maxTurns = adapter.config.revision?.maxTurns ?? 30;
   const maxBudget = adapter.config.revision?.maxBudget ?? 2.0;
+  const runner = adapter.config.agent.runner ?? "claude-sdk";
+  const repairAdapter: ProjectAdapter =
+    adapter.projectRoot === workDir ? adapter : { ...adapter, projectRoot: workDir };
+  let repairSessionId: string | undefined;
+
+  // Every mutable repair goes through runAgent(), regardless of provider. Resolve
+  // the canonical task contract first so both workers receive the same protected
+  // spec path and deterministic verification can parse the exact contract being
+  // repaired.
+  const resolvedTask = await findTaskFile(taskId, getTaskDir(repairAdapter));
+  if (!resolvedTask) {
+    const message = `${runner} lifecycle repair could not resolve the active task spec for ${taskId}`;
+    events.emit("session_error", {
+      error: message,
+      failedStage: "lifecycle_fix",
+      runner,
+    });
+    return {
+      fixed: false,
+      attemptsUsed: 0,
+      finalResult: {
+        passed: false,
+        issues: [message],
+        criteriaResults: lastResult.criteriaResults,
+      },
+    };
+  }
 
   for (let attempt = 1; attempt <= MAX_FIX_ATTEMPTS; attempt++) {
     attemptsUsed = attempt;
@@ -504,6 +656,8 @@ async function runFixCycle(
       taskId,
       attempt,
       issues: lastResult.issues,
+      runner,
+      ...(repairSessionId ? { sessionId: repairSessionId } : {}),
     });
 
     const issueList = lastResult.issues.map((issue, i) => `${i + 1}. ${issue}`).join("\n");
@@ -517,39 +671,92 @@ ${issueList}
 Task Success Criteria:
 ${task.successCriteria.map((c, i) => `${i + 1}. ${c}`).join("\n")}
 
-Fix these issues. After making changes, commit them with a message describing the fix.
+Fix these issues.
+Do not run git write commands. Quack will seal and commit the validated repair after your turn.
 Be thorough — each issue must be resolved for verification to pass.`;
 
+    let repairFailed = false;
     try {
-      const query = await getQueryFn();
-      const stream = query({
-        prompt,
-        options: {
+      const repairContext: TaskContext = {
+        taskSpec: resolvedTask.content,
+        taskSpecPath: resolvedTask.filePath,
+        conventions: adapter.adrDocs ?? {},
+        conventionsSummary: adapter.conventionsDoc,
+        relevantFiles: task.filesToModify.map((file) => file.path),
+        relatedPatterns: [],
+        existingTests: task.testingRequirements,
+        claudeMd: [],
+        blueprint: prompt,
+      };
+      const repairResult = await runAgent(
+        taskId,
+        repairContext,
+        repairAdapter,
+        {
           model,
           maxTurns,
-          maxBudget,
-          ...getSdkPermissionOptions(),
-          cwd: workDir,
+          maxBudgetUsd: maxBudget,
+          ...(repairSessionId ? { resumeSessionId: repairSessionId, retryFeedback: prompt } : {}),
         },
-      });
+        events,
+      );
+      repairSessionId = repairResult.claudeSessionId ?? repairSessionId;
 
-      // Consume the stream to let the fix agent run
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      for await (const _message of stream) {
-        // Agent runs to completion
+      if (repairResult.outcome !== "success" || repairResult.verification?.allPassed !== true) {
+        repairFailed = true;
+        const detail =
+          repairResult.error ??
+          (repairResult.outcome !== "success"
+            ? `worker outcome ${repairResult.outcome}`
+            : "worker completed without passing deterministic verification");
+        lastResult = {
+          passed: false,
+          issues: [`${runner} repair attempt ${attempt} failed: ${detail}`],
+          criteriaResults: lastResult.criteriaResults,
+        };
+        events.emit("session_error", {
+          error: lastResult.issues[0],
+          failedStage: "lifecycle_fix",
+          runner,
+          ...(repairSessionId ? { sessionId: repairSessionId } : {}),
+        });
+      } else {
+        // A repair is not eligible for adversarial re-verification until its
+        // guarded worker verification passed and its output is durably sealed.
+        await sealAgentOutputAttempt({
+          taskId,
+          adapter: repairAdapter,
+          events,
+          attempt,
+          kind: "lifecycle_fix",
+          claudeSessionId: repairSessionId,
+        });
       }
     } catch (err) {
+      repairFailed = true;
       const error = err instanceof Error ? err.message : String(err);
+      lastResult = {
+        passed: false,
+        issues: [`${runner} repair attempt ${attempt} failed: ${error}`],
+        criteriaResults: lastResult.criteriaResults,
+      };
       events.emit("session_error", {
-        error: `Fix cycle attempt ${attempt} failed: ${error}`,
+        error: lastResult.issues[0],
         failedStage: "lifecycle_fix",
+        runner,
+        ...(repairSessionId ? { sessionId: repairSessionId } : {}),
       });
     }
 
     events.emit("lifecycle_fix_complete", {
       taskId,
       attempt,
+      runner,
+      ...(repairSessionId ? { sessionId: repairSessionId } : {}),
+      outcome: repairFailed ? "failure" : "success",
     });
+
+    if (repairFailed) continue;
 
     // Re-run adversarial verification
     lastResult = await runAdversarialVerification(taskId, task, adapter, workDir, events);
@@ -575,7 +782,29 @@ export async function updateTaskStatus(
   taskDir: string,
   newStatus: string,
   events?: IEventWriter,
+  adapter?: ProjectAdapter,
+  allowDecomposedCurrent = false,
 ): Promise<boolean> {
+  let mutationAdapter = adapter;
+  if (!mutationAdapter) {
+    const projectRoot = await resolveProjectRootFromTaskDir(taskDir);
+    if (projectRoot) {
+      mutationAdapter = {
+        projectRoot,
+        config: {
+          project: {
+            name: "lifecycle-status-update",
+            root: ".",
+            taskDir: relative(projectRoot, taskDir),
+            conventionsDir: ".quack",
+          },
+        },
+      } as ProjectAdapter;
+    }
+  }
+  if (!mutationAdapter) {
+    throw new Error("Canonical task status updates require an identifiable project root.");
+  }
   const resolvedTask = await findTaskFile(taskId, taskDir);
   if (!resolvedTask) {
     await appendLifecycleError(taskDir, {
@@ -616,60 +845,36 @@ export async function updateTaskStatus(
       });
       return false;
     }
-    const claimants = await listDuplicateClaimants(taskDir, taskId);
-    if (claimants.length > 0) {
-      await appendLifecycleError(taskDir, {
-        taskId,
-        errorType: "duplicate_claimants",
-        message: formatDuplicateClaimantsMessage(taskId, claimants),
-        specPath: taskFile,
-        expectedStatus: newStatus,
-        claimants,
-        createdAt: new Date().toISOString(),
-      });
-      return false;
-    }
-    await fs.writeFile(taskFile, updated, "utf-8");
-
-    // Post-write verification: re-read and confirm status was written
-    try {
-      const reread = await fs.readFile(taskFile, "utf-8");
-      const statusMatch = reread.match(/\*\*Status:\*\*\s*(\w+)/);
-      const actualStatus = statusMatch?.[1];
-      if (actualStatus !== newStatus) {
-        const msg = `Status update failed for ${taskId}: wrote ${newStatus} but file still shows ${actualStatus ?? "unknown"}`;
-        console.error(`[lifecycle] ${msg}`);
-        if (events) {
-          events.emit("lifecycle_status_update_failed", {
-            taskId,
-            expectedStatus: newStatus,
-            actualContent: reread.slice(0, 200),
-          });
-        }
-        await appendLifecycleError(taskDir, {
-          taskId,
-          errorType: "status_write_mismatch",
-          message: msg,
-          specPath: taskFile,
-          expectedStatus: newStatus,
-          observedStatusLine: statusMatch?.[0] ?? "(none)",
-          createdAt: new Date().toISOString(),
-        });
-        return false;
-      }
-    } catch {
-      // Re-read failed — treat the write as successful since writeFile returned ok
-    }
+    await withCanonicalTaskSpecMutationFence({
+      adapter: mutationAdapter,
+      taskId,
+      taskFilePath: taskFile,
+      expectedContent: content,
+      replacementContent: updated,
+      allowDecomposedCurrent,
+    });
 
     return true;
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
+    const duplicateClaimants =
+      error instanceof CanonicalTaskSpecMutationError && error.claimants.length > 1
+        ? [...error.claimants]
+        : undefined;
+    if (events) {
+      events.emit("lifecycle_status_update_failed", {
+        taskId,
+        expectedStatus: newStatus,
+        error: message,
+      });
+    }
     await appendLifecycleError(taskDir, {
       taskId,
-      errorType: "status_write_exception",
+      errorType: duplicateClaimants ? "duplicate_claimants" : "status_write_exception",
       message,
       specPath: taskFile,
       expectedStatus: newStatus,
+      ...(duplicateClaimants ? { claimants: duplicateClaimants } : {}),
       createdAt: new Date().toISOString(),
     });
     return false;
@@ -691,8 +896,33 @@ async function resolveBlockers(
 
   if (!task.blocks || task.blocks.length === 0) return promoted;
 
+  const { listTaskClaimantDeclarations } = await import("../core/task-file-resolver.js");
+  // The dependent's mutation fence cannot establish ownership of its blockers.
+  // Certify all dependency reads against the full declared inventory first.
+  const claimantIndex = await buildStrictDuplicateClaimantIndex(() =>
+    listTaskClaimantDeclarations(taskDir),
+  );
+  async function holdForClaimantRefusal(taskId: string, dependentId: string): Promise<boolean> {
+    const refusal = duplicateClaimantRefusalForIndex(claimantIndex, taskId);
+    if (!refusal) return false;
+    const message = `Task ${dependentId} promotion held: ${refusal.message}`;
+    events.emit("session_error", {
+      error: message,
+      failedStage: "lifecycle_blocker_resolution",
+    });
+    await appendLifecycleError(taskDir, {
+      taskId: dependentId,
+      errorType: "blocker_identity_conflict",
+      message,
+      claimants: refusal.claimants,
+      createdAt: new Date().toISOString(),
+    });
+    return true;
+  }
+
   for (const blockedTaskId of task.blocks) {
     try {
+      if (await holdForClaimantRefusal(blockedTaskId, blockedTaskId)) continue;
       const blockedFile = await findTaskFile(blockedTaskId, taskDir);
       if (!blockedFile) continue;
 
@@ -713,6 +943,10 @@ async function resolveBlockers(
       // Check if ALL blockers of this task are now COMPLETE
       let allBlockersComplete = true;
       for (const blockerId of blockedTask.blockedBy) {
+        if (await holdForClaimantRefusal(blockerId, blockedTaskId)) {
+          allBlockersComplete = false;
+          break;
+        }
         const blockerFile = await findTaskFile(blockerId, taskDir);
         if (!blockerFile) {
           allBlockersComplete = false;
@@ -737,7 +971,7 @@ async function resolveBlockers(
       }
 
       if (allBlockersComplete) {
-        const updated = await updateTaskStatus(blockedTaskId, taskDir, "READY", events);
+        const updated = await updateTaskStatus(blockedTaskId, taskDir, "READY", events, adapter);
         if (updated) {
           promoted.push(blockedTaskId);
           events.emit("lifecycle_blocker_resolved", {
@@ -757,65 +991,91 @@ async function resolveBlockers(
 
 // ─── Step 6: Check Parent Completion ─────────────────────────────
 
+function parentTaskIdFromField(content: string): string | undefined {
+  // A field is a complete line, either plain or the emitted bold bullet.
+  // Prefix-related IDs and prose mentions cannot establish membership.
+  return content
+    .match(
+      /^[\t ]*(?:-[\t ]*)?(?:\*\*Parent Task:\*\*|Parent Task:)[\t ]*(TASK-\d+(?:-[A-Z])?|SAURUS-REM-\d{3})[\t ]*$/im,
+    )?.[1]
+    .toUpperCase();
+}
+
 async function checkParentCompletion(
   task: ParsedTask,
   adapter: ProjectAdapter,
   events: IEventWriter,
   statusOverlay: RuntimeStatusOverlay,
 ): Promise<string | null> {
-  // Parse rawContent for parent task reference
-  const parentMatch = task.rawContent.match(/Parent Task:\s*(TASK-\d+)/i);
-  if (!parentMatch) return null;
-
-  const parentId = parentMatch[1];
+  const parentId = parentTaskIdFromField(task.rawContent);
+  if (!parentId || parentId === task.id) return null;
   const taskDir = getTaskDir(adapter);
 
   try {
-    // Find all task files in the directory
-    const files = await fs.readdir(taskDir);
-    const taskFiles = files.filter((f) => f.startsWith("TASK-") && f.endsWith(".md"));
-
-    // Find subtasks of this parent
-    const subtaskIds: string[] = [];
-    for (const file of taskFiles) {
+    const { listTaskClaimantDeclarations } = await import("../core/task-file-resolver.js");
+    // Ownership spans the entire declared inventory: a second claimant does
+    // not become safe merely by omitting or changing its Parent Task field.
+    const claimantIndex = await buildStrictDuplicateClaimantIndex(() =>
+      listTaskClaimantDeclarations(taskDir),
+    );
+    const files = (await fs.readdir(taskDir)).filter((file) => /\.md$/i.test(file)).sort();
+    const subtasks: ParsedTask[] = [];
+    for (const file of files) {
       const filePath = join(taskDir, file);
       const content = await fs.readFile(filePath, "utf-8");
-      if (content.match(new RegExp(`Parent Task:\\s*${parentId}`, "i"))) {
-        const idMatch = file.match(/^(TASK-\d+)/);
-        if (idMatch) subtaskIds.push(idMatch[1]);
+      if (parentTaskIdFromField(content) !== parentId) continue;
+      try {
+        const subtask = parseTaskFile(content, filePath);
+        if (subtask.id === parentId) continue;
+        const refusal = duplicateClaimantRefusalForIndex(claimantIndex, subtask.id);
+        if (refusal) {
+          const message = `Parent ${parentId} completion held: ${refusal.message}`;
+          events.emit("session_error", {
+            error: message,
+            failedStage: "lifecycle_parent_completion",
+          });
+          await appendLifecycleError(taskDir, {
+            taskId: parentId,
+            errorType: "parent_child_identity_conflict",
+            message,
+            specPath: filePath,
+            claimants: refusal.claimants,
+            createdAt: new Date().toISOString(),
+          });
+          return null;
+        }
+        subtasks.push(subtask);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        const message = `Parent ${parentId} completion held: claiming child ${filePath} cannot be parsed: ${detail}`;
+        events.emit("session_error", {
+          error: message,
+          failedStage: "lifecycle_parent_completion",
+        });
+        await appendLifecycleError(taskDir, {
+          taskId: parentId,
+          errorType: "parent_child_parse_error",
+          message,
+          specPath: filePath,
+          createdAt: new Date().toISOString(),
+        });
+        return null;
       }
     }
 
-    if (subtaskIds.length === 0) return null;
-
-    // Check if ALL subtasks are COMPLETE
-    let allComplete = true;
-    for (const subtaskId of subtaskIds) {
-      const subtaskFile = await findTaskFile(subtaskId, taskDir);
-      if (!subtaskFile) {
-        allComplete = false;
-        break;
-      }
-      const content = subtaskFile.content;
-      const subtask = parseTaskFile(content, subtaskFile.filePath);
-      // TASK-1318 S2: shared predicate over the RESOLVED status, same
-      // dependency semantics as the blocker pass. Rolling the parent up
-      // writes COMPLETE into `task_status` for the parent, so an
-      // unresolved subtask read would let a spec line decide it.
-      const subtaskState = resolveTaskStateWithOverlay({
-        taskId: subtaskId,
+    if (subtasks.length === 0) return null;
+    const allComplete = subtasks.every((subtask) => {
+      const state = resolveTaskStateWithOverlay({
+        taskId: subtask.id,
         specStatus: subtask.status,
         overlay: statusOverlay,
       });
-      if (!isCompleteStatus(subtaskState.status)) {
-        allComplete = false;
-        break;
-      }
-    }
-
+      return isCompleteStatus(state.status);
+    });
     if (allComplete) {
-      const updated = await updateTaskStatus(parentId, taskDir, "COMPLETE", events);
+      const updated = await updateTaskStatus(parentId, taskDir, "COMPLETE", events, adapter, true);
       if (updated) {
+        const subtaskIds = subtasks.map((subtask) => subtask.id).sort();
         events.emit("lifecycle_parent_completed", {
           parentTaskId: parentId,
           subtaskCount: subtaskIds.length,
@@ -825,15 +1085,14 @@ async function checkParentCompletion(
       }
     }
   } catch {
-    // Non-fatal, log and continue
+    // A failed directory/file read cannot establish that every sibling is done.
   }
-
   return null;
 }
 
 // ─── Step 7: Atomic Git Commit ───────────────────────────────────
 
-function atomicCommit(
+export function atomicCommit(
   taskId: string,
   adapter: ProjectAdapter,
   workDir: string,
@@ -845,11 +1104,16 @@ function atomicCommit(
     // Stage task spec files only (NOT verified.json — it's shared state
     // that should only be updated on the main working directory, not on
     // task branches where it causes merge conflicts)
-    gitExec(`git add "${join(taskDir, "*.md")}"`, workDir);
+    runTrustedGitSync(["add", "--", join(taskDir, "*.md")], workDir, {
+      trustedBoundaryRoot: adapter.projectRoot,
+      errorContext: "Unable to stage lifecycle task specs",
+    });
 
     // Check if there are staged changes
     try {
-      gitExec("git diff --cached --quiet", workDir);
+      runTrustedGitSync(["diff", "--cached", "--quiet"], workDir, {
+        trustedBoundaryRoot: adapter.projectRoot,
+      });
       // No changes staged — skip commit
       return undefined;
     } catch {
@@ -860,7 +1124,10 @@ function atomicCommit(
       promotedTasks.length > 0 ? `, resolve blockers (${promotedTasks.join(", ")})` : "";
     const message = `[${taskId}] lifecycle: mark complete${blockerNote}`;
 
-    gitExec(`git commit -m "${message}"`, workDir);
+    runTrustedGitSync(["commit", "-m", message], workDir, {
+      trustedBoundaryRoot: adapter.projectRoot,
+      errorContext: "Unable to commit lifecycle task specs",
+    });
 
     return undefined; // success, no error
   } catch (err) {
@@ -965,7 +1232,7 @@ export async function runPostApprovalLifecycle(
   // Only update status to COMPLETE if verification passed
   if (verified) {
     try {
-      statusUpdated = await updateTaskStatus(taskId, taskDir, "COMPLETE", events);
+      statusUpdated = await updateTaskStatus(taskId, taskDir, "COMPLETE", events, adapter);
       if (statusUpdated) {
         events.emit("lifecycle_status_updated", {
           taskId,

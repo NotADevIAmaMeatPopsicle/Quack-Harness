@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { ProjectAdapter } from "../core/adapter-loader.js";
+import { listTaskClaimantDeclarations } from "../core/task-file-resolver.js";
 
 /**
  * Builds the planner prompt for the task generation agent.
@@ -143,14 +144,13 @@ async function detectNextTaskId(adapter: ProjectAdapter): Promise<number> {
   const taskDir = path.resolve(adapter.projectRoot, adapter.config.project.taskDir);
 
   try {
-    const entries = await fs.readdir(taskDir);
-    const taskNumbers = entries
-      .filter((entry) => entry.startsWith("TASK-") && entry.endsWith(".md"))
-      .map((entry) => {
-        const match = entry.match(/^TASK-(\d+)/);
-        return match ? parseInt(match[1], 10) : 0;
+    const declarations = await listTaskClaimantDeclarations(taskDir);
+    const taskNumbers = declarations
+      .map(({ declaredId }) => {
+        const match = declaredId.match(/^TASK-(\d+)(?:-[A-Z])?$/);
+        return match ? Number.parseInt(match[1], 10) : 0;
       })
-      .filter((num) => num > 0);
+      .filter((num) => Number.isFinite(num) && num > 0);
 
     if (taskNumbers.length === 0) {
       return 1;

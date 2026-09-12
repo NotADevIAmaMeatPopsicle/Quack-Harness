@@ -115,14 +115,14 @@ describe("worker refresh service-token auth", () => {
   });
 
   it("allows scoped service tokens through dashboard auth for /api/workers refresh", async () => {
-    const port = 46000 + Math.floor(Math.random() * 1000);
     const serverObj = createMonitorServer({
       projectRoot,
       logDir: path.join(projectRoot, ".quack", "logs"),
       quackRoot,
-      port,
+      port: 0,
+      host: "127.0.0.1",
     });
-    const { stop } = await serverObj.start();
+    const { port, stop } = await serverObj.start();
     stopServer = stop;
 
     const response = await httpPost(

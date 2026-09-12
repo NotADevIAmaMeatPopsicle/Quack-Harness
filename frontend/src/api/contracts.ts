@@ -87,7 +87,7 @@ export const TASK_STATUSES = [
   "VERIFIED",
   "REJECTED",
 ] as const;
-export type TaskStatus = typeof TASK_STATUSES[number];
+export type TaskStatus = (typeof TASK_STATUSES)[number];
 
 // ─── Tasks ──────────────────────────────────────────────────────────
 
@@ -274,11 +274,26 @@ export interface FederationHostSummary {
   runtimeRole?: "headnode" | "worker";
   protocolVersion?: string;
   lastCommand?: {
-    kind: "git_pull" | "refresh_project" | "worker.refresh" | "probe_capabilities" | "collect_diagnostics" | "sync_wiki";
+    kind:
+      | "git_pull"
+      | "refresh_project"
+      | "worker.refresh"
+      | "probe_capabilities"
+      | "collect_diagnostics"
+      | "sync_wiki";
     status: "accepted" | "running" | "completed" | "failed" | "retryable" | "non_retryable";
     completedAt?: string;
     durationMs?: number;
-    errorCategory?: "transport" | "auth" | "tool_missing" | "bad_payload" | "project_not_found" | "platform_mismatch" | "execution_failed" | "not_supported" | "unknown";
+    errorCategory?:
+      | "transport"
+      | "auth"
+      | "tool_missing"
+      | "bad_payload"
+      | "project_not_found"
+      | "platform_mismatch"
+      | "execution_failed"
+      | "not_supported"
+      | "unknown";
     message?: string;
     metadata?: Record<string, unknown>;
   };
@@ -287,6 +302,7 @@ export interface FederationHostSummary {
 }
 
 export interface FederationJobSummary {
+  projectId: string;
   jobId: string;
   taskId: string;
   status: string;
@@ -301,6 +317,11 @@ export interface FederationJobSummary {
 }
 
 export interface FederationQueueSummary {
+  listenerRegistry?: {
+    healthy: boolean;
+    unavailable: boolean;
+    issues: Array<{ file: string; hostId?: string; code: string; reason: string }>;
+  };
   total: number;
   byStatus: Record<string, number>;
   mergeLaneActive: boolean;
@@ -1071,7 +1092,17 @@ export interface WorkerEnrollmentSessionSummary {
 
 export interface WorkerEnrollmentProgressEvent {
   id: string;
-  phase: "bootstrap" | "prerequisites" | "repo_sync" | "dependency_install" | "env_write" | "capability_probe" | "runtime_start" | "runtime_health" | "listener_register" | "completed";
+  phase:
+    | "bootstrap"
+    | "prerequisites"
+    | "repo_sync"
+    | "dependency_install"
+    | "env_write"
+    | "capability_probe"
+    | "runtime_start"
+    | "runtime_health"
+    | "listener_register"
+    | "completed";
   state: "running" | "completed" | "failed" | "waiting";
   message: string;
   timestamp: string;
@@ -1094,7 +1125,13 @@ export interface WorkerCapabilityProbeResult {
   };
 }
 
-export type WorkerCapabilityTier = "base" | "project" | "browser" | "docker" | "auth" | "staging-db";
+export type WorkerCapabilityTier =
+  | "base"
+  | "project"
+  | "browser"
+  | "docker"
+  | "auth"
+  | "staging-db";
 
 export interface WorkerRepoFreshness {
   repoId: string;
@@ -1110,7 +1147,15 @@ export interface WorkerRepoFreshness {
   ahead: number;
   behind: number;
   fastForwarded?: boolean;
-  status: "missing" | "current" | "behind" | "ahead" | "diverged" | "wrong_branch" | "dirty" | "unknown";
+  status:
+    | "missing"
+    | "current"
+    | "behind"
+    | "ahead"
+    | "diverged"
+    | "wrong_branch"
+    | "dirty"
+    | "unknown";
   blockers: string[];
   repairCommand?: string;
 }
@@ -1147,7 +1192,15 @@ export interface WorkerEnrollmentReadiness {
 }
 
 export interface WorkerEnrollmentInstallStatus {
-  state: "pending" | "bootstrap_consumed" | "installing" | "registered" | "healthy" | "needs_follow_up" | "failed" | "expired";
+  state:
+    | "pending"
+    | "bootstrap_consumed"
+    | "installing"
+    | "registered"
+    | "healthy"
+    | "needs_follow_up"
+    | "failed"
+    | "expired";
   progressPercent: number;
   currentStep?: WorkerEnrollmentProgressEvent["phase"];
   lastMessage?: string;

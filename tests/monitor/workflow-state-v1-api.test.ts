@@ -201,17 +201,17 @@ describe("GET /v1/tasks/:id/workflow-state", () => {
     writeTaskFile(projectRoot, "TASK-843", "COMPLETE");
     writeReviewFixture(projectRoot, "TASK-843");
 
-    const port = 41000 + Math.floor(Math.random() * 2000);
     const server = createMonitorServer({
       projectRoot,
       taskDir: "docs/tasks",
       logDir: path.join(projectRoot, ".quack", "logs"),
-      port,
+      port: 0,
+      host: "127.0.0.1",
     });
     broadcastSpy = jest.spyOn(server.sse, "broadcast");
     const started = await server.start();
     stop = started.stop;
-    baseUrl = `http://127.0.0.1:${port}`;
+    baseUrl = `http://127.0.0.1:${started.port}`;
     await pause(150);
     broadcastSpy.mockClear();
   });

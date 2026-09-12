@@ -48,21 +48,34 @@ jest.mock("../../src/testing/test-formatter.js", () => ({
 
 // Mock verify.js to bypass Windows POSIX tool detection
 jest.mock("../../src/worker/tools/verify.js", () => ({
+  normalizeVerificationTimeoutMs: jest.fn().mockImplementation((timeout: unknown) => {
+    const raw = typeof timeout === "number" ? timeout : 300_000;
+    return raw < 10_000 ? raw * 1000 : raw;
+  }),
   prepareVerificationCommandRuntime: jest
     .fn()
     .mockImplementation((command: unknown) => ({ command, env: {} })),
+  runVerification: jest.fn(),
+}));
+
+jest.mock("../../src/dispatcher/trusted-git.js", () => ({
+  runTrustedGitSync: jest.fn(),
 }));
 
 import * as childProcess from "node:child_process";
 import { runSmartTests } from "../../src/testing/smart-test-runner.js";
 import { loadBaseline, compareWithBaseline } from "../../src/testing/test-baseline.js";
 import { formatTestSummary } from "../../src/testing/test-formatter.js";
+import { runVerification } from "../../src/worker/tools/verify.js";
+import { runTrustedGitSync } from "../../src/dispatcher/trusted-git.js";
 
 const mockExecSync = childProcess.execSync as ReturnType<typeof jest.fn>;
 const mockRunSmartTests = runSmartTests as ReturnType<typeof jest.fn>;
 const mockLoadBaseline = loadBaseline as ReturnType<typeof jest.fn>;
 const mockCompareWithBaseline = compareWithBaseline as ReturnType<typeof jest.fn>;
 const mockFormatTestSummary = formatTestSummary as ReturnType<typeof jest.fn>;
+const mockRunVerification = runVerification as ReturnType<typeof jest.fn>;
+const mockRunTrustedGitSync = runTrustedGitSync as ReturnType<typeof jest.fn>;
 
 describe("post-judge-verifier smart testing integration", () => {
   let mockAdapter: ProjectAdapter;
@@ -208,6 +221,48 @@ describe("post-judge-verifier smart testing integration", () => {
     expect(mockRunSmartTests).toHaveBeenCalled();
     expect(result.testsPassed).toBe(true);
   });
+
+  it.each(["codex-sandbox", "docker-sandbox"] as const)(
+    "bypasses direct smart and sync runners when %s is required",
+    async (hostExecution) => {
+      mockAdapter = makeAdapter(true);
+      mockAdapter.config.verification.hostExecution = hostExecution;
+      mockRunVerification.mockResolvedValue({
+        allPassed: true,
+        commands: [
+          {
+            name: "build",
+            passed: true,
+            required: true,
+            status: "passed",
+            output: "build ok",
+          },
+          {
+            name: "test",
+            passed: true,
+            required: true,
+            status: "passed",
+            output: "Tests: 12 passed, 12 total",
+          },
+        ],
+        conventionChecks: [],
+      });
+
+      const result = await runPostJudgeVerification(
+        "TASK-001",
+        mockTask,
+        mockAdapter,
+        "/test/project",
+        mockEvents,
+      );
+
+      expect(mockRunVerification).toHaveBeenCalledTimes(1);
+      expect(mockRunSmartTests).not.toHaveBeenCalled();
+      expect(mockExecSync).not.toHaveBeenCalled();
+      expect(result.verified).toBe(true);
+      expect(result.testCount).toBe(12);
+    },
+  );
 
   it("runs explicit adapter verify scripts instead of smart test mapping", async () => {
     mockAdapter = makeAdapter(true);
@@ -532,10 +587,13 @@ describe("post-judge-verifier smart testing integration", () => {
           "frontend/src/components/Foo.tsx(3,32): error TS2307: Cannot find module 'react-router-dom'";
         throw error;
       }
-      // git fetch, git merge-base, git diff --name-only: return non-frontend files
-      if (cmd.includes("merge-base")) return "abc123";
-      if (cmd.includes("--name-only"))
+      return "";
+    });
+    mockRunTrustedGitSync.mockImplementation((args: readonly string[]) => {
+      if (args.includes("merge-base")) return "abc123";
+      if (args.includes("--name-only")) {
         return "src/dispatcher/worktree-lifecycle.ts\nsrc/core/types.ts";
+      }
       return "";
     });
 
@@ -572,11 +630,13 @@ describe("post-judge-verifier smart testing integration", () => {
           "frontend/src/App.tsx(1,50): error TS2307: Cannot find module '@tanstack/react-query'";
         throw error;
       }
-      // git fetch, git merge-base: succeed
-      if (cmd.includes("merge-base")) return "abc123";
-      // git diff --name-only: returns frontend/ files
-      if (cmd.includes("--name-only"))
+      return "";
+    });
+    mockRunTrustedGitSync.mockImplementation((args: readonly string[]) => {
+      if (args.includes("merge-base")) return "abc123";
+      if (args.includes("--name-only")) {
         return "frontend/src/App.tsx\nfrontend/src/components/Foo.tsx";
+      }
       return "";
     });
 
@@ -698,7 +758,9 @@ describe("post-judge-verifier semantic truncation", () => {
   it("Mode B: skips semantic layer and emits semantic_skipped_too_large for 50K-token diff", async () => {
     // 50K tokens ≈ 150K chars; maxSemanticTokens=12000, skip threshold = 12000*9 = 108000 chars
     const hugeDiff = "diff --git a/huge.ts b/huge.ts\n" + "a".repeat(150000);
-    mockExecSync.mockReturnValue(hugeDiff);
+    mockRunTrustedGitSync.mockImplementation((args: readonly string[]) =>
+      args.includes("--name-only") ? "" : hugeDiff,
+    );
 
     const result = await runPostJudgeVerification(
       "TASK-001",
@@ -731,8 +793,8 @@ describe("post-judge-verifier semantic truncation", () => {
       "+".repeat(30000) +
       "\ndiff --git a/bar.ts b/bar.ts\nindex abc..def 100644\n--- a/bar.ts\n+++ b/bar.ts\n" +
       "+".repeat(30000);
-    mockExecSync.mockImplementation((cmd: unknown) => {
-      if (typeof cmd === "string" && cmd.includes("--name-only")) return "";
+    mockRunTrustedGitSync.mockImplementation((args: readonly string[]) => {
+      if (args.includes("--name-only")) return "";
       return mediumDiff;
     });
 
@@ -766,8 +828,8 @@ describe("post-judge-verifier semantic truncation", () => {
     const smallDiff =
       "diff --git a/small.ts b/small.ts\nindex abc..def 100644\n--- a/small.ts\n+++ b/small.ts\n" +
       "+".repeat(15000);
-    mockExecSync.mockImplementation((cmd: unknown) => {
-      if (typeof cmd === "string" && cmd.includes("--name-only")) return "";
+    mockRunTrustedGitSync.mockImplementation((args: readonly string[]) => {
+      if (args.includes("--name-only")) return "";
       return smallDiff;
     });
 

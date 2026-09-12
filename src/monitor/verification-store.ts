@@ -29,8 +29,11 @@
 
 import * as path from "node:path";
 import { promises as fsPromises } from "node:fs";
+import { randomUUID } from "node:crypto";
 
-import type { VerifiedRow } from "../db/types.js";
+import type { VerifiedRow, QuackDbHealth } from "../db/types.js";
+import { withOwnerFencedFileLock } from "./federation/store.js";
+import { verificationEntrySchema } from "./verification-schema.js";
 import {
   buildStrictDuplicateClaimantIndex,
   duplicateClaimantRefusalForIndex,
@@ -48,6 +51,7 @@ export interface VerificationStoreProject {
   projectRoot: string | undefined;
   taskDir?: string;
   db: {
+    getHealth(): QuackDbHealth;
     setVerified(entry: VerifiedRow): void;
     getVerified(taskId: string): VerifiedRow | undefined;
     getAllVerified(): Map<string, VerifiedRow>;
@@ -104,7 +108,36 @@ export interface RecordOptions {
    * write-recency precedence.
    */
   skipIfExistingVerdict?: string[];
+  /**
+   * Re-run status and JSON projection writes for an identical canonical row.
+   * Journaled callers use this to finish a partially persisted compound effect.
+   */
+  replayIdenticalEffects?: boolean;
+  /**
+   * Internal deterministic crash seam for callers that journal a compound
+   * verification effect. Each stage means that local sub-effect is durable.
+   */
+  afterLocalEffectForTest?: (
+    stage:
+      | "verification_row_persisted"
+      | "verification_status_persisted"
+      | "verification_projection_persisted",
+  ) => void | Promise<void>;
+  /** Internal deterministic seam used to hold one projection read in flight. */
+  afterProjectionReadForTest?: (taskId: string) => void | Promise<void>;
+  /** Internal deterministic crash seam for atomic projection publication. */
+  afterProjectionPersistenceStageForTest?: (
+    stage: VerificationProjectionPersistenceStage,
+    taskId: string,
+  ) => void | Promise<void>;
 }
+
+export type VerificationProjectionPersistenceStage =
+  | "projection_temp_file_synced"
+  | "projection_published"
+  | "projection_published_file_synced"
+  | "projection_directory_synced"
+  | "projection_durability_acknowledged";
 
 export interface NormalizedVerificationEntry extends VerificationEntry {
   verifiedAt: string;
@@ -154,6 +187,25 @@ export async function recordVerification(
   options: RecordOptions = {},
   claimantIndex?: DuplicateClaimantIndex,
 ): Promise<RecordVerificationResult> {
+  const validated = verificationEntrySchema.parse(entry);
+  assertVerificationDatabaseAvailable(p);
+  const write = async (): Promise<RecordVerificationResult> => {
+    assertVerificationDatabaseAvailable(p);
+    const doc = p.projectRoot
+      ? await readJsonOrDefault(path.join(p.projectRoot, ".quack", "verified.json"))
+      : undefined;
+    return recordVerificationLocked(p, validated, options, claimantIndex, doc);
+  };
+  return p.projectRoot ? withVerificationProjectionLock(p.projectRoot, write) : write();
+}
+
+async function recordVerificationLocked(
+  p: ResolvedProject,
+  entry: VerificationEntry,
+  options: RecordOptions,
+  claimantIndex: DuplicateClaimantIndex | undefined,
+  projection: VerifiedJsonDocument | undefined,
+): Promise<RecordVerificationResult> {
   const verifiedAt = entry.verifiedAt ?? todayIso();
   const updatedAt = entry.updatedAt ?? nowIso();
   const notes = composeNotes(entry);
@@ -171,6 +223,7 @@ export async function recordVerification(
   };
 
   const existing = p.db.getVerified(entry.taskId);
+  let identical = false;
   if (existing && options.skipIfExistingVerdict?.includes(existing.verdict)) {
     return { applied: false, skippedReason: "existing-verdict", row: existing };
   }
@@ -180,11 +233,21 @@ export async function recordVerification(
       return { applied: false, skippedReason: "stale", row: existing };
     }
     if (precedence === 0 && verifiedRowsEqual(row, existing)) {
-      return { applied: false, skippedReason: "identical", row: existing };
+      // An identical canonical row does not prove the later status and JSON
+      // projection effects survived. Continue through those idempotent writes
+      // so a journal replay converges every sub-effect after a crash.
+      identical = true;
+      if (options.replayIdenticalEffects !== true) {
+        return { applied: false, skippedReason: "identical", row: existing };
+      }
     }
   }
 
-  if (claimantIndex && (entry.verdict === "VERIFIED" || entry.verdict === "SOFT-VERIFIED")) {
+  if (
+    !identical &&
+    claimantIndex &&
+    (entry.verdict === "VERIFIED" || entry.verdict === "SOFT-VERIFIED")
+  ) {
     const refusal = duplicateClaimantRefusalForIndex(claimantIndex, entry.taskId);
     if (refusal) {
       return {
@@ -199,8 +262,10 @@ export async function recordVerification(
     }
   }
 
-  // 1. DB write.
-  p.db.setVerified(row);
+  // 1. DB write. On an identical replay the row is already durable, but the
+  // same boundary is reported so deterministic crash tests exercise replay.
+  if (!identical) p.db.setVerified(row);
+  await options.afterLocalEffectForTest?.("verification_row_persisted");
 
   // 2. Task status update — caller can opt out if they advance status themselves.
   if (options.updateTaskStatus !== false) {
@@ -210,22 +275,31 @@ export async function recordVerification(
       p.db.setStatus(entry.taskId, "REJECTED", entry.method);
     }
   }
+  await options.afterLocalEffectForTest?.("verification_status_persisted");
 
   // 3. JSON ledger update — only when projectRoot is configured. The store
   // tolerates missing projectRoot for tests + non-disk monitors.
   if (p.projectRoot) {
-    await upsertJsonEntry(p.projectRoot, entry.taskId, {
-      verified: verifiedAt,
-      commit: entry.commitSha,
-      method: entry.method,
-      verdict: entry.verdict,
-      criteriaChecked: entry.criteriaChecked,
-      criteriaPassed: entry.criteriaPassed,
-      reviewId: entry.reviewId,
-      workflowId: entry.workflowId,
-      notes,
-    });
+    await upsertJsonEntryLocked(
+      p.projectRoot,
+      projection as VerifiedJsonDocument,
+      entry.taskId,
+      {
+        verified: verifiedAt,
+        commit: entry.commitSha,
+        method: entry.method,
+        verdict: entry.verdict,
+        criteriaChecked: entry.criteriaChecked,
+        criteriaPassed: entry.criteriaPassed,
+        reviewId: entry.reviewId,
+        workflowId: entry.workflowId,
+        notes,
+      },
+      options.afterProjectionReadForTest,
+      options.afterProjectionPersistenceStageForTest,
+    );
   }
+  await options.afterLocalEffectForTest?.("verification_projection_persisted");
 
   // 4. Push to peers (Phase 3 — currently a no-op stub).
   // Wired so future code can light up federation sync without touching
@@ -234,7 +308,7 @@ export async function recordVerification(
   const peerSyncHandler = p.projectRoot
     ? verificationPeerSyncHandlers.get(p.projectRoot)
     : undefined;
-  if (options.syncToPeers !== false && peerSyncHandler) {
+  if (!identical && options.syncToPeers !== false && peerSyncHandler) {
     const normalizedEntry: NormalizedVerificationEntry = {
       ...entry,
       notes,
@@ -247,7 +321,9 @@ export async function recordVerification(
     });
   }
 
-  return { applied: true, row };
+  return identical
+    ? { applied: false, skippedReason: "identical", row: existing ?? row }
+    : { applied: true, row };
 }
 
 /**
@@ -256,25 +332,36 @@ export async function recordVerification(
  * recovery tool when the JSON gets out of sync.
  *
  * Preserves the JSON document's `_description` and `_schema` headers if they
- * already exist; replaces only the `tasks` map.
+ * already exist. DB rows win for their IDs; JSON-only evidence is retained
+ * until it can be reconciled, including skipped or interrupted migrations.
  */
 export async function regenerateProjection(p: ResolvedProject): Promise<{ entryCount: number }> {
   if (!p.projectRoot) return { entryCount: 0 };
+  assertVerificationDatabaseAvailable(p);
+  const projectRoot = p.projectRoot;
+  return withVerificationProjectionLock(projectRoot, () =>
+    regenerateProjectionLocked(p, projectRoot),
+  );
+}
+
+async function regenerateProjectionLocked(
+  p: ResolvedProject,
+  projectRoot: string,
+): Promise<{ entryCount: number }> {
+  assertVerificationDatabaseAvailable(p);
   const allRows = p.db.getAllVerified();
-
-  // Sort tasks ascending by taskId for deterministic byte output.
+  const jsonPath = path.join(projectRoot, ".quack", "verified.json");
+  const existing = await readJsonOrDefault(jsonPath);
+  const tasks: Record<string, unknown> = { ...existing.tasks };
   const sortedTaskIds = Array.from(allRows.keys()).sort((a, b) => a.localeCompare(b));
-
-  const tasks: Record<string, JsonLedgerEntry> = {};
   for (const taskId of sortedTaskIds) {
     const row = allRows.get(taskId);
     if (!row) continue;
     tasks[taskId] = rowToLedgerEntry(row);
   }
 
-  const jsonPath = path.join(p.projectRoot, ".quack", "verified.json");
-  const existing = await readJsonOrDefault(jsonPath);
   const doc: VerifiedJsonDocument = {
+    ...existing,
     _description:
       existing._description ??
       "Post-completion verification index. Records which COMPLETE tasks have been independently verified. Regenerated from quack.db on monitor startup.",
@@ -284,12 +371,11 @@ export async function regenerateProjection(p: ResolvedProject): Promise<{ entryC
       method: "string",
       verdict: "string",
     },
-    tasks,
+    tasks: Object.fromEntries(Object.entries(tasks).sort(([a], [b]) => a.localeCompare(b))),
   };
 
-  await fsPromises.mkdir(path.dirname(jsonPath), { recursive: true });
-  await fsPromises.writeFile(jsonPath, JSON.stringify(doc, null, 2) + "\n", "utf-8");
-  return { entryCount: sortedTaskIds.length };
+  await writeProjectionAtomically(jsonPath, doc, "__projection-regeneration__");
+  return { entryCount: Object.keys(tasks).length };
 }
 
 /**
@@ -303,6 +389,7 @@ export async function findDbJsonDrift(p: ResolvedProject): Promise<{
   missingFromDb: string[];
 }> {
   if (!p.projectRoot) return { missingFromJson: [], missingFromDb: [] };
+  assertVerificationDatabaseAvailable(p);
   const dbRows = p.db.getAllVerified();
   const jsonPath = path.join(p.projectRoot, ".quack", "verified.json");
   const json = await readJsonOrDefault(jsonPath);
@@ -363,9 +450,21 @@ export async function reconcileVerifiedDrift(
   if (!p.projectRoot) {
     return { jsonToDb: [], dbToJson: [], taskStatusFixed: [], promotionsSkipped: [] };
   }
+  assertVerificationDatabaseAvailable(p);
+  const projectRoot = p.projectRoot;
+  return withVerificationProjectionLock(projectRoot, () =>
+    reconcileVerifiedDriftLocked(p, options, projectRoot),
+  );
+}
 
+async function reconcileVerifiedDriftLocked(
+  p: ResolvedProject,
+  options: ReconcileOptions,
+  projectRoot: string,
+): Promise<ReconcileResult> {
+  assertVerificationDatabaseAvailable(p);
   const dbRows = p.db.getAllVerified();
-  const jsonPath = path.join(p.projectRoot, ".quack", "verified.json");
+  const jsonPath = path.join(projectRoot, ".quack", "verified.json");
   const json = await readJsonOrDefault(jsonPath);
 
   const result: ReconcileResult = {
@@ -396,9 +495,15 @@ export async function reconcileVerifiedDrift(
   };
 
   // 1. JSON entries missing from DB -> insert.
-  for (const [taskId, entry] of Object.entries(json.tasks ?? {})) {
+  for (const [taskId, rawEntry] of Object.entries(json.tasks ?? {})) {
     if (dbRows.has(taskId)) continue;
-    if (!isReconcilableLedgerEntry(entry)) continue;
+    const entry = parseReconcilableLedgerEntry(taskId, rawEntry);
+    if (!entry) {
+      options.log?.(
+        `[verification-store] preserving unreconciled entry for ${taskId}: invalid verification evidence`,
+      );
+      continue;
+    }
     if (
       (entry.verdict === "VERIFIED" || entry.verdict === "SOFT-VERIFIED") &&
       refusePromotion(taskId)
@@ -463,30 +568,48 @@ export async function reconcileVerifiedDrift(
 
   if (jsonDirty) {
     // Sort task keys for deterministic git diffs.
-    const sortedTasks: Record<string, JsonLedgerEntry> = {};
+    const sortedTasks: Record<string, unknown> = {};
     for (const k of Object.keys(json.tasks ?? {}).sort((a, b) => a.localeCompare(b))) {
       const v = (json.tasks ?? {})[k];
-      if (v) sortedTasks[k] = v;
+      sortedTasks[k] = v;
     }
     json.tasks = sortedTasks;
-    await fsPromises.mkdir(path.dirname(jsonPath), { recursive: true });
-    await fsPromises.writeFile(jsonPath, JSON.stringify(json, null, 2) + "\n", "utf-8");
+    await writeProjectionAtomically(jsonPath, json, "__projection-reconciliation__");
   }
 
   return result;
 }
 
-function isReconcilableLedgerEntry(entry: unknown): entry is JsonLedgerEntry {
-  if (typeof entry !== "object" || entry === null) return false;
-  const e = entry as Record<string, unknown>;
-  return (
-    typeof e.verified === "string" &&
-    typeof e.commit === "string" &&
-    typeof e.method === "string" &&
-    typeof e.verdict === "string" &&
-    typeof e.criteriaChecked === "number" &&
-    typeof e.criteriaPassed === "number"
-  );
+function parseReconcilableLedgerEntry(taskId: string, entry: unknown): JsonLedgerEntry | undefined {
+  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return undefined;
+  const value = entry as Record<string, unknown>;
+  const parsed = verificationEntrySchema.safeParse({
+    taskId,
+    verdict: value.verdict,
+    commitSha: value.commit,
+    method: value.method,
+    criteriaChecked: value.criteriaChecked,
+    criteriaPassed: value.criteriaPassed,
+    verifiedAt: value.verified,
+    notes: value.notes,
+    reviewId: value.reviewId,
+    workflowId: value.workflowId,
+  });
+  // A new verification may default to today, but a legacy record must carry
+  // its actual historical date. Never invent that date during reconciliation.
+  if (!parsed.success || parsed.data.verifiedAt === undefined) return undefined;
+  const normalized = parsed.data;
+  return {
+    verified: parsed.data.verifiedAt,
+    commit: normalized.commitSha,
+    method: normalized.method,
+    verdict: normalized.verdict,
+    criteriaChecked: normalized.criteriaChecked,
+    criteriaPassed: normalized.criteriaPassed,
+    notes: normalized.notes ?? null,
+    reviewId: normalized.reviewId,
+    workflowId: normalized.workflowId,
+  };
 }
 
 function appendReconcileMarker(notes: string | null, direction: string): string {
@@ -513,7 +636,48 @@ interface JsonLedgerEntry {
 interface VerifiedJsonDocument {
   _description?: string;
   _schema?: Record<string, string>;
-  tasks: Record<string, JsonLedgerEntry>;
+  tasks: Record<string, unknown>;
+}
+
+const verificationProjectionTails = new Map<string, Promise<void>>();
+
+async function withVerificationProjectionLock<T>(
+  projectRoot: string,
+  action: () => Promise<T>,
+): Promise<T> {
+  const key = path.resolve(projectRoot);
+  const predecessor = verificationProjectionTails.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = predecessor.then(() => current);
+  verificationProjectionTails.set(key, tail);
+  await predecessor;
+  try {
+    return await withOwnerFencedFileLock(
+      path.join(key, ".quack", "verified.json.lock"),
+      key,
+      action,
+    );
+  } finally {
+    release();
+    if (verificationProjectionTails.get(key) === tail) {
+      verificationProjectionTails.delete(key);
+    }
+  }
+}
+
+export function assertVerificationDatabaseAvailable(p: ResolvedProject): void {
+  const health = p.db.getHealth();
+  if (!health.available) throw new VerificationDatabaseUnavailableError(health.reason);
+}
+
+export class VerificationDatabaseUnavailableError extends Error {
+  constructor(reason: string) {
+    super(`Verification database is unavailable: ${reason}`);
+    this.name = "VerificationDatabaseUnavailableError";
+  }
 }
 
 function todayIso(): string {
@@ -588,44 +752,129 @@ function extractStructuredNoteValue(
   return match?.[1];
 }
 
-async function upsertJsonEntry(
+async function upsertJsonEntryLocked(
   projectRoot: string,
+  doc: VerifiedJsonDocument,
   taskId: string,
   entry: JsonLedgerEntry,
+  afterReadForTest?: (taskId: string) => void | Promise<void>,
+  afterPersistenceStageForTest?: (
+    stage: VerificationProjectionPersistenceStage,
+    taskId: string,
+  ) => void | Promise<void>,
 ): Promise<void> {
   const jsonPath = path.join(projectRoot, ".quack", "verified.json");
-  const doc = await readJsonOrDefault(jsonPath);
+  await afterReadForTest?.(taskId);
   doc.tasks[taskId] = entry;
   // Sort task keys for deterministic git diffs.
-  const sortedTasks: Record<string, JsonLedgerEntry> = {};
+  const sortedTasks: Record<string, unknown> = {};
   for (const k of Object.keys(doc.tasks).sort((a, b) => a.localeCompare(b))) {
     const v = doc.tasks[k];
-    if (v) sortedTasks[k] = v;
+    sortedTasks[k] = v;
   }
   doc.tasks = sortedTasks;
-  await fsPromises.mkdir(path.dirname(jsonPath), { recursive: true });
-  await fsPromises.writeFile(jsonPath, JSON.stringify(doc, null, 2) + "\n", "utf-8");
+  await writeProjectionAtomically(jsonPath, doc, taskId, afterPersistenceStageForTest);
+}
+
+async function syncProjectionDirectoryIfSupported(directory: string): Promise<boolean> {
+  if (process.platform === "win32") return false;
+  let handle: Awaited<ReturnType<typeof fsPromises.open>> | undefined;
+  try {
+    handle = await fsPromises.open(directory, "r");
+    await handle.sync();
+    return true;
+  } catch (error: unknown) {
+    if (
+      ["EINVAL", "ENOTSUP", "EISDIR", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")
+    ) {
+      return false;
+    }
+    throw error;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function writeProjectionAtomically(
+  jsonPath: string,
+  doc: VerifiedJsonDocument,
+  taskId: string,
+  afterStageForTest?: (
+    stage: VerificationProjectionPersistenceStage,
+    taskId: string,
+  ) => void | Promise<void>,
+): Promise<void> {
+  const directory = path.dirname(jsonPath);
+  await fsPromises.mkdir(directory, { recursive: true });
+  const temporary = `${jsonPath}.${process.pid}.${randomUUID()}.tmp`;
+  let renamed = false;
+  try {
+    const temporaryHandle = await fsPromises.open(temporary, "wx", 0o600);
+    try {
+      await temporaryHandle.writeFile(`${JSON.stringify(doc, null, 2)}\n`, "utf-8");
+      await temporaryHandle.sync();
+      await afterStageForTest?.("projection_temp_file_synced", taskId);
+    } finally {
+      await temporaryHandle.close();
+    }
+    await fsPromises.rename(temporary, jsonPath);
+    renamed = true;
+    await afterStageForTest?.("projection_published", taskId);
+    const publishedHandle = await fsPromises.open(jsonPath, "r+");
+    try {
+      await publishedHandle.sync();
+    } finally {
+      await publishedHandle.close();
+    }
+    await afterStageForTest?.("projection_published_file_synced", taskId);
+    if (await syncProjectionDirectoryIfSupported(directory)) {
+      await afterStageForTest?.("projection_directory_synced", taskId);
+    }
+    await afterStageForTest?.("projection_durability_acknowledged", taskId);
+  } finally {
+    if (!renamed) {
+      await fsPromises.unlink(temporary).catch((error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      });
+    }
+  }
 }
 
 async function readJsonOrDefault(jsonPath: string): Promise<VerifiedJsonDocument> {
+  let raw: string;
   try {
-    const raw = await fsPromises.readFile(jsonPath, "utf-8");
-    const parsed = JSON.parse(raw.replace(/^\uFEFF/u, "")) as VerifiedJsonDocument;
-    if (typeof parsed.tasks !== "object" || parsed.tasks === null) {
-      parsed.tasks = {};
-    }
-    return parsed;
-  } catch {
+    raw = await fsPromises.readFile(jsonPath, "utf-8");
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     return {
       _description:
         "Post-completion verification index. Records which COMPLETE tasks have been independently verified. Regenerated from quack.db on monitor startup.",
-      _schema: {
-        taskId: "TASK-NNN",
-        verified: "ISO date",
-        method: "string",
-        verdict: "string",
-      },
+      _schema: { taskId: "TASK-NNN", verified: "ISO date", method: "string", verdict: "string" },
       tasks: {},
     };
   }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.replace(/^\uFEFF/u, ""));
+  } catch (cause: unknown) {
+    throw new Error(`Verification projection is not valid JSON; preserve and repair ${jsonPath}`, {
+      cause,
+    });
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    Array.isArray(parsed) ||
+    !("tasks" in parsed) ||
+    typeof parsed.tasks !== "object" ||
+    parsed.tasks === null ||
+    Array.isArray(parsed.tasks)
+  ) {
+    throw new Error(
+      `Verification projection must contain an object tasks map; preserve and repair ${jsonPath}`,
+    );
+  }
+  // Individual legacy/unreconciled entries remain opaque until validation in
+  // reconciliation. Reading or regenerating must not discard their evidence.
+  return parsed as VerifiedJsonDocument;
 }

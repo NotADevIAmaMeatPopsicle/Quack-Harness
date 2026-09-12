@@ -4,15 +4,10 @@
 // Only removes values pointing inside .quack/worktrees/ — values set
 // for other reasons (operator custom usage) are preserved.
 
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
+import * as path from "node:path";
 
 import type { IEventWriter } from "../monitor/event-emitter.js";
-
-const execAsync = promisify(exec);
-
-const MAX_BUFFER = 1024 * 1024;
-const GIT_TIMEOUT_MS = 10_000;
+import { readTrustedCoreWorktree, unsetTrustedCoreWorktree } from "../worker/trusted-executable.js";
 
 export interface CoreWorktreeCleanResult {
   /** Whether a leaked value was found */
@@ -24,11 +19,20 @@ export interface CoreWorktreeCleanResult {
 }
 
 /**
- * Returns true if the given core.worktree value looks like a Quack-managed
- * worktree path (contains .quack/worktrees/ in either slash style).
+ * Returns true only when the resolved core.worktree value is a child of this
+ * project's own managed worktree directory.
  */
-function isQuackWorktreePath(value: string): boolean {
-  return value.includes(".quack/worktrees/") || value.includes(".quack\\worktrees\\");
+function isQuackWorktreePath(value: string, repoPath: string): boolean {
+  const managedRoot = path.resolve(repoPath, ".quack", "worktrees");
+  const candidate = path.resolve(repoPath, value);
+  const relative = path.relative(managedRoot, candidate);
+  const normalized = process.platform === "win32" ? relative.toLowerCase() : relative;
+  return (
+    normalized !== "" &&
+    normalized !== ".." &&
+    !normalized.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(normalized)
+  );
 }
 
 /**
@@ -43,28 +47,21 @@ export async function safeUnsetCoreWorktree(
   events?: IEventWriter,
 ): Promise<CoreWorktreeCleanResult> {
   try {
-    const { stdout } = await execAsync("git config --local --get core.worktree", {
-      cwd: repoPath,
-      timeout: GIT_TIMEOUT_MS,
-      maxBuffer: MAX_BUFFER,
-    });
-    const value = stdout.trim();
+    const value = (await Promise.resolve(readTrustedCoreWorktree(repoPath)))?.trim() ?? "";
     if (!value) {
       return { leaked: false, cleaned: false };
     }
 
     // Only clean values that point inside Quack's managed worktrees directory
-    if (!isQuackWorktreePath(value)) {
+    if (!isQuackWorktreePath(value, repoPath)) {
       return { leaked: true, cleaned: false, leakedValue: value };
     }
 
     // Remove the leaked value
     try {
-      await execAsync("git config --local --unset core.worktree", {
-        cwd: repoPath,
-        timeout: GIT_TIMEOUT_MS,
-        maxBuffer: MAX_BUFFER,
-      });
+      if (!(await Promise.resolve(unsetTrustedCoreWorktree(repoPath, value)))) {
+        return { leaked: true, cleaned: false, leakedValue: value };
+      }
       events?.emit("core_worktree_cleaned", {
         repoPath,
         leakedValue: value,
@@ -75,8 +72,8 @@ export async function safeUnsetCoreWorktree(
       return { leaked: true, cleaned: false, leakedValue: value };
     }
   } catch {
-    // git config --get exits non-zero when key is not set — that is the normal
-    // "no leak" path. Any other error is also treated as no-op.
+    // Cleanup is a best-effort finally-path operation. Missing or unreadable
+    // metadata is reported as a bounded no-op rather than masking the run.
     return { leaked: false, cleaned: false };
   }
 }

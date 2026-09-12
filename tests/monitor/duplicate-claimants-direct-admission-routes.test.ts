@@ -50,10 +50,6 @@ function makeJob(taskId: string): DispatchJob {
   };
 }
 
-function testPort(): number {
-  return 0;
-}
-
 function writeSessionEvidence(logDir: string, includeJudge: boolean): void {
   const sessionId = "session-prior";
   fs.writeFileSync(
@@ -172,7 +168,8 @@ describe.each(DUPLICATE_FIXTURE_CASES)("direct route admission veto (%s, %s)", (
           ? fs.readFileSync(artifactPath, "utf-8")
           : undefined;
       const monitor = createMonitorServer({
-        port: testPort(),
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: fixture.root,
         taskDir: "docs/tasks",
         adapterPath,
@@ -206,7 +203,8 @@ it("single claimant START preserves the success response and dispatch mutation",
   try {
     const adapterPath = writeAdapter(fixture.root);
     const monitor = createMonitorServer({
-      port: testPort(),
+      port: 0,
+      host: "127.0.0.1",
       projectRoot: fixture.root,
       taskDir: "docs/tasks",
       adapterPath,
@@ -251,7 +249,8 @@ it("START preserves the already-running response ahead of the contested veto", a
   try {
     const adapterPath = writeAdapter(fixture.root);
     const monitor = createMonitorServer({
-      port: testPort(),
+      port: 0,
+      host: "127.0.0.1",
       projectRoot: fixture.root,
       taskDir: "docs/tasks",
       adapterPath,
@@ -313,7 +312,8 @@ describe.each(DUPLICATE_FIXTURE_CASES)("active-job no-op precedence (%s, %s)", (
       const adapterPath = writeAdapter(fixture.root);
       await provision(surface, fixture.root);
       const monitor = createMonitorServer({
-        port: testPort(),
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: fixture.root,
         taskDir: "docs/tasks",
         adapterPath,
@@ -346,8 +346,8 @@ describe.each([
     "no prior runs",
   ],
   ["blueprint approve", "/api/tasks/TASK-100/blueprint/approve", {}, 500, "No pending approval"],
-  ["judge approve", "/api/tasks/TASK-100/judge/approve", {}, 500, "No pending judge approval"],
-  ["judge reject", "/api/tasks/TASK-100/judge/reject", {}, 500, "No pending judge approval"],
+  ["judge approve", "/api/tasks/TASK-100/judge/approve", {}, 409, "approval record does not exist"],
+  ["judge reject", "/api/tasks/TASK-100/judge/reject", {}, 409, "approval record does not exist"],
   ["force retry", "/api/tasks/TASK-100/force-retry", {}, 404, "No judge feedback"],
   ["resume", "/api/tasks/TASK-100/resume", {}, 404, "No checkpoint"],
 ] as const)("%s no-op precedence", (_label, pathname, body, expectedStatus, expectedText) => {
@@ -357,7 +357,8 @@ describe.each([
     try {
       const adapterPath = writeAdapter(fixture.root);
       const monitor = createMonitorServer({
-        port: testPort(),
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: fixture.root,
         taskDir: "docs/tasks",
         adapterPath,

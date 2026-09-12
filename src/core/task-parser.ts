@@ -58,7 +58,7 @@ export class TaskParseError extends Error {
  * Optional fields (returns empty string/array if missing):
  *   - blockedBy, blocks, conventions, tags
  *   - currentState, recommendedApproach
- *   - filesToModify, contextReferences
+ *   - filesToModify, contextReferences, decidedFacts, mandatedChecks
  */
 export function parseTaskFile(content: string, filePath?: string): ParsedTask {
   const rawContent = content;
@@ -131,6 +131,11 @@ export function parseTaskFile(content: string, filePath?: string): ParsedTask {
   // only an explicit `## Decided Facts` section counts (no prose scrape).
   const decidedFacts = parseBulletList(sections.get("decided facts") ?? "");
 
+  // TASK-1325 decision: mandated checks use the same bullet-text grammar
+  // as Decided Facts. Fenced blocks are intentionally not scraped: only
+  // an explicit `- ...` entry creates an exact fidelity claim.
+  const mandatedChecks = parseBulletList(sections.get("mandated checks") ?? "");
+
   return {
     id,
     title,
@@ -155,6 +160,7 @@ export function parseTaskFile(content: string, filePath?: string): ParsedTask {
     testingRequirements,
     contextReferences,
     ...(decidedFacts.length > 0 ? { decidedFacts } : {}),
+    ...(mandatedChecks.length > 0 ? { mandatedChecks } : {}),
     rawContent,
   };
 }
@@ -191,18 +197,19 @@ function parseExecutionMode(metadataSection: string, filePath?: string): Executi
  * written as escapes so a dash sweep cannot narrow heading parity.
  */
 export function matchTaskHeading(heading: string): { id: string; title: string } | null {
+  // Match a complete bare ID before considering '-' as a title separator.
+  // Otherwise TASK-1402-A backtracks to TASK-1402 with the title "A".
+  const idOnly = heading.match(/^((?:TASK-\d+(?:-[A-Z])?|SAURUS-REM-\d{3}))\s*$/);
+  if (idOnly) {
+    return { id: idOnly[1], title: "" };
+  }
+
   // Match "TASK-NNN: Title" or "TASK-NNN-A: Title" (subtasks) or "TASK-NNN - Title"
   const match = heading.match(
     /^((?:TASK-\d+(?:-[A-Z])?|SAURUS-REM-\d{3}))\s*[:\u2014\u2013-]\s*(.+)$/,
   );
   if (match) {
     return { id: match[1], title: match[2].trim() };
-  }
-
-  // A bare id with no separator and no title is also a valid declaration.
-  const idOnly = heading.match(/^((?:TASK-\d+(?:-[A-Z])?|SAURUS-REM-\d{3}))\s*$/);
-  if (idOnly) {
-    return { id: idOnly[1], title: "" };
   }
 
   return null;
@@ -282,6 +289,8 @@ const CANONICAL_SECTION_HEADINGS = [
   "success criteria",
   "testing requirements",
   "context references",
+  "decided facts",
+  "mandated checks",
 ];
 
 const SECTION_HEADING_ALIASES: ReadonlyArray<{

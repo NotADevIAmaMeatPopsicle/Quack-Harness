@@ -58,7 +58,6 @@ describe("appendDispatchChildExit (QPI-043)", () => {
       exitCode: null,
       signal: null,
       worktreePath: "C:\\repo\\.quack\\worktrees\\TASK-1273",
-      isolation: "worktree",
       ...overrides,
     };
   }
@@ -87,7 +86,7 @@ describe("appendDispatchChildExit (QPI-043)", () => {
     const payload = events[0].payload as DispatchChildExitPayload;
     expect(payload.exitCode).toBe(0);
     expect(payload.killed).toBe(false);
-    expect(payload.isolation).toBe("worktree");
+    expect(payload.operatorRequested).toBe(false);
     expect(payload.sessionResolution).toBe("child-session");
   });
 
@@ -229,6 +228,33 @@ describe("appendDispatchChildExit (QPI-043)", () => {
     expect(readEvents("quack-diagnostic-claimant-task-1273-kind")).toEqual([]);
   });
 
+  test("a pinned monitor session cannot attach exit facts to a newer or older same-task session", () => {
+    writeSessions([
+      {
+        sessionId: "newer",
+        taskId: "TASK-1273",
+        project: "fixture",
+        startTime: "2026-08-09T11:00:00.000Z",
+        status: "active",
+      },
+      {
+        sessionId: "older",
+        taskId: "TASK-1273",
+        project: "fixture",
+        startTime: "2026-08-09T09:00:00.000Z",
+        status: "completed",
+      },
+    ]);
+    const input = opts({ exactSession: true, exitCode: 0 });
+    expect(appendDispatchChildExit(input)).toEqual({
+      sessionId: input.jobSessionId,
+      resolution: "job-fallback",
+    });
+    expect(readEvents("newer")).toEqual([]);
+    expect(readEvents("older")).toEqual([]);
+    expect(readEvents(input.jobSessionId)).toHaveLength(1);
+  });
+
   test("a SIGKILLed child is recorded as killed with the signal preserved", () => {
     const result = appendDispatchChildExit(opts({ exitCode: null, signal: "SIGKILL" }));
 
@@ -237,6 +263,21 @@ describe("appendDispatchChildExit (QPI-043)", () => {
     expect(payload.signal).toBe("SIGKILL");
     expect(payload.killed).toBe(true);
     expect(payload.exitCode).toBeNull();
+  });
+
+  test("records an operator-requested signal separately from an external kill", () => {
+    const result = appendDispatchChildExit(
+      opts({ exitCode: null, signal: "SIGTERM", operatorRequested: true }),
+    );
+
+    const events = readEvents(result.sessionId);
+    const payload = events[0].payload as DispatchChildExitPayload;
+    expect(payload).toMatchObject({
+      exitCode: null,
+      signal: "SIGTERM",
+      killed: true,
+      operatorRequested: true,
+    });
   });
 
   test("the appended line is returned by EventReader.getSessionEvents (the investigator's read path)", () => {

@@ -224,6 +224,20 @@ describe("blueprint-approval", () => {
           reviewedAt: "2026-07-16T00:00:00.000Z",
           reviewGate: {
             crossModelSatisfied: true,
+            crossModelEvidence: {
+              status: "satisfied",
+              basis: "different_runner",
+              producer: {
+                runner: "claude-sdk",
+                provider: "anthropic",
+                model: "claude-sonnet-4-6",
+              },
+              reviewer: {
+                runner: "codex-cli",
+                provider: "openai",
+                model: "gpt-5.6-terra",
+              },
+            },
             anchorAuditPassed: true,
             treeClean: true,
             fidelityPassed: true,
@@ -238,6 +252,12 @@ describe("blueprint-approval", () => {
         state: "auto-approved",
         executionMode: "loop",
         review: { status: "completed", verdict: "SHIP" },
+        reviewGate: {
+          crossModelEvidence: {
+            status: "satisfied",
+            basis: "different_runner",
+          },
+        },
       });
     });
 
@@ -277,6 +297,20 @@ describe("blueprint-approval", () => {
           reviewedAt: "2026-08-09T01:06:10.041Z",
           reviewGate: {
             crossModelSatisfied: true,
+            crossModelEvidence: {
+              status: "satisfied",
+              basis: "different_runner",
+              producer: {
+                runner: "claude-sdk",
+                provider: "anthropic",
+                model: "claude-sonnet-4-6",
+              },
+              reviewer: {
+                runner: "codex-cli",
+                provider: "openai",
+                model: "gpt-5.6-terra",
+              },
+            },
             anchorAuditPassed: true,
             treeClean: true,
             fidelityPassed: true,
@@ -307,6 +341,10 @@ describe("blueprint-approval", () => {
       expect(resaved!.reviewGate).toMatchObject({
         eligibleForAutoApproval: false,
         reasons: ["review verdict is FIX_FIRST"],
+        crossModelEvidence: {
+          status: "satisfied",
+          basis: "different_runner",
+        },
       });
       expect(resaved!.executionMode).toBe("loop");
       expect(resaved!.blueprint.fileAnalyses).toHaveLength(1);

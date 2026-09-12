@@ -1,5 +1,6 @@
 import {
   buildStrictDuplicateClaimantIndex,
+  buildStrictTaskClaimantIndex,
   duplicateClaimantRefusalForIndex,
   type TaskClaimantDeclaration,
 } from "../../src/core/duplicate-claimants";
@@ -11,6 +12,25 @@ const declarations: TaskClaimantDeclaration[] = [
 ];
 
 describe("TASK-1338-F strict duplicate claimant index", () => {
+  // The pre-change index intentionally collapsed singleton owners; TASK-1345
+  // adds the non-collapsing view required before a creator writes claimant #2.
+  it("TASK-1345: retains a single owner in the non-collapsing creator index", async () => {
+    const index = await buildStrictTaskClaimantIndex(() => Promise.resolve(declarations));
+    expect(index.status).toBe("scanned");
+    if (index.status !== "scanned") throw new Error("expected scanned index");
+    expect([...index.claimants]).toEqual([
+      ["TASK-100", ["TASK-100-z.md", "TASK-999-a.md"]],
+      ["TASK-200", ["TASK-200-only.md"]],
+    ]);
+  });
+
+  it("TASK-1345: makes an unavailable creator scan explicit", async () => {
+    await expect(buildStrictTaskClaimantIndex()).resolves.toEqual({
+      status: "unavailable",
+      reason: "TaskService is unavailable for claimant scan.",
+    });
+  });
+
   it("returns a normalized scanned index with sorted contested claimants", async () => {
     const index = await buildStrictDuplicateClaimantIndex(() => Promise.resolve(declarations));
 

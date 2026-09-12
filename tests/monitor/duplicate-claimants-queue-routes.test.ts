@@ -18,10 +18,6 @@ import {
   writeAdapter,
 } from "../helpers/duplicate-claimants-fixture";
 
-function testPort(): number {
-  return 0;
-}
-
 describe.each(DUPLICATE_FIXTURE_CASES)("queue route claimant scan (%s, %s)", (kind, order) => {
   it("explicit enqueue refuses before the core mutation", async () => {
     const fixture = createDuplicateFixture("quack-queue-route-enqueue-", kind, order);
@@ -29,7 +25,8 @@ describe.each(DUPLICATE_FIXTURE_CASES)("queue route claimant scan (%s, %s)", (ki
     try {
       const adapterPath = writeAdapter(fixture.root);
       const monitor = createMonitorServer({
-        port: testPort(),
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: fixture.root,
         taskDir: "docs/tasks",
         adapterPath,
@@ -80,7 +77,8 @@ describe.each(DUPLICATE_FIXTURE_CASES)("queue route claimant scan (%s, %s)", (ki
       );
       const adapterPath = writeAdapter(fixture.root);
       const monitor = createMonitorServer({
-        port: testPort(),
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: fixture.root,
         taskDir: "docs/tasks",
         adapterPath,
@@ -114,7 +112,8 @@ describe.each(DUPLICATE_FIXTURE_CASES)("enqueue-all route matrix (%s, %s)", (kin
       );
       const adapterPath = writeAdapter(fixture.root);
       const monitor = createMonitorServer({
-        port: testPort(),
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: fixture.root,
         taskDir: "docs/tasks",
         adapterPath,
@@ -145,7 +144,8 @@ it("explicit enqueue preserves the already-queued response after a contest forms
   try {
     const adapterPath = writeAdapter(fixture.root);
     const monitor = createMonitorServer({
-      port: testPort(),
+      port: 0,
+      host: "127.0.0.1",
       projectRoot: fixture.root,
       taskDir: "docs/tasks",
       adapterPath,

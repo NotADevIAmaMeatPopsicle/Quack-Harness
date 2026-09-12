@@ -10,6 +10,7 @@ import { loadAdapter } from "../core/adapter-loader.js";
 import { listDuplicateClaimants, resolveTaskFile } from "../core/task-file-resolver.js";
 import { formatDuplicateClaimantsMessage } from "../core/duplicate-claimants.js";
 import { runReadinessGate } from "../gate/gate.js";
+import { withCanonicalTaskSpecMutationFence } from "../preflight/canonical-task-spec-mutation.js";
 
 // ─── Prompt helper ──────────────────────────────────────────────────
 
@@ -99,14 +100,13 @@ export async function enrichCommand(taskId: string, options: { project?: string 
     switch (answer) {
       case "y":
       case "yes": {
-        const claimants = await listDuplicateClaimants(taskDir, taskId);
-        if (claimants.length > 0) {
-          console.error(formatDuplicateClaimantsMessage(taskId, claimants));
-          process.exit(1);
-          return;
-        }
-        // Write enriched content back to the task file
-        await fs.writeFile(filePath, enrichedTask.enriched.rawContent, "utf-8");
+        await withCanonicalTaskSpecMutationFence({
+          adapter,
+          taskId,
+          taskFilePath: filePath,
+          expectedContent: resolved.content,
+          replacementContent: enrichedTask.enriched.rawContent,
+        });
         console.log(`\nEnriched task written to ${filePath}`);
         process.exit(0);
         break;

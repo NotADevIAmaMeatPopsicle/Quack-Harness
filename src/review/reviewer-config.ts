@@ -19,6 +19,21 @@ export const CodexRunnerConfigSchema = z
     sandbox: z.literal("read-only").default("read-only"),
     /** CODEX_HOME override for the plugin-free headless profile. Operator-trust surface. */
     codexHome: z.string().optional(),
+    /** Optional named Codex profile (passed as `-p`) for provider/model selection. */
+    profile: z.string().min(1).optional(),
+    /** Optional provider id, passed as a quoted model_provider config override. */
+    provider: z
+      .string()
+      .regex(/^[A-Za-z0-9._-]+$/)
+      .optional(),
+    /** Provider API-key environment variable copied into the scrubbed Codex env. */
+    credentialEnvVar: z
+      .string()
+      .regex(/^[A-Z_][A-Z0-9_]*$/)
+      .refine((name) => !name.startsWith("QUACK_"), {
+        message: "credentialEnvVar cannot use the QUACK_* namespace",
+      })
+      .optional(),
   })
   .strict();
 

@@ -49,6 +49,7 @@ describe("loadAdapter", () => {
         ".quack/convention-checks/",
         ".quack/templates/",
       ]);
+      expect(adapter.config.sandbox.disposablePaths).toBeUndefined();
       expect(adapter.config.sandbox.allowedBashPatterns).toEqual([]);
       expect(adapter.config.sandbox.deniedBashPatterns).toEqual([]);
     });
@@ -80,6 +81,25 @@ describe("loadAdapter", () => {
 
     it("should resolve projectRoot to an absolute path", () => {
       expect(path.isAbsolute(adapter.projectRoot)).toBe(true);
+    });
+
+    it("loads local Git read grants only from the project-bound operator environment", async () => {
+      const previous = process.env.QUACK_TRUSTED_LOCAL_READ_REMOTES;
+      const projectRoot = path.join(FIXTURES_DIR, "minimal");
+      const remotePath = path.resolve(FIXTURES_DIR, "operator-origin.git");
+      process.env.QUACK_TRUSTED_LOCAL_READ_REMOTES = JSON.stringify({
+        projectRoot,
+        paths: [remotePath],
+      });
+      try {
+        const operatorConfigured = await loadAdapter(projectRoot);
+        const otherProject = await loadAdapter(path.join(FIXTURES_DIR, "full"));
+        expect(operatorConfigured.trustedLocalReadRemotePaths).toEqual([remotePath]);
+        expect(otherProject.trustedLocalReadRemotePaths).toBeUndefined();
+      } finally {
+        if (previous === undefined) delete process.env.QUACK_TRUSTED_LOCAL_READ_REMOTES;
+        else process.env.QUACK_TRUSTED_LOCAL_READ_REMOTES = previous;
+      }
     });
 
     it("should set verification commands", () => {
@@ -120,6 +140,7 @@ describe("loadAdapter", () => {
     it("should use explicitly provided sandbox values (not defaults)", () => {
       expect(adapter.config.sandbox.writablePaths).toEqual(["src/", "tests/", "docs/"]);
       expect(adapter.config.sandbox.deniedPaths).toContain("infrastructure/");
+      expect(adapter.config.sandbox.disposablePaths).toBeUndefined();
       expect(adapter.config.sandbox.allowedBashPatterns).toContain("npm test *");
       expect(adapter.config.sandbox.deniedBashPatterns).toContain("rm *");
     });
@@ -290,6 +311,106 @@ describe("loadAdapter", () => {
       };
 
       expect(computeAdapterBundleMetadata(changed).sharedHash).not.toBe(baseline.sharedHash);
+    });
+
+    it("treats the Codex home as machine-local worker configuration", () => {
+      const withCodexA: AdapterConfig = {
+        ...adapter.config,
+        agent: {
+          ...adapter.config.agent,
+          runner: "codex-cli",
+          codex: {
+            binaryPath: "codex",
+            sandbox: "workspace-write",
+            provider: "azure",
+            codexHome: "C:/Users/host-a/.codex-headless",
+            timeoutMs: 1_800_000,
+          },
+        },
+        evaluationProviders: {
+          blueprint: {
+            runner: "codex-cli",
+            model: "gpt-5.6-terra",
+            maxTurns: 30,
+            timeoutMs: 600_000,
+            codex: {
+              binaryPath: "codex",
+              sandbox: "read-only",
+              provider: "azure",
+              codexHome: "C:/Users/host-a/.codex-headless",
+            },
+          },
+        },
+        judgment: {
+          runner: {
+            provider: "codex-cli",
+            model: "gpt-5.6-terra",
+            maxTurns: 5,
+            timeoutMs: 120_000,
+            codex: {
+              binaryPath: "codex",
+              sandbox: "read-only",
+              provider: "azure",
+              codexHome: "C:/Users/host-a/.codex-headless",
+            },
+          },
+          stages: {
+            docsReview: { mode: "off" },
+            readiness: { mode: "off" },
+            loopBrief: { mode: "off" },
+            loopDiff: { mode: "off" },
+            judge: { mode: "off" },
+          },
+        },
+      };
+      const withCodexB: AdapterConfig = {
+        ...withCodexA,
+        agent: {
+          ...withCodexA.agent,
+          codex: {
+            ...withCodexA.agent.codex!,
+            codexHome: "/home/host-b/.codex-headless",
+          },
+        },
+        evaluationProviders: {
+          blueprint: {
+            ...withCodexA.evaluationProviders!.blueprint!,
+            codex: {
+              ...withCodexA.evaluationProviders!.blueprint!.codex,
+              codexHome: "/home/host-b/.codex-headless",
+            },
+          },
+        },
+        judgment: {
+          ...withCodexA.judgment!,
+          runner: {
+            ...withCodexA.judgment!.runner,
+            provider: "codex-cli",
+            codex: {
+              ...("codex" in withCodexA.judgment!.runner
+                ? withCodexA.judgment!.runner.codex
+                : { binaryPath: "codex", sandbox: "read-only" as const }),
+              codexHome: "/home/host-b/.codex-headless",
+            },
+          },
+        },
+      };
+
+      const hostA = computeAdapterBundleMetadata(withCodexA);
+      const hostB = computeAdapterBundleMetadata(withCodexB);
+      expect(hostA.sharedHash).toBe(hostB.sharedHash);
+      expect(hostA.normalizedConfig.agent.codex?.codexHome).toBeUndefined();
+      expect(
+        hostA.normalizedConfig.evaluationProviders?.blueprint?.codex.codexHome,
+      ).toBeUndefined();
+      expect(
+        hostA.normalizedConfig.judgment?.runner.provider === "codex-cli"
+          ? hostA.normalizedConfig.judgment.runner.codex.codexHome
+          : "wrong-provider",
+      ).toBeUndefined();
+      expect(hostA.machineLocalFields).toContain("agent.codex.codexHome");
+      expect(hostA.machineLocalFields).toContain("evaluationProviders.*.codex.codexHome");
+      expect(hostA.machineLocalFields).toContain("judgment.runner.codex.codexHome");
     });
 
     it("applies typed worker overlays deterministically", () => {

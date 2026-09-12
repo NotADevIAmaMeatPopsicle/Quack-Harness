@@ -24,12 +24,19 @@ import { getAdminRunStagePolicy, type AdminRunStage } from "../monitor/admin-run
 import type { SpecReviewResult } from "./spec-review-types.js";
 import { reviewSpecAmbiguity } from "./spec-reviewer.js";
 import { decomposeTask } from "./task-decomposer.js";
-import { writeSubtaskSpecs, commitSubtaskSpecs } from "./subtask-writer.js";
-import { buildFallbackChildDraft } from "./subtask-materializer.js";
-import { runChildQualityGate } from "./subtask-quality-gate.js";
+import {
+  buildDecompositionCoverageReport,
+  hasValidDecompositionTopologyIdentity,
+} from "./decomposition-plan-integrity.js";
+import { resolveEffectiveDecompositionMaxSubtasks } from "./decomposition-limits.js";
+import { materializeChildDrafts } from "./subtask-materializer.js";
+import {
+  DecompositionFinalizeError,
+  finalizeDecompositionTransaction,
+} from "./decomposition-finalizer.js";
 import { toRuntimeDiagnostics, type RuntimeDiagnostics } from "../core/runtime-errors.js";
 import { ReadinessService } from "../monitor/readiness-service.js";
-import { listDuplicateClaimants } from "../core/task-file-resolver.js";
+import { listDuplicateClaimants, resolveParsedTaskFile } from "../core/task-file-resolver.js";
 
 export type PreflightStageName = Extract<
   AdminRunStage,
@@ -58,6 +65,8 @@ export interface PreflightOptions {
   stageHeartbeatIntervalMs?: number;
 }
 
+type AutoDecomposeRefusal = NonNullable<NonNullable<PreflightResult["decomposition"]>["refused"]>;
+
 /**
  * Run the full pre-flight pipeline for a task.
  *
@@ -83,12 +92,15 @@ export async function runPreflight(
   const events = options?.events;
   const stageReporter = options?.stageReporter;
   const stageHeartbeatIntervalMs = options?.stageHeartbeatIntervalMs ?? 30_000;
+  let decompositionCommitCompleted = false;
 
   events?.emit("preflight_start", { taskId: task.id });
 
   // Compute content hash for cache validation
   const taskContent = task.rawContent;
   const contentHash = computeContentHash(taskContent);
+  let resultTaskContent = taskContent;
+  let resultContentHash = contentHash;
 
   // TASK-1315: gate authority is mode-scoped; a flip invalidates.
   const readinessJudgmentMode = adapter.config.judgment?.stages.readiness.mode ?? "off";
@@ -152,16 +164,39 @@ export async function runPreflight(
     try {
       const result = await work();
       if (heartbeatTimer) clearInterval(heartbeatTimer);
-      events?.emit("stage_completed", {
-        taskId: task.id,
-        scope: "preflight",
-        stage,
-        detail,
-      });
-      await Promise.resolve(stageReporter?.completed(stage, detail));
+      if (decompositionCommitCompleted) {
+        try {
+          events?.emit("stage_completed", {
+            taskId: task.id,
+            scope: "preflight",
+            stage,
+            detail,
+          });
+        } catch {
+          // Observability cannot reverse an already-committed decomposition.
+        }
+        try {
+          await Promise.resolve(stageReporter?.completed(stage, detail));
+        } catch {
+          // Same committed boundary for async admin-run projection.
+        }
+      } else {
+        events?.emit("stage_completed", {
+          taskId: task.id,
+          scope: "preflight",
+          stage,
+          detail,
+        });
+        await Promise.resolve(stageReporter?.completed(stage, detail));
+      }
       return result;
     } catch (err: unknown) {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (decompositionCommitCompleted) {
+        // The decompose stage is side-effect complete. Downstream observers
+        // may fail, but callers must still receive the committed result.
+        return undefined as T;
+      }
       const message = err instanceof Error ? err.message : String(err);
       events?.emit("stage_failed", {
         taskId: task.id,
@@ -267,12 +302,16 @@ export async function runPreflight(
   // Step 1.5: Spec ambiguity review
   let specReview: SpecReviewResult | undefined;
   const reviewConfig = adapter.config.preflight?.specReview;
+  const specReviewEvaluator = adapter.config.evaluationProviders?.specReview;
   const reviewEnabled = reviewConfig?.enabled ?? true;
   if (reviewEnabled && executionMode === "full") {
     await runStage("spec_review", "Reviewing spec ambiguity.", async () => {
       try {
         specReview = await reviewSpecAmbiguity(task, {
-          model: reviewConfig?.model,
+          model: specReviewEvaluator?.model ?? reviewConfig?.model,
+          evaluator: specReviewEvaluator,
+          projectRoot: adapter.projectRoot,
+          apiKeys: adapter.config.agent.apiKeys,
         });
         degradedChecksRun.add("spec_review");
         events?.emit("preflight_spec_review", {
@@ -325,6 +364,16 @@ export async function runPreflight(
 
     try {
       blueprint = await generateBlueprint(task, adapter);
+      if (blueprint.fidelity?.status === "failed") {
+        const details = blueprint.fidelity.violations
+          .map((violation) => `${violation.kind}: ${violation.detail}`)
+          .join("; ");
+        throw new Error(
+          `Generated blueprint failed deterministic fidelity validation${
+            details ? `: ${details}` : ""
+          }`,
+        );
+      }
       blueprintMarkdown = formatBlueprintForPrompt(blueprint);
       blueprintSummary = {
         fileAnalyses: blueprint.fileAnalyses.length,
@@ -336,6 +385,7 @@ export async function runPreflight(
     } catch (err: unknown) {
       fallbackDiagnostics ??= toRuntimeDiagnostics(err, "preflight.blueprint");
       executionMode = "deterministic";
+      blueprint = undefined;
       blueprintMarkdown = buildDeterministicBlueprint(task);
       blueprintSummary = {
         fileAnalyses: task.filesToModify.length,
@@ -385,7 +435,7 @@ export async function runPreflight(
 
   // Step 5: Auto-decomposition (if enabled and recommended)
   let decomposition: PreflightResult["decomposition"];
-  let autoDecomposeRefused = false;
+  let skipPreflightPersistence = false;
   const autoDecomposeConfig = adapter.config.preflight?.autoDecompose;
   const blueprintForDecompose = blueprint;
   // Skip auto-decompose if the task is itself an auto-decomposed subtask:
@@ -429,67 +479,207 @@ export async function runPreflight(
       try {
         const plan = await decomposeTask(task, adapter, blueprintForDecompose, {
           maxSubtasks: autoDecomposeConfig.maxSubtasks,
+          preferConfiguredProvider: autoDecomposeConfig.writeSpecs,
         });
 
         let subtaskFiles: string[] = [];
         if (autoDecomposeConfig.writeSpecs && plan.subtasks.length > 0) {
-          const taskDir = path.resolve(adapter.projectRoot, adapter.config.project.taskDir);
-          const claimants = await listDuplicateClaimants(taskDir, task.id);
-          if (claimants.length > 0) {
-            autoDecomposeRefused = true;
+          const subtaskIds = plan.subtasks.map((subtask) => subtask.id);
+          const refuse = (
+            refused: AutoDecomposeRefusal,
+            options: { skipPersistence?: boolean } = {},
+          ): void => {
+            skipPreflightPersistence ||= options.skipPersistence === true;
             decomposition = {
               decomposed: false,
-              subtaskIds: plan.subtasks.map((subtask) => subtask.id),
+              subtaskIds,
               subtaskFiles: [],
-              refused: {
-                errorType: "duplicate_claimants",
-                claimants,
-              },
+              refused,
             };
             events?.emit("preflight_auto_decompose_refused", {
               taskId: task.id,
-              errorType: "duplicate_claimants",
-              claimants,
+              ...refused,
+            });
+          };
+
+          const taskDir = path.resolve(adapter.projectRoot, adapter.config.project.taskDir);
+          const claimants = await listDuplicateClaimants(taskDir, task.id);
+          if (claimants.length > 0) {
+            refuse({ errorType: "duplicate_claimants", claimants }, { skipPersistence: true });
+            return;
+          }
+
+          if (
+            !hasValidDecompositionTopologyIdentity(
+              task.id,
+              plan.subtasks,
+              resolveEffectiveDecompositionMaxSubtasks(
+                plan.maxSubtasks ?? autoDecomposeConfig.maxSubtasks,
+                autoDecomposeConfig.maxSubtasks,
+              ),
+            )
+          ) {
+            refuse({
+              errorType: "invalid_plan",
+              message:
+                "Topology must use exact sequential child identities, backward-only dependencies, the configured child-count limit, and exactly one trailing final child.",
             });
             return;
           }
-          // Convert topology subtasks to ChildDraft[] using fallback drafts
-          // (auto-decompose does not go through the materializer LLM step)
-          const fallbackDrafts = plan.subtasks.map((subtask) => {
-            const markdown = buildFallbackChildDraft(subtask, task);
-            const gate = runChildQualityGate(subtask.id, markdown);
-            return {
-              subtaskId: subtask.id,
-              title: subtask.title,
-              markdown,
-              sectionsPresent: gate.sectionsPresent,
-              prepScore: gate.prepScore,
-              prepReady: gate.prepReady,
-              deficiencies: gate.deficiencies,
-              parseError: gate.parseError,
-            };
-          });
-          subtaskFiles = await writeSubtaskSpecs(fallbackDrafts, adapter);
 
-          // TASK-900: auto-commit subtask specs so dispatcher worktrees
-          // (which materialize from the object database via `git worktree
-          // add`) can resolve them at session_start.
-          try {
-            const commitResult = await commitSubtaskSpecs(adapter, subtaskFiles, task.id);
-            events?.emit("preflight_auto_decompose_specs_committed", {
-              taskId: task.id,
-              committed: commitResult.committed,
-              sha: commitResult.sha,
-              staged: commitResult.staged,
+          // Recompute coverage from the topology rather than trusting a
+          // provider-supplied report. Auto-write is destructive and therefore
+          // requires exact, non-duplicated ownership of every parent file and
+          // success criterion.
+          const coverage = buildDecompositionCoverageReport(task, plan.subtasks);
+          if (coverage.hasCoverageGap) {
+            refuse({
+              errorType: "coverage_gap",
+              unmappedFiles: coverage.unmappedFiles,
+              unmappedCriteria: coverage.unmappedCriteria,
+              duplicatedFiles: coverage.duplicatedFiles,
+              duplicatedCriteria: coverage.duplicatedCriteria ?? [],
+              unexpectedFiles: coverage.unexpectedFiles ?? [],
+              mismatchedFileActions: coverage.mismatchedFileActions ?? [],
+              unexpectedCriteria: coverage.unexpectedCriteria ?? [],
             });
-          } catch (commitErr) {
-            const commitMsg = commitErr instanceof Error ? commitErr.message : String(commitErr);
+            return;
+          }
+
+          // Capture the exact parent path used for planning. The transaction
+          // resolves and verifies the sole claimant again under its lock after
+          // the potentially long materialization call.
+          const parent = await resolveParsedTaskFile(taskDir, task.id);
+          if (!parent || parent.content !== task.rawContent) {
+            refuse(
+              {
+                errorType: "parent_spec_changed",
+                message: parent
+                  ? "The resolved parent content changed before decomposition materialized."
+                  : "The exact parsed parent task file could not be resolved.",
+              },
+              { skipPersistence: true },
+            );
+            return;
+          }
+
+          const materializedDrafts = await materializeChildDrafts(
+            plan,
+            task,
+            adapter,
+            blueprintForDecompose,
+          );
+          try {
+            const finalized = await finalizeDecompositionTransaction({
+              adapter,
+              parentTask: task,
+              parentFilePath: parent.filePath,
+              parentContent: task.rawContent,
+              topology: plan,
+              drafts: materializedDrafts,
+              preserveDraftDiagnostics: true,
+            });
+            subtaskFiles = finalized.writtenPaths;
+            resultTaskContent = finalized.parentContent;
+            resultContentHash = computeContentHash(finalized.parentContent);
+            decomposition = {
+              decomposed: true,
+              subtaskIds,
+              subtaskFiles,
+              recoveryPending: finalized.commit.recoveryPending,
+              statusProjectionId: finalized.commit.statusProjectionId,
+            };
+            decompositionCommitCompleted = true;
+            // Event sinks are observability only. Once the commit exists they
+            // cannot turn a successful transaction into a failed preflight.
+            try {
+              events?.emit("preflight_auto_decompose_specs_committed", {
+                taskId: task.id,
+                committed: finalized.commit.committed,
+                sha: finalized.commit.sha,
+                staged: finalized.commit.staged,
+                recoveryPending: finalized.commit.recoveryPending === true,
+                statusProjectionId: finalized.commit.statusProjectionId,
+              });
+            } catch {
+              // Best effort after commit.
+            }
+          } catch (finalizeError) {
+            if (decompositionCommitCompleted) return;
+            if (!(finalizeError instanceof DecompositionFinalizeError)) throw finalizeError;
+            const details = finalizeError.details;
+            if (finalizeError.kind === "coverage_gap") {
+              const failedCoverage = details.coverageReport as typeof coverage | undefined;
+              refuse({
+                errorType: "coverage_gap",
+                unmappedFiles: failedCoverage?.unmappedFiles ?? [],
+                unmappedCriteria: failedCoverage?.unmappedCriteria ?? [],
+                duplicatedFiles: failedCoverage?.duplicatedFiles ?? [],
+                duplicatedCriteria: failedCoverage?.duplicatedCriteria ?? [],
+                unexpectedFiles: failedCoverage?.unexpectedFiles ?? [],
+                mismatchedFileActions: failedCoverage?.mismatchedFileActions ?? [],
+                unexpectedCriteria: failedCoverage?.unexpectedCriteria ?? [],
+              });
+              return;
+            }
+            if (finalizeError.kind === "invalid_plan") {
+              refuse({ errorType: "invalid_plan", message: finalizeError.message });
+              return;
+            }
+            if (finalizeError.kind === "child_quality") {
+              refuse({
+                errorType: "child_quality",
+                drafts:
+                  (details.rejectedDrafts as
+                    | Array<{
+                        subtaskId: string;
+                        prepScore: number;
+                        deficiencies: string[];
+                        parseError?: string;
+                      }>
+                    | undefined) ?? [],
+                message: finalizeError.message,
+              });
+              return;
+            }
+            if (finalizeError.kind === "parent_changed") {
+              const claimants = details.claimants as string[] | undefined;
+              if (claimants && claimants.length > 1) {
+                refuse({ errorType: "duplicate_claimants", claimants }, { skipPersistence: true });
+                return;
+              }
+              refuse(
+                { errorType: "parent_spec_changed", message: finalizeError.message },
+                { skipPersistence: true },
+              );
+              return;
+            }
+            if (finalizeError.kind === "commit_indeterminate") {
+              refuse(
+                {
+                  errorType: "recovery_pending",
+                  message: finalizeError.message,
+                  retryable: false,
+                },
+                { skipPersistence: true },
+              );
+              return;
+            }
             events?.emit("preflight_auto_decompose_specs_commit_failed", {
               taskId: task.id,
-              error: commitMsg,
+              error: finalizeError.message,
               subtaskFiles,
+              rollbackErrors: finalizeError.rollbackErrors,
             });
-            // Non-fatal — disk writes succeeded; operator can commit manually.
+            refuse(
+              {
+                errorType: "write_failed",
+                message: finalizeError.message,
+                rollbackErrors: finalizeError.rollbackErrors,
+              },
+              { skipPersistence: finalizeError.rollbackErrors.length > 0 },
+            );
+            return;
           }
         }
 
@@ -499,20 +689,34 @@ export async function runPreflight(
         // written, and the dispatch gate then refused the parent for
         // phantom subtasks (structurally undispatched without cache
         // surgery — the opposite of the advisory flip's intent).
-        decomposition = {
+        decomposition ??= {
           decomposed: subtaskFiles.length > 0,
           subtaskIds: plan.subtasks.map((s) => s.id),
           subtaskFiles,
           ...(plan.subtasks.length > 0 && subtaskFiles.length === 0 ? { advisoryOnly: true } : {}),
         };
 
-        events?.emit("preflight_auto_decompose_complete", {
-          taskId: task.id,
-          subtaskCount: plan.subtasks.length,
-          subtaskIds: decomposition.subtaskIds,
-          filesWritten: subtaskFiles.length,
-        });
+        if (subtaskFiles.length > 0) {
+          try {
+            events?.emit("preflight_auto_decompose_complete", {
+              taskId: task.id,
+              subtaskCount: plan.subtasks.length,
+              subtaskIds: decomposition.subtaskIds,
+              filesWritten: subtaskFiles.length,
+            });
+          } catch {
+            // Best effort after the parent+children commit has succeeded.
+          }
+        } else {
+          events?.emit("preflight_auto_decompose_complete", {
+            taskId: task.id,
+            subtaskCount: plan.subtasks.length,
+            subtaskIds: decomposition.subtaskIds,
+            filesWritten: 0,
+          });
+        }
       } catch (err) {
+        if (decompositionCommitCompleted) return;
         const msg = err instanceof Error ? err.message : String(err);
         events?.emit("preflight_auto_decompose_failed", {
           taskId: task.id,
@@ -537,11 +741,20 @@ export async function runPreflight(
     if (structuredSize <= STRUCTURED_MAX_CHARS) {
       structuredForStore = blueprint;
     } else {
-      events?.emit("blueprint_structured_omitted", {
+      const omittedPayload = {
         taskId: task.id,
         bytes: structuredSize,
         limit: STRUCTURED_MAX_CHARS,
-      });
+      };
+      if (decompositionCommitCompleted) {
+        try {
+          events?.emit("blueprint_structured_omitted", omittedPayload);
+        } catch {
+          // Best effort after commit.
+        }
+      } else {
+        events?.emit("blueprint_structured_omitted", omittedPayload);
+      }
     }
   }
 
@@ -549,7 +762,7 @@ export async function runPreflight(
   const result: PreflightResult = {
     taskId: task.id,
     timestamp: new Date().toISOString(),
-    contentHash,
+    contentHash: resultContentHash,
     gate: {
       ready: gateReady,
       score: gateScore,
@@ -587,29 +800,75 @@ export async function runPreflight(
       : undefined,
   };
 
-  // A duplicate-claimant refusal is not a readiness result. Skipping the
-  // entire persistence block preserves both a clean store and any prior entry.
-  if (!autoDecomposeRefused) {
-    const cache = new PrepCache(adapter.projectRoot);
-    await cache.writePreflight(result);
+  // Duplicate ownership and parent drift mean this result is not about one
+  // stable source spec, so preserve the existing store. Coverage, quality,
+  // and rolled-back write refusals are honest results for this exact hash and
+  // intentionally replace any older current cache entry.
+  if (!skipPreflightPersistence) {
+    if (decompositionCommitCompleted) {
+      try {
+        const cache = new PrepCache(adapter.projectRoot);
+        await cache.writePreflight(result);
+      } catch {
+        // The committed parent+children remain authoritative.
+      }
+    } else {
+      const cache = new PrepCache(adapter.projectRoot);
+      await cache.writePreflight(result);
+    }
 
-    const readiness = new ReadinessService({
-      projectRoot: adapter.projectRoot,
-    });
-    try {
-      readiness.persistPreflightResult(task.id, taskContent, result);
-    } finally {
-      readiness.close();
+    if (decompositionCommitCompleted) {
+      try {
+        const readiness = new ReadinessService({
+          projectRoot: adapter.projectRoot,
+        });
+        try {
+          readiness.persistPreflightResult(task.id, resultTaskContent, result);
+        } catch {
+          // Projection failure cannot negate a committed decomposition.
+        } finally {
+          try {
+            readiness.close();
+          } catch {
+            // Observer cleanup cannot negate a committed decomposition.
+          }
+        }
+      } catch {
+        // Projection construction cannot negate a committed decomposition.
+      }
+    } else {
+      const readiness = new ReadinessService({
+        projectRoot: adapter.projectRoot,
+      });
+      try {
+        readiness.persistPreflightResult(task.id, resultTaskContent, result);
+      } finally {
+        readiness.close();
+      }
     }
   }
 
-  events?.emit("preflight_complete", {
-    taskId: task.id,
-    cached: false,
-    recommendDecomposition: complexity.recommendDecomposition,
-    mode: executionMode,
-    degraded: Boolean(fallbackDiagnostics),
-  });
+  if (decompositionCommitCompleted) {
+    try {
+      events?.emit("preflight_complete", {
+        taskId: task.id,
+        cached: false,
+        recommendDecomposition: complexity.recommendDecomposition,
+        mode: executionMode,
+        degraded: Boolean(fallbackDiagnostics),
+      });
+    } catch {
+      // Best effort after commit.
+    }
+  } else {
+    events?.emit("preflight_complete", {
+      taskId: task.id,
+      cached: false,
+      recommendDecomposition: complexity.recommendDecomposition,
+      mode: executionMode,
+      degraded: Boolean(fallbackDiagnostics),
+    });
+  }
 
   return result;
 }

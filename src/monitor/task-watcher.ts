@@ -13,7 +13,15 @@ import { normalizeSpec, hasUnresolvedRepairMarkers } from "../core/spec-normaliz
 import { verifyRepairIsAdditive } from "../core/repair-guard.js";
 import type { ParsedTask } from "../core/types.js";
 import type { ProjectAdapter } from "../core/adapter-loader.js";
+import {
+  TaskCreationIdentityConflictError,
+  TaskCreationScanUnavailableError,
+} from "../core/task-creation-reservation.js";
 import { computeContentHash } from "./prep-cache.js";
+import {
+  CanonicalTaskSpecMutationError,
+  withCanonicalTaskSpecMutationFence,
+} from "../preflight/canonical-task-spec-mutation.js";
 
 export interface TaskWatcherCallbacks {
   /** Called when a new task file is detected and successfully parsed */
@@ -81,8 +89,11 @@ export interface TaskWatcherOptions {
  */
 export class TaskWatcher {
   private watcher: { close: () => Promise<void> } | null = null;
+  private startPromise: Promise<void> | null = null;
+  private closeRequested = false;
   private debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private processing = new Set<string>();
+  private inFlightProcessing = new Set<Promise<void>>();
   private readonly debounceMs: number;
   private readonly autoRepair: boolean;
   private readonly repairMode: "off" | "deterministic" | "full";
@@ -103,10 +114,20 @@ export class TaskWatcher {
   /**
    * Start watching the task directory for TASK-*.md / SAURUS-REM-*.md files.
    */
-  async start(): Promise<void> {
-    if (this.watcher) return;
+  start(): Promise<void> {
+    if (this.closeRequested) return Promise.resolve();
+    if (this.startPromise) return this.startPromise;
 
+    this.startPromise = this.startWatching();
+    return this.startPromise;
+  }
+
+  private async startWatching(): Promise<void> {
     const chokidar = await import("chokidar");
+    // close() may have won the race while the dynamic import was pending.
+    // Never create a new native watcher after terminal cleanup has begun.
+    if (this.closeRequested) return;
+
     const pattern = [
       path.join(this.taskDir, "TASK-*.md"),
       path.join(this.taskDir, "SAURUS-REM-*.md"),
@@ -141,28 +162,54 @@ export class TaskWatcher {
    * Stop watching and clean up.
    */
   async close(): Promise<void> {
+    // Fence admission synchronously, before waiting for a start already in
+    // progress. This also makes close terminal and idempotent.
+    this.closeRequested = true;
+
     // Clear all pending debounce timers
     for (const timer of this.debounceTimers.values()) {
       clearTimeout(timer);
     }
     this.debounceTimers.clear();
 
-    if (this.watcher) {
-      await this.watcher.close();
-      this.watcher = null;
+    // startWatching() performs no further asynchronous work after it creates
+    // the watcher. Awaiting it therefore covers both sides of the import race.
+    if (this.startPromise) {
+      try {
+        await this.startPromise;
+      } catch {
+        // The start caller owns the startup failure. Cleanup still has to close
+        // any watcher that may have been installed before that failure.
+      }
     }
+
+    if (this.watcher) {
+      const watcher = this.watcher;
+      await watcher.close();
+      if (this.watcher === watcher) this.watcher = null;
+    }
+
+    // A debounce callback may already have entered processFile() before the
+    // close fence was raised. Let that operation finish before callers close
+    // project-scoped resources such as the database.
+    await Promise.allSettled([...this.inFlightProcessing]);
   }
 
   /**
    * Schedule processing of a file with debouncing.
    */
   private scheduleProcess(filePath: string): void {
+    // Chokidar may already have queued an event when close() starts. Do not
+    // allow that callback to recreate a referenced debounce timer afterward.
+    if (this.closeRequested) return;
+
     // Clear existing timer for this file
     const existing = this.debounceTimers.get(filePath);
     if (existing) clearTimeout(existing);
 
     const timer = setTimeout(() => {
       this.debounceTimers.delete(filePath);
+      if (this.closeRequested) return;
       void this.processFile(filePath);
     }, this.debounceMs);
 
@@ -172,11 +219,23 @@ export class TaskWatcher {
   /**
    * Process a single task file: parse → repair → preflight.
    */
-  async processFile(filePath: string): Promise<void> {
+  processFile(filePath: string): Promise<void> {
+    if (this.closeRequested) return Promise.resolve();
+
     // Prevent concurrent processing of the same file
-    if (this.processing.has(filePath)) return;
+    if (this.processing.has(filePath)) return Promise.resolve();
     this.processing.add(filePath);
 
+    const operation = this.processFileTracked(filePath);
+    this.inFlightProcessing.add(operation);
+    void operation.then(
+      () => this.inFlightProcessing.delete(operation),
+      () => this.inFlightProcessing.delete(operation),
+    );
+    return operation;
+  }
+
+  private async processFileTracked(filePath: string): Promise<void> {
     try {
       let currentContent = fs.readFileSync(filePath, "utf-8");
       const fileName = path.basename(filePath);
@@ -207,7 +266,14 @@ export class TaskWatcher {
           detParseError = det.parseError;
           if (det.resolved && det.changed) {
             repairedTask = parseTaskFile(det.content, filePath);
-            fs.writeFileSync(filePath, det.content, "utf-8");
+            try {
+              await this.promoteRepair(filePath, currentContent, det.content, repairedTask.id);
+            } catch (promotionErr) {
+              if (this.reportPromotionRefusal(promotionErr, repairedTask.id, filePath)) {
+                return;
+              }
+              throw promotionErr;
+            }
             currentContent = det.content;
             this.callbacks.onRepaired?.(repairedTask.id, filePath, det.actions);
           }
@@ -248,7 +314,14 @@ export class TaskWatcher {
             const sectionsAdded = this.detectAddedSections(currentContent, repaired);
 
             // Write repaired content back
-            fs.writeFileSync(filePath, repaired, "utf-8");
+            try {
+              await this.promoteRepair(filePath, currentContent, repaired, repairedTask.id);
+            } catch (promotionErr) {
+              if (this.reportPromotionRefusal(promotionErr, repairedTask.id, filePath)) {
+                return;
+              }
+              throw promotionErr;
+            }
             currentContent = repaired;
 
             this.callbacks.onRepaired?.(repairedTask.id, filePath, sectionsAdded);
@@ -273,13 +346,22 @@ export class TaskWatcher {
         task = repairedTask;
       }
 
-      // Skip COMPLETE or REJECTED tasks — no point preflighting. Also fire
+      // Skip terminal tasks and decomposition trackers — none are dispatchable
+      // parents, and re-preflighting a freshly committed DECOMPOSED tracker
+      // would immediately collide with its own child specs. Also fire
       // the TASK-914 sync callback so the server can propagate terminal
       // spec-Status changes into the DB task_status table (the federation
       // scheduler reads DB-first for dependency resolution).
-      if (task.status === "COMPLETE" || task.status === "VERIFIED" || task.status === "REJECTED") {
+      if (
+        task.status === "COMPLETE" ||
+        task.status === "VERIFIED" ||
+        task.status === "REJECTED" ||
+        task.status === "DECOMPOSED"
+      ) {
         this.callbacks.onNewTask?.(task, filePath);
-        this.callbacks.onTerminalStatus?.(task.id, task.status, filePath);
+        if (task.status !== "DECOMPOSED") {
+          this.callbacks.onTerminalStatus?.(task.id, task.status, filePath);
+        }
         return;
       }
 
@@ -303,6 +385,52 @@ export class TaskWatcher {
     } finally {
       this.processing.delete(filePath);
     }
+  }
+
+  /**
+   * Promote an unparseable file only while every creator shares the same
+   * declared-id reservation. The watched file itself is the intended owner;
+   * any other filename already declaring the repaired id makes this a refusal.
+   */
+  private async promoteRepair(
+    filePath: string,
+    expectedContent: string,
+    repairedContent: string,
+    declaredId: string,
+  ): Promise<void> {
+    await withCanonicalTaskSpecMutationFence({
+      adapter: this.adapter,
+      taskId: declaredId,
+      taskFilePath: filePath,
+      expectedContent,
+      replacementContent: repairedContent,
+      allowUnparseableCurrent: true,
+    });
+  }
+
+  private reportPromotionRefusal(err: unknown, declaredId: string, filePath: string): boolean {
+    if (err instanceof CanonicalTaskSpecMutationError) {
+      this.callbacks.onRepairFailed?.(declaredId, filePath, err.message);
+      return true;
+    }
+    if (err instanceof TaskCreationIdentityConflictError) {
+      const conflict = err.conflicts.find((item) => item.taskId === declaredId) ?? err.conflicts[0];
+      this.callbacks.onRepairFailed?.(
+        declaredId,
+        filePath,
+        `Repair promotion refused for ${declaredId}; existing claimants: ${conflict?.claimants.join(", ") ?? "unknown"}`,
+      );
+      return true;
+    }
+    if (err instanceof TaskCreationScanUnavailableError) {
+      this.callbacks.onRepairFailed?.(
+        declaredId,
+        filePath,
+        `Repair promotion refused for ${declaredId}; claimant scan unavailable: ${err.reason}`,
+      );
+      return true;
+    }
+    return false;
   }
 
   /**

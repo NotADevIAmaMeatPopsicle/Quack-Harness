@@ -1,3 +1,4 @@
+import { getClaudeSdkEnvironment } from "../sdk/claude-auth.js";
 // ─── Task Decomposer ────────────────────────────────────────────────
 // Main decomposition engine that breaks complex tasks into focused subtasks.
 // Uses file clustering + LLM assistance to generate executable topology plans.
@@ -6,15 +7,25 @@
 import type { ParsedTask, FileModification } from "../core/types.js";
 import type { ProjectAdapter } from "../core/adapter-loader.js";
 import type { Blueprint } from "../blueprint/blueprint-types.js";
-import type {
-  SubtaskDefinition,
-  DecompositionTopology,
-  CoverageReport,
-  FileOwnership,
-} from "./decompose-types.js";
+import type { SubtaskDefinition, DecompositionTopology } from "./decompose-types.js";
+import {
+  buildDecompositionCoverageReport,
+  computeDecompositionParentHash,
+} from "./decomposition-plan-integrity.js";
+export {
+  buildDecompositionCoverageReport,
+  computeDecompositionParentHash,
+} from "./decomposition-plan-integrity.js";
 import { buildDecomposePrompt } from "./decompose-prompt.js";
 import { resolveModel } from "../dispatcher/model-router.js";
 import { getSdkPermissionOptions } from "../sdk/permission-mode.js";
+import { runCodexStructuredEvaluation } from "../llm/codex-structured-evaluator.js";
+import {
+  buildTaskDecompositionOutputSchema,
+  parseTaskDecompositionOutput,
+  validateTaskDecompositionValue,
+} from "./decomposition-provider-contract.js";
+import { resolveEffectiveDecompositionMaxSubtasks } from "./decomposition-limits.js";
 
 /**
  * Minimal SDK result message shape used for type narrowing.
@@ -75,7 +86,9 @@ interface FileCluster {
 }
 
 /**
- * Decompose a complex task into 2-4 focused subtasks.
+ * Decompose a complex task into 2..effectiveMax focused subtasks.
+ * effectiveMax is the lower of the request/default and the adapter-owned
+ * maxSubtasks ceiling (schema range 2-6, default 4).
  * Uses file clustering based on blueprint integration points, then
  * falls back to LLM-based decomposition if needed.
  * Returns a DecompositionTopology with coverage report — no side effects.
@@ -90,91 +103,38 @@ export async function decomposeTask(
   task: ParsedTask,
   adapter: ProjectAdapter,
   blueprint: Blueprint,
-  options?: { maxSubtasks?: number },
+  options?: { maxSubtasks?: number; preferConfiguredProvider?: boolean },
 ): Promise<DecompositionTopology> {
-  const maxSubtasks = options?.maxSubtasks ?? 4;
+  const maxSubtasks = resolveEffectiveDecompositionMaxSubtasks(
+    options?.maxSubtasks,
+    adapter.config.preflight?.autoDecompose?.maxSubtasks,
+  );
+  const hasConfiguredProvider = Boolean(adapter.config.evaluationProviders?.taskDecomposition);
 
   // Try file clustering first (deterministic approach)
   const clusters = clusterFilesByDependencies(task, blueprint);
 
   let subtasks: SubtaskDefinition[];
-  if (clusters.length > 0 && clusters.length <= maxSubtasks) {
+  if (
+    !(options?.preferConfiguredProvider && hasConfiguredProvider) &&
+    clusters.length >= 2 &&
+    clusters.length <= maxSubtasks
+  ) {
     // File clustering worked — convert to subtasks
-    subtasks = clustersToSubtasks(task.id, clusters).slice(0, maxSubtasks);
+    subtasks = clustersToSubtasks(task.id, clusters, task.successCriteria).slice(0, maxSubtasks);
   } else {
     // Fall back to LLM-based decomposition
     const plan = await llmDecomposeTask(task, adapter, blueprint, maxSubtasks);
     subtasks = plan.subtasks;
   }
 
-  const coverageReport = buildCoverageReport(task, subtasks);
-  return { parentTaskId: task.id, subtasks, coverageReport };
-}
-
-/**
- * Build a coverage report proving every parent file and criterion is mapped.
- */
-function buildCoverageReport(task: ParsedTask, subtasks: SubtaskDefinition[]): CoverageReport {
-  // Build file → [ownerIds] map
-  const fileOwnerMap = new Map<string, string[]>();
-  for (const subtask of subtasks) {
-    for (const file of subtask.filesToModify) {
-      const owners = fileOwnerMap.get(file.path) ?? [];
-      owners.push(subtask.id);
-      fileOwnerMap.set(file.path, owners);
-    }
-  }
-
-  // Build FileOwnership entries
-  const fileOwnership: FileOwnership[] = [];
-  for (const [filePath, owners] of fileOwnerMap) {
-    fileOwnership.push({
-      filePath,
-      ownedBy: owners[0],
-      isShared: owners.length > 1,
-    });
-  }
-
-  // Unmapped files: parent files not appearing in any subtask
-  const mappedFiles = new Set(fileOwnerMap.keys());
-  const unmappedFiles = task.filesToModify.map((f) => f.path).filter((p) => !mappedFiles.has(p));
-
-  // Duplicated files: files assigned to more than one subtask
-  const duplicatedFiles = [...fileOwnerMap.entries()]
-    .filter(([, owners]) => owners.length > 1)
-    .map(([p]) => p);
-
-  // Criterion ownership
-  const criterionOwnership: Array<{ criterion: string; ownedBy: string[] }> = [];
-  for (const criterion of task.successCriteria) {
-    // Exact match first, then partial match (case-insensitive)
-    const exactOwners = subtasks
-      .filter((s) => s.successCriteria.includes(criterion))
-      .map((s) => s.id);
-    const owners =
-      exactOwners.length > 0
-        ? exactOwners
-        : subtasks
-            .filter((s) =>
-              s.successCriteria.some((sc) => sc.toLowerCase().includes(criterion.toLowerCase())),
-            )
-            .map((s) => s.id);
-    criterionOwnership.push({ criterion, ownedBy: owners });
-  }
-
-  const unmappedCriteria = criterionOwnership
-    .filter((co) => co.ownedBy.length === 0)
-    .map((co) => co.criterion);
-
-  const hasCoverageGap = unmappedFiles.length > 0 || unmappedCriteria.length > 0;
-
+  const coverageReport = buildDecompositionCoverageReport(task, subtasks);
   return {
-    fileOwnership,
-    criterionOwnership,
-    unmappedFiles,
-    unmappedCriteria,
-    duplicatedFiles,
-    hasCoverageGap,
+    parentTaskId: task.id,
+    parentContentHash: computeDecompositionParentHash(task.rawContent),
+    maxSubtasks,
+    subtasks,
+    coverageReport,
   };
 }
 
@@ -313,11 +273,17 @@ function deriveClusterTitle(files: FileModification[]): string {
 function orderClustersByDependency(clusters: FileCluster[]): FileCluster[] {
   const ordered: FileCluster[] = [];
   const remaining = [...clusters];
+  const clusteredFiles = new Set(
+    clusters.flatMap((cluster) => cluster.files.map((file) => file.path)),
+  );
 
   while (remaining.length > 0) {
     const ready = remaining.filter((cluster) => {
       const orderedFiles = new Set(ordered.flatMap((c) => c.files.map((f) => f.path)));
-      return cluster.dependencies.every((dep) => orderedFiles.has(dep) || !dep);
+      const ownFiles = new Set(cluster.files.map((file) => file.path));
+      return cluster.dependencies.every(
+        (dep) => ownFiles.has(dep) || orderedFiles.has(dep) || !clusteredFiles.has(dep),
+      );
     });
 
     if (ready.length === 0) {
@@ -337,20 +303,38 @@ function orderClustersByDependency(clusters: FileCluster[]): FileCluster[] {
 /**
  * Convert file clusters to subtask definitions.
  */
-function clustersToSubtasks(parentId: string, clusters: FileCluster[]): SubtaskDefinition[] {
+function clustersToSubtasks(
+  parentId: string,
+  clusters: FileCluster[],
+  parentCriteria: string[],
+): SubtaskDefinition[] {
+  const claimedCriteria = new Set(clusters.flatMap((cluster) => cluster.criteria));
+  const unclaimedCriteria = parentCriteria.filter((criterion) => !claimedCriteria.has(criterion));
+  const assignedCriteria = new Set<string>();
   return clusters.map((cluster, idx) => {
     const letter = String.fromCharCode(65 + idx); // A, B, C...
     const id = `${parentId}-${letter}`;
     const dependsOn = idx > 0 ? [`${parentId}-${String.fromCharCode(65 + idx - 1)}`] : [];
     const isFinal = idx === clusters.length - 1;
+    const ownedCriteria = cluster.criteria.filter((criterion) => {
+      if (assignedCriteria.has(criterion)) return false;
+      assignedCriteria.add(criterion);
+      return true;
+    });
 
     return {
       id,
       title: cluster.title,
       filesToModify: cluster.files,
       successCriteria: isFinal
-        ? [...cluster.criteria, "All parent task success criteria verified"]
-        : cluster.criteria,
+        ? [
+            ...new Set([
+              ...ownedCriteria,
+              ...unclaimedCriteria,
+              "All parent task success criteria verified",
+            ]),
+          ]
+        : ownedCriteria,
       dependsOn,
       isFinal,
     };
@@ -367,11 +351,39 @@ async function llmDecomposeTask(
   blueprint: Blueprint,
   maxSubtasks: number,
 ): Promise<{ subtasks: SubtaskDefinition[] }> {
-  const prompt = buildDecomposePrompt(task, blueprint);
-  const model = resolveModel(adapter.config.modelRouting, adapter.config.agent, {
-    stage: "plan",
-  });
+  const prompt = buildDecomposePrompt(task, blueprint, maxSubtasks);
+  const evaluator = adapter.config.evaluationProviders?.taskDecomposition;
+  const model =
+    evaluator?.model ??
+    resolveModel(adapter.config.modelRouting, adapter.config.agent, {
+      stage: "plan",
+    });
   const maxTurns = 15;
+
+  if (evaluator?.runner === "codex-cli") {
+    const result = await runCodexStructuredEvaluation(
+      {
+        projectRoot: adapter.projectRoot,
+        model,
+        systemPrompt:
+          "Plan only the requested child-task topology. Inspect the repository read-only and return the required JSON object; do not modify files.",
+        prompt,
+        outputSchema: buildTaskDecompositionOutputSchema(maxSubtasks),
+        parse: (rawText) => parseTaskDecompositionOutput(rawText, task.id, maxSubtasks),
+      },
+      evaluator,
+    );
+    if (result.status === "runner_error") {
+      throw new Error(`Codex task decomposition ${result.errorKind}: ${result.message}`);
+    }
+    const validated = validateTaskDecompositionValue(result.value, task.id, maxSubtasks);
+    if (!validated) {
+      throw new Error(
+        "Codex task decomposition parse_failed: evaluator returned an invalid or conflicting child topology",
+      );
+    }
+    return validated;
+  }
 
   const queryFn = await getQueryFn();
 
@@ -381,6 +393,7 @@ async function llmDecomposeTask(
       allowedTools: ["Read", "Glob", "Grep"],
       disallowedTools: ["Edit", "Write", "Bash", "WebSearch", "WebFetch"],
       ...getSdkPermissionOptions(),
+      env: getClaudeSdkEnvironment(adapter.config.agent.apiKeys),
       model,
       maxTurns,
       cwd: adapter.projectRoot,
@@ -401,8 +414,7 @@ async function llmDecomposeTask(
     for await (const message of queryResult) {
       if (message.type === "result" && message.subtype === "success") {
         const result = (message as SDKSuccessResult).result;
-        const parsed = parseTopologyResult(result, task.id);
-        return { subtasks: parsed.subtasks.slice(0, maxSubtasks) };
+        return parseTopologyResult(result, task.id, maxSubtasks);
       }
     }
 
@@ -418,7 +430,11 @@ async function llmDecomposeTask(
 /**
  * Parse the LLM result to extract topology JSON.
  */
-function parseTopologyResult(result: string, parentId: string): { subtasks: SubtaskDefinition[] } {
+function parseTopologyResult(
+  result: string,
+  parentId: string,
+  maxSubtasks: number,
+): { subtasks: SubtaskDefinition[] } {
   let jsonText = result;
 
   // Strategy 1: extract from code fence
@@ -446,11 +462,12 @@ function parseTopologyResult(result: string, parentId: string): { subtasks: Subt
   }
 
   try {
-    const parsed = JSON.parse(jsonText) as { subtasks: SubtaskDefinition[] };
-    if (!Array.isArray(parsed.subtasks)) {
-      throw new Error("Response JSON missing 'subtasks' array");
+    const parsed: unknown = JSON.parse(jsonText);
+    const validated = validateTaskDecompositionValue(parsed, parentId, maxSubtasks);
+    if (!validated) {
+      throw new Error("Response JSON failed the task decomposition contract");
     }
-    return { subtasks: parsed.subtasks };
+    return validated;
   } catch (err) {
     throw new Error(
       `Failed to parse topology result as JSON for ${parentId}: ${err instanceof Error ? err.message : String(err)}\n` +

@@ -8,14 +8,17 @@ import { loadAdapter } from "../core/adapter-loader.js";
 import { parseTaskFile } from "../core/task-parser.js";
 import { decomposeTask } from "../preflight/task-decomposer.js";
 import { materializeChildDrafts } from "../preflight/subtask-materializer.js";
-import { writeSubtaskSpecs } from "../preflight/subtask-writer.js";
+import {
+  DecompositionFinalizeError,
+  finalizeDecompositionTransaction,
+} from "../preflight/decomposition-finalizer.js";
 import { generateBlueprint } from "../blueprint/blueprint-agent.js";
 import { evaluateComplexity } from "../preflight/complexity-evaluator.js";
 import { assembleContext } from "../dispatcher/context-assembler.js";
-import { PREP_THRESHOLD } from "../preflight/subtask-quality-gate.js";
 import type { DecompositionTopology, ChildDraft } from "../preflight/decompose-types.js";
 import { listDuplicateClaimants } from "../core/task-file-resolver.js";
 import { formatDuplicateClaimantsMessage } from "../core/duplicate-claimants.js";
+import { recoverPendingDecompositionTransactions } from "../preflight/decomposition-transaction-journal.js";
 
 export interface DecomposeOptions {
   project?: string;
@@ -56,6 +59,7 @@ export async function decomposeCommand(taskId: string, options: DecomposeOptions
 
     // Load adapter and parse task
     const adapter = await loadAdapter(projectPath);
+    await recoverPendingDecompositionTransactions(adapter);
     const taskDir = path.resolve(adapter.projectRoot, adapter.config.project.taskDir);
     // TASK-1334: ONE canonical resolution, and its content reused rather than
     // re-read. Decompose finalize writes subtask specs derived from whatever
@@ -239,9 +243,9 @@ export async function decomposeCommand(taskId: string, options: DecomposeOptions
       }
 
       // Gate: parent readiness — check prep cache for parent score
-      const { PrepCache } = await import("../monitor/prep-cache.js");
+      const { PrepCache, computeContentHash } = await import("../monitor/prep-cache.js");
       const prepCache = new PrepCache(adapter.projectRoot);
-      const parentPrep = await prepCache.read(taskId, filePath);
+      const parentPrep = await prepCache.read(taskId, filePath, computeContentHash(content));
       const parentThreshold = adapter.config.preflight?.autoDecompose?.parentPrepThreshold ?? 4.0;
       if (!parentPrep) {
         console.error(
@@ -249,6 +253,14 @@ export async function decomposeCommand(taskId: string, options: DecomposeOptions
             `   Run 'quack prep ${taskId}' before finalizing decomposition.\n`,
         );
         process.exit(1);
+      }
+      if (parentPrep.stale) {
+        console.error(
+          `\n❌ Parent task ${taskId} prep result is stale for the current spec.\n` +
+            `   Run 'quack prep ${taskId}' again before finalizing decomposition.\n`,
+        );
+        process.exit(1);
+        return;
       }
       if (parentPrep.depthScore < parentThreshold || !parentPrep.depthReady) {
         console.error(
@@ -276,39 +288,15 @@ export async function decomposeCommand(taskId: string, options: DecomposeOptions
       const draftsJson = await fs.readFile(options.draftsFile, "utf-8");
       const drafts = JSON.parse(draftsJson) as ChildDraft[];
 
-      let topology: DecompositionTopology | undefined;
-      if (options.planFile) {
-        const planJson = await fs.readFile(options.planFile, "utf-8");
-        topology = JSON.parse(planJson) as DecompositionTopology;
-      }
-
-      // Gate: check quality
-      const failedDrafts = drafts.filter((d) => d.parseError || !d.prepReady);
-      if (failedDrafts.length > 0) {
-        console.error(`\n❌ ${failedDrafts.length} draft(s) failed quality gates:\n`);
-        for (const d of failedDrafts) {
-          console.error(`   ${d.subtaskId}: prep ${d.prepScore} (threshold ${PREP_THRESHOLD})`);
-          for (const deficiency of d.deficiencies.slice(0, 3)) {
-            console.error(`      - ${deficiency}`);
-          }
-        }
-        console.error(`\n   Fix deficiencies and re-run --mode materialize before finalizing.\n`);
+      if (!options.planFile) {
+        console.error(
+          `\n❌ Finalize requires --plan-file for the reviewed topology produced from the current parent.\n`,
+        );
         process.exit(1);
+        return;
       }
-
-      // Gate: coverage
-      if (topology?.coverageReport?.hasCoverageGap) {
-        const cr = topology.coverageReport;
-        console.error(`\n❌ Coverage gap — cannot finalize:\n`);
-        if (cr.unmappedFiles.length > 0) {
-          console.error(`   Unmapped files: ${cr.unmappedFiles.join(", ")}`);
-        }
-        if (cr.unmappedCriteria.length > 0) {
-          console.error(`   Unmapped criteria: ${cr.unmappedCriteria.join("; ")}`);
-        }
-        console.error("");
-        process.exit(1);
-      }
+      const planJson = await fs.readFile(options.planFile, "utf-8");
+      const topology = JSON.parse(planJson) as DecompositionTopology;
 
       const claimants = await listDuplicateClaimants(taskDir, taskId);
       if (claimants.length > 0) {
@@ -316,51 +304,32 @@ export async function decomposeCommand(taskId: string, options: DecomposeOptions
         process.exit(1);
         return;
       }
-      console.log("Writing child task spec files...");
-      const writtenPaths = await writeSubtaskSpecs(drafts, adapter);
+      console.log("Finalizing and committing parent + child task specs...");
+      const finalized = await finalizeDecompositionTransaction({
+        adapter,
+        parentTask: parsedTask,
+        parentFilePath: filePath,
+        parentContent: content,
+        topology,
+        drafts,
+      });
+      const writtenPaths = finalized.writtenPaths;
 
       console.log(`\n✓ Created ${writtenPaths.length} subtask spec file(s):\n`);
       for (const fp of writtenPaths) {
         console.log(`  - ${path.basename(fp)}`);
       }
 
-      // Rewrite parent as tracker.
-      // TASK-1334: the file resolved at entry, not a second lookup. This is
-      // the destructive half of decompose, and it must rewrite the SAME file
-      // the drafts were derived from. Round 2 (R2-1): and the same CONTENT,
-      // carried from that resolution rather than re-read at write time.
-      const taskFilePath = filePath;
-      const parentContent = content;
-      const childIds = drafts.map((d) => d.subtaskId);
-      const tableRows = drafts
-        .map((d) => {
-          const deps = topology?.subtasks?.find((s) => s.id === d.subtaskId)?.dependsOn ?? [];
-          return `| \`${d.subtaskId}\` | ${d.title} | ${deps.length > 0 ? deps.join(", ") : "—"} | prep ${d.prepScore} |`;
-        })
-        .join("\n");
+      const childIds = finalized.drafts.map((draft) => draft.subtaskId);
+      console.log(`✓ Parent task ${taskId} and children committed atomically`);
 
-      const decompositionSummary =
-        `\n\n## Decomposition Summary\n\n` +
-        `This task has been decomposed into ${childIds.length} child task(s). ` +
-        `It is now a tracker task and should not be dispatched directly while the child chain is active.\n\n` +
-        `| Child | Scope | Depends On | Ready Gate |\n` +
-        `|-------|-------|------------|------------|\n` +
-        tableRows;
-
-      let updatedParent = parentContent
-        .replace(/(\*\*Status:\*\*\s*)\S+/, "$1DECOMPOSED")
-        .replace(/(\*\*Blocks:\*\*\s*)\[.*?\]/, `$1[${childIds.join(", ")}]`);
-
-      if (!updatedParent.includes("## Decomposition Summary")) {
-        updatedParent += decompositionSummary;
+      if (finalized.commit.recoveryPending) {
+        console.log(
+          "  ⚠ Recovery/status projection remains pending; the durable transaction is committed and must not be finalized again.",
+        );
       }
 
-      if (updatedParent !== parentContent) {
-        await fs.writeFile(taskFilePath, updatedParent, "utf-8");
-        console.log(`✓ Parent task ${taskId} rewritten as decomposition tracker`);
-      }
-
-      if (options.enqueue) {
+      if (options.enqueue && !finalized.commit.recoveryPending) {
         console.log("\nEnqueuing subtasks in dispatch queue...");
         try {
           const port = options.port ?? 3333;
@@ -383,11 +352,19 @@ export async function decomposeCommand(taskId: string, options: DecomposeOptions
           console.log("  ⚠ Could not connect to monitor server");
           console.log("    Start the monitor first: quack monitor --project .");
         }
+      } else if (options.enqueue) {
+        console.log(
+          "  ⚠ Enqueue suppressed until the monitor reconciles the committed transaction.",
+        );
       }
 
       console.log(`\nNext steps:`);
       console.log(`  1. Review the generated child spec files in ${taskDir}`);
-      console.log(`  2. Run 'quack queue enqueue ${childIds.join(" ")}' to queue them`);
+      console.log(
+        finalized.commit.recoveryPending
+          ? "  2. Start or restart the monitor so it can reconcile the durable status projection"
+          : `  2. Run 'quack queue enqueue ${childIds.join(" ")}' to queue them`,
+      );
       console.log(`  3. Or dispatch each subtask individually with 'quack run <subtask-id>'`);
       console.log("");
 
@@ -397,6 +374,18 @@ export async function decomposeCommand(taskId: string, options: DecomposeOptions
     console.error(
       `\n❌ Decomposition failed: ${err instanceof Error ? err.message : String(err)}\n`,
     );
+    if (err instanceof DecompositionFinalizeError && err.kind === "commit_indeterminate") {
+      console.error(
+        "   The ref update could not be observed. Do not retry finalize; start or restart the monitor so durable recovery can determine the transaction outcome.\n",
+      );
+    }
+    if (err instanceof DecompositionFinalizeError && err.rollbackErrors.length > 0) {
+      console.error("   Recovery remains incomplete:");
+      for (const rollbackError of err.rollbackErrors) {
+        console.error(`     - ${rollbackError}`);
+      }
+      console.error("");
+    }
     process.exit(1);
   }
 }

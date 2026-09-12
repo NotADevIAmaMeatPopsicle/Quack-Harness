@@ -11,6 +11,8 @@ export type QueueEventType =
   | "task_enqueued"
   | "task_ready"
   | "task_started"
+  | "task_awaiting_approval"
+  | "task_resumed"
   | "task_completed"
   | "task_failed"
   | "task_blocked"
@@ -128,6 +130,24 @@ export class QueuePersistence {
           if (item) {
             item.status = "running";
             item.startedAt = event.ts;
+          }
+          break;
+        }
+
+        case "task_awaiting_approval": {
+          const item = items.get(event.taskId);
+          if (item) {
+            item.status = "awaiting_approval";
+            item.awaitingApprovalAt = event.ts;
+          }
+          break;
+        }
+
+        case "task_resumed": {
+          const item = items.get(event.taskId);
+          if (item) {
+            item.status = "running";
+            if (event.dispatchOptions) item.dispatchOptions = event.dispatchOptions;
           }
           break;
         }

@@ -151,6 +151,40 @@ describe("runReadinessGate", () => {
     expect(result.outcome).toBe("pass");
   });
 
+  test("forwards the explicit Codex readiness provider and project root", async () => {
+    const task = makeTask();
+    const adapter = makeAdapter();
+    const evaluator = {
+      runner: "codex-cli" as const,
+      model: "gpt-5.6-terra",
+      maxTurns: 30,
+      timeoutMs: 600_000,
+      codex: { binaryPath: "codex", sandbox: "read-only" as const },
+    };
+    adapter.config.evaluationProviders = { readinessDepth: evaluator };
+    mockEvaluateTaskDepth.mockResolvedValue({
+      ready: true,
+      overallScore: 4.9,
+      scores: defaultScores,
+      deficiencies: [],
+      enrichmentSuggestions: [],
+    });
+
+    const result = await runReadinessGate(task, adapter);
+
+    expect(result.outcome).toBe("pass");
+    expect(mockEvaluateTaskDepth).toHaveBeenCalledWith(
+      task,
+      adapter.conventionsDoc,
+      expect.objectContaining({
+        model: "gpt-5.6-terra",
+        evaluator,
+        projectRoot: adapter.projectRoot,
+      }),
+    );
+    expect(mockEnrichTask).not.toHaveBeenCalled();
+  });
+
   test("should reject when schema invalid", async () => {
     const task = makeTask();
     const adapter = makeAdapter();

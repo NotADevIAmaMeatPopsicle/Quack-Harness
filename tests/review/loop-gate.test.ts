@@ -8,9 +8,16 @@ import type { ReviewerRunnerConfig } from "../../src/review/reviewer-config";
 
 const config: ReviewerRunnerConfig = {
   runner: "claude-sdk",
+  model: "gpt-5.6-terra",
   maxTurns: 30,
   timeoutMs: 600_000,
-  codex: { binaryPath: "codex", sandbox: "read-only" },
+  codex: { binaryPath: "codex", sandbox: "read-only", provider: "openai" },
+};
+
+const claudeProducer = {
+  runner: "claude-sdk" as const,
+  provider: "anthropic",
+  model: "claude-sonnet-4-6",
 };
 
 const request: ReviewRequest = {
@@ -57,6 +64,9 @@ describe("evaluateLoopReview", () => {
           safetyCode: "machinery_tamper",
         },
       ],
+      undefined,
+      undefined,
+      claudeProducer,
     );
 
     expect(evaluation.reviewGate.eligibleForAutoApproval).toBe(false);
@@ -80,6 +90,9 @@ describe("evaluateLoopReview", () => {
           deterministic: true,
         },
       ],
+      undefined,
+      undefined,
+      claudeProducer,
     );
 
     expect(evaluation.reviewGate.eligibleForAutoApproval).toBe(true);
@@ -97,6 +110,10 @@ describe("evaluateLoopReview", () => {
       true,
       request,
       factory(completed(), "codex-cli"),
+      [],
+      undefined,
+      undefined,
+      claudeProducer,
     );
 
     expect(evaluation.reviewGate).toMatchObject({
@@ -174,13 +191,21 @@ describe("evaluateLoopReview", () => {
       config,
       false,
       request,
-      factory(completed({ runner: "claude-sdk" }), "claude-sdk"),
+      factory(completed({ runner: "claude-sdk", model: "claude-sonnet-4-6" }), "claude-sdk"),
+      [],
+      undefined,
+      undefined,
+      claudeProducer,
     );
     const blocked = await evaluateLoopReview(
       config,
       true,
       request,
-      factory(completed({ runner: "claude-sdk" }), "claude-sdk"),
+      factory(completed({ runner: "claude-sdk", model: "claude-sonnet-4-6" }), "claude-sdk"),
+      [],
+      undefined,
+      undefined,
+      claudeProducer,
     );
 
     expect(allowed.reviewGate.eligibleForAutoApproval).toBe(true);

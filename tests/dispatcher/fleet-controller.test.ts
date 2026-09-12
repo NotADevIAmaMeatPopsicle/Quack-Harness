@@ -14,6 +14,9 @@ import type { DispatchJob } from "../../src/monitor/dispatch-manager";
 class MockDispatchManager {
   private jobs = new Map<string, DispatchJob>();
   private mockPids = new Map<string, number>();
+  killAllCalls = 0;
+  killAllResult = true;
+  pendingOperatorStopCleanup = false;
 
   start(taskId: string, pid = Math.floor(Math.random() * 100000) + 1): DispatchJob {
     const job: DispatchJob = {
@@ -76,13 +79,20 @@ class MockDispatchManager {
     timedOut: string[];
   }> {
     this.shutdownAllCalled = true;
-    const requested = this.getActiveJobs().map((job) => job.taskId);
-    for (const taskId of requested) this.stop(taskId);
-    return Promise.resolve({ requested, exited: requested, escalated: [], timedOut: [] });
+    const requested = Array.from(this.jobs.values())
+      .filter((job) => job.status === "running" || job.operatorStopCleanupPending === true)
+      .map((job) => job.taskId);
+    const exited: string[] = [];
+    const timedOut: string[] = [];
+    for (const taskId of requested) {
+      if (this.stop(taskId)) exited.push(taskId);
+      else timedOut.push(taskId);
+    }
+    return Promise.resolve({ requested, exited, escalated: [], timedOut });
   }
 
   canResumeAfterShutdown(): boolean {
-    return this.canResumeAfterShutdownResult;
+    return this.canResumeAfterShutdownResult && !this.hasPendingOperatorStopCleanup();
   }
 
   resumeAfterShutdown(): boolean {
@@ -90,10 +100,23 @@ class MockDispatchManager {
     return this.canResumeAfterShutdownResult;
   }
 
-  killAll(): void {
+  waitForIdle(): Promise<boolean> {
+    return Promise.resolve(true);
+  }
+
+  hasPendingOperatorStopCleanup(): boolean {
+    return (
+      this.pendingOperatorStopCleanup ||
+      Array.from(this.jobs.values()).some((job) => job.operatorStopCleanupPending === true)
+    );
+  }
+
+  killAll(): boolean {
+    this.killAllCalls += 1;
     for (const job of this.jobs.values()) {
       job.status = "stopped";
     }
+    return this.killAllResult;
   }
 }
 
@@ -339,6 +362,21 @@ describe("FleetController", () => {
       expect(result.killedTasks).toEqual([]);
       expect(result.killedPids).toEqual([]);
       expect(result.errors).toEqual([]);
+      expect(dispatchManager.shutdownAllCalled).toBe(true);
+    });
+
+    it("fails closed when bounded dispatch shutdown reports unresolved ownership", async () => {
+      jest.spyOn(dispatchManager, "shutdownAll").mockResolvedValue({
+        requested: ["TASK-ORPHAN"],
+        exited: [],
+        escalated: ["TASK-ORPHAN"],
+        timedOut: ["TASK-ORPHAN"],
+      });
+
+      const result = await controller.emergencyStop("orphaned dispatch ownership");
+
+      expect(result.killedTasks).toEqual(["TASK-ORPHAN"]);
+      expect(result.errors).toContain("Timed out stopping dispatch resources for: TASK-ORPHAN");
     });
 
     it("should set state to emergency_stopped", async () => {
@@ -372,6 +410,41 @@ describe("FleetController", () => {
       } finally {
         killSpy.mockRestore();
       }
+    });
+
+    it("reports an unconfirmed process-tree stop instead of counting it as killed", async () => {
+      const job = dispatchManager.start("TASK-UNCONFIRMED");
+      jest.spyOn(dispatchManager, "stop").mockImplementation(() => {
+        job.status = "stopped";
+        job.operatorStopTreeTerminated = false;
+        job.operatorStopCleanupPending = true;
+        return false;
+      });
+
+      const result = await controller.emergencyStop("containment failure");
+
+      expect(result.killedTasks).toEqual(["TASK-UNCONFIRMED"]);
+      expect(result.killedPids).toEqual([job.pid]);
+      expect(result.errors).toContain(
+        "Timed out stopping dispatch resources for: TASK-UNCONFIRMED",
+      );
+    });
+
+    it("includes cleanup-only dispatch ownership and keeps resume closed", async () => {
+      const job = dispatchManager.start("TASK-CLEANUP-ONLY");
+      job.status = "stopped";
+      job.operatorStopCleanupPending = true;
+      dispatchManager.pendingOperatorStopCleanup = true;
+
+      const result = await controller.emergencyStop("cleanup still pending");
+
+      expect(result.killedTasks).toEqual(["TASK-CLEANUP-ONLY"]);
+      expect(result.errors).toContain(
+        "Timed out stopping dispatch resources for: TASK-CLEANUP-ONLY",
+      );
+      await expect(controller.resume()).rejects.toThrow(
+        "Fleet cannot resume while agent resources are still shutting down",
+      );
     });
   });
 

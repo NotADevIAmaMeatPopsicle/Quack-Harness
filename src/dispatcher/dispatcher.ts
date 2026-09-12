@@ -1,3 +1,4 @@
+import { withClaudeApiKeysScope } from "../sdk/claude-auth.js";
 // ─── Task Dispatcher ────────────────────────────────────────────────
 // Main dispatch pipeline. Orchestrates the full lifecycle of a task:
 // gate -> branch -> agent -> judge -> retry/PR
@@ -11,8 +12,24 @@ import * as path from "node:path";
 import type { ProjectAdapter } from "../core/adapter-loader.js";
 import type { JobProvenance } from "../monitor/federation/types.js";
 import { listDuplicateClaimants, resolveTaskFile } from "../core/task-file-resolver.js";
-import { DuplicateClaimantAdmissionError } from "../core/duplicate-claimants.js";
+import {
+  DuplicateClaimantAdmissionError,
+  normalizeClaimantTaskId,
+} from "../core/duplicate-claimants.js";
+import {
+  assertTaskCreationIdsAvailable,
+  readTaskCreationClaimants,
+  TaskCreationIdentityConflictError,
+  TaskCreationScanUnavailableError,
+  withTaskCreationReservation,
+} from "../core/task-creation-reservation.js";
+import { parseTaskFile } from "../core/task-parser.js";
 import { hasUnresolvedRepairMarkers } from "../core/spec-normalizer.js";
+import {
+  recoverPendingTaskSpecMutationsWithinReservation,
+  withDecompositionAdmissionFence,
+} from "../preflight/decomposition-transaction-journal.js";
+import { writeDecompositionFileAtomicExclusive } from "../preflight/decomposition-file-io.js";
 import type {
   DispatchResult,
   ParsedTask,
@@ -33,28 +50,33 @@ import {
   createBranch,
   createFeatureBranch,
   cleanupBranch,
-  pushExactBranch,
-  resolveExactBranchHead,
+  pushBranch,
   abandonBranch,
   hasSealableProgress,
   getBranchCommitCount,
   buildBranchName,
+  resolveBranchPublicationBinding,
   mergeBranchToTarget,
   updateTaskFileStatus,
   deleteAfterMerge,
 } from "./branch-manager.js";
 import { safeUnsetCoreWorktree } from "./worktree-cleanup.js";
+import { runWorktreeInit, WORKTREE_INIT_FRESH_ENV } from "./worktree-init.js";
+import { runTrustedGitSync } from "./trusted-git.js";
 import { resolveTargetBranch } from "./branch-resolver.js";
+import {
+  assertBranchDeletionAllowed,
+  resolveProtectedBranches,
+} from "../judgment/producers/branch-mutation.js";
 import { sealAgentOutputAttempt } from "./output-snapshot.js";
 import { runAgent } from "../worker/agent-worker.js";
 import { runJudge, type JudgeInput } from "../judge/llm-judge.js";
 import { blueprintToChecks } from "../judge/spec-compliance.js";
-import { buildPrBodyWithIssueLink, createPullRequest } from "./pr-creator.js";
 import {
-  resolveOriginRepository,
-  type GitOriginIdentity,
-  type GitHubRepositoryIdentity,
-} from "./github-repository.js";
+  buildPrBodyWithIssueLink,
+  createPullRequest,
+  type PullRequestBinding,
+} from "./pr-creator.js";
 import type { IEventWriter } from "../monitor/event-emitter.js";
 import { EventWriter, generateSessionId, createNoOpWriter } from "../monitor/event-emitter.js";
 import { discoverTranscripts, copyTranscript } from "../monitor/transcript-linker.js";
@@ -88,7 +110,8 @@ import {
 } from "../integrations/github/status-syncer.js";
 import type { PreflightResult } from "../preflight/preflight-types.js";
 import type { Blueprint } from "../blueprint/blueprint-types.js";
-import { evaluateLoopReview } from "../review/loop-gate.js";
+import { evaluateLoopReview, mayReuseLoopReviewApproval } from "../review/loop-gate.js";
+import type { ModelProvenance } from "../review/reviewer-types.js";
 import {
   buildInjectedSignals as buildSnapshotSignals,
   safetyStopRequested as evaluateSnapshotSafetyStop,
@@ -111,14 +134,19 @@ import { buildJudgeIntentRequest } from "../judgment/intent-request.js";
 import { createIntentJudgmentRunner } from "../judgment/runner/intent-judgment-runner.js";
 
 function resolveDispatchEventSessionId(taskId: string): string {
-  const assigned = process.env.QUACK_DOCKER_EVENT_SESSION_ID;
+  const dockerSession = process.env.QUACK_DOCKER_EVENT_SESSION_ID;
+  const monitorSession = process.env.QUACK_MONITOR_EVENT_SESSION_ID;
+  if (dockerSession && monitorSession && dockerSession !== monitorSession) {
+    throw new Error("Conflicting host-assigned dispatch event identities");
+  }
+  const assigned = dockerSession ?? monitorSession;
   if (!assigned) return generateSessionId(taskId);
   const prefix = `quack-${taskId}-`;
   const ownership = assigned.startsWith(prefix) ? assigned.slice(prefix.length) : "";
   if (
     !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(ownership)
   ) {
-    throw new Error("Invalid host-assigned Docker event session identity");
+    throw new Error("Invalid host-assigned dispatch event session identity");
   }
   return assigned;
 }
@@ -197,6 +225,15 @@ export interface DispatchOptions {
    *  pass it via QUACK_PROVENANCE env; direct callers set it here; a
    *  bare `quack run` defaults to the cli channel. */
   provenance?: JobProvenance;
+  /** Exact parent-spec hash captured under the decomposition admission reservation. */
+  admittedTaskContentHash?: string;
+  /**
+   * The one-use monitor marker was consumed by this child. The monitor
+   * already created the worktree/container entry while holding the owning
+   * project's reservation; read-only Docker children cannot acquire that
+   * host-side lock themselves.
+   */
+  managedDecompositionAdmission?: boolean;
 }
 
 /**
@@ -218,6 +255,96 @@ function parseProvenanceFromEnv(): JobProvenance | undefined {
   return undefined;
 }
 
+/** Resolve the model actually used by the judge's configured runner. */
+export function resolveDispatchJudgeModel(adapter: ProjectAdapter): string {
+  const loopModel =
+    adapter.config.executionMode === "loop" ? adapter.config.loop?.models?.judge : undefined;
+  return (
+    loopModel ??
+    adapter.config.evaluationProviders?.judge?.model ??
+    resolveModel(adapter.config.modelRouting, adapter.config.agent, { stage: "judge" })
+  );
+}
+
+const LEGACY_INLINE_BLUEPRINT_TIMEOUT_MS = 300_000;
+const CODEX_BLUEPRINT_CLEANUP_GRACE_MS = 30_000;
+
+export interface InlineBlueprintTimeoutPolicy {
+  watchdogTimeoutMs: number;
+  timeoutSource: "environment" | "provider" | "legacy";
+  providerTimeoutMs?: number;
+  cleanupGraceMs: number;
+}
+
+/**
+ * Resolve the inline dispatch watchdog independently from the provider's own
+ * hard timeout. A Codex evaluator kills its process tree at `timeoutMs`, then
+ * performs a final workspace-integrity probe before it settles. Giving that
+ * owned shutdown a small, bounded grace keeps the dispatcher watchdog from
+ * winning the race and abandoning a still-running evaluator.
+ */
+export function resolveInlineBlueprintTimeoutPolicy(
+  adapter: ProjectAdapter,
+  rawEnvironmentOverride = process.env.QUACK_BLUEPRINT_TIMEOUT_MS,
+): InlineBlueprintTimeoutPolicy {
+  const parsedOverride =
+    rawEnvironmentOverride === undefined ? undefined : Number(rawEnvironmentOverride);
+  if (parsedOverride !== undefined && Number.isFinite(parsedOverride) && parsedOverride > 0) {
+    return {
+      watchdogTimeoutMs: parsedOverride,
+      timeoutSource: "environment",
+      ...(adapter.config.evaluationProviders?.blueprint?.timeoutMs
+        ? { providerTimeoutMs: adapter.config.evaluationProviders.blueprint.timeoutMs }
+        : {}),
+      cleanupGraceMs: 0,
+    };
+  }
+
+  const provider = adapter.config.evaluationProviders?.blueprint;
+  if (provider) {
+    const cleanupGraceMs = provider.runner === "codex-cli" ? CODEX_BLUEPRINT_CLEANUP_GRACE_MS : 0;
+    return {
+      watchdogTimeoutMs: provider.timeoutMs + cleanupGraceMs,
+      timeoutSource: "provider",
+      providerTimeoutMs: provider.timeoutMs,
+      cleanupGraceMs,
+    };
+  }
+
+  return {
+    watchdogTimeoutMs: LEGACY_INLINE_BLUEPRINT_TIMEOUT_MS,
+    timeoutSource: "legacy",
+    cleanupGraceMs: 0,
+  };
+}
+
+/** Stamp the actual implementation route used for one worker attempt. */
+function implementationProducerProvenance(adapter: ProjectAdapter, model: string): ModelProvenance {
+  const runner = adapter.config.agent.runner ?? "claude-sdk";
+  return {
+    runner,
+    ...(runner === "claude-sdk"
+      ? { provider: "anthropic" }
+      : adapter.config.agent.codex?.provider
+        ? { provider: adapter.config.agent.codex.provider }
+        : {}),
+    model,
+  };
+}
+
+function assertDispatchTaskBranchAllowed(branchName: string, adapter: ProjectAdapter): void {
+  const guard = assertBranchDeletionAllowed(
+    branchName,
+    resolveProtectedBranches(adapter.config.git),
+  );
+  if (!guard.allowed) {
+    throw new Error(
+      `Refusing task branch ${branchName}: it collides with a protected/base branch. ` +
+        (guard.reason ?? ""),
+    );
+  }
+}
+
 // ─── Main dispatch function ─────────────────────────────────────────
 
 /**
@@ -237,7 +364,17 @@ function parseProvenanceFromEnv(): JobProvenance | undefined {
  * @param options - Optional dispatch configuration
  * @returns Structured DispatchResult with outcome and details
  */
-export async function dispatchTask(
+export function dispatchTask(
+  taskId: string,
+  adapter: ProjectAdapter,
+  options?: DispatchOptions,
+): Promise<DispatchResult> {
+  return withClaudeApiKeysScope(adapter.config.agent.apiKeys, () =>
+    dispatchTaskWithAuth(taskId, adapter, options),
+  );
+}
+
+async function dispatchTaskWithAuth(
   taskId: string,
   adapter: ProjectAdapter,
   options?: DispatchOptions,
@@ -252,6 +389,8 @@ export async function dispatchTask(
       ...(sharedBranchName ? { sharedBranchName } : {}),
     };
   }
+  const monitorAttestedFreshWorktree = process.env[WORKTREE_INIT_FRESH_ENV] === "1";
+  delete process.env[WORKTREE_INIT_FRESH_ENV];
   const taskDir = path.resolve(adapter.projectRoot, adapter.config.project.taskDir);
   const claimants = await listDuplicateClaimants(taskDir, taskId);
   if (claimants.length > 1) {
@@ -379,8 +518,33 @@ export async function dispatchTask(
     }
 
     // ── Step 1: Parse the task file ──────────────────────────────
-    const loadedTask = await loadTaskWithPath(taskId, adapter);
+    const loadAdmittedTask = async () => {
+      const loaded = await loadTaskWithPath(taskId, adapter);
+      if (
+        options?.admittedTaskContentHash &&
+        computeContentHash(loaded.task.rawContent) !== options.admittedTaskContentHash
+      ) {
+        throw new Error(
+          `Task ${taskId} changed after decomposition-safe dispatch admission; refusing the stale dispatch.`,
+        );
+      }
+      return loaded;
+    };
+    const loadedTask =
+      options?.admittedTaskContentHash && !options.managedDecompositionAdmission
+        ? await withDecompositionAdmissionFence(adapter, taskId, async (admission) => {
+            if (admission.contentHash !== options.admittedTaskContentHash) {
+              throw new Error(
+                `Task ${taskId} changed after decomposition-safe dispatch admission; refusing the stale dispatch.`,
+              );
+            }
+            return loadAdmittedTask();
+          })
+        : await loadAdmittedTask();
     let task = loadedTask.task;
+    if (task.status === "DECOMPOSED") {
+      throw new Error(`Task ${taskId} is DECOMPOSED and cannot be dispatched.`);
+    }
     const taskSpecRelativePath = path
       .relative(adapter.projectRoot, loadedTask.specPath)
       .split(path.sep)
@@ -1029,33 +1193,39 @@ export async function dispatchTask(
     }
 
     if (!usedCachedBlueprint) {
-      // TASK-833: inline blueprint generation is a silent up-to-10-min LLM
-      // call. Without dedicated stage events operators cannot distinguish
-      // "blueprint still working" from "dispatch hung," and the dispatcher
-      // used to block here until the old 600_000 ms outer timeout fired.
-      // We now emit a blueprint_start event up front, fire a soft warning
-      // at WARNING_MS, and fall back to createMinimalBlueprint at
-      // TIMEOUT_MS so the session still reaches branch/worktree creation.
+      // TASK-833: inline blueprint generation needs a visible, bounded
+      // watchdog. The legacy path keeps its five-minute ceiling. A configured
+      // provider supplies its own stage budget; Codex gets a bounded cleanup
+      // grace so its inner timeout can kill the process tree and complete the
+      // final read-only workspace probe before this outer watchdog fires.
       const WARNING_MS = Number(process.env.QUACK_BLUEPRINT_WARNING_MS) || 120_000;
-      const TIMEOUT_MS = Number(process.env.QUACK_BLUEPRINT_TIMEOUT_MS) || 300_000;
+      const timeoutPolicy = resolveInlineBlueprintTimeoutPolicy(adapter);
+      const WATCHDOG_TIMEOUT_MS = timeoutPolicy.watchdogTimeoutMs;
       const blueprintStartedAt = Date.now();
+      const timeoutTelemetry = {
+        timeoutMs: WATCHDOG_TIMEOUT_MS,
+        watchdogTimeoutMs: WATCHDOG_TIMEOUT_MS,
+        timeoutSource: timeoutPolicy.timeoutSource,
+        cleanupGraceMs: timeoutPolicy.cleanupGraceMs,
+        ...(timeoutPolicy.providerTimeoutMs !== undefined
+          ? { providerTimeoutMs: timeoutPolicy.providerTimeoutMs }
+          : {}),
+      };
 
       events.emit("blueprint_start", {
         taskId,
         cached: false,
         mode: effectiveExecutionMode,
         warningMs: WARNING_MS,
-        timeoutMs: TIMEOUT_MS,
+        ...timeoutTelemetry,
       });
 
       const warningTimer: NodeJS.Timeout = setTimeout(() => {
         events.emit("blueprint_warning", {
           taskId,
           reason: "inline_blueprint_slow",
-          // Timer callbacks can run a millisecond before Date.now() reflects the
-          // requested delay on some platforms. A warning event must never report
-          // an elapsed duration below the threshold that caused it.
-          elapsedMs: Math.max(WARNING_MS, Date.now() - blueprintStartedAt),
+          elapsedMs: Date.now() - blueprintStartedAt,
+          ...timeoutTelemetry,
         });
       }, WARNING_MS);
       // Don't keep the event loop alive purely for timer bookkeeping —
@@ -1067,7 +1237,7 @@ export async function dispatchTask(
       const timeoutSentinel: TimeoutSentinel = { __blueprintTimeout: true };
       let timeoutTimer: NodeJS.Timeout | undefined;
       const timeoutPromise = new Promise<TimeoutSentinel>((resolve) => {
-        timeoutTimer = setTimeout(() => resolve(timeoutSentinel), TIMEOUT_MS);
+        timeoutTimer = setTimeout(() => resolve(timeoutSentinel), WATCHDOG_TIMEOUT_MS);
         if (typeof timeoutTimer.unref === "function") timeoutTimer.unref();
       });
 
@@ -1089,17 +1259,73 @@ export async function dispatchTask(
         // fidelity seam, so it stamps its own audit — which marks the
         // empty shape fidelity: failed instead of letting a timeout
         // launder into an approvable brief.
-        freshBlueprint = stampBriefFidelity(createMinimalBlueprint(taskId), adapter.projectRoot);
+        freshBlueprint = stampBriefFidelity(
+          createMinimalBlueprint(taskId),
+          adapter.projectRoot,
+          task.mandatedChecks,
+        );
         events.emit("blueprint_fallback", {
           taskId,
           reason: "dispatch_timeout_minimal_blueprint",
           elapsedMs: Date.now() - blueprintStartedAt,
+          ...timeoutTelemetry,
         });
       } else {
         freshBlueprint = raceResult as Awaited<ReturnType<typeof generateBlueprint>>;
       }
 
       blueprint = freshBlueprint;
+
+      // A fresh agent/provider failure is represented by the same empty
+      // Blueprint shape as createMinimalBlueprint. TASK-1324 correctly made
+      // that shape fidelity-failed, but only the auto-approve predicate used
+      // the verdict: dispatch still checkpointed the stub, paid for a review
+      // of an empty artifact, and then created a human-approval pend. There is
+      // nothing a reviewer can salvage in this specific case. Fail closed at
+      // the generation boundary, before any checkpoint or approval record.
+      //
+      // Keep the guard deliberately narrower than `fidelity.status ===
+      // "failed"`: substantive briefs with missing anchors, softened checks,
+      // or invalid typed directives remain reviewable under the established
+      // human-gate contract.
+      const emptyBriefFailure =
+        freshBlueprint.fidelity?.status === "failed"
+          ? freshBlueprint.fidelity.violations.find((violation) => violation.kind === "empty_brief")
+          : undefined;
+      if (emptyBriefFailure) {
+        const violationSummary = freshBlueprint
+          .fidelity!.violations.map((violation) => `${violation.kind}: ${violation.detail}`)
+          .join("; ");
+        const message =
+          "Blueprint synthesis produced an unusable empty brief" +
+          (violationSummary ? `: ${violationSummary}` : ".") +
+          " Restore the configured blueprint provider/runtime, then retry dispatch or request a replan." +
+          " The empty brief was not checkpointed or sent for review.";
+        events.emit("blueprint_fidelity_failed", {
+          taskId,
+          reason: "empty_brief",
+          message,
+          retryable: true,
+          recovery: "replan_or_retry",
+          producerProvenancePresent: freshBlueprint.producerProvenance !== undefined,
+          violations: freshBlueprint.fidelity!.violations,
+        });
+        events.emit("session_error", {
+          error: message,
+          failedStage: "blueprint",
+        });
+        events.recordSession("error", {
+          outcome: "error",
+          durationMs: Date.now() - startTime,
+        });
+        return {
+          taskId,
+          outcome: "error" as const,
+          retriesUsed: 0,
+          error: message,
+        };
+      }
+
       blueprintMarkdown = formatBlueprintForPrompt(freshBlueprint);
       events.emit("blueprint_generated", {
         taskId,
@@ -1137,7 +1363,38 @@ export async function dispatchTask(
       } = await import("./blueprint-approval.js");
 
       // Check if a human already approved this blueprint (resume after approval)
-      const existingApproval = await loadApproval(taskId, logDir);
+      let existingApproval = await loadApproval(taskId, logDir);
+      let retiredStaleRejection = false;
+
+      if (existingApproval?.state === "rejected") {
+        const rejectionComparison = compareResolvedSpecIdentity(
+          existingApproval.specIdentity,
+          currentSpecResolution(),
+          existingApproval,
+        );
+        if (rejectionComparison.verdict === "stale") {
+          // A rejection decides one generated brief, not every future brief
+          // for this task id. A fresh dispatch after a contract amendment has
+          // already generated a new blueprint by the time it reaches this
+          // gate. Let that new generation create its own approval record;
+          // saveBlueprintApproval/savePendingApproval will replace the stale
+          // decision. Same-contract retries still remain blocked.
+          existingApproval = null;
+          retiredStaleRejection = true;
+        } else if (!mayConsume(rejectionComparison.verdict)) {
+          return refuseForSpecIdentity({
+            surface: "blueprint rejection reuse",
+            stage: "approve",
+            verdict: rejectionComparison.verdict,
+            reason: rejectionComparison.reason,
+            message: new StaleSpecIdentityError(
+              taskId,
+              "blueprint rejection reuse",
+              rejectionComparison,
+            ).message,
+          });
+        }
+      }
 
       // Check for expired pending approvals — auto-reject if timed out
       if (existingApproval?.state === "pending") {
@@ -1195,7 +1452,12 @@ export async function dispatchTask(
       const existingApprovalCarriesLoopEvidence =
         existingApproval?.executionMode === "loop" &&
         existingApproval.review !== undefined &&
-        existingApproval.reviewGate !== undefined;
+        existingApproval.reviewGate !== undefined &&
+        mayReuseLoopReviewApproval(
+          existingApproval.reviewGate,
+          loopConfig?.briefReview.requireCrossModel ?? false,
+          existingApproval.state === "approved",
+        );
       if (
         (existingApproval?.state === "approved" || existingApproval?.state === "auto-approved") &&
         (effectiveExecutionMode === "dispatch" || existingApprovalCarriesLoopEvidence)
@@ -1301,6 +1563,7 @@ export async function dispatchTask(
             // TASK-1324: the brief's pipeline-stamped fidelity audit
             // joins the gate facts (brief gate only).
             (blueprint as Blueprint).fidelity,
+            (blueprint as Blueprint).producerProvenance,
           );
         }
 
@@ -1366,6 +1629,27 @@ export async function dispatchTask(
         }
 
         if (shouldAutoApprove) {
+          if (!loopReview && retiredStaleRejection) {
+            // A non-loop auto-approval normally needs no durable record. When
+            // it supersedes a rejected generation, however, leaving that old
+            // record in place makes the v1 approval API report a rejection
+            // after this fresh generation has already passed the gate. Replace
+            // only the spec-proven stale decision with this generation's
+            // current identity; same-contract rejections never reach here.
+            const approvalIdentity = identityForApprovalSave(
+              "replacement auto-approved blueprint approval save",
+            );
+            if ("refusal" in approvalIdentity) return approvalIdentity.refusal;
+            await saveBlueprintApproval(
+              taskId,
+              blueprint as Blueprint,
+              preflightResult,
+              logDir,
+              "auto-approved",
+              undefined,
+              approvalIdentity.identity,
+            );
+          }
           // Auto-approved — mark checkpoint and continue
           await checkpointMgr.markStageComplete(taskId, "approve", {});
           events.emit("checkpoint_saved", {
@@ -1444,9 +1728,21 @@ export async function dispatchTask(
     }
 
     // ── Step 2.9: Create parent feature branch (for subtask chains) ──
+    if (!options?.skipBranch) {
+      const branchCandidates = new Set<string>([buildBranchName(taskId, adapter)]);
+      if (options?.parentTaskId) {
+        branchCandidates.add(buildBranchName(options.parentTaskId, adapter));
+      }
+      if (options?.sharedBranchName) branchCandidates.add(options.sharedBranchName);
+      if (existingCheckpoint?.branchName) branchCandidates.add(existingCheckpoint.branchName);
+      for (const candidate of branchCandidates) {
+        assertDispatchTaskBranchAllowed(candidate, adapter);
+      }
+    }
+
     let featureBranch: string | undefined;
     if (options?.parentTaskId && !options?.sharedBranchName) {
-      const fbResult = await createFeatureBranch(options.parentTaskId, adapter);
+      const fbResult = await createFeatureBranch(options.parentTaskId, adapter, events);
       if (fbResult.success) {
         featureBranch = fbResult.branchName;
       } else {
@@ -1483,6 +1779,11 @@ export async function dispatchTask(
 
     // ── Step 3: Create branch (branch-aware) ───────────────────
     let branchName: string | undefined = existingCheckpoint?.branchName;
+    let allowShellWorktreeInit =
+      monitorAttestedFreshWorktree &&
+      !options?.sharedBranchName &&
+      !options?.resumeFromCheckpoint &&
+      !existingCheckpoint;
     if (completedStages.has("branch")) {
       events.emit("stage_skipped", {
         taskId,
@@ -1510,23 +1811,19 @@ export async function dispatchTask(
       // Ensure we're on the shared branch and have the latest commits
       // from prior subtasks. This is critical for context continuity:
       // subtask B must see files committed by subtask A.
-      await ensureSharedBranchCheckout(branchName, adapter, events);
+      ensureSharedBranchCheckout(branchName, adapter, events);
       events.emit("stage_skipped", {
         taskId,
         stage: "branch",
         reason: "using shared branch from parent task",
       });
     } else if (!options?.skipBranch && !completedStages.has("branch")) {
-      const { execSync } = await import("node:child_process");
       const expectedBranchName = buildBranchName(taskId, adapter);
 
       // Check if branch already exists
       let branchExists = false;
       try {
-        execSync(`git rev-parse --verify ${expectedBranchName}`, {
-          cwd: adapter.projectRoot,
-          stdio: "pipe",
-        });
+        runTrustedGitSync(["rev-parse", "--verify", expectedBranchName], adapter.projectRoot);
         branchExists = true;
       } catch {
         // Branch doesn't exist - normal case
@@ -1559,33 +1856,25 @@ export async function dispatchTask(
             };
           }
           branchName = branchResult.branchName;
+          allowShellWorktreeInit = monitorAttestedFreshWorktree;
           events.emit("branch_created", { branchName });
         } else if (existingCheckpoint && checkpointMgr.isUsable(existingCheckpoint, maxRetries)) {
           // Resume path: checkpoint with incomplete stages or retry path
           if (existingCheckpoint.judgeResult?.verdict === "REVISE") {
             // Retry path: checkout branch and inject judge feedback
-            execSync(`git checkout ${expectedBranchName}`, {
-              cwd: adapter.projectRoot,
-              stdio: "pipe",
-            });
+            runTrustedGitSync(["checkout", expectedBranchName], adapter.projectRoot);
             branchName = expectedBranchName;
             events.emit("branch_resumed", { branchName, reason: "retry_after_revise" });
             // Note: Judge feedback injection is handled later via existingCheckpoint.judgeResult
           } else {
             // Resume from incomplete stages
-            execSync(`git checkout ${expectedBranchName}`, {
-              cwd: adapter.projectRoot,
-              stdio: "pipe",
-            });
+            runTrustedGitSync(["checkout", expectedBranchName], adapter.projectRoot);
             branchName = expectedBranchName;
             events.emit("branch_resumed", { branchName, reason: "incomplete_checkpoint" });
           }
         } else if (!existingCheckpoint) {
           // Reuse path: no checkpoint but branch exists - reuse from agent stage
-          execSync(`git checkout ${expectedBranchName}`, {
-            cwd: adapter.projectRoot,
-            stdio: "pipe",
-          });
+          runTrustedGitSync(["checkout", expectedBranchName], adapter.projectRoot);
           branchName = expectedBranchName;
           events.emit("branch_reused", { branchName, reason: "no_checkpoint" });
         } else {
@@ -1616,6 +1905,7 @@ export async function dispatchTask(
             };
           }
           branchName = branchResult.branchName;
+          allowShellWorktreeInit = monitorAttestedFreshWorktree;
           events.emit("branch_created", { branchName });
         }
 
@@ -1657,11 +1947,82 @@ export async function dispatchTask(
           };
         }
         branchName = branchResult.branchName;
+        allowShellWorktreeInit = monitorAttestedFreshWorktree;
         events.emit("branch_created", { branchName });
 
         await checkpointMgr.markStageComplete(taskId, "branch", {
           branchName,
         });
+      }
+    }
+
+    if (completedStages.has("branch") && !options?.sharedBranchName && !options?.skipBranch) {
+      if (!branchName) {
+        throw new Error(
+          `Cannot resume ${taskId}: checkpoint marks the branch stage complete but has no branchName`,
+        );
+      }
+      ensureExistingBranchCheckout(branchName, adapter, events, "checkpoint_resume");
+    }
+
+    // ── Step 3.1: Initialize the fresh worktree ──────────────────
+    // The monitor creates the outer git worktree before launching this
+    // dispatcher.  A new worktree deliberately has no ignored dependency
+    // directories, so initialize it before baseline capture, context
+    // assembly, or any worker/verification process can run.  skipBranch is
+    // the explicit "use this checkout as-is" escape hatch used by CI/tests.
+    if (!options?.skipBranch && branchName) {
+      const initResult = await runWorktreeInit(
+        adapter.projectRoot,
+        adapter.config.dispatch?.worktreeInit,
+        events,
+        {
+          allowShellSteps: allowShellWorktreeInit,
+          validateNpmMetadata: !allowShellWorktreeInit,
+        },
+      ).catch((error: unknown) => ({
+        success: false,
+        stepsRun: 0,
+        errors: [
+          {
+            step: "worktree init",
+            message: error instanceof Error ? error.message : String(error),
+          },
+        ],
+      }));
+
+      if (!initResult.success) {
+        const failureDetail = initResult.errors
+          .map((error) => `  • ${error.step}: ${error.message}`)
+          .join("\n");
+        const errorMessage =
+          `Worktree init failed (${initResult.errors.length} step(s) failed):` +
+          (failureDetail ? `\n${failureDetail}` : "");
+
+        events.emit(
+          "worktree_init_failed" as Parameters<IEventWriter["emit"]>[0],
+          {
+            taskId,
+            errors: initResult.errors,
+            stepsRun: initResult.stepsRun,
+          } as Parameters<IEventWriter["emit"]>[1],
+        );
+        events.emit("session_complete", {
+          outcome: "error",
+          durationMs: Date.now() - startTime,
+          totalCostUsd: 0,
+        });
+        events.recordSession("error", {
+          outcome: "error",
+          durationMs: Date.now() - startTime,
+        });
+
+        return {
+          taskId,
+          outcome: "error",
+          retriesUsed: 0,
+          error: errorMessage,
+        };
       }
     }
 
@@ -1850,6 +2211,7 @@ export async function dispatchTask(
         workerModel,
         totalBudget > 0 ? totalBudget : undefined,
         adapter.config,
+        adapter.projectRoot,
       ).catch((err) => {
         // Non-fatal: log but don't block dispatch
         console.error(`GitHub sync (dispatch_started) failed: ${err}`);
@@ -1857,6 +2219,7 @@ export async function dispatchTask(
     }
 
     let agentResult: AgentResult;
+    let implementationProvenance = existingCheckpoint?.implementationProvenance;
     if (completedStages.has("agent") && existingCheckpoint?.agentResult) {
       agentResult = existingCheckpoint.agentResult;
       events.emit("stage_skipped", {
@@ -1877,11 +2240,13 @@ export async function dispatchTask(
         },
         events,
       );
+      implementationProvenance = implementationProducerProvenance(adapter, workerModel);
       await linkTranscripts(taskId, adapter, events, agentRunStart, 0);
 
       // Save checkpoint with session ID regardless of outcome
       await checkpointMgr.markStageComplete(taskId, "agent", {
         agentResult,
+        implementationProvenance,
         claudeSessionId: agentResult.claudeSessionId,
         totalCostUsd: agentResult.totalCostUsd,
       });
@@ -1929,11 +2294,13 @@ export async function dispatchTask(
             },
             events,
           );
+          implementationProvenance = implementationProducerProvenance(adapter, workerModel);
           await linkTranscripts(taskId, adapter, events, resumeStart, 0);
 
           // Update checkpoint with new result
           await checkpointMgr.markStageComplete(taskId, "agent", {
             agentResult,
+            implementationProvenance,
             claudeSessionId: agentResult.claudeSessionId,
             totalCostUsd: agentResult.totalCostUsd,
           });
@@ -2065,6 +2432,8 @@ export async function dispatchTask(
         loadJudgeApproval,
         isApprovalExpired,
         updateJudgeApprovalState,
+        compareJudgeApprovalSpecIdentity,
+        StaleJudgeApprovalError,
         DEFAULT_APPROVAL_TIMEOUT_MS,
       } = await import("./judge-approval.js");
 
@@ -2125,7 +2494,32 @@ export async function dispatchTask(
       const existingApprovalCarriesLoopEvidence =
         existingApproval?.executionMode === "loop" &&
         existingApproval.review !== undefined &&
-        existingApproval.reviewGate !== undefined;
+        existingApproval.reviewGate !== undefined &&
+        mayReuseLoopReviewApproval(
+          existingApproval.reviewGate,
+          loopConfig?.diffReview.requireCrossModel ?? false,
+          existingApproval.state === "approved",
+        );
+
+      // TASK-1333: an approval may be consumed only under the semantic
+      // contract it reviewed. Check before the skip branch so a stale
+      // approved record cannot silently carry the checkpoint forward.
+      if (existingApproval?.state === "approved" || existingApproval?.state === "auto-approved") {
+        const comparison = compareJudgeApprovalSpecIdentity(
+          existingApproval,
+          currentSpecResolution(),
+        );
+        if (!mayConsume(comparison.verdict)) {
+          return refuseForSpecIdentity({
+            surface: "judge approval consumption",
+            stage: "judge_review",
+            verdict: comparison.verdict,
+            reason: comparison.reason,
+            message: new StaleJudgeApprovalError(taskId, "judge approval consumption", comparison)
+              .message,
+          });
+        }
+      }
       if (
         (existingApproval?.state === "approved" || existingApproval?.state === "auto-approved") &&
         (effectiveExecutionMode === "dispatch" || existingApprovalCarriesLoopEvidence)
@@ -2186,6 +2580,8 @@ export async function dispatchTask(
               mode: adapter.config.judgment?.stages?.loopDiff?.mode ?? "off",
               runnerConfig: adapter.config.judgment?.runner,
             },
+            undefined,
+            implementationProvenance,
           );
         }
 
@@ -2341,9 +2737,7 @@ export async function dispatchTask(
     }
 
     // ── Step 7: Pre-judge scope check + Run judge ──────────────
-    const judgeModel =
-      loopConfig?.models?.judge ??
-      resolveModel(adapter.config.modelRouting, adapter.config.agent, { stage: "judge" });
+    const judgeModel = resolveDispatchJudgeModel(adapter);
     const judgeRunStart = Date.now();
     const changedFiles = outputSnapshot.changedFiles;
 
@@ -2380,16 +2774,9 @@ export async function dispatchTask(
     // Build compact backlog summary for judge follow-up dedup (non-blocking, best-effort)
     let recentBacklogSummary: string | undefined;
     try {
-      const { loadBacklogEntries } = await import("./follow-up-dedup.js");
+      const { loadRecentBacklogSummary } = await import("./follow-up-dedup.js");
       const backlogTaskDir = path.resolve(adapter.projectRoot, adapter.config.project.taskDir);
-      const backlogEntries = await loadBacklogEntries(backlogTaskDir);
-      if (backlogEntries.length > 0) {
-        recentBacklogSummary = backlogEntries
-          .map(
-            (e) => `- ${e.taskId}: ${e.title}${e.tags.length > 0 ? ` [${e.tags.join(", ")}]` : ""}`,
-          )
-          .join("\n");
-      }
+      recentBacklogSummary = await loadRecentBacklogSummary(backlogTaskDir);
     } catch {
       // Non-fatal: backlog summary is best-effort
     }
@@ -2481,9 +2868,34 @@ export async function dispatchTask(
       // APPROVED record whose fingerprint still matches means this work
       // was already reviewed and released, and the cutover stands down
       // for this attempt. A different diff re-arms it.
-      const { loadJudgeApproval, saveJudgeApproval } = await import("./judge-approval.js");
+      const {
+        compareJudgeApprovalSpecIdentity,
+        loadJudgeApproval,
+        saveJudgeApproval,
+        StaleJudgeApprovalError,
+      } = await import("./judge-approval.js");
       const diffFingerprint = computeContentHash(gitDiff);
       const priorApproval = await loadJudgeApproval(taskId, logDir);
+      if (priorApproval?.state === "approved" || priorApproval?.state === "auto-approved") {
+        const comparison = compareJudgeApprovalSpecIdentity(priorApproval, currentSpecResolution());
+        if (!mayConsume(comparison.verdict)) {
+          return {
+            judgeResult: current,
+            pause: false,
+            refusal: refuseForSpecIdentity({
+              surface: "judge intent hold clearance",
+              stage: "judge",
+              verdict: comparison.verdict,
+              reason: comparison.reason,
+              message: new StaleJudgeApprovalError(
+                taskId,
+                "judge intent hold clearance",
+                comparison,
+              ).message,
+            }),
+          };
+        }
+      }
       if (
         priorApproval?.state === "approved" &&
         priorApproval.intentHold?.diffFingerprint === diffFingerprint
@@ -2887,6 +3299,7 @@ export async function dispatchTask(
           },
           events,
         );
+        implementationProvenance = implementationProducerProvenance(adapter, retryWorkerModel);
       } else {
         // Fresh session fallback: model escalation or no session ID
         if (agentResult.claudeSessionId && retryWorkerModel !== previousModel) {
@@ -2913,6 +3326,7 @@ export async function dispatchTask(
           },
           events,
         );
+        implementationProvenance = implementationProducerProvenance(adapter, retryWorkerModel);
       }
       await linkTranscripts(taskId, adapter, events, retryAgentStart, retriesUsed);
       totalAgentCostUsd += agentResult.totalCostUsd;
@@ -2952,6 +3366,7 @@ export async function dispatchTask(
 
       await checkpointMgr.markStageComplete(taskId, "agent", {
         agentResult,
+        implementationProvenance,
         claudeSessionId: agentResult.claudeSessionId,
         retriesUsed,
         totalCostUsd: totalAgentCostUsd,
@@ -3033,6 +3448,8 @@ export async function dispatchTask(
             mode: adapter.config.judgment?.stages?.loopDiff?.mode ?? "off",
             runnerConfig: adapter.config.judgment?.runner,
           },
+          undefined,
+          implementationProvenance,
         );
         const autoRules = loopConfig.diffReview.autoApproveWhen;
         const thresholdsPass =
@@ -3391,7 +3808,13 @@ export async function dispatchTask(
 
       // Sync dispatch completion to GitHub if configured
       if (!dockerHostPromotion && adapter.config.integrations?.github?.reportBack) {
-        await syncDispatchComplete(taskId, "approved", undefined, adapter.config).catch((err) => {
+        await syncDispatchComplete(
+          taskId,
+          "approved",
+          undefined,
+          adapter.config,
+          adapter.projectRoot,
+        ).catch((err) => {
           // Non-fatal: log but don't block
           console.error(`GitHub sync failed: ${err}`);
         });
@@ -3419,9 +3842,11 @@ export async function dispatchTask(
 
         // Sync PR creation to GitHub if configured
         if (adapter.config.integrations?.github?.reportBack) {
-          await syncPRCreated(taskId, result.prUrl, adapter.config).catch((err) => {
-            console.error(`GitHub sync failed: ${err}`);
-          });
+          await syncPRCreated(taskId, result.prUrl, adapter.config, adapter.projectRoot).catch(
+            (err) => {
+              console.error(`GitHub sync failed: ${err}`);
+            },
+          );
         }
       }
       // Emit subtask merge event when merged to feature branch
@@ -3545,16 +3970,7 @@ export async function dispatchTask(
           // Push branch so human can review
           if (branchName) {
             try {
-              const sealed = await resolveExactBranchHead(branchName, adapter);
-              if (sealed.success) {
-                const repository = await resolveOriginRepository(adapter.projectRoot);
-                await pushExactBranch(
-                  branchName,
-                  sealed.headCommitSha,
-                  adapter,
-                  repository.pushUrl,
-                );
-              }
+              await pushBranch(taskId, adapter);
             } catch {
               // Non-fatal: branch may already be pushed
             }
@@ -3609,11 +4025,15 @@ export async function dispatchTask(
 
     // Sync rejection to GitHub if configured
     if (adapter.config.integrations?.github?.reportBack) {
-      await syncDispatchComplete(taskId, "rejected", judgeResult.feedback, adapter.config).catch(
-        (err) => {
-          console.error(`GitHub sync failed: ${err}`);
-        },
-      );
+      await syncDispatchComplete(
+        taskId,
+        "rejected",
+        judgeResult.feedback,
+        adapter.config,
+        adapter.projectRoot,
+      ).catch((err) => {
+        console.error(`GitHub sync failed: ${err}`);
+      });
     }
 
     events.emit("session_complete", {
@@ -4129,14 +4549,20 @@ async function handleApproval(
     };
   }
 
-  // Freeze the final lifecycle-mutated branch once. Every publication side
-  // effect below uses this object ID rather than dereferencing the mutable
-  // branch name again.
-  let sealedHeadCommit: string | undefined;
-  let repositoryBinding: GitOriginIdentity | undefined;
-  if (branchName) {
-    const sealed = await resolveExactBranchHead(branchName, adapter);
-    if (!sealed.success) {
+  const pullRequestRequired = Boolean(
+    adapter.config.git.autoCreatePr && !options?.skipPr && branchName,
+  );
+  const targetBranch =
+    mergeTargetBranch ?? adapter.config.git.autoMergeTarget ?? adapter.config.git.baseBranch;
+  const remotePublicationRequired = Boolean(
+    branchName &&
+    (adapter.config.git.autoPush !== false || pullRequestRequired || adapter.config.git.autoMerge),
+  );
+  let publicationBinding: Awaited<ReturnType<typeof resolveBranchPublicationBinding>> | undefined;
+  if (branchName && remotePublicationRequired) {
+    try {
+      publicationBinding = await resolveBranchPublicationBinding(taskId, adapter, branchName);
+    } catch (error: unknown) {
       return {
         taskId,
         outcome: "error",
@@ -4144,35 +4570,8 @@ async function handleApproval(
         agentResult,
         judgeResult,
         retriesUsed,
-        error: sealed.error,
+        error: `Failed to seal branch publication: ${error instanceof Error ? error.message : String(error)}`,
       };
-    }
-    sealedHeadCommit = sealed.headCommitSha;
-    const requiresRemotePublication =
-      adapter.config.git.autoPush !== false ||
-      adapter.config.git.autoMerge === true ||
-      (adapter.config.git.autoCreatePr === true && !options?.skipPr);
-    if (requiresRemotePublication) {
-      try {
-        repositoryBinding = await resolveOriginRepository(adapter.projectRoot);
-        if (
-          adapter.config.git.autoCreatePr === true &&
-          !options?.skipPr &&
-          !repositoryBinding.github
-        ) {
-          throw new Error("Could not resolve a GitHub repository from the exact origin push URL");
-        }
-      } catch (error: unknown) {
-        return {
-          taskId,
-          outcome: "error",
-          branchName,
-          agentResult,
-          judgeResult,
-          retriesUsed,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
     }
   }
 
@@ -4181,7 +4580,7 @@ async function handleApproval(
     // Content validation: verify branch has commits before pushing.
     // Pass branchName explicitly — after worktree teardown, HEAD points to
     // the base branch, so base..HEAD would always be 0 commits.
-    const commitCount = await getBranchCommitCount(adapter, diffBase, sealedHeadCommit);
+    const commitCount = await getBranchCommitCount(adapter, diffBase, branchName);
     if (commitCount === 0) {
       return {
         taskId,
@@ -4194,12 +4593,7 @@ async function handleApproval(
       };
     }
 
-    const pushResult = await pushExactBranch(
-      branchName,
-      sealedHeadCommit!,
-      adapter,
-      repositoryBinding!.pushUrl,
-    );
+    const pushResult = await pushBranch(taskId, adapter, publicationBinding);
     if (!pushResult.success) {
       return {
         taskId,
@@ -4216,19 +4610,17 @@ async function handleApproval(
   // For subtasks with a feature branch, merge to the feature branch
   // instead of the normal autoMergeTarget
   if (featureBranch && options?.parentTaskId && branchName) {
-    const { execSync } = await import("node:child_process");
     const cwd = adapter.projectRoot;
 
     try {
+      runTrustedGitSync(["check-ref-format", "--branch", featureBranch], cwd);
+      runTrustedGitSync(["check-ref-format", "--branch", branchName], cwd);
       // Checkout feature branch
-      execSync(`git checkout ${featureBranch}`, { cwd, stdio: "pipe" });
+      runTrustedGitSync(["checkout", featureBranch], cwd);
       // Merge subtask branch
-      execSync(
-        `git merge --no-ff ${sealedHeadCommit!} -m "[${taskId}] merge subtask to feature branch"`,
-        {
-          cwd,
-          stdio: "pipe",
-        },
+      runTrustedGitSync(
+        ["merge", "--no-ff", branchName, "-m", `[${taskId}] merge subtask to feature branch`],
+        cwd,
       );
 
       return {
@@ -4257,62 +4649,61 @@ async function handleApproval(
 
   // Create PR
   let prUrl: string | undefined;
-  let prCreationBlockedAutoMerge = false;
-  if (adapter.config.git.autoCreatePr && !options?.skipPr) {
-    if (!branchName || !sealedHeadCommit || !repositoryBinding) {
-      // An explicit skipBranch run has no branch/OID to bind. Preserve its
-      // non-fatal result semantics, but never fall back to an ambient gh head.
-      prCreationBlockedAutoMerge = true;
-    } else {
-      const prBody = await buildPrBodyWithIssueLink(
-        taskId,
-        task.rawContent,
-        agentResult.verification,
-        judgeResult,
-        adapter,
-      );
-
-      const githubRepository: GitHubRepositoryIdentity = {
-        ...repositoryBinding.github!,
-        pushUrl: repositoryBinding.pushUrl,
-        pushUrlHash: repositoryBinding.pushUrlHash,
+  let pullRequestBinding: PullRequestBinding | undefined;
+  let requiredPullRequestFailed = false;
+  const expectedSourceOid = publicationBinding?.headOid;
+  if (pullRequestRequired && branchName) {
+    const prBody = await buildPrBodyWithIssueLink(
+      taskId,
+      task.rawContent,
+      agentResult.verification,
+      judgeResult,
+      adapter,
+    );
+    try {
+      if (!expectedSourceOid) throw new Error("sealed source commit is unavailable");
+      const repository = publicationBinding?.repository;
+      if (!repository) throw new Error("sealed repository identity is unavailable");
+      const candidateBinding: PullRequestBinding = {
+        repository,
+        headBranch: branchName,
+        baseBranch: targetBranch,
+        headOid: expectedSourceOid,
       };
       const prResult = await createPullRequest(
         {
           taskId,
           title: `[${taskId}] ${task.title}`,
           body: prBody,
-          baseBranch: mergeTargetBranch ?? adapter.config.git.baseBranch,
+          baseBranch: targetBranch,
           headBranch: branchName,
-          headCommitSha: sealedHeadCommit,
+          expectedHeadOid: expectedSourceOid,
+          repository,
         },
         adapter,
-        githubRepository,
       );
 
       if (prResult.success && prResult.prUrl) {
         prUrl = prResult.prUrl;
+        pullRequestBinding = candidateBinding;
       } else {
-        // PR creation remains non-fatal because the branch is already pushed,
-        // but an auto-merge configured to use that PR must not silently fall
-        // through to the separate no-PR/local merge path.
-        prCreationBlockedAutoMerge = true;
-        if (adapter.config.git.autoMerge) {
-          console.warn(
-            `[pr-create] Auto-merge skipped for ${taskId}: ${prResult.error ?? "no confirmed pull request URL"}`,
-          );
-        }
+        requiredPullRequestFailed = true;
+        console.warn(
+          `[auto-merge] Pull request was not identity-confirmed for ${taskId}: ${prResult.error ?? "URL unavailable"}`,
+        );
       }
-      // PR creation failure is non-fatal — the branch is pushed
+    } catch (error: unknown) {
+      requiredPullRequestFailed = true;
+      console.warn(
+        `[auto-merge] Pull request publication failed for ${taskId}: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 
   // Auto-merge to target branch if enabled
   let autoMerged = false;
   let mergeCommitSha: string | undefined;
-  if (adapter.config.git.autoMerge && branchName && !prCreationBlockedAutoMerge) {
-    const targetBranch =
-      mergeTargetBranch ?? adapter.config.git.autoMergeTarget ?? adapter.config.git.baseBranch;
+  if (adapter.config.git.autoMerge && branchName && !requiredPullRequestFailed) {
     const mergeResult = await mergeBranchToTarget(
       taskId,
       adapter,
@@ -4320,9 +4711,9 @@ async function handleApproval(
       targetBranch,
       eventWriter,
       branchName,
-      sealedHeadCommit,
-      undefined,
-      repositoryBinding,
+      pullRequestBinding,
+      expectedSourceOid,
+      publicationBinding?.repository,
     );
 
     if (mergeResult.success) {
@@ -4334,7 +4725,7 @@ async function handleApproval(
         taskId,
         adapter,
         targetBranch,
-        repositoryBinding!.pushUrl,
+        publicationBinding!.repository,
       );
       if (!statusResult.success) {
         // Non-fatal: merge succeeded, just couldn't update task file
@@ -4345,14 +4736,19 @@ async function handleApproval(
       if (branchName) {
         const deleteResult = await deleteAfterMerge(branchName, adapter, {
           eventWriter,
-          expectedHeadCommit: sealedHeadCommit,
-          ...(mergeCommitSha ? { expectedMergedCommit: mergeCommitSha } : {}),
-          expectedOriginPushUrl: repositoryBinding!.pushUrl,
+          baseBranch: targetBranch,
+          expectedMergedCommit: mergeCommitSha,
+          ...(publicationBinding
+            ? {
+                expectedRepository: publicationBinding.repository,
+                expectedSourceOid: publicationBinding.headOid,
+              }
+            : {}),
         });
-        if (!deleteResult.deleted) {
-          // Non-fatal — log and continue
+        if (!deleteResult.deleted || deleteResult.remoteDeleted === false) {
+          // Non-fatal, but never report a local-only deletion as complete.
           console.warn(
-            `[branch-cleanup] deleteAfterMerge skipped for ${branchName}: ${deleteResult.reason}`,
+            `[branch-cleanup] deleteAfterMerge incomplete for ${branchName}: ${deleteResult.reason ?? "remote branch was not deleted"}`,
           );
         }
       }
@@ -4431,7 +4827,7 @@ async function cleanupEarlyFailureArtifacts(
 
 /**
  * Create follow-up task specs from judge's non-blocking suggestions.
- * Generates TASK-{parentId}-FU{N}.md files in the task directory.
+ * Generates parser-valid, globally allocated TASK-NNNN files.
  * These are BACKLOG tasks blocked by the parent — they won't auto-dispatch.
  * Runs dedup check: if a similar task already exists in the backlog,
  * appends a linked-from comment to the existing task instead of creating a new spec.
@@ -4447,6 +4843,7 @@ export async function createFollowUpTasks(
   await fs.mkdir(taskDir, { recursive: true });
 
   const createdPaths: string[] = [];
+  const createdTaskIds: string[] = [];
 
   // Load backlog entries and ignore list once for the whole batch
   const {
@@ -4461,23 +4858,24 @@ export async function createFollowUpTasks(
 
   let claimantQuery: Promise<string[]> | undefined;
   let followUpRefused = false;
+  const refuseForParentClaimants = (claimants: string[]): void => {
+    if (followUpRefused) return;
+    followUpRefused = true;
+    events.emit("follow_up_tasks_refused", {
+      parentTaskId,
+      errorType: "duplicate_claimants",
+      claimants,
+    });
+  };
   const allowMutation = async (): Promise<boolean> => {
     claimantQuery ??= listDuplicateClaimants(taskDir, parentTaskId);
     const claimants = await claimantQuery;
     if (claimants.length === 0) return true;
 
-    if (!followUpRefused) {
-      followUpRefused = true;
-      events.emit("follow_up_tasks_refused", {
-        parentTaskId,
-        errorType: "duplicate_claimants",
-        claimants,
-      });
-    }
+    refuseForParentClaimants(claimants);
     return false;
   };
 
-  let fuIndex = 1;
   for (const item of followUpItems) {
     try {
       // Check if this follow-up matches an ignored pattern
@@ -4495,8 +4893,18 @@ export async function createFollowUpTasks(
       const similar = findSimilarTask(item.title, backlogEntries);
       if (similar) {
         // Append a reference to the existing task instead of creating a new one
-        await appendLinkedFromComment(similar.filePath, parentTaskId, allowMutation).catch(() => {
-          // Non-fatal: append failure should not block the rest
+        await appendLinkedFromComment(
+          similar.filePath,
+          similar.taskId,
+          parentTaskId,
+          adapter,
+          allowMutation,
+        ).catch((error: unknown) => {
+          // Non-fatal: append failure should not block the rest, but preserve
+          // actionable evidence instead of silently hiding a safety refusal.
+          console.error(
+            `[follow-up] Linked-from annotation for ${similar.taskId} failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
         });
         if (followUpRefused) break;
         continue;
@@ -4508,20 +4916,77 @@ export async function createFollowUpTasks(
       );
     }
 
-    const subtaskId = `${parentTaskId}-FU${fuIndex++}`;
     const slug = item.title
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/^-+|-+$/g, "")
       .slice(0, 50);
-    const fileName = `${subtaskId}-${slug}.md`;
-    const filePath = path.join(taskDir, fileName);
-
-    const spec = buildFollowUpSpec(subtaskId, item, parentTaskId, parentTask);
 
     if (!(await allowMutation())) break;
-    await fs.writeFile(filePath, spec, "utf-8");
-    createdPaths.push(filePath);
+    try {
+      const created = await withTaskCreationReservation(
+        taskDir,
+        {
+          creator: "judge-follow-up",
+        },
+        async () => {
+          await recoverPendingTaskSpecMutationsWithinReservation(adapter);
+          const claimants = await readTaskCreationClaimants(taskDir);
+          const parentClaimants = claimants.get(normalizeClaimantTaskId(parentTaskId)) ?? [];
+          if (parentClaimants.length > 1) {
+            throw new DuplicateClaimantAdmissionError({
+              taskId: parentTaskId,
+              claimants: parentClaimants,
+            });
+          }
+          if (parentClaimants.length !== 1) {
+            throw new TaskCreationIdentityConflictError([
+              { taskId: parentTaskId, claimants: parentClaimants },
+            ]);
+          }
+          const subtaskId = allocateFollowUpTaskId(claimants.keys());
+          const fileName = `${subtaskId}-${slug}.md`;
+          const filePath = path.join(taskDir, fileName);
+          assertTaskCreationIdsAvailable(claimants, [
+            {
+              taskId: subtaskId,
+              fileName,
+            },
+          ]);
+
+          const spec = buildFollowUpSpec(subtaskId, item, parentTaskId, parentTask);
+          // A generated follow-up is part of the canonical task population, so
+          // prove the emitted grammar before making it visible on disk.
+          parseTaskFile(spec, filePath);
+          await writeDecompositionFileAtomicExclusive(filePath, spec);
+          return { filePath, taskId: subtaskId };
+        },
+      );
+      createdPaths.push(created.filePath);
+      createdTaskIds.push(created.taskId);
+    } catch (err: unknown) {
+      if (err instanceof DuplicateClaimantAdmissionError) {
+        refuseForParentClaimants(err.claimants);
+        break;
+      }
+      if (
+        err instanceof TaskCreationIdentityConflictError ||
+        err instanceof TaskCreationScanUnavailableError ||
+        (err as NodeJS.ErrnoException).code === "EEXIST"
+      ) {
+        events.emit("follow_up_child_creation_refused", {
+          parentTaskId,
+          errorType:
+            err instanceof TaskCreationScanUnavailableError
+              ? "claimant_scan_unavailable"
+              : "task_identity_conflict",
+          conflicts: err instanceof TaskCreationIdentityConflictError ? err.conflicts : [],
+          message: err instanceof Error ? err.message : String(err),
+        });
+        break;
+      }
+      throw err;
+    }
   }
 
   if (followUpRefused) return [];
@@ -4530,11 +4995,21 @@ export async function createFollowUpTasks(
     events.emit("follow_up_tasks_created", {
       parentTaskId,
       count: createdPaths.length,
-      taskIds: createdPaths.map((p) => path.basename(p, ".md")),
+      taskIds: createdTaskIds,
     });
   }
 
   return createdPaths;
+}
+
+function allocateFollowUpTaskId(existingDeclaredIds: Iterable<string>): string {
+  let max = 0;
+  for (const taskId of existingDeclaredIds) {
+    const match = taskId.match(/^TASK-(\d+)$/);
+    if (!match) continue;
+    max = Math.max(max, Number.parseInt(match[1], 10));
+  }
+  return `TASK-${String(max + 1).padStart(4, "0")}`;
 }
 
 /**
@@ -4555,6 +5030,7 @@ function buildFollowUpSpec(
   lines.push(`- **Effort:** ${item.estimatedEffort ?? "1-2 hours"}`);
   lines.push(`- **Status:** BACKLOG`);
   lines.push(`- **Blocked By:** [${parentTaskId}]`);
+  lines.push(`- **Parent Task:** ${parentTaskId}`);
   lines.push(`- **Blocks:** []`);
   lines.push(`- **Tags:** follow-up, ${item.type}, auto-generated`);
   lines.push("");
@@ -4703,35 +5179,37 @@ export async function ensureDiffOrAutoCommit(
  * This guarantees that later subtasks see code committed by earlier subtasks.
  * Called before each subtask starts when using a shared branch.
  */
-async function ensureSharedBranchCheckout(
+function ensureSharedBranchCheckout(
   branchName: string,
   adapter: ProjectAdapter,
   events: IEventWriter,
-): Promise<void> {
-  const { execSync } = await import("node:child_process");
+): void {
   const cwd = adapter.projectRoot;
 
   try {
+    runTrustedGitSync(["check-ref-format", "--branch", branchName], cwd);
     // Check current branch
-    const currentBranch = execSync("git rev-parse --abbrev-ref HEAD", {
-      cwd,
-      encoding: "utf-8",
-    }).trim();
+    const currentBranch = runTrustedGitSync(["branch", "--show-current"], cwd).trim();
 
     if (currentBranch !== branchName) {
       // Check if the branch exists
+      let branchExists = false;
       try {
-        execSync(`git rev-parse --verify ${branchName}`, {
-          cwd,
-          encoding: "utf-8",
-          stdio: ["pipe", "pipe", "pipe"],
-        });
-        // Branch exists — checkout to it
-        execSync(`git checkout ${branchName}`, { cwd, encoding: "utf-8" });
+        runTrustedGitSync(["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], cwd);
+        branchExists = true;
       } catch {
-        // Branch doesn't exist yet — create it (first subtask in chain)
-        execSync(`git checkout -b ${branchName}`, { cwd, encoding: "utf-8" });
+        branchExists = false;
       }
+      if (branchExists) {
+        runTrustedGitSync(["checkout", branchName], cwd);
+      } else {
+        runTrustedGitSync(["checkout", "-b", branchName], cwd);
+      }
+    }
+
+    const selectedBranch = runTrustedGitSync(["branch", "--show-current"], cwd).trim();
+    if (selectedBranch !== branchName) {
+      throw new Error(`selected branch is ${selectedBranch || "detached HEAD"}`);
     }
 
     events.emit("branch_created", {
@@ -4745,7 +5223,37 @@ async function ensureSharedBranchCheckout(
       error: `Failed to checkout shared branch ${branchName}: ${msg}`,
       failedStage: "shared_branch_checkout",
     });
-    // Non-fatal — proceed with current branch state
+    throw new Error(`Failed to checkout shared branch ${branchName}: ${msg}`);
+  }
+}
+
+/** Restore and prove the checkpoint branch before any init or worker command. */
+function ensureExistingBranchCheckout(
+  branchName: string,
+  adapter: ProjectAdapter,
+  events: IEventWriter,
+  reason: string,
+): void {
+  const cwd = adapter.projectRoot;
+  try {
+    runTrustedGitSync(["check-ref-format", "--branch", branchName], cwd);
+    runTrustedGitSync(["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], cwd);
+    const currentBranch = runTrustedGitSync(["branch", "--show-current"], cwd).trim();
+    if (currentBranch !== branchName) {
+      runTrustedGitSync(["checkout", branchName], cwd);
+    }
+    const selectedBranch = runTrustedGitSync(["branch", "--show-current"], cwd).trim();
+    if (selectedBranch !== branchName) {
+      throw new Error(`selected branch is ${selectedBranch || "detached HEAD"}`);
+    }
+    events.emit("branch_resumed", { branchName, reason });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    events.emit("session_error", {
+      error: `Failed to restore checkpoint branch ${branchName}: ${message}`,
+      failedStage: "branch_resume",
+    });
+    throw new Error(`Failed to restore checkpoint branch ${branchName}: ${message}`);
   }
 }
 

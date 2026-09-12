@@ -3,7 +3,7 @@
 // This gate must pass for every child draft before finalize is allowed.
 
 import { parseTaskFile, TaskParseError } from "../core/task-parser.js";
-import type { QualityGateResult } from "./decompose-types.js";
+import type { QualityGateResult, SubtaskDefinition } from "./decompose-types.js";
 
 /** Minimum prep score for a child draft to be considered ready */
 export const PREP_THRESHOLD = 4.0;
@@ -67,20 +67,30 @@ export function runChildQualityGate(subtaskId: string, markdown: string): Qualit
   }
 
   try {
-    parseTaskFile(markdown);
+    const parsed = parseTaskFile(markdown);
+    if (parsed.id !== subtaskId) {
+      parseError = `Draft declares ${parsed.id}; expected ${subtaskId}`;
+      deficiencies.push(`Parse failure: ${parseError}`);
+    }
   } catch (err) {
     parseError = err instanceof TaskParseError ? err.message : String(err);
     deficiencies.push(`Parse failure: ${parseError}`);
     // Continue checking sections even if parse fails partially
   }
 
-  // Step 2: check required H2 sections
+  // Step 2: require exact H2 headings and meaningful section bodies. A
+  // heading prefix (for example, "## Current State Notes") is not the
+  // required section, and an empty/TBD body does not establish readiness.
   for (const section of REQUIRED_SECTIONS) {
-    const hasSection = new RegExp(`^## ${section}`, "im").test(markdown);
-    if (hasSection) {
-      sectionsPresent.push(section);
-    } else {
+    const sectionBody = extractSection(markdown, section);
+    if (sectionBody === undefined) {
       deficiencies.push(`Missing required section: ## ${section}`);
+      continue;
+    }
+    sectionsPresent.push(section);
+    const contentDeficiency = validateRequiredSectionBody(section, sectionBody);
+    if (contentDeficiency) {
+      deficiencies.push(contentDeficiency);
     }
   }
 
@@ -124,7 +134,10 @@ export function runChildQualityGate(subtaskId: string, markdown: string): Qualit
   const rawScore =
     sectionScore + 2.0 - stubPenalty - testingPenalty - parsePenalty - problemPenalty;
   const prepScore = Math.max(0, Math.min(5, rawScore));
-  const prepReady = prepScore >= PREP_THRESHOLD && !parseError;
+  // A numeric score is diagnostic, not authorization. Any deterministic
+  // deficiency (missing section, generic stub, weak scenarios, etc.) blocks
+  // finalization even when the weighted score remains above the threshold.
+  const prepReady = prepScore >= PREP_THRESHOLD && !parseError && deficiencies.length === 0;
 
   return {
     subtaskId,
@@ -137,10 +150,223 @@ export function runChildQualityGate(subtaskId: string, markdown: string): Qualit
 }
 
 /**
+ * Verify that a well-formed child draft still describes the topology node it
+ * was materialized for. Section completeness alone cannot catch a provider
+ * swapping file ownership, omitting criteria, or changing dependencies.
+ */
+export function validateChildDraftScope(subtask: SubtaskDefinition, markdown: string): string[] {
+  let parsed;
+  try {
+    parsed = parseTaskFile(markdown);
+  } catch (err) {
+    return [`Draft scope could not be parsed: ${err instanceof Error ? err.message : String(err)}`];
+  }
+
+  const deficiencies: string[] = [];
+  if (parsed.id !== subtask.id) {
+    deficiencies.push(`Draft declares ${parsed.id}; expected ${subtask.id}`);
+  }
+  if (parsed.title !== subtask.title) {
+    deficiencies.push(`Draft title mismatch: expected ${subtask.title}, got ${parsed.title}`);
+  }
+  if (parsed.status !== "READY") {
+    deficiencies.push(`Draft status must be READY; got ${parsed.status}`);
+  }
+
+  const expectedFiles = new Map(subtask.filesToModify.map((file) => [file.path, file.action]));
+  const actualFiles = new Map(parsed.filesToModify.map((file) => [file.path, file.action]));
+  const expectedPathCounts = countValues(subtask.filesToModify.map((file) => file.path));
+  const actualPathCounts = countValues(parsed.filesToModify.map((file) => file.path));
+  const duplicateExpectedPaths = [...expectedPathCounts]
+    .filter(([, count]) => count > 1)
+    .map(([filePath]) => filePath);
+  const duplicateActualPaths = [...actualPathCounts]
+    .filter(([, count]) => count > 1)
+    .map(([filePath]) => filePath);
+  if (duplicateExpectedPaths.length > 0) {
+    deficiencies.push(
+      `Topology contains duplicate owned file paths: ${duplicateExpectedPaths.join(", ")}`,
+    );
+  }
+  if (duplicateActualPaths.length > 0) {
+    deficiencies.push(`Duplicate owned file rows: ${duplicateActualPaths.join(", ")}`);
+  }
+  const missingFiles = [...expectedFiles.keys()].filter((filePath) => !actualFiles.has(filePath));
+  const unexpectedFiles = [...actualFiles.keys()].filter(
+    (filePath) => !expectedFiles.has(filePath),
+  );
+  if (missingFiles.length > 0) {
+    deficiencies.push(`Missing owned files: ${missingFiles.join(", ")}`);
+  }
+  if (unexpectedFiles.length > 0) {
+    deficiencies.push(`Unexpected owned files: ${unexpectedFiles.join(", ")}`);
+  }
+  for (const file of parsed.filesToModify) {
+    const expectedAction = expectedFiles.get(file.path);
+    if (expectedAction && file.action !== expectedAction) {
+      deficiencies.push(
+        `Action mismatch for ${file.path}: expected ${expectedAction}, got ${file.action}`,
+      );
+    }
+  }
+
+  const expectedFileRows = countValues(
+    subtask.filesToModify.map((file) => `${file.path}\u0000${file.action}`),
+  );
+  const actualFileRows = countValues(
+    parsed.filesToModify.map((file) => `${file.path}\u0000${file.action}`),
+  );
+  const missingFileRows = expandCountDifference(expectedFileRows, actualFileRows);
+  const unexpectedFileRows = expandCountDifference(actualFileRows, expectedFileRows);
+  if (missingFileRows.length > 0) {
+    deficiencies.push(
+      `Missing exact file rows: ${missingFileRows.map(describeFileRow).join(", ")}`,
+    );
+  }
+  if (unexpectedFileRows.length > 0) {
+    deficiencies.push(
+      `Unexpected exact file rows: ${unexpectedFileRows.map(describeFileRow).join(", ")}`,
+    );
+  }
+
+  const expectedCriterionCounts = countValues(subtask.successCriteria);
+  const actualCriterionCounts = countValues(parsed.successCriteria);
+  const missingCriteria = expandCountDifference(expectedCriterionCounts, actualCriterionCounts);
+  const unexpectedCriteria = expandCountDifference(actualCriterionCounts, expectedCriterionCounts);
+  if (missingCriteria.length > 0) {
+    deficiencies.push(`Missing assigned criteria: ${missingCriteria.join("; ")}`);
+  }
+  if (unexpectedCriteria.length > 0) {
+    deficiencies.push(`Unexpected assigned criteria: ${unexpectedCriteria.join("; ")}`);
+  }
+
+  const expectedDependencies = [...subtask.dependsOn].sort();
+  const actualDependencies = [...parsed.blockedBy].sort();
+  const duplicateExpectedDependencies = repeatedValues(expectedDependencies);
+  const duplicateActualDependencies = repeatedValues(actualDependencies);
+  if (duplicateExpectedDependencies.length > 0) {
+    deficiencies.push(
+      `Topology contains duplicate dependencies: ${duplicateExpectedDependencies.join(", ")}`,
+    );
+  }
+  if (duplicateActualDependencies.length > 0) {
+    deficiencies.push(`Duplicate Blocked By entries: ${duplicateActualDependencies.join(", ")}`);
+  }
+  if (
+    expectedDependencies.length !== actualDependencies.length ||
+    expectedDependencies.some((dependency, index) => dependency !== actualDependencies[index])
+  ) {
+    deficiencies.push(
+      `Blocked By mismatch: expected [${expectedDependencies.join(", ")}], got [${actualDependencies.join(", ")}]`,
+    );
+  }
+
+  return deficiencies;
+}
+
+function repeatedValues(values: readonly string[]): string[] {
+  return [...countValues(values)].filter(([, count]) => count > 1).map(([value]) => value);
+}
+
+function describeFileRow(row: string): string {
+  const [filePath, action] = row.split("\u0000");
+  return `${filePath} (${action})`;
+}
+
+function isPlaceholderText(value: string): boolean {
+  const normalized = value
+    .replace(/^[-*]\s+/, "")
+    .replace(/^\[[ xX]\]\s*/, "")
+    .replace(/[`_*|#]/g, "")
+    .trim();
+  return /^(?:tbd|todo|n\/?a|none|placeholder|to be determined|not applicable)(?:\b.*)?[.!]?$/i.test(
+    normalized,
+  );
+}
+
+function listEntries(sectionBody: string, checkbox: boolean): string[] {
+  const pattern = checkbox ? /^\s*-\s*\[[ xX]\]\s+(.+)$/ : /^\s*-\s+(.+)$/;
+  return sectionBody
+    .split(/\r?\n/)
+    .map((line) => pattern.exec(line)?.[1]?.trim())
+    .filter((entry): entry is string => Boolean(entry));
+}
+
+function validateRequiredSectionBody(section: string, sectionBody: string): string | null {
+  if (sectionBody.trim().length === 0) {
+    return `Required section ## ${section} is empty`;
+  }
+
+  if (section === "Files to Modify") {
+    const dataRows = sectionBody.split(/\r?\n/).filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("|") || /^\|[\s:-]+\|/.test(trimmed)) return false;
+      const cells = trimmed
+        .split("|")
+        .map((cell) => cell.trim())
+        .filter(Boolean);
+      return (
+        cells.length >= 2 &&
+        cells[0].toLowerCase() !== "file" &&
+        !isPlaceholderText(cells[0]) &&
+        !isPlaceholderText(cells[1])
+      );
+    });
+    return dataRows.length > 0
+      ? null
+      : "Required section ## Files to Modify has no substantive file rows";
+  }
+
+  if (section === "Success Criteria" || section === "Testing Requirements") {
+    const entries = listEntries(sectionBody, true);
+    return entries.length > 0 && entries.every((entry) => !isPlaceholderText(entry))
+      ? null
+      : `Required section ## ${section} has no substantive checklist entries`;
+  }
+
+  if (section === "Anti-Patterns" || section === "Context References") {
+    const entries = listEntries(sectionBody, false);
+    return entries.length > 0 && entries.every((entry) => !isPlaceholderText(entry))
+      ? null
+      : `Required section ## ${section} has no substantive list entries`;
+  }
+
+  if (isPlaceholderText(sectionBody)) {
+    return `Required section ## ${section} contains placeholder content`;
+  }
+  const wordCount = sectionBody.trim().split(/\s+/).filter(Boolean).length;
+  const minimumWords = section === "Problem Statement" ? 15 : section === "Current State" ? 3 : 5;
+  return wordCount >= minimumWords
+    ? null
+    : `Required section ## ${section} is too short (${wordCount}/${minimumWords} words)`;
+}
+
+function countValues(values: readonly string[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const value of values) counts.set(value, (counts.get(value) ?? 0) + 1);
+  return counts;
+}
+
+function expandCountDifference(
+  actual: ReadonlyMap<string, number>,
+  expected: ReadonlyMap<string, number>,
+): string[] {
+  const difference: string[] = [];
+  for (const [value, count] of actual) {
+    const extra = count - (expected.get(value) ?? 0);
+    for (let index = 0; index < extra; index += 1) difference.push(value);
+  }
+  return difference;
+}
+
+/**
  * Extract the text content of a specific H2 section from markdown.
  */
 function extractSection(markdown: string, sectionName: string): string | undefined {
-  const regex = new RegExp(`^## ${sectionName}\\s*\\n([\\s\\S]*?)(?=^## |$)`, "im");
-  const match = markdown.match(regex);
-  return match?.[1]?.trim();
+  const heading = new RegExp(`^## ${sectionName}\\s*$`, "im").exec(markdown);
+  if (!heading) return undefined;
+  const sectionStart = heading.index + heading[0].length;
+  const remainder = markdown.slice(sectionStart).replace(/^\r?\n/, "");
+  const nextHeading = /^## /m.exec(remainder);
+  return (nextHeading ? remainder.slice(0, nextHeading.index) : remainder).trim();
 }

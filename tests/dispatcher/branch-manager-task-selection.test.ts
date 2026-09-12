@@ -14,6 +14,52 @@ import * as path from "node:path";
 import type { ProjectAdapter } from "../../src/core/adapter-loader";
 import { updateTaskFileStatus } from "../../src/dispatcher/branch-manager";
 
+// This integration fixture deliberately uses a filesystem bare repository so
+// it can inspect the exact commit published by updateTaskFileStatus. Production
+// trusted Git correctly refuses local push/send-pack transports. Keep that
+// policy intact and replace only this suite's exact status-publication push
+// with the real Git executable against the test-owned temporary repository.
+jest.mock("../../src/worker/trusted-executable", () => {
+  const actual = jest.requireActual<typeof import("../../src/worker/trusted-executable")>(
+    "../../src/worker/trusted-executable",
+  );
+  const { execFileSync: execFileSyncActual } =
+    jest.requireActual<typeof import("node:child_process")>("node:child_process");
+
+  return {
+    ...actual,
+    resolveTrustedGitHubRepository: () =>
+      Promise.resolve({ host: "github.com", owner: "org", repo: "repo" }),
+    runTrustedGitResult: (
+      projectRoot: string,
+      args: readonly string[],
+      options: Parameters<typeof actual.runTrustedGitResult>[2],
+    ) => {
+      const isFixtureStatusPush =
+        args.length === 3 &&
+        args[0] === "push" &&
+        args[1] === "origin" &&
+        args[2]?.endsWith(":refs/heads/dev");
+      if (!isFixtureStatusPush) {
+        return actual.runTrustedGitResult(projectRoot, args, options);
+      }
+
+      const executable = actual.resolveTrustedExecutable(
+        "git",
+        projectRoot,
+        "task-selection fixture Git",
+      );
+      const stdout = execFileSyncActual(executable, ["-C", projectRoot, ...args], {
+        cwd: path.dirname(executable),
+        encoding: "utf8",
+        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      return Promise.resolve({ exitCode: 0, stdout, stderr: "" });
+    },
+  };
+});
+
 jest.setTimeout(120000);
 
 const originalGitTerminalPrompt = process.env.GIT_TERMINAL_PROMPT;
@@ -119,6 +165,7 @@ describe.each([["child-first"], ["parent-first"]])(
         config: {
           project: { taskDir: "docs/tasks" },
         },
+        trustedLocalReadRemotePaths: [originRoot],
       } as ProjectAdapter;
     });
 
@@ -140,7 +187,11 @@ describe.each([["child-first"], ["parent-first"]])(
     });
 
     it("commits and pushes COMPLETE only for the parent", async () => {
-      const result = await updateTaskFileStatus("TASK-100", adapter, "dev");
+      const result = await updateTaskFileStatus("TASK-100", adapter, "dev", {
+        host: "github.com",
+        owner: "org",
+        repo: "repo",
+      });
       expect(result).toEqual({ success: true });
 
       git(verificationRoot, ["fetch", "origin", "dev"]);

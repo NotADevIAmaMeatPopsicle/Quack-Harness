@@ -108,7 +108,7 @@ describe("buildSystemPrompt", () => {
   it("should include runtime path authority after project docs", () => {
     const adapter = makeAdapter({ projectRoot: "C:\\repo\\.quack\\worktrees\\TASK-123" });
     const result = buildSystemPrompt(adapter, [
-      "--- CLAUDE.md ---\nMigration note: use /srv/example-service on Headnode.",
+      "--- CLAUDE.md ---\nMigration note: use /root/example-service on Headnode.",
     ]);
 
     const docsPos = result.indexOf("Project Documentation (CLAUDE.md)");

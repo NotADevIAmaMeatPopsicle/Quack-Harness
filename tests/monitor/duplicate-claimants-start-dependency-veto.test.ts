@@ -36,10 +36,6 @@ function makeJob(taskId: string): DispatchJob {
   };
 }
 
-function testPort(): number {
-  return 0;
-}
-
 function seedStatuses(root: string, entries: Array<[string, string]>): void {
   const db = new QuackDB(path.join(root, ".quack", "quack.db"));
   try {
@@ -61,7 +57,8 @@ async function startTask(root: string): Promise<{
     .mockImplementation((taskId) => makeJob(taskId));
   const adapterPath = writeAdapter(root);
   const monitor = createMonitorServer({
-    port: testPort(),
+    port: 0,
+    host: "127.0.0.1",
     projectRoot: root,
     taskDir: "docs/tasks",
     adapterPath,

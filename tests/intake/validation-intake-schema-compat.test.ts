@@ -68,7 +68,7 @@ function basePayload(): Record<string, unknown> {
       "Auth refactor is NOT touched by this branch",
     ],
     knownRisks: ["Bedrock client cache not invalidated on this path"],
-    submitter: "contributor@example.test",
+    submitter: "contributor@example.invalid",
     submittedAt: "2026-05-31T13:54:00-04:00",
   };
 }
@@ -176,7 +176,7 @@ const FIXTURES: FixtureCase[] = [
     payload: withOverride({
       screenshots: [
         {
-          file: "https://uploads.example.test/handoffs/2026-05-31/client-detail.png",
+          file: "https://uploads.example.invalid/handoffs/2026-05-31/client-detail.png",
           caption: "Hosted screenshot via CDN",
         },
       ],
@@ -380,7 +380,7 @@ describe("validation-intake schema-compat (Zod <-> example JSON Schema)", () => 
     // simultaneously editing the example repo. See the file header comment.
     const raw = fs.readFileSync(SCHEMA_FIXTURE_PATH, "utf8");
     const schema = JSON.parse(raw) as Record<string, unknown>;
-    expect(schema.$id).toBe("https://example.test/schemas/validation-intake/v1.json");
+    expect(schema.$id).toBe("https://example.invalid/schemas/validation-intake/v1.json");
     expect(schema.title).toBe("Quack Validation Intake Payload (schemaVersion:1)");
     expect(schema.additionalProperties).toBe(false);
     expect(Array.isArray(schema.required)).toBe(true);

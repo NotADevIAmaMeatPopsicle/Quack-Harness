@@ -7,6 +7,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execFileSync } from "node:child_process";
 
 import type { ProjectAdapter } from "../../src/core/adapter-loader";
 import * as taskFileResolver from "../../src/core/task-file-resolver";
@@ -69,6 +70,20 @@ function writeExistingBacklog(taskDir: string, marker = false): string {
   return filePath;
 }
 
+function initializeRepository(root: string): void {
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "quack-tests@example.invalid"], {
+    cwd: root,
+    stdio: "ignore",
+  });
+  execFileSync("git", ["config", "user.name", "Quack Tests"], {
+    cwd: root,
+    stdio: "ignore",
+  });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["commit", "-m", "fixture"], { cwd: root, stdio: "ignore" });
+}
+
 describe.each(DUPLICATE_FIXTURE_CASES)(
   "judge follow-up duplicate claimant veto (%s, %s)",
   (kind, order) => {
@@ -113,6 +128,7 @@ describe.each(DUPLICATE_FIXTURE_CASES)(
 it("single claimant passes through both append and create arms", async () => {
   const fixture = createSingleClaimantFixture("quack-follow-up-single-");
   const existingPath = writeExistingBacklog(fixture.taskDir);
+  initializeRepository(fixture.root);
   const parent = parseTaskFile(
     fs.readFileSync(fixture.claimantPaths[0], "utf-8"),
     fixture.claimantPaths[0],
@@ -132,6 +148,55 @@ it("single claimant passes through both append and create arms", async () => {
     );
     expect(fs.existsSync(created[0])).toBe(true);
   } finally {
+    removeFixture(fixture.root);
+  }
+});
+
+it("rechecks the parent claimant inside the child-creation reservation", async () => {
+  const fixture = createSingleClaimantFixture("quack-follow-up-race-");
+  initializeRepository(fixture.root);
+  const parent = parseTaskFile(
+    fs.readFileSync(fixture.claimantPaths[0], "utf-8"),
+    fixture.claimantPaths[0],
+  );
+  const duplicatePath = path.join(fixture.taskDir, "TASK-999-racing-parent.md");
+  const events: Array<{ stage: string; payload: unknown }> = [];
+  const listClaimants = taskFileResolver.listDuplicateClaimants;
+  const querySpy = jest
+    .spyOn(taskFileResolver, "listDuplicateClaimants")
+    .mockImplementation(async (...args) => {
+      const claimants = await listClaimants(...args);
+      fs.writeFileSync(
+        duplicatePath,
+        taskSpec("TASK-100", { title: "Racing duplicate parent" }),
+        "utf-8",
+      );
+      return claimants;
+    });
+
+  try {
+    const created = await createFollowUpTasks(
+      "TASK-100",
+      parent,
+      adapter(fixture.root),
+      [items()[1]],
+      writer(events),
+    );
+
+    expect(created).toEqual([]);
+    expect(
+      fs.readdirSync(fixture.taskDir).filter((name) => /^TASK-\d{4}-unique-follow-up/.test(name)),
+    ).toEqual([]);
+    expect(events).toContainEqual({
+      stage: "follow_up_tasks_refused",
+      payload: {
+        parentTaskId: "TASK-100",
+        errorType: "duplicate_claimants",
+        claimants: [path.basename(fixture.claimantPaths[0]), path.basename(duplicatePath)].sort(),
+      },
+    });
+  } finally {
+    querySpy.mockRestore();
     removeFixture(fixture.root);
   }
 });
@@ -204,6 +269,7 @@ it("all idempotent appends on a contested parent perform zero claimant queries",
 it("a single-claimant batch reaching append and create mutation intents queries exactly once", async () => {
   const fixture = createSingleClaimantFixture("quack-follow-up-memo-");
   const existingPath = writeExistingBacklog(fixture.taskDir);
+  initializeRepository(fixture.root);
   const parent = parseTaskFile(
     fs.readFileSync(fixture.claimantPaths[0], "utf-8"),
     fixture.claimantPaths[0],

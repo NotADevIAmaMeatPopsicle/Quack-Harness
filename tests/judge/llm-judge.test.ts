@@ -533,8 +533,41 @@ describe("buildJudgePrompt", () => {
     const prompt = buildJudgePrompt(input);
 
     expect(prompt).toContain("SOME FAILED");
-    expect(prompt).toContain("FAIL");
+    expect(prompt).toContain("FAIL (REQUIRED; BLOCKING)");
     expect(prompt).toContain("3 tests failed");
+  });
+
+  test("labels skipped and unavailable optional checks as non-blocking", () => {
+    const input = makePromptInput({
+      verificationResults: makeVerificationResult({
+        allPassed: true,
+        commands: [
+          {
+            name: "browser-smoke",
+            passed: false,
+            required: false,
+            status: "optional-unavailable",
+            output: "TASK-006 browser harness is not integrated",
+          },
+          {
+            name: "visual-sweep",
+            passed: false,
+            required: false,
+            status: "skipped",
+            output: "Optional verifier execution was disabled",
+          },
+        ],
+      }),
+    });
+
+    const prompt = buildJudgePrompt(input);
+
+    expect(prompt).toContain("Overall: ALL PASSED");
+    expect(prompt).toContain("**browser-smoke**: OPTIONAL UNAVAILABLE (NON-BLOCKING)");
+    expect(prompt).toContain("**visual-sweep**: SKIPPED (OPTIONAL; NON-BLOCKING)");
+    expect(prompt).not.toContain("**browser-smoke**: FAIL");
+    expect(prompt).not.toContain("**visual-sweep**: FAIL");
+    expect(JUDGE_SYSTEM_PROMPT).toContain("MUST NOT be the sole basis\n  for REVISE or REJECT");
   });
 
   test("should include universal evaluation criteria in system prompt", () => {
@@ -754,6 +787,49 @@ describe("runJudge", () => {
       expect(result.criteriaEvaluation).toHaveLength(2);
       expect(result.criteriaEvaluation![0].status).toBe("PASS");
       expect(result.criteriaEvaluation![0].enforcement_type).toBe("deterministic_code");
+    });
+
+    test("reconciles a legacy optional failure from a resumed checkpoint against adapter config", async () => {
+      const responseJson = {
+        verdict: "APPROVE",
+        confidence: 0.9,
+        scope_violations: [],
+        criteria_gaps: [],
+        quality_issues: [],
+        feedback: "Required checks and task criteria pass.",
+      };
+      const { fn, calls } = createMockQueryFn(responseJson);
+      _setQueryFn(fn);
+      const adapter = makeAdapter();
+      adapter.config.verification.commands.push({
+        name: "browser-smoke",
+        command: "npm run test:browser",
+        required: false,
+        timeout: 300,
+      });
+
+      const result = await runJudge(
+        makeJudgeInput({
+          verificationResults: {
+            allPassed: true,
+            commands: [
+              {
+                name: "browser-smoke",
+                passed: false,
+                output: "TASK-006 browser harness is not integrated",
+              },
+            ],
+            conventionChecks: [],
+          },
+        }),
+        adapter,
+      );
+
+      expect(result.verdict).toBe("APPROVE");
+      expect(calls).toHaveLength(1);
+      const promptSent = calls[0]?.prompt ?? "";
+      expect(promptSent).toContain("**browser-smoke**: OPTIONAL UNAVAILABLE (NON-BLOCKING)");
+      expect(promptSent).not.toContain("**browser-smoke**: FAIL");
     });
   });
 

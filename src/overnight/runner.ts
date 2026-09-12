@@ -22,6 +22,7 @@ import {
 } from "../core/task-hygiene.js";
 import { parseTaskFile, TaskParseError } from "../core/task-parser.js";
 import { resolveTaskFile } from "../core/task-file-resolver.js";
+import { declaredTaskIdFromSpec } from "../core/task-spec-declaration.js";
 import { validateTaskSchema } from "../gate/schema-validator.js";
 import { evaluateTaskDepth } from "../gate/depth-evaluator.js";
 import { runPreflight, type PreflightStageReporter } from "../preflight/preflight-runner.js";
@@ -50,7 +51,6 @@ import type {
 } from "./types.js";
 
 const execFileAsync = promisify(execFile);
-const TASK_ID_RE = /\bTASK-\d+(?:-[A-Z])?\b/;
 const RUNNER_SCHEMA_VERSION = 1;
 
 // ─── TASK-1318 S2: doneness, per site, over resolved status ─────────
@@ -135,7 +135,7 @@ interface CommandResult {
 interface TaskParseInventory {
   tasksById: Map<string, ParsedTask>;
   taskFilesById: Map<string, string>;
-  parseErrors: Array<{ file: string; error: string }>;
+  parseErrors: Array<{ file: string; error: string; declaredId?: string }>;
   hygieneByTaskId: Map<string, TaskBacklogHygiene>;
 }
 
@@ -736,12 +736,13 @@ async function buildInventory(
       taskDir,
       source.sourceBranch,
       source.targetBranch,
+      logger,
     )) {
       if (!ids.has(item.taskId)) ids.set(item.taskId, item);
     }
   }
 
-  if (ids.size === 0) {
+  if (ids.size === 0 && source.taskIds.length === 0 && !source.sourceBranch) {
     // Round-3 F3: AUTOMATIC discovery, the path taken when no task ids
     // were named and no source branch was given. It gated on the raw
     // spec `Status:` line and on spec-only hygiene, BEFORE anything
@@ -774,26 +775,34 @@ async function buildInventory(
   }
 
   const verifiedTaskIds = await loadVerifiedTaskIds(projectRoot);
-  const items = [...ids.values()].map((item) => {
-    const currentTask = current.tasksById.get(item.taskId);
-    const taskFile = current.taskFilesById.get(item.taskId);
-    const parseError = current.parseErrors.find((err) => err.file.startsWith(item.taskId))?.error;
-    return {
-      ...item,
-      task: currentTask ?? item.task,
-      taskFile: taskFile ?? item.taskFile,
-      parseError,
-      verified: verifiedTaskIds.has(item.taskId),
-      dependenciesSatisfied: currentTask
-        ? areParsedDependenciesSatisfied(
-            currentTask.blockedBy,
-            current.tasksById,
-            verifiedTaskIds,
-            overlayLoad.overlay,
-          )
-        : item.dependenciesSatisfied,
-    };
-  });
+  const items = await Promise.all(
+    [...ids.values()].map(async (item) => {
+      const currentTask = current.tasksById.get(item.taskId);
+      const taskFile = current.taskFilesById.get(item.taskId);
+      const resolved = currentTask
+        ? undefined
+        : await resolveTaskFile(path.resolve(projectRoot, taskDir), item.taskId);
+      const parseError = current.parseErrors.find((error) => {
+        if (error.declaredId) return error.declaredId === item.taskId;
+        return resolved?.filePath === path.resolve(projectRoot, taskDir, error.file);
+      })?.error;
+      return {
+        ...item,
+        task: currentTask ?? item.task,
+        taskFile: taskFile ?? item.taskFile,
+        parseError,
+        verified: verifiedTaskIds.has(item.taskId),
+        dependenciesSatisfied: currentTask
+          ? areParsedDependenciesSatisfied(
+              currentTask.blockedBy,
+              current.tasksById,
+              verifiedTaskIds,
+              overlayLoad.overlay,
+            )
+          : item.dependenciesSatisfied,
+      };
+    }),
+  );
   return {
     items,
     overlay: overlayLoad.overlay,
@@ -808,26 +817,38 @@ async function taskIdsFromBranchDiff(
   taskDir: string,
   sourceBranch: string,
   targetBranch: string,
+  logger: (message: string) => void,
 ): Promise<OvernightInventoryItem[]> {
   const taskDirForGit = taskDir.replace(/\\/g, "/").replace(/\/+$/, "");
+  // Read each blob from the same commit that supplied the diff inventory.
+  const sourceRef = (
+    await runGit(projectRoot, ["rev-parse", "--verify", `${sourceBranch}^{commit}`])
+  ).stdout.trim();
+  const targetRef = (
+    await runGit(projectRoot, ["rev-parse", "--verify", `${targetBranch}^{commit}`])
+  ).stdout.trim();
   const result = await runGit(projectRoot, [
     "diff",
+    "--no-renames",
     "--name-only",
-    `${targetBranch}...${sourceBranch}`,
+    "-z",
+    `${targetRef}...${sourceRef}`,
     "--",
     `${taskDirForGit}/TASK-*.md`,
   ]);
-  return result.stdout
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .reduce<OvernightInventoryItem[]>((items, sourcePath) => {
-      const match = path.basename(sourcePath).match(TASK_ID_RE);
-      if (match) {
-        items.push({ taskId: match[0], sourcePath });
-      }
-      return items;
-    }, []);
+  const items: OvernightInventoryItem[] = [];
+  for (const sourcePath of result.stdout.split("\0").filter(Boolean)) {
+    try {
+      const blob = await runGit(projectRoot, ["show", `${sourceRef}:${sourcePath}`]);
+      const task = parseTaskFile(blob.stdout, `${sourceRef}:${sourcePath}`);
+      items.push({ taskId: task.id, sourcePath });
+    } catch (error) {
+      logger(
+        `[overnight] branch inventory skipped ${sourcePath} (unreadable_or_unparseable_source_blob): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  return items;
 }
 
 /**
@@ -853,7 +874,7 @@ async function parseAllCurrentTasks(
   const absoluteTaskDir = path.resolve(projectRoot, taskDir);
   const tasksById = new Map<string, ParsedTask>();
   const taskFilesById = new Map<string, string>();
-  const parseErrors: Array<{ file: string; error: string }> = [];
+  const parseErrors: Array<{ file: string; error: string; declaredId?: string }> = [];
   const taskSources: Array<{ file: string; task: ParsedTask }> = [];
   let entries: string[] = [];
   try {
@@ -870,8 +891,9 @@ async function parseAllCurrentTasks(
   const taskFiles = entries.filter((entry) => /^TASK-\d+.*\.md$/.test(entry)).sort();
   for (const file of taskFiles) {
     const filePath = path.join(absoluteTaskDir, file);
+    let content: string | undefined;
     try {
-      const content = await fs.readFile(filePath, "utf-8");
+      content = await fs.readFile(filePath, "utf-8");
       const task = parseTaskFile(content, filePath);
       tasksById.set(task.id, task);
       taskFilesById.set(task.id, filePath);
@@ -880,6 +902,7 @@ async function parseAllCurrentTasks(
       parseErrors.push({
         file,
         error: err instanceof TaskParseError ? err.message : String(err),
+        declaredId: content === undefined ? undefined : declaredTaskIdFromSpec(content),
       });
     }
   }
@@ -1212,7 +1235,13 @@ async function runPrepEvaluation(
     return result;
   }
 
-  const depth = await evaluateTaskDepth(parsed, conventionsDoc);
+  const depthEvaluator = adapter.config.evaluationProviders?.readinessDepth;
+  const depth = await evaluateTaskDepth(parsed, conventionsDoc, {
+    model: depthEvaluator?.model,
+    evaluator: depthEvaluator,
+    projectRoot: adapter.projectRoot,
+    apiKeys: adapter.config.agent.apiKeys,
+  });
   let recommendDecomposition = false;
   let decompositionReason: string | undefined;
 

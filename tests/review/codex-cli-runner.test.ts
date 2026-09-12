@@ -14,8 +14,11 @@ import {
 } from "../../src/review/codex-cli-runner";
 import { ReviewerRunnerConfigSchema } from "../../src/review/reviewer-config";
 import type { ReviewRequest } from "../../src/review/reviewer-types";
+import { codexShellEnvironmentPolicyArgs } from "../../src/llm/codex-process-security";
 
 const CODEX_CONFIG = ReviewerRunnerConfigSchema.parse({ runner: "codex-cli" });
+const ORIGINAL_QUACK_SENTINEL = process.env.QUACK_SENTINEL_SECRET;
+const ORIGINAL_OPENAI_CREDENTIAL = process.env.OPENAI_API_KEY;
 
 class FakeChild extends EventEmitter {
   stdout = new EventEmitter();
@@ -93,6 +96,16 @@ beforeEach(() => {
 afterEach(() => {
   _setSpawnFn(undefined);
   fs.rmSync(tmpRoot, { recursive: true, force: true });
+  if (ORIGINAL_QUACK_SENTINEL === undefined) {
+    delete process.env.QUACK_SENTINEL_SECRET;
+  } else {
+    process.env.QUACK_SENTINEL_SECRET = ORIGINAL_QUACK_SENTINEL;
+  }
+  if (ORIGINAL_OPENAI_CREDENTIAL === undefined) {
+    delete process.env.OPENAI_API_KEY;
+  } else {
+    process.env.OPENAI_API_KEY = ORIGINAL_OPENAI_CREDENTIAL;
+  }
 });
 
 function request(overrides: Partial<ReviewRequest> = {}): ReviewRequest {
@@ -117,6 +130,8 @@ describe("buildCodexArgs", () => {
     expect(args[args.indexOf("--cd") + 1]).toBe("C:/proj");
     expect(args[args.indexOf("--output-last-message") + 1]).toBe("C:/out.txt");
     expect(args[args.length - 1]).toContain("C:/req.md");
+    const shellPolicy = codexShellEnvironmentPolicyArgs();
+    expect(args.slice(3, 3 + shellPolicy.length)).toEqual(shellPolicy);
     // escalation flags are unrepresentable in our argv
     expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
     expect(args).not.toContain("--full-auto");
@@ -131,10 +146,30 @@ describe("buildCodexArgs", () => {
     const args = buildCodexArgs(withModel, "r.md", "p");
     expect(args[args.indexOf("-m") + 1]).toBe("gpt-5.3-codex-spark");
   });
+
+  it("passes a configured profile as a fixed -p pair", () => {
+    const withProfile = ReviewerRunnerConfigSchema.parse({
+      runner: "codex-cli",
+      codex: { profile: "openai" },
+    });
+    const args = buildCodexArgs(withProfile, "r.md", "p");
+    expect(args[args.indexOf("-p") + 1]).toBe("openai");
+  });
+
+  it("pins a configured model provider without caller-defined argv", () => {
+    const withProvider = ReviewerRunnerConfigSchema.parse({
+      runner: "codex-cli",
+      codex: { provider: "openai" },
+    });
+    const args = buildCodexArgs(withProvider, "r.md", "p");
+    expect(args[args.indexOf("-c") + 1]).toBe('model_provider="openai"');
+  });
 });
 
 describe("runCodexCliReview", () => {
   it("completes on stdout JSON: exact argv, request file on disk, clean tree", async () => {
+    process.env.QUACK_SENTINEL_SECRET = "must-not-cross-process-boundary";
+    process.env.OPENAI_API_KEY = "selected-provider-credential";
     const { calls } = installFakeSpawn({
       onCodex: (child) => {
         child.stdout.emit("data", VERDICT_JSON);
@@ -166,6 +201,8 @@ describe("runCodexCliReview", () => {
       buildCodexArgs(CODEX_CONFIG, result.requestFile!, tmpRoot, outputFile),
     );
     expect(codexCall!.opts.cwd).toBe(tmpRoot);
+    expect(codexCall!.opts.env?.OPENAI_API_KEY).toBe("selected-provider-credential");
+    expect(codexCall!.opts.env?.QUACK_SENTINEL_SECRET).toBeUndefined();
 
     // JSON round-trip (approval-file persistence contract)
     expect(JSON.parse(JSON.stringify(result))).toEqual(result);

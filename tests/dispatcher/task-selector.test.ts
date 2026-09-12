@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-require-imports */
 import type { TaskPriority, FileModification } from "../../src/core/types";
 import type { TaskSummary } from "../../src/dispatcher/dependency-resolver";
 

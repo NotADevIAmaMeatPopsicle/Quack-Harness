@@ -73,6 +73,8 @@ export function normalizeFederatedPriority(value: number | string | undefined): 
  * deliberately CANNOT override the core identity fields or provenance.
  */
 export function mintFederatedJobRecord(input: {
+  /** Optional only for legacy fixture/import compatibility; production callers pass it. */
+  projectId?: string;
   taskId: string;
   jobType: FederatedJobRecord["jobType"];
   requiredCapabilities: string[];
@@ -84,6 +86,7 @@ export function mintFederatedJobRecord(input: {
   extra?: Omit<
     Partial<FederatedJobRecord>,
     | "jobId"
+    | "projectId"
     | "taskId"
     | "jobType"
     | "status"
@@ -99,6 +102,7 @@ export function mintFederatedJobRecord(input: {
   return {
     decision: {},
     ...(input.extra ?? {}),
+    projectId: input.projectId,
     jobId,
     taskId: input.taskId,
     jobType: input.jobType,
@@ -112,6 +116,8 @@ export function mintFederatedJobRecord(input: {
 }
 
 export function queueFederatedJobRecord(input: {
+  /** Optional only for legacy fixture/import compatibility; production callers pass it. */
+  projectId?: string;
   taskId: string;
   jobType: FederatedJobRecord["jobType"];
   requiredCapabilities: string[];
@@ -140,6 +146,7 @@ export function queueFederatedJobRecord(input: {
 }): FederatedJobRecord {
   const priority = normalizeFederatedPriority(input.priority);
   const record = mintFederatedJobRecord({
+    projectId: input.projectId,
     taskId: input.taskId,
     jobType: input.jobType,
     requiredCapabilities: input.requiredCapabilities,
@@ -148,6 +155,7 @@ export function queueFederatedJobRecord(input: {
     correlationId: input.correlationId,
     extra: {
       parentJobId: input.parentJobId,
+      preferredHostId: input.preferredHostId,
       priority: priority.priority,
       priorityLabel: priority.priorityLabel,
       leaseTtlMs: input.leaseTtlMs,

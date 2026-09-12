@@ -5,6 +5,7 @@ import * as http from "node:http";
 
 import { createMonitorServer } from "../../src/monitor/server";
 import type { TestRunResult } from "../../src/core/types";
+import { loadAdapter } from "../../src/core/adapter-loader";
 
 // Prevent tests from picking up real .quack/auth.json (which has users → auth enabled)
 jest.mock("../../src/monitor/auth", () => ({
@@ -75,7 +76,7 @@ async function waitForRunningState(
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const res = await httpGet(`http://localhost:${port}/api/testing/status`);
+    const res = await httpGet(`http://127.0.0.1:${port}/api/testing/status`);
     const st = JSON.parse(res.body) as { running: boolean };
     if (st.running === running) return;
     await sleep(200);
@@ -93,11 +94,14 @@ interface CommandOverride {
   timeout: number;
 }
 
-function buildAdapterConfig(commands: CommandOverride[]): Record<string, unknown> {
+function buildAdapterConfig(
+  commands: CommandOverride[],
+  projectName = "test-project",
+): Record<string, unknown> {
   return {
     version: "1.0",
     project: {
-      name: "test-project",
+      name: projectName,
       root: ".",
       taskDir: "docs/tasks",
       conventionsDir: "docs/conventions",
@@ -153,7 +157,7 @@ describe("Testing API", () => {
   let projectRoot: string;
   let adapterPath: string;
   let stopServer: (() => Promise<void>) | undefined;
-  const port = 30000 + Math.floor(Math.random() * 10000);
+  let port: number;
 
   beforeAll(async () => {
     logDir = makeTempDir();
@@ -172,12 +176,12 @@ describe("Testing API", () => {
 
     const serverObj = createMonitorServer({
       logDir,
-      port,
+      port: 0,
+      host: "127.0.0.1",
       adapterPath,
       projectRoot,
     });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    ({ port, stop: stopServer } = await serverObj.start());
   });
 
   afterAll(async () => {
@@ -199,7 +203,7 @@ describe("Testing API", () => {
   // ─── GET /api/testing/commands ────────────────────────────
 
   it("returns verification commands from adapter.json", async () => {
-    const { status, body } = await httpGet(`http://localhost:${port}/api/testing/commands`);
+    const { status, body } = await httpGet(`http://127.0.0.1:${port}/api/testing/commands`);
     expect(status).toBe(200);
 
     const commands = JSON.parse(body) as Array<{
@@ -229,7 +233,7 @@ describe("Testing API", () => {
     };
     fs.writeFileSync(adapterPath, JSON.stringify(malformed, null, 2), "utf-8");
 
-    const { status, body } = await httpGet(`http://localhost:${port}/api/testing/commands`);
+    const { status, body } = await httpGet(`http://127.0.0.1:${port}/api/testing/commands`);
     expect(status).toBe(200);
 
     const commands = JSON.parse(body) as unknown[];
@@ -246,7 +250,7 @@ describe("Testing API", () => {
   // ─── POST /api/testing/run ────────────────────────────────
 
   it("starts a command and returns ok", async () => {
-    const { status, body } = await httpPost(`http://localhost:${port}/api/testing/run`, {
+    const { status, body } = await httpPost(`http://127.0.0.1:${port}/api/testing/run`, {
       command: "test",
     });
     expect(status).toBe(200);
@@ -265,7 +269,7 @@ describe("Testing API", () => {
     // Wait for the echo command to finish
     await waitForRunningState(port, false);
 
-    const historyResp = await httpGet(`http://localhost:${port}/api/testing/history`);
+    const historyResp = await httpGet(`http://127.0.0.1:${port}/api/testing/history`);
     const history = JSON.parse(historyResp.body) as TestRunResult[];
     expect(history.at(-1)?.adapterFreshness).toMatchObject({
       status: "fresh",
@@ -274,8 +278,45 @@ describe("Testing API", () => {
     });
   });
 
+  it("routes non-direct verification through the configured sandbox instead of the host", async () => {
+    const sentinel = path.join(projectRoot, "host-execution-sentinel.txt");
+    const maliciousCommand = `node -e "require('node:fs').writeFileSync('${sentinel.replace(/\\/g, "/")}', 'unsafe')"`;
+    const config = buildAdapterConfig([
+      { name: "test", command: maliciousCommand, required: true, timeout: 10000 },
+    ]);
+    const verification = config.verification as Record<string, unknown>;
+    verification.hostExecution = "codex-sandbox";
+    const agent = config.agent as Record<string, unknown>;
+    agent.runner = "codex-cli";
+    agent.codex = {
+      binaryPath: path.join(projectRoot, "missing-codex-executable"),
+      sandbox: "workspace-write",
+    };
+    // An unavailable sandbox executable must fail closed before the command
+    // can touch the monitor host.
+    fs.writeFileSync(adapterPath, JSON.stringify(config, null, 2), "utf-8");
+
+    const { status } = await httpPost(`http://127.0.0.1:${port}/api/testing/run`, {
+      command: "test",
+    });
+    expect(status).toBe(200);
+    await waitForRunningState(port, false);
+
+    expect(fs.existsSync(sentinel)).toBe(false);
+    const historyResp = await httpGet(`http://127.0.0.1:${port}/api/testing/history`);
+    const history = JSON.parse(historyResp.body) as TestRunResult[];
+    expect(history.at(-1)?.command).toBe("verification:test");
+    expect(history.at(-1)?.exitCode).toBe(1);
+
+    fs.writeFileSync(
+      adapterPath,
+      JSON.stringify(buildAdapterConfig(FAST_COMMANDS), null, 2),
+      "utf-8",
+    );
+  });
+
   it("returns 400 when command is missing", async () => {
-    const { status, body } = await httpPost(`http://localhost:${port}/api/testing/run`, {});
+    const { status, body } = await httpPost(`http://127.0.0.1:${port}/api/testing/run`, {});
     expect(status).toBe(400);
 
     const data = JSON.parse(body) as { error: string };
@@ -283,7 +324,7 @@ describe("Testing API", () => {
   });
 
   it("returns 400 for unknown command name", async () => {
-    const { status, body } = await httpPost(`http://localhost:${port}/api/testing/run`, {
+    const { status, body } = await httpPost(`http://127.0.0.1:${port}/api/testing/run`, {
       command: "nonexistent",
     });
     expect(status).toBe(400);
@@ -305,7 +346,7 @@ describe("Testing API", () => {
       "utf-8",
     );
 
-    const { status: startStatus } = await httpPost(`http://localhost:${port}/api/testing/run`, {
+    const { status: startStatus } = await httpPost(`http://127.0.0.1:${port}/api/testing/run`, {
       command: "test",
     });
     expect(startStatus).toBe(200);
@@ -314,7 +355,7 @@ describe("Testing API", () => {
     await waitForRunningState(port, true);
 
     // Try to start another while first is running
-    const { status, body } = await httpPost(`http://localhost:${port}/api/testing/run`, {
+    const { status, body } = await httpPost(`http://127.0.0.1:${port}/api/testing/run`, {
       command: "lint",
     });
     expect(status).toBe(409);
@@ -323,7 +364,7 @@ describe("Testing API", () => {
     expect(data.error).toContain("already running");
 
     // Stop the running command and wait for it to finish
-    await httpPost(`http://localhost:${port}/api/testing/stop`);
+    await httpPost(`http://127.0.0.1:${port}/api/testing/stop`);
     await waitForRunningState(port, false);
 
     // Restore fast commands
@@ -337,7 +378,7 @@ describe("Testing API", () => {
   // ─── GET /api/testing/status ──────────────────────────────
 
   it("returns running state with name and command", async () => {
-    const { status, body } = await httpGet(`http://localhost:${port}/api/testing/status`);
+    const { status, body } = await httpGet(`http://127.0.0.1:${port}/api/testing/status`);
     expect(status).toBe(200);
 
     const data = JSON.parse(body) as { running: boolean; name: string; command: string };
@@ -361,10 +402,10 @@ describe("Testing API", () => {
       "utf-8",
     );
 
-    await httpPost(`http://localhost:${port}/api/testing/run`, { command: "test" });
+    await httpPost(`http://127.0.0.1:${port}/api/testing/run`, { command: "test" });
     await waitForRunningState(port, true);
 
-    const { status, body } = await httpPost(`http://localhost:${port}/api/testing/stop`);
+    const { status, body } = await httpPost(`http://127.0.0.1:${port}/api/testing/stop`);
     expect(status).toBe(200);
 
     const data = JSON.parse(body) as { ok: boolean };
@@ -384,7 +425,7 @@ describe("Testing API", () => {
     // Ensure nothing is running
     await waitForRunningState(port, false);
 
-    const { status, body } = await httpPost(`http://localhost:${port}/api/testing/stop`);
+    const { status, body } = await httpPost(`http://127.0.0.1:${port}/api/testing/stop`);
     expect(status).toBe(404);
 
     const data = JSON.parse(body) as { error: string };
@@ -394,7 +435,7 @@ describe("Testing API", () => {
   // ─── GET /api/testing/history ─────────────────────────────
 
   it("returns completed run results with exitCode and durationMs", async () => {
-    const { status, body } = await httpGet(`http://localhost:${port}/api/testing/history`);
+    const { status, body } = await httpGet(`http://127.0.0.1:${port}/api/testing/history`);
     expect(status).toBe(200);
 
     const history = JSON.parse(body) as TestRunResult[];
@@ -413,7 +454,7 @@ describe("Testing API", () => {
 
   it("returns SSE headers (Content-Type: text/event-stream)", async () => {
     const { status } = await new Promise<{ status: number; body: string }>((resolve) => {
-      http.get(`http://localhost:${port}/api/testing/stream`, (res) => {
+      http.get(`http://127.0.0.1:${port}/api/testing/stream`, (res) => {
         // Just check the headers and close
         resolve({ status: res.statusCode ?? 0, body: "" });
         res.destroy();
@@ -424,18 +465,162 @@ describe("Testing API", () => {
   });
 });
 
+describe("Testing API project isolation", () => {
+  let rootAlpha: string;
+  let rootBeta: string;
+  let stopServer: (() => Promise<void>) | undefined;
+  let port: number;
+
+  beforeAll(async () => {
+    rootAlpha = makeTempDir();
+    rootBeta = makeTempDir();
+    for (const [root, name] of [
+      [rootAlpha, "scope-alpha"],
+      [rootBeta, "scope-beta"],
+    ] as const) {
+      fs.mkdirSync(path.join(root, ".quack"), { recursive: true });
+      fs.mkdirSync(path.join(root, "docs", "tasks"), { recursive: true });
+      const command = `node -e "require('node:fs').writeFileSync('selected-project.txt', '${name}')"`;
+      fs.writeFileSync(
+        path.join(root, ".quack", "adapter.json"),
+        JSON.stringify(
+          buildAdapterConfig([{ name: "test", command, required: true, timeout: 10_000 }], name),
+          null,
+          2,
+        ),
+      );
+    }
+    const adapters = await Promise.all([loadAdapter(rootAlpha), loadAdapter(rootBeta)]);
+    const server = createMonitorServer({
+      port: 0,
+      host: "127.0.0.1",
+      projectAdapters: adapters,
+    });
+    ({ port, stop: stopServer } = await server.start());
+  });
+
+  afterAll(async () => {
+    if (stopServer) await stopServer();
+    for (const root of [rootAlpha, rootBeta]) {
+      try {
+        fs.rmSync(root, { recursive: true, force: true });
+      } catch {
+        // Windows may retain a short-lived file handle after process exit.
+      }
+    }
+  });
+
+  it("runs a selected project's command only in that project's root", async () => {
+    const { status } = await httpPost(`http://127.0.0.1:${port}/api/testing/run`, {
+      command: "test",
+      projectId: "scope-beta",
+    });
+    expect(status).toBe(200);
+
+    const marker = path.join(rootBeta, "selected-project.txt");
+    const deadline = Date.now() + 10_000;
+    while (!fs.existsSync(marker) && Date.now() < deadline) {
+      await sleep(100);
+    }
+    expect(fs.readFileSync(marker, "utf8")).toBe("scope-beta");
+    expect(fs.existsSync(path.join(rootAlpha, "selected-project.txt"))).toBe(false);
+
+    const betaHistory = await httpGet(
+      `http://127.0.0.1:${port}/api/testing/history?project=scope-beta`,
+    );
+    const alphaHistory = await httpGet(
+      `http://127.0.0.1:${port}/api/testing/history?project=scope-alpha`,
+    );
+    expect((JSON.parse(betaHistory.body) as TestRunResult[]).at(-1)?.projectId).toBe(rootBeta);
+    expect(JSON.parse(alphaHistory.body)).toEqual([]);
+  });
+});
+
+describe("Tier 3 drain tracking", () => {
+  let projectRoot: string;
+  let logDir: string;
+  let stopServer: (() => Promise<void>) | undefined;
+  let port: number;
+
+  beforeAll(async () => {
+    projectRoot = makeTempDir();
+    logDir = makeTempDir();
+    fs.mkdirSync(path.join(projectRoot, ".quack"), { recursive: true });
+    fs.mkdirSync(path.join(projectRoot, "docs", "tasks"), { recursive: true });
+    const config = buildAdapterConfig(
+      [
+        {
+          name: "full-suite",
+          command: 'node -e "setTimeout(() => {}, 2000)"',
+          required: true,
+          timeout: 10_000,
+        },
+      ],
+      "drain-project",
+    );
+    const verification = config.verification as Record<string, unknown>;
+    verification.tieredTesting = { enabled: true };
+    const adapterPath = path.join(projectRoot, ".quack", "adapter.json");
+    fs.writeFileSync(adapterPath, JSON.stringify(config, null, 2));
+    const server = createMonitorServer({
+      port: 0,
+      host: "127.0.0.1",
+      projectRoot,
+      adapterPath,
+      logDir,
+    });
+    ({ port, stop: stopServer } = await server.start());
+  });
+
+  afterAll(async () => {
+    if (stopServer) await stopServer();
+    for (const root of [projectRoot, logDir]) {
+      try {
+        fs.rmSync(root, { recursive: true, force: true });
+      } catch {
+        // Windows may retain a short-lived file handle after process exit.
+      }
+    }
+  });
+
+  it("keeps drain unsafe until the tracked full-suite verifier exits", async () => {
+    const started = await httpPost(`http://127.0.0.1:${port}/api/test/full-suite`);
+    expect(started.status).toBe(200);
+
+    const draining = await httpPost(`http://127.0.0.1:${port}/api/admin/drain`, {
+      reason: "test",
+    });
+    expect(draining.status).toBe(202);
+    expect(JSON.parse(draining.body)).toMatchObject({
+      active: true,
+      acceptingWork: false,
+      safeToTerminate: false,
+      testRunActive: true,
+    });
+
+    await sleep(2500);
+    const settled = await httpGet(`http://127.0.0.1:${port}/api/admin/drain`);
+    expect(settled.status).toBe(200);
+    expect(JSON.parse(settled.body)).toMatchObject({
+      active: true,
+      acceptingWork: false,
+      safeToTerminate: true,
+      testRunActive: false,
+    });
+  }, 15_000);
+});
+
 // ─── Server without project root ────────────────────────────────
 
 describe("Testing API without project root", () => {
   let logDir: string;
   let stopServer: (() => Promise<void>) | undefined;
-  const port = 30000 + Math.floor(Math.random() * 10000);
+  let port: number;
 
   beforeAll(async () => {
     logDir = makeTempDir();
-    const serverObj = createMonitorServer({ logDir, port });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    const serverObj = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+    ({ port, stop: stopServer } = await serverObj.start());
   });
 
   afterAll(async () => {
@@ -444,7 +629,7 @@ describe("Testing API without project root", () => {
   });
 
   it("POST /api/testing/run returns 500 when projectRoot is not configured", async () => {
-    const { status, body } = await httpPost(`http://localhost:${port}/api/testing/run`, {
+    const { status, body } = await httpPost(`http://127.0.0.1:${port}/api/testing/run`, {
       command: "test",
     });
     expect(status).toBe(500);
@@ -454,7 +639,7 @@ describe("Testing API without project root", () => {
   });
 
   it("GET /api/testing/commands returns empty array when no adapter configured", async () => {
-    const { status, body } = await httpGet(`http://localhost:${port}/api/testing/commands`);
+    const { status, body } = await httpGet(`http://127.0.0.1:${port}/api/testing/commands`);
     expect(status).toBe(200);
 
     const commands = JSON.parse(body) as unknown[];

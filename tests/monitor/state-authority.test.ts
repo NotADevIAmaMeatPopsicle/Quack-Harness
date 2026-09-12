@@ -51,10 +51,6 @@ function removeTempDir(dir: string): void {
   fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 }
 
-function randomPort(): number {
-  return 30000 + Math.floor(Math.random() * 10000);
-}
-
 function request(method: string, url: string, body?: unknown): Promise<HttpResult> {
   const payload = body === undefined ? undefined : JSON.stringify(body);
   return new Promise((resolve, reject) => {
@@ -103,12 +99,17 @@ describe("monitor state authority", () => {
     const quackRoot = makeTempDir();
     const uiBuildDir = makeUiBuildDir();
     tempDirs.push(logDir, quackRoot, uiBuildDir);
-    const port = randomPort();
-    const server = createMonitorServer({ logDir, quackRoot, uiBuildDir, port });
+    const server = createMonitorServer({
+      logDir,
+      quackRoot,
+      uiBuildDir,
+      port: 0,
+      host: "127.0.0.1",
+    });
     const started = await server.start();
     stopServer = started.stop;
 
-    const response = await request("GET", `http://localhost:${port}/api/health`);
+    const response = await request("GET", `http://127.0.0.1:${started.port}/api/health`);
     const body = JSON.parse(response.body) as AuthorityResponse;
 
     expect(response.status).toBe(200);
@@ -122,27 +123,27 @@ describe("monitor state authority", () => {
     const quackRoot = makeTempDir();
     const projectRoot = makeProjectRoot();
     tempDirs.push(logDir, quackRoot, projectRoot);
-    const port = randomPort();
     const canonicalBaseUrl = "http://127.0.0.1:3333";
     const server = createMonitorServer({
       logDir,
       quackRoot,
       projectRoot,
-      port,
+      port: 0,
+      host: "127.0.0.1",
       runtimeRole: "worker",
       canonicalBaseUrl,
     });
     const started = await server.start();
     stopServer = started.stop;
 
-    const health = await request("GET", `http://localhost:${port}/api/health`);
+    const health = await request("GET", `http://127.0.0.1:${started.port}/api/health`);
     const healthBody = JSON.parse(health.body) as AuthorityResponse;
     expect(healthBody.runtimeRole).toBe("worker");
     expect(healthBody.stateAuthority).toBe("cache");
     expect(healthBody.localDbAuthoritative).toBe(false);
     expect(healthBody.canonicalBaseUrl).toBe(canonicalBaseUrl);
 
-    const projects = await request("GET", `http://localhost:${port}/api/projects`);
+    const projects = await request("GET", `http://127.0.0.1:${started.port}/api/projects`);
     const projectBody = JSON.parse(projects.body) as ProjectSummary[];
     expect(projectBody[0]).toMatchObject({
       stateAuthority: "cache",
@@ -155,19 +156,19 @@ describe("monitor state authority", () => {
     const logDir = makeTempDir();
     const quackRoot = makeTempDir();
     tempDirs.push(logDir, quackRoot);
-    const port = randomPort();
     const canonicalBaseUrl = "http://127.0.0.1:3333";
     const server = createMonitorServer({
       logDir,
       quackRoot,
-      port,
+      port: 0,
+      host: "127.0.0.1",
       runtimeRole: "worker",
       canonicalBaseUrl,
     });
     const started = await server.start();
     stopServer = started.stop;
 
-    const response = await request("GET", `http://localhost:${port}/api/testing/status`);
+    const response = await request("GET", `http://127.0.0.1:${started.port}/api/testing/status`);
     const body = JSON.parse(response.body) as TestingStatusResponse;
 
     expect(response.status).toBe(200);
@@ -185,26 +186,30 @@ describe("monitor state authority", () => {
     const quackRoot = makeTempDir();
     const projectRoot = makeProjectRoot();
     tempDirs.push(logDir, quackRoot, projectRoot);
-    const port = randomPort();
     const canonicalBaseUrl = "http://127.0.0.1:3333";
     const server = createMonitorServer({
       logDir,
       quackRoot,
       projectRoot,
-      port,
+      port: 0,
+      host: "127.0.0.1",
       runtimeRole: "worker",
       canonicalBaseUrl,
     });
     const started = await server.start();
     stopServer = started.stop;
 
-    const response = await request("POST", `http://localhost:${port}/api/tasks/TASK-921/verified`, {
-      verdict: "VERIFIED",
-      commit: "abc123",
-      method: "/verify-task",
-      criteria_checked: 1,
-      criteria_passed: 1,
-    });
+    const response = await request(
+      "POST",
+      `http://127.0.0.1:${started.port}/api/tasks/TASK-921/verified`,
+      {
+        verdict: "VERIFIED",
+        commit: "abc123",
+        method: "/verify-task",
+        criteria_checked: 1,
+        criteria_passed: 1,
+      },
+    );
     const body = JSON.parse(response.body) as AuthorityResponse & {
       error: string;
       correctEndpoint: string;

@@ -1,3 +1,4 @@
+import { getClaudeSdkEnvironment } from "../sdk/claude-auth.js";
 import { ProjectAdapter } from "../core/adapter-loader.js";
 import { buildPlannerPrompt } from "./planner-prompt.js";
 import { writeTaskFilesWithResult } from "./task-writer.js";
@@ -164,6 +165,7 @@ export async function planTasks(
       allowedTools: ["Read", "Glob", "Grep"],
       disallowedTools: ["Edit", "Write", "Bash", "WebSearch", "WebFetch"],
       ...getSdkPermissionOptions(),
+      env: getClaudeSdkEnvironment(adapter.config.agent.apiKeys),
       model,
       maxTurns,
       cwd: adapter.projectRoot,

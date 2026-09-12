@@ -17,11 +17,11 @@
 // restart that makes the queue look dead — the same restart that
 // prompts the re-POST.
 
-import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { DEFAULT_APPROVAL_TIMEOUT_MS } from "./blueprint-approval.js";
+import { runTrustedGitSync } from "./trusted-git.js";
 
 export type PausedGate = "blueprint" | "judge";
 
@@ -56,10 +56,28 @@ export interface PausedRunArchive {
   branchRef?: string;
   /** Archived checkpoint path, when a checkpoint existed. */
   checkpointPath?: string;
-  /** Archived approval-record path. */
+  /** Archived approval-record path for the gate that caused the pause. */
   approvalPath?: string;
+  /**
+   * Every approval record removed from the live namespace. This includes the
+   * other gate's record when present, because a fresh run must not inherit an
+   * earlier run's approval decision.
+   */
+  approvalPaths?: string[];
   /** Self-describing record of the archive, written to disk. */
   manifestPath?: string;
+}
+
+/**
+ * A stale judge run moved out of the live namespace. Unlike
+ * {@link PausedRunArchive}, every member is required: recycling is allowed only
+ * after the approval, checkpoint, and committed branch have all been secured.
+ */
+export interface JudgeRunRecycleArchive {
+  branchRef: string;
+  checkpointPath: string;
+  approvalPath: string;
+  manifestPath: string;
 }
 
 export class PausedRunArchiveError extends Error {
@@ -78,6 +96,41 @@ interface ApprovalRecordHead {
 }
 
 const KNOWN_APPROVAL_STATES = new Set(["pending", "approved", "auto-approved", "rejected"]);
+
+function assertSafeArchiveTaskId(taskId: string): void {
+  if (
+    !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(taskId) ||
+    taskId.includes("..") ||
+    taskId.endsWith(".")
+  ) {
+    throw new PausedRunArchiveError(`Cannot archive an unsafe task id: ${JSON.stringify(taskId)}`);
+  }
+}
+
+function assertSafeBranchName(projectRoot: string, branch: string, context: string): void {
+  if (!branch || branch !== branch.trim() || branch.startsWith("-") || branch.includes("@{")) {
+    throw new PausedRunArchiveError(`${context} is not a safe Git branch name`);
+  }
+  try {
+    runTrustedGitSync(["check-ref-format", "--branch", branch], projectRoot, {
+      trustedBoundaryRoot: projectRoot,
+      errorContext: `Invalid ${context}`,
+    });
+  } catch (error: unknown) {
+    throw new PausedRunArchiveError(`${context} is not a valid Git branch name`, error);
+  }
+}
+
+function assertSafeArchiveRef(projectRoot: string, ref: string): void {
+  try {
+    runTrustedGitSync(["check-ref-format", ref], projectRoot, {
+      trustedBoundaryRoot: projectRoot,
+      errorContext: "Invalid paused-run archive ref",
+    });
+  } catch (error: unknown) {
+    throw new PausedRunArchiveError(`Cannot archive an invalid Git ref: ${ref}`, error);
+  }
+}
 
 /**
  * Round-2b F1: `JSON.parse` succeeding is NOT the same as the record
@@ -301,12 +354,34 @@ export class PausedRunRefusalError extends Error {
  * cost the first run its archive, which is the whole reason these are
  * session-keyed instead of a single `.prev` slot.
  */
-function stampFor(paused: PausedRunState, logDir: string, taskId: string): string {
+function stampFor(
+  paused: PausedRunState,
+  projectRoot: string,
+  logDir: string,
+  taskId: string,
+): string {
   const raw = paused.sessionId ?? paused.createdAt;
   const safe = raw.replace(/[^A-Za-z0-9._-]/g, "-");
   const base = safe.length > 0 ? safe : "unknown";
-  const taken = (stamp: string): boolean =>
-    fs.existsSync(path.join(logDir, "checkpoints-archive", `${taskId}-${stamp}.manifest.json`));
+  const taken = (stamp: string): boolean => {
+    const fileTaken = [
+      path.join(logDir, "checkpoints-archive", `${taskId}-${stamp}.manifest.json`),
+      path.join(logDir, "checkpoints-archive", `checkpoint-${taskId}-${stamp}.json`),
+      path.join(logDir, "approvals", "archive", `${taskId}-${stamp}.json`),
+      path.join(logDir, "approvals", "archive", `${taskId}-judge-${stamp}.json`),
+    ].some((candidate) => fs.existsSync(candidate));
+    if (fileTaken) return true;
+    const archiveRef = `refs/quack-archive/${taskId}/${stamp}`;
+    assertSafeArchiveRef(projectRoot, archiveRef);
+    try {
+      runTrustedGitSync(["show-ref", "--verify", "--quiet", archiveRef], projectRoot, {
+        trustedBoundaryRoot: projectRoot,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  };
   if (!taken(base)) return base;
   for (let n = 2; n <= 50; n += 1) {
     if (!taken(`${base}-${n}`)) return `${base}-${n}`;
@@ -329,10 +404,77 @@ function copyOrThrow(from: string, to: string, what: string): void {
   }
 }
 
+interface ArchivedLiveFile {
+  sourcePath: string;
+  archivePath: string;
+  description: string;
+}
+
 /**
- * Preserve everything an override is about to destroy. THROWS on
- * failure — the entire point is that losing a run someone paid for is
- * not an acceptable outcome of a failed cleanup. Scoped by
+ * Clear files only after byte-for-byte archive copies exist.
+ *
+ * The pending approval is deliberately last. If checkpoint cleanup fails, or
+ * if either live file changes between the archive copy and this commit step,
+ * the approval remains in place and the normal paused-run guard still blocks
+ * the next dispatch. Any earlier removals are restored from the archive on a
+ * best-effort basis; the archive itself is never removed.
+ */
+function clearArchivedLiveFiles(files: ArchivedLiveFile[], blockingApprovalSource: string): void {
+  const ordered = [
+    ...files.filter((file) => file.sourcePath !== blockingApprovalSource),
+    ...files.filter((file) => file.sourcePath === blockingApprovalSource),
+  ];
+  const cleared: ArchivedLiveFile[] = [];
+
+  try {
+    // Validate the whole transaction before removing its first live file.
+    for (const file of ordered) {
+      const live = fs.readFileSync(file.sourcePath);
+      const archived = fs.readFileSync(file.archivePath);
+      if (!live.equals(archived)) {
+        throw new Error(`${file.description} changed while it was being archived`);
+      }
+    }
+
+    for (const file of ordered) {
+      // Re-check immediately before unlinking so a concurrent approval
+      // decision cannot be mistaken for the state this override archived.
+      const live = fs.readFileSync(file.sourcePath);
+      const archived = fs.readFileSync(file.archivePath);
+      if (!live.equals(archived)) {
+        throw new Error(`${file.description} changed before live-state cleanup`);
+      }
+      fs.unlinkSync(file.sourcePath);
+      cleared.push(file);
+    }
+  } catch (error) {
+    const rollbackErrors: string[] = [];
+    for (const file of [...cleared].reverse()) {
+      if (fs.existsSync(file.sourcePath)) continue;
+      try {
+        fs.copyFileSync(file.archivePath, file.sourcePath, fs.constants.COPYFILE_EXCL);
+      } catch (rollbackError) {
+        rollbackErrors.push(
+          `${file.description}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+        );
+      }
+    }
+    throw new PausedRunArchiveError(
+      "Refusing to overwrite a paused run: its archived state could not be cleared " +
+        "from the live namespace" +
+        (rollbackErrors.length > 0
+          ? `; rollback also failed for ${rollbackErrors.join("; ")}`
+          : ""),
+      error,
+    );
+  }
+}
+
+/**
+ * Preserve everything an override is about to destroy, then remove the
+ * preserved approval/checkpoint records from the live namespace. THROWS on
+ * any archive or clear failure — the entire point is that losing a run someone
+ * paid for is not an acceptable outcome of a failed cleanup. Scoped by
  * construction: callers only reach here when a paused run exists, so an
  * unwritable archive path cannot deny dispatch for tasks with nothing
  * to protect.
@@ -345,6 +487,11 @@ function copyOrThrow(from: string, to: string, what: string): void {
  * commits stay reachable when the caller's `git branch -D` runs, the
  * live branch name keeps working for anything mid-flight, and nothing
  * about the normal path changes.
+ *
+ * The live files are cleared only after the approval copies, checkpoint copy,
+ * branch ref, and manifest all exist. The gate that caused the pause is
+ * removed last, so an interrupted clear remains visible to the paused-run
+ * guard rather than admitting a fresh dispatch on partially-cleared state.
  */
 export function archivePausedRunState(
   projectRoot: string,
@@ -352,26 +499,54 @@ export function archivePausedRunState(
   taskId: string,
   paused: PausedRunState,
 ): PausedRunArchive {
-  const stamp = stampFor(paused, logDir, taskId);
+  assertSafeArchiveTaskId(taskId);
+  const stamp = stampFor(paused, projectRoot, logDir, taskId);
   const archive: PausedRunArchive = {};
+  const archivedLiveFiles: ArchivedLiveFile[] = [];
 
   const approvalSource = path.join(logDir, "approvals", paused.approvalFile);
-  if (fs.existsSync(approvalSource)) {
+  if (!fs.existsSync(approvalSource)) {
+    throw new PausedRunArchiveError(
+      `Refusing to overwrite a paused run: its pending approval record disappeared before it could be archived (${approvalSource})`,
+    );
+  }
+
+  const approvalFiles = [
+    paused.approvalFile,
+    ...[`${taskId}.json`, `${taskId}-judge.json`]
+      .filter((file) => file !== paused.approvalFile)
+      .filter((file) => fs.existsSync(path.join(logDir, "approvals", file))),
+  ];
+  const approvalPaths: string[] = [];
+  for (const approvalFile of approvalFiles) {
+    const source = path.join(logDir, "approvals", approvalFile);
     const target = path.join(
       logDir,
       "approvals",
       "archive",
-      `${path.basename(paused.approvalFile, ".json")}-${stamp}.json`,
+      `${path.basename(approvalFile, ".json")}-${stamp}.json`,
     );
-    copyOrThrow(approvalSource, target, "pending approval record");
-    archive.approvalPath = target;
+    copyOrThrow(source, target, `${approvalFile} approval record`);
+    approvalPaths.push(target);
+    archivedLiveFiles.push({
+      sourcePath: source,
+      archivePath: target,
+      description: `${approvalFile} approval record`,
+    });
   }
+  archive.approvalPath = approvalPaths[0];
+  archive.approvalPaths = approvalPaths;
 
   const checkpointSource = path.join(logDir, `checkpoint-${taskId}.json`);
   if (fs.existsSync(checkpointSource)) {
     const target = path.join(logDir, "checkpoints-archive", `checkpoint-${taskId}-${stamp}.json`);
     copyOrThrow(checkpointSource, target, "checkpoint");
     archive.checkpointPath = target;
+    archivedLiveFiles.push({
+      sourcePath: checkpointSource,
+      archivePath: target,
+      description: "checkpoint",
+    });
   }
 
   const branchRef = archiveBranchTip(projectRoot, taskId, paused, stamp);
@@ -415,6 +590,11 @@ export function archivePausedRunState(
   }
   archive.manifestPath = manifestPath;
 
+  // Commit the fresh-run transition only after the recovery bundle is fully
+  // durable. Until the blocking approval is removed last, any failure still
+  // resolves as paused and therefore cannot rebill or destroy the old run.
+  clearArchivedLiveFiles(archivedLiveFiles, approvalSource);
+
   return archive;
 }
 
@@ -430,24 +610,26 @@ function archiveBranchTip(
   stamp: string,
 ): string | undefined {
   const branch = paused.branchName ?? defaultBranchName(projectRoot, taskId);
+  assertSafeBranchName(projectRoot, branch, "paused-run branch");
   let sha: string;
   try {
-    sha = execFileSync("git", ["rev-parse", "--verify", `${branch}^{commit}`], {
-      cwd: projectRoot,
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
+    sha = runTrustedGitSync(
+      ["rev-parse", "--verify", "--end-of-options", `${branch}^{commit}`],
+      projectRoot,
+      { trustedBoundaryRoot: projectRoot },
+    ).trim();
   } catch {
     return undefined; // no branch (blueprint-gate pauses usually have none)
   }
   const ref = `refs/quack-archive/${taskId}/${stamp}`;
+  assertSafeArchiveRef(projectRoot, ref);
   try {
     // Round-2 F4: create-only. `update-ref <ref> <new>` with an empty
     // <oldvalue> fails if the ref already exists, so a stamp collision
     // cannot silently move an earlier run's archive onto this one.
-    execFileSync("git", ["update-ref", ref, sha, ""], {
-      cwd: projectRoot,
-      stdio: ["ignore", "ignore", "pipe"],
+    runTrustedGitSync(["update-ref", ref, sha, ""], projectRoot, {
+      trustedBoundaryRoot: projectRoot,
+      errorContext: "Unable to create paused-run archive ref",
     });
   } catch (error) {
     throw new PausedRunArchiveError(
@@ -469,4 +651,165 @@ function defaultBranchName(projectRoot: string, taskId: string): string {
     // defaults
   }
   return `${prefix}${taskId}`;
+}
+
+/**
+ * TASK-1333: archive one stale judge record and MOVE it out of the live
+ * namespace before a fresh dispatch starts.
+ *
+ * This deliberately remains separate from `archivePausedRunState`: a whole-run
+ * override archives and clears every gate record for a clean restart, while
+ * judge supersession is record-scoped, requires a committed branch and
+ * checkpoint, and preserves the judge-specific intent-hold evidence.
+ *
+ * All prerequisites are validated and the branch ref is created before either
+ * live file moves. The two renames are rolled back on a later failure. Nothing
+ * deletes the task branch; the caller may replace it only after this function
+ * has made the worker commit reachable through `branchRef`.
+ */
+export function archiveAndMoveJudgeRunState(
+  projectRoot: string,
+  logDir: string,
+  taskId: string,
+): JudgeRunRecycleArchive {
+  assertSafeArchiveTaskId(taskId);
+  const approvalSource = path.join(logDir, "approvals", `${taskId}-judge.json`);
+  const checkpointSource = path.join(logDir, `checkpoint-${taskId}.json`);
+
+  let approval: { taskId?: string; createdAt?: string; intentHold?: unknown };
+  let checkpoint: { taskId?: string; sessionId?: string; branchName?: string };
+  try {
+    approval = JSON.parse(fs.readFileSync(approvalSource, "utf-8")) as typeof approval;
+  } catch (error) {
+    throw new PausedRunArchiveError(
+      `Cannot recycle ${taskId}: its live judge approval record is missing or unreadable`,
+      error,
+    );
+  }
+  try {
+    checkpoint = JSON.parse(fs.readFileSync(checkpointSource, "utf-8")) as typeof checkpoint;
+  } catch (error) {
+    throw new PausedRunArchiveError(
+      `Cannot recycle ${taskId}: its live checkpoint is missing or unreadable`,
+      error,
+    );
+  }
+  if (approval.taskId !== taskId || checkpoint.taskId !== taskId) {
+    throw new PausedRunArchiveError(
+      `Cannot recycle ${taskId}: the live judge approval or checkpoint belongs to another task`,
+    );
+  }
+
+  const branch = checkpoint.branchName ?? defaultBranchName(projectRoot, taskId);
+  assertSafeBranchName(projectRoot, branch, "judge-run branch");
+  let branchSha: string;
+  try {
+    branchSha = runTrustedGitSync(
+      ["rev-parse", "--verify", "--end-of-options", `${branch}^{commit}`],
+      projectRoot,
+      { trustedBoundaryRoot: projectRoot },
+    ).trim();
+  } catch (error) {
+    throw new PausedRunArchiveError(
+      `Cannot recycle ${taskId}: its committed branch ${branch} could not be preserved`,
+      error,
+    );
+  }
+
+  const rawStamp = checkpoint.sessionId ?? approval.createdAt ?? "unknown";
+  const safeStamp = rawStamp.replace(/[^A-Za-z0-9._-]/g, "-") || "unknown";
+  const archiveParent = path.join(logDir, "judge-recycle", taskId);
+  fs.mkdirSync(archiveParent, { recursive: true });
+
+  let stamp = safeStamp;
+  let archiveDir = path.join(archiveParent, stamp);
+  let branchRef = `refs/quack-archive/${taskId}/judge-recycle-${stamp}`;
+  for (let n = 1; n <= 50; n += 1) {
+    assertSafeArchiveRef(projectRoot, branchRef);
+    const refExists = (() => {
+      try {
+        runTrustedGitSync(["show-ref", "--verify", "--quiet", branchRef], projectRoot, {
+          trustedBoundaryRoot: projectRoot,
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+    if (!fs.existsSync(archiveDir) && !refExists) break;
+    if (n === 50) {
+      throw new PausedRunArchiveError(
+        `Cannot recycle ${taskId}: 50 judge archives already use stamp ${safeStamp}`,
+      );
+    }
+    stamp = `${safeStamp}-${n + 1}`;
+    archiveDir = path.join(archiveParent, stamp);
+    branchRef = `refs/quack-archive/${taskId}/judge-recycle-${stamp}`;
+  }
+
+  fs.mkdirSync(archiveDir);
+  const approvalPath = path.join(archiveDir, "judge-approval.json");
+  const checkpointPath = path.join(archiveDir, "checkpoint.json");
+  const manifestPath = path.join(archiveDir, "manifest.json");
+
+  try {
+    // Create-only: the empty old-value makes update-ref refuse replacement.
+    runTrustedGitSync(["update-ref", branchRef, branchSha, ""], projectRoot, {
+      trustedBoundaryRoot: projectRoot,
+      errorContext: "Unable to create judge-run recycle ref",
+    });
+  } catch (error) {
+    throw new PausedRunArchiveError(
+      `Cannot recycle ${taskId}: branch ${branch} (${branchSha}) could not be archived as ${branchRef}`,
+      error,
+    );
+  }
+
+  let approvalMoved = false;
+  let checkpointMoved = false;
+  try {
+    fs.renameSync(approvalSource, approvalPath);
+    approvalMoved = true;
+    fs.renameSync(checkpointSource, checkpointPath);
+    checkpointMoved = true;
+    fs.writeFileSync(
+      manifestPath,
+      JSON.stringify(
+        {
+          taskId,
+          reason: "judge_spec_identity_stale",
+          archivedAt: new Date().toISOString(),
+          originalBranch: branch,
+          branchSha,
+          branchRef,
+          approvalPath,
+          checkpointPath,
+          intentHoldPreserved: approval.intentHold !== undefined,
+          recovery: `git branch <name> ${branchRef}`,
+        },
+        null,
+        2,
+      ),
+      { encoding: "utf-8", flag: "wx" },
+    );
+  } catch (error) {
+    // Best-effort transactional rollback. Even if a rollback itself fails,
+    // the file remains in the archive directory; no state is deleted.
+    try {
+      if (checkpointMoved && !fs.existsSync(checkpointSource)) {
+        fs.renameSync(checkpointPath, checkpointSource);
+      }
+      if (approvalMoved && !fs.existsSync(approvalSource)) {
+        fs.renameSync(approvalPath, approvalSource);
+      }
+    } catch {
+      // Preserve the original error; its archive directory names the state.
+    }
+    throw new PausedRunArchiveError(
+      `Cannot recycle ${taskId}: live judge state could not be moved into ${archiveDir}`,
+      error,
+    );
+  }
+
+  return { branchRef, checkpointPath, approvalPath, manifestPath };
 }

@@ -76,21 +76,22 @@ function writeAdapter(projectRoot: string): void {
 
 describe("adapter bundle metadata API", () => {
   let projectRoot: string;
-  let port: number;
+  let baseUrl: string;
   let stop: (() => Promise<void>) | null = null;
 
   beforeEach(async () => {
     projectRoot = makeTempDir();
     writeAdapter(projectRoot);
     const adapter = await loadAdapter(projectRoot);
-    port = 42000 + Math.floor(Math.random() * 2000);
     const server = createMonitorServer({
-      port,
+      port: 0,
+      host: "127.0.0.1",
       projectAdapters: [adapter],
       runtimeRole: "worker",
     });
     const started = await server.start();
     stop = started.stop;
+    baseUrl = `http://127.0.0.1:${started.port}`;
   });
 
   afterEach(async () => {
@@ -102,7 +103,7 @@ describe("adapter bundle metadata API", () => {
   });
 
   it("includes authoritative adapter bundle metadata in the project list", async () => {
-    const resp = await httpGet(`http://localhost:${port}/api/projects`);
+    const resp = await httpGet(`${baseUrl}/api/projects`);
     expect(resp.status).toBe(200);
     const body = JSON.parse(resp.body) as Array<{
       id: string;
@@ -121,9 +122,9 @@ describe("adapter bundle metadata API", () => {
   });
 
   it("includes authoritative adapter bundle metadata in project detail", async () => {
-    const listResp = await httpGet(`http://localhost:${port}/api/projects`);
+    const listResp = await httpGet(`${baseUrl}/api/projects`);
     const [project] = JSON.parse(listResp.body) as Array<{ id: string }>;
-    const detailResp = await httpGet(`http://localhost:${port}/api/projects/${project.id}`);
+    const detailResp = await httpGet(`${baseUrl}/api/projects/${project.id}`);
     expect(detailResp.status).toBe(200);
     const detail = JSON.parse(detailResp.body) as {
       adapterBundle?: {

@@ -223,10 +223,15 @@ describe("API-key project object scope", () => {
   });
 
   afterEach(async () => {
-    if (stop) await stop();
-    stop = undefined;
+    // Route-view fixtures do not represent live children owned by the manager.
+    // Restore them before the real drain inspects and stops its actual runs.
     jest.restoreAllMocks();
-    fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+    try {
+      if (stop) await stop();
+      fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+    } finally {
+      stop = undefined;
+    }
   });
 
   it("uses the explicitly authorized project for every GitHub integration route", async () => {

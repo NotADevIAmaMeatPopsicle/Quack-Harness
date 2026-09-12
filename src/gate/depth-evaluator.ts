@@ -1,3 +1,4 @@
+import { getClaudeSdkEnvironment, type ClaudeApiKeys } from "../sdk/claude-auth.js";
 import { BatchConfig, DepthEvalResult, DepthScores, ParsedTask, TaskType } from "../core/types.js";
 import { BatchClient, BatchRequest, DEFAULT_BATCH_CONFIG } from "../core/batch-client.js";
 import { getSdkPermissionOptions } from "../sdk/permission-mode.js";
@@ -8,6 +9,8 @@ import {
 } from "./depth-dimensions.js";
 import { buildDepthPrompt } from "./depth-prompt.js";
 import { detectTaskType } from "./task-type-detector.js";
+import type { ReviewerRunnerConfig } from "../review/reviewer-config.js";
+import { runCodexStructuredEvaluation } from "../llm/codex-structured-evaluator.js";
 
 interface RawDepthResponse {
   ready: boolean;
@@ -45,17 +48,35 @@ const DEFAULT_MODEL = "claude-sonnet-4-6";
 export async function evaluateTaskDepth(
   task: ParsedTask,
   conventionsSummary: string,
-  options?: { model?: string; maxTurns?: number },
+  options?: {
+    model?: string;
+    maxTurns?: number;
+    evaluator?: ReviewerRunnerConfig;
+    projectRoot?: string;
+    apiKeys?: ClaudeApiKeys;
+  },
 ): Promise<DepthEvalResult> {
   const taskType = detectTaskType(task);
   const prompt = buildDepthPrompt(task, conventionsSummary);
-  const model = options?.model ?? DEFAULT_MODEL;
+  const model = options?.model ?? options?.evaluator?.model ?? DEFAULT_MODEL;
   const maxTurns = options?.maxTurns ?? 5;
   const errors: Error[] = [];
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      return await callDepthEvaluation(prompt, model, taskType, maxTurns);
+      if (options?.evaluator?.runner === "codex-cli") {
+        if (!options.projectRoot) {
+          throw new Error("Codex depth evaluation requires projectRoot");
+        }
+        return await callCodexDepthEvaluation(
+          prompt,
+          model,
+          taskType,
+          options.projectRoot,
+          options.evaluator,
+        );
+      }
+      return await callDepthEvaluation(prompt, model, taskType, maxTurns, options?.apiKeys);
     } catch (error: unknown) {
       errors.push(error instanceof Error ? error : new Error(String(error)));
     }
@@ -66,6 +87,37 @@ export async function evaluateTaskDepth(
     .join("\n\n");
 
   throw new Error(`Depth evaluation failed after ${errors.length} attempts:\n${errorDetails}`);
+}
+
+async function callCodexDepthEvaluation(
+  prompt: string,
+  model: string,
+  taskType: TaskType,
+  projectRoot: string,
+  evaluator: ReviewerRunnerConfig,
+): Promise<DepthEvalResult> {
+  const result = await runCodexStructuredEvaluation(
+    {
+      projectRoot,
+      model,
+      systemPrompt:
+        "Evaluate only the supplied task specification and conventions. Return the required JSON object; do not modify the repository.",
+      prompt,
+      outputSchema: buildDepthResponseSchema(taskType),
+      parse: (rawText) => {
+        try {
+          return parseDepthResponse(rawText, taskType);
+        } catch {
+          return null;
+        }
+      },
+    },
+    evaluator,
+  );
+  if (result.status === "runner_error") {
+    throw new Error(`Codex depth evaluation ${result.errorKind}: ${result.message}`);
+  }
+  return result.value;
 }
 
 let SDK_TIMEOUT_MS = 90_000;
@@ -79,6 +131,7 @@ async function callDepthEvaluation(
   model: string,
   taskType: TaskType,
   maxTurns = 5,
+  apiKeys?: ClaudeApiKeys,
 ): Promise<DepthEvalResult> {
   const queryFn = await getQueryFn();
   const messages: Array<{ type: string; subtype?: string; [key: string]: unknown }> = [];
@@ -90,6 +143,7 @@ async function callDepthEvaluation(
       maxTurns,
       tools: [],
       ...getSdkPermissionOptions(),
+      env: getClaudeSdkEnvironment(apiKeys),
       outputFormat: {
         type: "json_schema",
         schema: buildDepthResponseSchema(taskType),
@@ -208,9 +262,14 @@ function parseDepthResponse(resultText: string, taskType: TaskType): DepthEvalRe
     typeof raw.overall_score !== "number" ||
     raw.scores === undefined ||
     raw.scores === null ||
-    typeof raw.scores !== "object"
+    typeof raw.scores !== "object" ||
+    Array.isArray(raw.scores) ||
+    !Array.isArray(raw.deficiencies) ||
+    !raw.deficiencies.every((item) => typeof item === "string") ||
+    !Array.isArray(raw.enrichment_suggestions) ||
+    !raw.enrichment_suggestions.every((item) => typeof item === "string")
   ) {
-    throw new Error("Depth evaluation response missing required score fields");
+    throw new Error("Depth evaluation response missing or invalid required fields");
   }
 
   const config = getTaskTypeDepthConfig(taskType);

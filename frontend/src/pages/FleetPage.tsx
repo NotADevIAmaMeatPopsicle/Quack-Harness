@@ -80,13 +80,16 @@ export function FleetPage() {
   });
 
   const cancelJob = useMutation({
-    mutationFn: (jobId: string) => cancelFederationJob(jobId),
-    onSuccess: (_, jobId) => {
-      toast.success(`Canceled ${jobId}`);
+    mutationFn: (job: FederationJobSummary) => cancelFederationJob(job.jobId, job.projectId),
+    onSuccess: (_, job) => {
+      toast.success(`Canceled ${job.jobId}`);
       invalidate();
     },
-    onError: (error: unknown, jobId) => {
-      toast.error(`Failed to cancel ${jobId}`, error instanceof Error ? error.message : String(error));
+    onError: (error: unknown, job) => {
+      toast.error(
+        `Failed to cancel ${job.jobId}`,
+        error instanceof Error ? error.message : String(error),
+      );
     },
   });
 
@@ -113,14 +116,16 @@ export function FleetPage() {
         danger: true,
       });
       if (ok) {
-        cancelJob.mutate(job.jobId);
+        cancelJob.mutate(job);
       }
     })();
   };
 
   const activeAgents = health.data?.agents ?? [];
-  const warningAgents = activeAgents.filter((agent) =>
-    agent.status === "warning" || agent.status === "critical" || agent.status === "stuck");
+  const warningAgents = activeAgents.filter(
+    (agent) =>
+      agent.status === "warning" || agent.status === "critical" || agent.status === "stuck",
+  );
   const activeSnapshots = velocity.data?.activeSnapshots ?? [];
   const canPause = status.data?.state === "running";
   const canResume = status.data?.state === "paused" || status.data?.state === "emergency_stopped";
@@ -131,7 +136,9 @@ export function FleetPage() {
         title="Fleet"
         subtitle="Federation queue, listener hosts, and fleet-wide controls."
       >
-        {status.data && <span className={`pill ${fleetPillClass(status.data.state)}`}>{status.data.state}</span>}
+        {status.data && (
+          <span className={`pill ${fleetPillClass(status.data.state)}`}>{status.data.state}</span>
+        )}
         {canPause && (
           <button
             type="button"
@@ -162,12 +169,42 @@ export function FleetPage() {
         </button>
       </PageHeader>
 
+      {queue.data?.summary?.listenerRegistry?.healthy === false && (
+        <div className="card" role="alert">
+          <strong>Listener registry needs attention</strong>
+          <p>Valid workers remain listed below. Invalid registrations cannot receive work.</p>
+          <ul>
+            {queue.data.summary.listenerRegistry.issues.map((issue) => (
+              <li key={`${issue.file}:${issue.code}`}>
+                <code>{issue.file}</code>: {issue.reason}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       <section className="card">
         <div className="metrics-grid">
-          <MetricCard label="Fleet state" value={status.data?.state ?? "-"} detail={status.data?.reason ?? "No fleet pause reason"} />
-          <MetricCard label="Active jobs" value={String(status.data?.activeJobs ?? 0)} detail={`${queue.data?.jobs.length ?? 0} visible federation jobs`} />
-          <MetricCard label="Velocity watch" value={String(activeSnapshots.length)} detail={velocity.data?.config.enabled ? "active snapshots" : "disabled"} />
-          <MetricCard label="Agent health alerts" value={String(warningAgents.length)} detail={`${activeAgents.length} tracked agents`} />
+          <MetricCard
+            label="Fleet state"
+            value={status.data?.state ?? "-"}
+            detail={status.data?.reason ?? "No fleet pause reason"}
+          />
+          <MetricCard
+            label="Active jobs"
+            value={String(status.data?.activeJobs ?? 0)}
+            detail={`${queue.data?.jobs.length ?? 0} visible federation jobs`}
+          />
+          <MetricCard
+            label="Velocity watch"
+            value={String(activeSnapshots.length)}
+            detail={velocity.data?.config.enabled ? "active snapshots" : "disabled"}
+          />
+          <MetricCard
+            label="Agent health alerts"
+            value={String(warningAgents.length)}
+            detail={`${activeAgents.length} tracked agents`}
+          />
         </div>
       </section>
 
@@ -245,7 +282,9 @@ export function FleetPage() {
               ))}
               {queue.data.jobs.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="empty-state">No federated jobs are queued right now.</td>
+                  <td colSpan={7} className="empty-state">
+                    No federated jobs are queued right now.
+                  </td>
                 </tr>
               )}
             </tbody>
@@ -262,7 +301,8 @@ export function FleetPage() {
               {velocity.data.config.enabled
                 ? `Warn ${velocity.data.config.warnMultiplier}x, kill ${velocity.data.config.killMultiplier}x`
                 : "Cost velocity monitoring is disabled."}
-              {velocity.data.baseline && ` Baseline ${velocity.data.baseline.medianCostPerMinute.toFixed(4)}/min across ${velocity.data.baseline.sampleCount} tasks.`}
+              {velocity.data.baseline &&
+                ` Baseline ${velocity.data.baseline.medianCostPerMinute.toFixed(4)}/min across ${velocity.data.baseline.sampleCount} tasks.`}
             </p>
             <table className="table">
               <thead>
@@ -286,7 +326,9 @@ export function FleetPage() {
                 ))}
                 {activeSnapshots.length === 0 && (
                   <tr>
-                    <td colSpan={5} className="empty-state">No active dispatches to monitor.</td>
+                    <td colSpan={5} className="empty-state">
+                      No active dispatches to monitor.
+                    </td>
                   </tr>
                 )}
               </tbody>
@@ -327,7 +369,9 @@ export function FleetPage() {
               ))}
               {health.data.agents.length === 0 && (
                 <tr>
-                  <td colSpan={6} className="empty-state">No active local agents are being tracked right now.</td>
+                  <td colSpan={6} className="empty-state">
+                    No active local agents are being tracked right now.
+                  </td>
                 </tr>
               )}
             </tbody>

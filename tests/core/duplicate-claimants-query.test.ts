@@ -183,7 +183,7 @@ describe("TASK-1338-A: directory-scoped duplicate claimant query", () => {
     });
   });
 
-  it("MATCHER CONTROL: ignores unsupported and non-md top-level names", async () => {
+  it("MATCHER CONTROL: includes every parseable Markdown declaration but ignores non-md names", async () => {
     await withTaskFiles(
       [
         ["TASK-100-a.md", spec("TASK-100")],
@@ -192,7 +192,11 @@ describe("TASK-1338-A: directory-scoped duplicate claimant query", () => {
         ["TASK-997-note.txt", spec("TASK-100")],
       ],
       async (taskDir) => {
-        expect(await listDuplicateClaimants(taskDir, "TASK-100")).toEqual([]);
+        expect(await listDuplicateClaimants(taskDir, "TASK-100")).toEqual([
+          "NOT-A-TASK.md",
+          "TASK-100-a.md",
+          "TASK-999-uppercase.MD",
+        ]);
       },
     );
   });

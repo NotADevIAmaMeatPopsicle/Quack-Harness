@@ -6,6 +6,7 @@
 import type { ParsedTask } from "../core/types.js";
 import type { Blueprint } from "../blueprint/blueprint-types.js";
 import { formatBlueprintForPrompt } from "../blueprint/blueprint-prompt.js";
+import { resolveDecompositionMaxSubtasks } from "./decomposition-limits.js";
 
 /**
  * Build the topology planning prompt for the decompose agent.
@@ -17,7 +18,12 @@ import { formatBlueprintForPrompt } from "../blueprint/blueprint-prompt.js";
  * @param blueprint - Blueprint with file analyses and integration points
  * @returns Complete prompt string for the topology agent
  */
-export function buildDecomposePrompt(task: ParsedTask, blueprint: Blueprint): string {
+export function buildDecomposePrompt(
+  task: ParsedTask,
+  blueprint: Blueprint,
+  maxSubtasks = 4,
+): string {
+  const resolvedMax = resolveDecompositionMaxSubtasks(maxSubtasks);
   const blueprintSection = formatBlueprintForPrompt(blueprint);
 
   return `# Task Topology Planning Request
@@ -40,7 +46,7 @@ ${blueprintSection}
 
 ## Topology Rules
 
-1. **Create 2-4 subtasks maximum.** Each parent file must be owned by EXACTLY ONE child.
+1. **Create between 2 and ${resolvedMax} subtasks.** Each parent file must be owned by EXACTLY ONE child.
 2. **Each parent success criterion must be mapped to AT LEAST ONE child owner.**
 3. **Order children by dependency:** standalone first, integration last.
 4. **The final child** (isFinal: true) may carry "All parent task success criteria verified" as an extra criterion.
@@ -66,6 +72,7 @@ ${blueprintSection}
 
 **IMPORTANT:**
 - Subtask IDs MUST follow the pattern ${task.id}-A, ${task.id}-B, ${task.id}-C
+- A single child is not a decomposition; return at least two children
 - The last subtask must have isFinal: true
 - File paths must exactly match those from the parent task
 - Success criteria text must come from the parent task

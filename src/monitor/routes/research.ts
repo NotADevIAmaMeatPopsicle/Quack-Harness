@@ -62,7 +62,7 @@ function normalizedWorkerKey(analysis: DispatchAnalysis): string {
     analysis.workerHostAlias ?? analysis.workerHostId ?? analysis.executionMode ?? "unknown";
   const key = raw.trim().toLowerCase();
   if (key === "headnode") return "headnode";
-  if (key === "laptop" || key === "example laptop") return "worker-laptop";
+  if (key === "laptop" || key === "example laptop") return "example-laptop";
   if (analysis.sessionId.startsWith("federation-")) return "federation-ledger";
   return key || "unknown";
 }

@@ -80,7 +80,7 @@ describe("TASK-1332: every approval CREATION site stamps spec identity", () => {
   const dispatcher = read("dispatcher/dispatcher.ts");
 
   it.each([
-    ["saveBlueprintApproval", 1, "approvalIdentity.identity"],
+    ["saveBlueprintApproval", 2, "approvalIdentity.identity"],
     ["savePendingApproval", 1, "approvalIdentity.identity"],
     ["saveJudgeApproval", 3, "approvalIdentity.identity"],
     ["savePendingJudgeApproval", 1, "approvalIdentity.identity"],
@@ -95,9 +95,9 @@ describe("TASK-1332: every approval CREATION site stamps spec identity", () => {
     },
   );
 
-  it("keeps the two comparison consumers on full resolution while stamps use found-only", () => {
+  it("keeps every comparison consumer on full resolution while stamps use found-only", () => {
     const fullComparisons = callArgs(dispatcher, "compareResolvedSpecIdentity");
-    expect(fullComparisons).toHaveLength(2);
+    expect(fullComparisons).toHaveLength(3);
     for (const args of fullComparisons) {
       expect(args).toContain("currentSpecResolution()");
       expect(args).not.toContain("currentFoundSpecIdentity()");
@@ -106,7 +106,7 @@ describe("TASK-1332: every approval CREATION site stamps spec identity", () => {
     expect(dispatcher).toContain("const currentSpecResolution =");
     expect(dispatcher).toContain("const identityForApprovalSave =");
     expect(dispatcher).toContain("return { identity: foundSpecIdentity(resolution) }");
-    expect(callArgs(dispatcher, "identityForApprovalSave")).toHaveLength(6);
+    expect(callArgs(dispatcher, "identityForApprovalSave")).toHaveLength(7);
   });
 
   it("resolves identity from the adapter's project root, never from task.rawContent alone", () => {

@@ -1,3 +1,4 @@
+import { getClaudeSdkEnvironment } from "../sdk/claude-auth.js";
 // ─── Post-Judge Verification Agent ────────────────────────────────
 // Runs independent verification after judge APPROVE to catch quality
 // gaps that the LLM judge misses: runtime integration issues, stub
@@ -24,8 +25,44 @@ import { worktreeEnv } from "../utils/worktree-env.js";
 import { isDockerAvailable, run as dockerRun } from "../testing/docker-test-runner.js";
 import { analyzeTestOutput, isTestCommand } from "../testing/test-output-analysis.js";
 import { getSdkPermissionOptions } from "../sdk/permission-mode.js";
-import { prepareVerificationCommandRuntime } from "../worker/tools/verify.js";
+import {
+  normalizeVerificationTimeoutMs,
+  prepareVerificationCommandRuntime,
+  runVerification,
+} from "../worker/tools/verify.js";
 import { buildScopedTestCommand, collectScopedTestFiles } from "../testing/scoped-test-command.js";
+import { runCodexStructuredEvaluation } from "../llm/codex-structured-evaluator.js";
+import { runTrustedGitSync } from "./trusted-git.js";
+import { readContainedRegularFile } from "./safe-semantic-file-reader.js";
+
+const POST_JUDGE_GIT_TIMEOUT_MS = 30_000;
+const POST_JUDGE_GIT_MAX_BUFFER = 10 * 1024 * 1024;
+
+function postJudgeGit(
+  workDir: string,
+  args: readonly string[],
+  errorContext: string,
+  maxBuffer = POST_JUDGE_GIT_MAX_BUFFER,
+): string {
+  return runTrustedGitSync(args, workDir, {
+    timeoutMs: POST_JUDGE_GIT_TIMEOUT_MS,
+    maxBuffer,
+    errorContext,
+  });
+}
+
+function safeBaseBranch(baseBranch: string): string {
+  if (
+    !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(baseBranch) ||
+    baseBranch.includes("..") ||
+    baseBranch.includes("@{") ||
+    baseBranch.endsWith("/") ||
+    baseBranch.endsWith(".")
+  ) {
+    throw new Error(`Unsafe base branch name: ${baseBranch}`);
+  }
+  return baseBranch;
+}
 
 /**
  * Type for the SDK query function.
@@ -39,6 +76,27 @@ type QueryFn = (args: {
  * Lazily loaded reference to the SDK's query function.
  */
 let _queryFn: QueryFn | undefined;
+
+const SEMANTIC_RESPONSE_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    findings: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          criterion: { type: "string" },
+          status: { type: "string", enum: ["pass", "fail", "warn"] },
+          evidence: { type: "string" },
+        },
+        required: ["criterion", "status", "evidence"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["findings"],
+  additionalProperties: false,
+};
 
 function execAdapterCommandSync(
   command: string,
@@ -147,6 +205,75 @@ async function runDeterministicChecks(
   findings: VerificationFinding[];
   smartTestDetails?: string;
 }> {
+  const hostExecution = adapter.config.verification.hostExecution ?? "direct";
+  if (hostExecution === "codex-sandbox" || hostExecution === "docker-sandbox") {
+    // Smart/tiered runners and the historical sync command path execute in
+    // the monitor's security context.  An opted-in adapter must never fall
+    // back to either path: route every deterministic command and convention
+    // check through the shared fail-closed sandbox executor instead.
+    const isolatedAdapter: ProjectAdapter = { ...adapter, projectRoot: workDir };
+    const isolated = await runVerification(isolatedAdapter, "all", {
+      runThorough: true,
+      includeOptional: true,
+      task,
+      baseBranch: adapter.config.git?.baseBranch ?? "main",
+      authoritativeAdapterBundle: adapter.adapterBundle,
+    });
+
+    const findings: VerificationFinding[] = [];
+    let buildPassed = true;
+    let testsPassed = true;
+    let lintPassed = true;
+    let testCount = 0;
+    let smartTestDetails: string | undefined;
+
+    for (const result of [...isolated.commands, ...isolated.conventionChecks]) {
+      const configured = adapter.config.verification.commands.find(
+        (candidate) => candidate.name === result.name,
+      );
+      const commandText = configured ? verificationCommandShellString(configured) : result.name;
+      const required = result.required ?? configured?.required ?? true;
+      const status: VerificationFinding["status"] = result.passed
+        ? "pass"
+        : required
+          ? "fail"
+          : "warn";
+      const isTest = configured ? isTestCommand(configured.name, commandText) : false;
+      if (isTest) {
+        const analysis = analyzeTestOutput(result.output);
+        testCount += analysis.count ?? (result.passed ? 1 : 0);
+        if (!result.passed && required) testsPassed = false;
+        if (!result.passed) smartTestDetails = result.output;
+      }
+      if (configured?.name.toLowerCase().includes("build") && !result.passed && required) {
+        buildPassed = false;
+      }
+      if (configured?.name.toLowerCase().includes("lint") && !result.passed) {
+        lintPassed = false;
+      }
+      findings.push({
+        criterion: result.name,
+        status,
+        evidence: result.output,
+      });
+      events.emit("post_judge_verify_finding", {
+        taskId,
+        criterion: result.name,
+        status,
+        evidence: result.output,
+      });
+    }
+
+    return {
+      buildPassed,
+      testsPassed,
+      lintPassed,
+      testCount,
+      findings,
+      smartTestDetails,
+    };
+  }
+
   const findings: VerificationFinding[] = [];
   let buildPassed = true;
   let testsPassed = true;
@@ -167,6 +294,7 @@ async function runDeterministicChecks(
     // structured forms.
     const cmdString = verificationCommandShellString(cmd);
     const isTestCmd = isTestCommand(cmd.name, cmdString);
+    const timeoutMs = normalizeVerificationTimeoutMs(cmd.timeout);
 
     // ── Tiered testing path ───────────────────────────────────────
     // Takes precedence over smart testing when enabled.
@@ -184,17 +312,17 @@ async function runDeterministicChecks(
         // Get changed files from git diff
         let diffFiles: string[] = [];
         try {
-          const mergeBase = execSync(`git merge-base ${baseBranch} HEAD`, {
-            cwd: workDir,
-            env,
-            encoding: "utf-8",
-          }).trim();
+          const mergeBase = postJudgeGit(
+            workDir,
+            ["merge-base", safeBaseBranch(baseBranch), "HEAD"],
+            "Tiered verification could not resolve the merge base",
+          ).trim();
           const diffRef = mergeBase || "HEAD";
-          diffFiles = execSync(`git diff --name-only ${diffRef}..HEAD`, {
-            cwd: workDir,
-            env,
-            encoding: "utf-8",
-          })
+          diffFiles = postJudgeGit(
+            workDir,
+            ["diff", "--name-only", `${diffRef}..HEAD`],
+            "Tiered verification could not inspect changed files",
+          )
             .trim()
             .split("\n")
             .filter(Boolean);
@@ -345,7 +473,7 @@ async function runDeterministicChecks(
           baseBranch,
           outputDir: smartConfig.outputDir,
           taskId,
-          timeout: cmd.timeout,
+          timeout: timeoutMs,
         });
 
         // Baseline comparison
@@ -498,7 +626,7 @@ async function runDeterministicChecks(
         service: cmd.docker.service,
         command: cmdString,
         workDir,
-        timeout: cmd.timeout,
+        timeout: timeoutMs,
         dependsOn: cmd.docker.dependsOn,
       });
 
@@ -549,7 +677,7 @@ async function runDeterministicChecks(
             cwd: workDir,
             env: cmd.env ? { ...env, ...cmd.env } : env,
             encoding: "utf-8",
-            timeout: cmd.timeout,
+            timeout: timeoutMs,
             stdio: ["pipe", "pipe", "pipe"],
             structuredCwd: cmd.cwd,
           })
@@ -557,7 +685,7 @@ async function runDeterministicChecks(
             cwd: workDir,
             env,
             encoding: "utf-8",
-            timeout: cmd.timeout,
+            timeout: timeoutMs,
             stdio: ["pipe", "pipe", "pipe"],
           });
 
@@ -633,7 +761,7 @@ async function runDeterministicChecks(
               cwd: workDir,
               env,
               encoding: "utf-8",
-              timeout: cmd.timeout,
+              timeout: timeoutMs,
               stdio: ["pipe", "pipe", "pipe"],
             });
 
@@ -676,11 +804,11 @@ async function runDeterministicChecks(
         let diffTouchesFrontend = false;
         try {
           const diffBase = getDiffBase(workDir, adapter.config.git?.baseBranch ?? "main");
-          const diffFiles = execSync(`git diff --name-only ${diffBase}..HEAD`, {
-            cwd: workDir,
-            env,
-            encoding: "utf-8",
-          })
+          const diffFiles = postJudgeGit(
+            workDir,
+            ["diff", "--name-only", `${diffBase}..HEAD`],
+            "Post-judge verification could not inspect frontend changes",
+          )
             .trim()
             .split("\n")
             .filter(Boolean);
@@ -750,35 +878,25 @@ async function runDeterministicChecks(
  * Falls back to HEAD if merge-base detection fails.
  */
 function getDiffBase(workDir: string, baseBranch = "main"): string {
-  const env = worktreeEnv(workDir);
-  try {
-    execSync(`git fetch origin ${baseBranch}:refs/remotes/origin/${baseBranch}`, {
-      cwd: workDir,
-      env,
-      stdio: "ignore",
-    });
-  } catch {
-    // Non-fatal: an existing remote-tracking ref is still better than a stale
-    // local branch when the host is offline or fetch is transiently blocked.
-  }
+  const validatedBaseBranch = safeBaseBranch(baseBranch);
 
   try {
-    const mergeBase = execSync(`git merge-base origin/${baseBranch} HEAD`, {
-      cwd: workDir,
-      env,
-      encoding: "utf-8",
-    }).trim();
+    const mergeBase = postJudgeGit(
+      workDir,
+      ["merge-base", `origin/${validatedBaseBranch}`, "HEAD"],
+      "Post-judge verification could not resolve the remote merge base",
+    ).trim();
     if (mergeBase.length > 0) return mergeBase;
   } catch {
     // Fall through to local branch below.
   }
 
   try {
-    const mergeBase = execSync(`git merge-base ${baseBranch} HEAD`, {
-      cwd: workDir,
-      env,
-      encoding: "utf-8",
-    }).trim();
+    const mergeBase = postJudgeGit(
+      workDir,
+      ["merge-base", validatedBaseBranch, "HEAD"],
+      "Post-judge verification could not resolve the local merge base",
+    ).trim();
     if (mergeBase.length > 0) return mergeBase;
     return "HEAD";
   } catch {
@@ -797,7 +915,6 @@ async function runStructuralChecks(
 ): Promise<VerificationFinding[]> {
   const findings: VerificationFinding[] = [];
   const diffBase = getDiffBase(workDir, baseBranch);
-  const env = worktreeEnv(workDir);
 
   // Check 1: Verify files from "Files to Modify" exist and were changed
   // Build a list of actually-changed files from git diff for fuzzy matching
@@ -805,11 +922,11 @@ async function runStructuralChecks(
   // but agent correctly created "frontends/app/src/types/foo.ts").
   let changedFiles: string[] = [];
   try {
-    const diffOutput = execSync(`git diff --name-only ${diffBase}`, {
-      cwd: workDir,
-      env,
-      encoding: "utf-8",
-    });
+    const diffOutput = postJudgeGit(
+      workDir,
+      ["diff", "--name-only", diffBase],
+      "Structural verification could not list changed files",
+    );
     changedFiles = diffOutput.trim().split("\n").filter(Boolean);
   } catch {
     // If git diff fails, fall back to exact-path-only checks
@@ -822,11 +939,11 @@ async function runStructuralChecks(
         await fs.access(filePath);
         // File exists at exact path - check if it was actually modified
         try {
-          const gitDiff = execSync(`git diff ${diffBase} -- "${fileEntry.path}"`, {
-            cwd: workDir,
-            env,
-            encoding: "utf-8",
-          });
+          const gitDiff = postJudgeGit(
+            workDir,
+            ["diff", diffBase, "--", fileEntry.path],
+            `Structural verification could not inspect ${fileEntry.path}`,
+          );
           if (gitDiff.trim().length === 0) {
             findings.push({
               criterion: `File modified: ${fileEntry.path}`,
@@ -880,11 +997,11 @@ async function runStructuralChecks(
 
   // Check 2: Detect stub functions in new/modified files
   try {
-    const gitDiff = execSync(`git diff ${diffBase}`, {
-      cwd: workDir,
-      env,
-      encoding: "utf-8",
-    });
+    const gitDiff = postJudgeGit(
+      workDir,
+      ["diff", diffBase],
+      "Structural verification could not inspect stubs",
+    );
 
     const stubPatterns = [
       /not implemented/i,
@@ -928,11 +1045,11 @@ async function runStructuralChecks(
 
   // Check 3: Detect 'any' type usage in new TypeScript files
   try {
-    const gitDiff = execSync(`git diff ${diffBase}`, {
-      cwd: workDir,
-      env,
-      encoding: "utf-8",
-    });
+    const gitDiff = postJudgeGit(
+      workDir,
+      ["diff", diffBase],
+      "Structural verification could not inspect TypeScript additions",
+    );
 
     // Find TypeScript added lines with : any
     const addedLines = gitDiff.split("\n").filter((line) => line.startsWith("+"));
@@ -965,11 +1082,11 @@ async function runStructuralChecks(
   const testingReqs = task.testingRequirements?.length ?? 0;
   if (testingReqs > 0) {
     try {
-      const gitDiffNames = execSync(`git diff ${diffBase} --name-only`, {
-        cwd: workDir,
-        env,
-        encoding: "utf-8",
-      });
+      const gitDiffNames = postJudgeGit(
+        workDir,
+        ["diff", "--name-only", diffBase],
+        "Structural verification could not inspect changed tests",
+      );
 
       const testFiles = gitDiffNames
         .split("\n")
@@ -1029,12 +1146,11 @@ async function getModifiedFileContents(
 ): Promise<string> {
   try {
     const diffBase = getDiffBase(workDir, baseBranch);
-    const env = worktreeEnv(workDir);
-    const fileList = execSync(`git diff ${diffBase} --name-only`, {
-      cwd: workDir,
-      env,
-      encoding: "utf-8",
-    });
+    const fileList = postJudgeGit(
+      workDir,
+      ["diff", "--name-only", diffBase],
+      "Semantic verification could not list modified files",
+    );
 
     const files = fileList.split("\n").filter((f) => f.trim().length > 0);
     const maxChars = Math.floor(maxTokens * 0.5) * 3; // half the budget, ~3 chars/token
@@ -1044,11 +1160,10 @@ async function getModifiedFileContents(
     for (const file of files) {
       if (totalChars >= maxChars) break;
       try {
-        const filePath = join(workDir, file);
-        const content = await fs.readFile(filePath, "utf-8");
         const remaining = maxChars - totalChars;
+        const content = await readContainedRegularFile(workDir, file, remaining);
         const truncated =
-          content.length > remaining
+          content.length >= remaining
             ? content.slice(0, remaining) + "\n[... file truncated ...]"
             : content;
         sections.push(`── ${file} ──\n${truncated}`);
@@ -1163,13 +1278,12 @@ async function runSemanticVerification(
 
   try {
     // Get git diff
-    const env = worktreeEnv(workDir);
-    const gitDiff = execSync("git diff HEAD", {
-      cwd: workDir,
-      env,
-      encoding: "utf-8",
-      maxBuffer: 1024 * 1024 * 5, // 5MB max
-    });
+    const gitDiff = postJudgeGit(
+      workDir,
+      ["diff", "HEAD"],
+      "Semantic verification could not inspect the worktree diff",
+      5 * 1024 * 1024,
+    );
 
     // Mode B: skip semantic layer for diffs >3× token budget
     const truncation = applyTwoModeTruncation(gitDiff, config.maxSemanticTokens);
@@ -1217,55 +1331,76 @@ async function runSemanticVerification(
       truncation.note,
     );
 
-    // Call LLM via Agent SDK with 3-minute timeout cap (anti-pattern: don't block forever)
-    const SEMANTIC_TIMEOUT_MS = 180_000; // 3 minutes
-    const query = await getQueryFn();
-    const stream = query({
-      prompt,
-      options: {
-        model: config.model,
-        maxTurns: 3,
-        tools: [],
-        ...getSdkPermissionOptions(),
-      },
-    });
+    const evaluator = adapter.config.evaluationProviders?.semanticPostJudge;
+    if (evaluator?.runner === "codex-cli") {
+      const result = await runCodexStructuredEvaluation(
+        {
+          projectRoot: workDir,
+          model: evaluator.model ?? config.model,
+          prompt: `${prompt}\n\nReturn a JSON object with one findings entry per success criterion.`,
+          outputSchema: SEMANTIC_RESPONSE_SCHEMA,
+          parse: (rawText) => parseSemanticStructuredResponse(rawText, task),
+        },
+        evaluator,
+      );
+      if (result.status === "runner_error") {
+        // Fail closed into the existing authority-inversion path: deterministic
+        // green remains authoritative, but a human-review flag is mandatory.
+        findings.push({
+          criterion: "Semantic verification provider",
+          status: "fail",
+          evidence: `Codex semantic evaluator ${result.errorKind}: ${result.message}`,
+        });
+      } else {
+        findings.push(...result.value);
+      }
+    } else {
+      // Claude SDK legacy/default path with 3-minute timeout cap.
+      const SEMANTIC_TIMEOUT_MS = 180_000;
+      const query = await getQueryFn();
+      const stream = query({
+        prompt,
+        options: {
+          model: evaluator?.model ?? config.model,
+          maxTurns: evaluator?.maxTurns ?? 3,
+          tools: [],
+          ...getSdkPermissionOptions(),
+          env: getClaudeSdkEnvironment(adapter.config.agent.apiKeys),
+        },
+      });
 
-    // Collect response text from result message, with timeout
-    let responseText = "";
-    const llmPromise = (async () => {
-      for await (const message of stream) {
-        if (message.type === "result" && message.subtype === "success") {
-          const content = (message as { content?: string }).content;
-          if (content) {
-            return content;
+      let responseText = "";
+      const llmPromise = (async () => {
+        for await (const message of stream) {
+          if (message.type === "result" && message.subtype === "success") {
+            const content = (message as { content?: string }).content;
+            if (content) return content;
           }
         }
-      }
-      return "";
-    })();
-
-    const timeoutPromise = new Promise<string>((_, reject) =>
-      setTimeout(
-        () => reject(new Error("Layer 3 semantic verification timed out (3 minute cap)")),
-        SEMANTIC_TIMEOUT_MS,
-      ),
-    );
-
-    try {
-      responseText = await Promise.race([llmPromise, timeoutPromise]);
-    } catch (timeoutErr) {
-      // Timeout — fall back to Layer 1+2 results only
-      findings.push({
-        criterion: "Semantic verification",
-        status: "warn",
-        evidence:
-          timeoutErr instanceof Error ? timeoutErr.message : "Semantic verification timed out",
+        return "";
+      })();
+      const timeoutMs = evaluator?.timeoutMs ?? SEMANTIC_TIMEOUT_MS;
+      const timeoutPromise = new Promise<string>((_, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error(`Layer 3 semantic verification timed out (${timeoutMs}ms cap)`)),
+          timeoutMs,
+        );
+        timer.unref();
       });
-      return findings;
-    }
 
-    if (responseText) {
-      findings.push(...parseSemanticResponse(responseText, task));
+      try {
+        responseText = await Promise.race([llmPromise, timeoutPromise]);
+      } catch (timeoutErr) {
+        findings.push({
+          criterion: "Semantic verification",
+          status: "warn",
+          evidence:
+            timeoutErr instanceof Error ? timeoutErr.message : "Semantic verification timed out",
+        });
+        return findings;
+      }
+
+      if (responseText) findings.push(...parseSemanticResponse(responseText, task));
     }
 
     // Emit findings
@@ -1394,8 +1529,15 @@ function parseSemanticResponse(text: string, task: ParsedTask): VerificationFind
     });
   }
 
+  return ensureSemanticCoverage(findings, task);
+}
+
+function ensureSemanticCoverage(
+  findings: VerificationFinding[],
+  task: ParsedTask,
+): VerificationFinding[] {
   // Verify that every success criterion from the task received a response.
-  // If the LLM skipped a criterion, add a warn finding for it.
+  // If the evaluator skipped a criterion, add a warn finding for it.
   const respondedCriteria = new Set(findings.map((f) => f.criterion.toLowerCase()));
   for (const criterion of task.successCriteria) {
     const criterionLower = criterion.toLowerCase();
@@ -1414,6 +1556,39 @@ function parseSemanticResponse(text: string, task: ParsedTask): VerificationFind
   }
 
   return findings;
+}
+
+function parseSemanticStructuredResponse(
+  text: string,
+  task: ParsedTask,
+): VerificationFinding[] | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const raw = (parsed as Record<string, unknown>).findings;
+  if (!Array.isArray(raw)) return null;
+  const findings: VerificationFinding[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+    const item = entry as Record<string, unknown>;
+    if (
+      typeof item.criterion !== "string" ||
+      !["pass", "fail", "warn"].includes(String(item.status)) ||
+      typeof item.evidence !== "string"
+    ) {
+      return null;
+    }
+    findings.push({
+      criterion: item.criterion,
+      status: item.status as VerificationFinding["status"],
+      evidence: item.evidence,
+    });
+  }
+  return ensureSemanticCoverage(findings, task);
 }
 
 // ─── Main Verification Function ────────────────────────────────────

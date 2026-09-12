@@ -74,23 +74,23 @@ describe("Intake API Endpoints", () => {
   let logDir: string;
   let projectDir: string;
   let stopServer: (() => Promise<void>) | undefined;
-  const port = 30000 + Math.floor(Math.random() * 10000);
   let baseUrl: string;
 
   beforeAll(async () => {
     logDir = makeTempDir();
     projectDir = makeTempDir();
     createSampleProject(projectDir);
-    baseUrl = `http://localhost:${port}`;
 
     const serverObj = createMonitorServer({
       logDir,
-      port,
+      port: 0,
+      host: "127.0.0.1",
       projectRoot: projectDir,
       taskDir: "docs/tasks",
     });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    const started = await serverObj.start();
+    stopServer = started.stop;
+    baseUrl = `http://127.0.0.1:${started.port}`;
   }, 15000);
 
   afterAll(async () => {

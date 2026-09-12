@@ -202,6 +202,7 @@ describe("runtime-validator", () => {
         const task = makeTask({ tags: ["frontend"] });
         const adapter = makeAdapter({
           runtimeCheck: {
+            execution: "direct-trusted",
             startCommand: "npm run dev",
             healthUrl: "http://localhost:3000",
             routes: ["/"],
@@ -230,6 +231,7 @@ describe("runtime-validator", () => {
         const task = makeTask({ tags: ["frontend"] });
         const adapter = makeAdapter({
           runtimeCheck: {
+            execution: "direct-trusted",
             startCommand: "npm run dev",
             healthUrl: "http://localhost:3000",
             routes: ["/"],
@@ -259,6 +261,53 @@ describe("runtime-validator", () => {
         global.fetch = originalFetch;
       }
     }, 30000);
+
+    it("refuses an unacknowledged host command before it can write or detach", async () => {
+      const cp = await import("node:child_process");
+      const localSpawn = cp.spawn as ReturnType<typeof jest.fn>;
+      const task = makeTask({ tags: ["frontend"] });
+      const adapter = makeAdapter({
+        runtimeCheck: {
+          startCommand:
+            "node -e \"require('node:fs').writeFileSync('../protected-sentinel','x');require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true})\"",
+          healthUrl: "http://127.0.0.1:3000/health",
+          routes: ["/"],
+          baseUrl: "http://127.0.0.1:3000",
+        },
+      });
+
+      const result = await runRuntimeValidation("TASK-100", task, adapter, "/work", mockEvents);
+
+      expect(result.available).toBe(false);
+      expect(result.warnings[0]).toContain("direct-trusted");
+      expect(localSpawn).not.toHaveBeenCalled();
+    });
+
+    it("refuses direct runtime execution when verification uses a sandbox", async () => {
+      const cp = await import("node:child_process");
+      const localSpawn = cp.spawn as ReturnType<typeof jest.fn>;
+      const task = makeTask({ tags: ["frontend"] });
+      const adapter = makeAdapter({
+        verification: {
+          commands: [],
+          conventionChecks: [],
+          hostExecution: "docker-sandbox",
+        },
+        runtimeCheck: {
+          execution: "direct-trusted",
+          startCommand: "npm run dev",
+          healthUrl: "http://127.0.0.1:3000/health",
+          routes: ["/"],
+          baseUrl: "http://127.0.0.1:3000",
+        },
+      });
+
+      const result = await runRuntimeValidation("TASK-100", task, adapter, "/work", mockEvents);
+
+      expect(result.available).toBe(false);
+      expect(result.warnings[0]).toContain("cannot bypass");
+      expect(localSpawn).not.toHaveBeenCalled();
+    });
   });
 });
 
@@ -296,6 +345,7 @@ describe("runtime-validator (playwright unavailable)", () => {
         const task = makeTask({ tags: ["frontend"] });
         const adapter = makeAdapter({
           runtimeCheck: {
+            execution: "direct-trusted",
             startCommand: "npm run dev",
             healthUrl: "http://localhost:3000",
             routes: ["/"],

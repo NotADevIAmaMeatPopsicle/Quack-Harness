@@ -5,6 +5,8 @@ import * as http from "node:http";
 
 import { createMonitorServer } from "../../src/monitor/server";
 import { DispatchManager } from "../../src/monitor/dispatch-manager";
+import { reviseCommand } from "../../src/cli/revise";
+import * as dispatcher from "../../src/dispatcher/dispatcher";
 import type { SessionEntry, QuackEvent } from "../../src/monitor/event-types";
 
 // ─── Helpers ─────────────────────────────────────────────────────
@@ -155,8 +157,32 @@ describe("POST /api/tasks/:id/revise", () => {
       path.join(quackDir, "adapter.json"),
       JSON.stringify({
         version: "1.0",
-        project: { name: "test", root: ".", taskDir: "docs/tasks" },
+        project: {
+          name: "test",
+          root: ".",
+          taskDir: "docs/tasks",
+          conventionsDir: ".quack",
+        },
         agent: { model: "claude-sonnet-4-6", maxTurns: 100, maxBudgetPerTask: 8 },
+        verification: {
+          commands: [{ name: "test", command: "npm test", required: true, timeout: 60_000 }],
+          conventionChecks: [],
+        },
+        sandbox: {
+          writablePaths: ["src/", "tests/"],
+          deniedPaths: [],
+          allowedBashPatterns: [],
+          deniedBashPatterns: [],
+        },
+        git: {
+          baseBranch: "main",
+          branchPrefix: "quack/",
+          commitFormat: "[{taskId}] {message}",
+          commitTrailer: "",
+          autoCreatePr: false,
+          autoPush: false,
+        },
+        logging: { dir: logDir, level: "debug", retainDays: 30 },
         revision: { maxBudget: 1.5, maxTurns: 30 },
       }),
       "utf-8",
@@ -210,6 +236,62 @@ describe("POST /api/tasks/:id/revise", () => {
     expect(status).toBe(404);
     const data = JSON.parse(body) as { error: string };
     expect(data.error).toContain("not found");
+  });
+
+  it("both doors reject an unparseable task before persisted revision writes", async () => {
+    const taskPath = path.join(projectRoot, "docs", "tasks", "TASK-042-test.md");
+    const invalidSpec = fs
+      .readFileSync(taskPath, "utf-8")
+      .replace("- **Status:** READY", "- **Status:** READY\n- **Execution Mode:** unsafe-loop");
+    fs.writeFileSync(taskPath, invalidSpec, "utf-8");
+
+    const checkpointPath = path.join(logDir, "checkpoint-TASK-042.json");
+    const originalCheckpoint = JSON.stringify({ sentinel: "untouched" });
+    fs.writeFileSync(checkpointPath, originalCheckpoint, "utf-8");
+    const dispatchSpy = jest.spyOn(dispatcher, "dispatchTask");
+    const exitSpy = jest.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await reviseCommand("TASK-042", { project: projectRoot, feedback: "Retry" });
+
+    expect(errorSpy).toHaveBeenCalledWith("Error: Task TASK-042 not found");
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(dispatchSpy).not.toHaveBeenCalled();
+    expect(fs.readFileSync(checkpointPath, "utf-8")).toBe(originalCheckpoint);
+    expect(fs.existsSync(path.join(logDir, "sessions.jsonl"))).toBe(false);
+    errorSpy.mockRestore();
+    exitSpy.mockRestore();
+    dispatchSpy.mockRestore();
+
+    const port = await freePort();
+    const serverObj = createMonitorServer({
+      logDir,
+      port,
+      projectRoot,
+      taskDir: "docs/tasks",
+    });
+    const { stop } = await serverObj.start();
+    stopServer = stop;
+    const response = await httpPost(`http://localhost:${port}/api/tasks/TASK-042/revise`, {
+      feedback: "Retry",
+    });
+
+    expect(response.status).toBe(404);
+    expect(fs.readFileSync(checkpointPath, "utf-8")).toBe(originalCheckpoint);
+    expect(fs.existsSync(path.join(logDir, "sessions.jsonl"))).toBe(false);
+  });
+
+  it("CLI refuses a durable active session without a monitor", async () => {
+    writeJsonl(path.join(logDir, "sessions.jsonl"), [makeSession("active", "TASK-042", "active")]);
+    const dispatchSpy = jest.spyOn(dispatcher, "dispatchTask");
+    const exitSpy = jest.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await reviseCommand("TASK-042", { project: projectRoot, feedback: "Retry" });
+
+    expect(errorSpy).toHaveBeenCalledWith("Error: Task TASK-042 is already running");
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(dispatchSpy).not.toHaveBeenCalled();
   });
 
   it("returns 400 when task has no prior runs", async () => {
@@ -429,6 +511,122 @@ describe("POST /api/tasks/:id/revise", () => {
     expect(startSpy).toHaveBeenCalledTimes(1);
     expect(startSpy.mock.calls[0]?.[0]).toBe("TASK-042");
     expect(startSpy.mock.calls[0]?.[1]?.judgeFeedback).toContain("execution judge feedback");
+  });
+
+  it("leaves identical durable revision state through the CLI and HTTP doors", async () => {
+    const adapterPath = path.join(projectRoot, ".quack", "adapter.json");
+    const adapter = JSON.parse(fs.readFileSync(adapterPath, "utf-8")) as Record<string, unknown>;
+    adapter.executionMode = "loop";
+    fs.writeFileSync(adapterPath, JSON.stringify(adapter), "utf-8");
+
+    const sessions = [makeSession("s1", "TASK-042", "completed", "rejected")];
+    const events = [makeJudgeEvent("s1", "TASK-042", "REVISE", "Judge feedback")];
+    const checkpoint = {
+      taskId: "TASK-042",
+      sessionId: "s1",
+      claudeSessionId: "claude-session-1",
+      branchName: "quack/TASK-042-test",
+      completedStages: [
+        "gate",
+        "blueprint",
+        "approve",
+        "branch",
+        "context",
+        "agent",
+        "commit",
+        "judge_review",
+        "judge",
+      ],
+      agentResult: { success: true },
+      gitDiff: "diff --git a/a.ts b/a.ts",
+      outputSnapshots: [{ attempt: 1 }],
+      judgeResult: { verdict: "REVISE" },
+      retriesUsed: 2,
+      totalCostUsd: 3.5,
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    const approval = {
+      taskId: "TASK-042",
+      state: "rejected",
+      createdAt: new Date().toISOString(),
+      review: {
+        status: "completed",
+        verdict: "AMEND",
+        findings: [{ severity: "should_fix", summary: "Keep the retry focused" }],
+        summary: "The first attempt is close.",
+        rawText: "review",
+        runner: "codex-cli",
+        durationMs: 10,
+      },
+    };
+    const checkpointPath = path.join(logDir, "checkpoint-TASK-042.json");
+    const approvalDir = path.join(logDir, "approvals");
+    const approvalPath = path.join(approvalDir, "TASK-042-judge.json");
+    fs.mkdirSync(approvalDir, { recursive: true });
+    const resetDurableState = (): void => {
+      writeJsonl(path.join(logDir, "sessions.jsonl"), sessions);
+      writeJsonl(path.join(logDir, "events-s1.jsonl"), events);
+      fs.writeFileSync(checkpointPath, JSON.stringify(checkpoint, null, 2), "utf-8");
+      fs.writeFileSync(approvalPath, JSON.stringify(approval, null, 2), "utf-8");
+    };
+    const snapshotDurableState = (): { checkpoint: Record<string, unknown>; sessions: string } => {
+      const persisted = JSON.parse(fs.readFileSync(checkpointPath, "utf-8")) as Record<
+        string,
+        unknown
+      >;
+      delete persisted.updatedAt;
+      expect(fs.existsSync(approvalPath)).toBe(false);
+      return {
+        checkpoint: persisted,
+        sessions: fs.readFileSync(path.join(logDir, "sessions.jsonl"), "utf-8"),
+      };
+    };
+
+    resetDurableState();
+    const dispatchSpy = jest.spyOn(dispatcher, "dispatchTask").mockResolvedValue({
+      taskId: "TASK-042",
+      outcome: "approved",
+      retriesUsed: 0,
+    });
+    const exitSpy = jest.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    const logSpy = jest.spyOn(console, "log").mockImplementation(() => undefined);
+    await reviseCommand("TASK-042", { project: projectRoot, feedback: "Human feedback" });
+    const cliState = snapshotDurableState();
+    const cliOptions = dispatchSpy.mock.calls[0]?.[2];
+    expect(cliOptions?.skipGate).toBe(true);
+    expect(cliOptions?.resumeFromCheckpoint).toBe(true);
+    expect(cliOptions?.admittedTaskContentHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(exitSpy).toHaveBeenCalledWith(0);
+    logSpy.mockRestore();
+    exitSpy.mockRestore();
+    dispatchSpy.mockRestore();
+
+    resetDurableState();
+    startSpy.mockClear();
+    const port = await freePort();
+    const serverObj = createMonitorServer({
+      logDir,
+      port,
+      projectRoot,
+      taskDir: "docs/tasks",
+      adapterPath,
+    });
+    const { stop } = await serverObj.start();
+    stopServer = stop;
+    const response = await httpPost(`http://localhost:${port}/api/tasks/TASK-042/revise`, {
+      feedback: "Human feedback",
+    });
+
+    expect(response.status).toBe(200);
+    const httpState = snapshotDurableState();
+    expect(httpState).toEqual(cliState);
+    expect(startedOptions()).toMatchObject({
+      judgeFeedback: cliOptions?.retryFeedback,
+      skipGate: true,
+      reuseWorktree: true,
+      resume: true,
+    });
   });
 
   it("returns 500 when dispatch service not available", async () => {

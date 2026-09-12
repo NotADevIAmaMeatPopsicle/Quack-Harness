@@ -21,8 +21,9 @@ import {
 import {
   saveJudgeApproval,
   loadJudgeApproval,
-  updateJudgeApprovalState,
+  updateJudgeApprovalState as updateJudgeApprovalStateRaw,
 } from "../../src/dispatcher/judge-approval";
+import { computeSpecIdentity } from "../../src/core/spec-identity";
 import { AdvisoryOverrideRequiredError } from "../../src/judgment/advisory-override";
 import type { Blueprint } from "../../src/blueprint/blueprint-types";
 import type { PreflightResult } from "../../src/preflight/preflight-types";
@@ -30,6 +31,26 @@ import type { LoopReviewGateFacts } from "../../src/review/loop-gate";
 import type { ReviewRunResult, ReviewVerdict } from "../../src/review/reviewer-types";
 
 const tempDirs: string[] = [];
+const JUDGE_SPEC_IDENTITY = computeSpecIdentity("# TASK-TEST\n\nTest contract\n");
+
+function updateJudgeApprovalState(
+  taskId: string,
+  state: Parameters<typeof updateJudgeApprovalStateRaw>[1],
+  logDir: string,
+  approvedBy?: string,
+  rejectionReason?: string,
+  decision?: Parameters<typeof updateJudgeApprovalStateRaw>[5],
+): ReturnType<typeof updateJudgeApprovalStateRaw> {
+  return updateJudgeApprovalStateRaw(
+    taskId,
+    state,
+    logDir,
+    approvedBy,
+    rejectionReason,
+    decision,
+    JUDGE_SPEC_IDENTITY,
+  );
+}
 
 async function makeLogDir(): Promise<string> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "quack-1319-"));
@@ -102,6 +123,8 @@ describe("updateJudgeApprovalState is the enforcement boundary", () => {
       opts.verdict
         ? { review: review(opts.verdict), reviewedAt: "2026-08-07T00:00:00Z", reviewGate: gate() }
         : undefined,
+      undefined,
+      JUDGE_SPEC_IDENTITY,
     );
   }
 
@@ -438,11 +461,17 @@ describe("round-2 R2-3: a caller's own actor label survives detection", () => {
     // was detected. Replacing a real attribution with "unattributed" is
     // strictly worse than the attribution it had.
     const logDir = await makeLogDir();
-    await saveJudgeApproval("TASK-9301", "diff", ["src/a.ts"], false, logDir, "pending", {
-      review: review("FIX_FIRST"),
-      reviewedAt: "2026-08-07T00:00:00Z",
-      reviewGate: gate(),
-    });
+    await saveJudgeApproval(
+      "TASK-9301",
+      "diff",
+      ["src/a.ts"],
+      false,
+      logDir,
+      "pending",
+      { review: review("FIX_FIRST"), reviewedAt: "2026-08-07T00:00:00Z", reviewGate: gate() },
+      undefined,
+      JUDGE_SPEC_IDENTITY,
+    );
 
     await updateJudgeApprovalState("TASK-9301", "approved", logDir, "approval-timeout");
 

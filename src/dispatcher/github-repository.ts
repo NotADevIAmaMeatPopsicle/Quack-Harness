@@ -1,8 +1,7 @@
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { promisify } from "node:util";
 
-const execFileAsync = promisify(execFile);
+import { runTrustedGitResult } from "../worker/trusted-executable.js";
+
 const GIT_TIMEOUT_MS = 60_000;
 const MAX_BUFFER = 1024 * 1024;
 const REPOSITORY_SEGMENT = /^[A-Za-z0-9_.-]+$/u;
@@ -109,16 +108,15 @@ export function parseGitHubOrigin(remoteUrl: string): GitHubRepositoryIdentity |
 }
 
 async function readSingleOriginPushUrl(cwd: string): Promise<string> {
-  const { stdout } = await execFileAsync(
-    "git",
+  const result = await runTrustedGitResult(
+    cwd,
     ["remote", "get-url", "--push", "--all", "origin"],
-    {
-      cwd,
-      timeout: GIT_TIMEOUT_MS,
-      maxBuffer: MAX_BUFFER,
-    },
+    { timeoutMs: GIT_TIMEOUT_MS, maxBuffer: MAX_BUFFER },
   );
-  const urls = stdout
+  if (result.exitCode !== 0) {
+    throw new Error(result.stderr.trim() || "Git origin push URL is unavailable");
+  }
+  const urls = result.stdout
     .split(/\r?\n/u)
     .map((value) => value.trim())
     .filter(Boolean);

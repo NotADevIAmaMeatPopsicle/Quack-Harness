@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { parseTaskFile, TaskParseError } from "../../src/core/task-parser";
+import { matchTaskHeading, parseTaskFile, TaskParseError } from "../../src/core/task-parser";
 import type { ParsedTask } from "../../src/core/types";
 
 // ─── Helpers ──────────────────────────────────────────────────────
@@ -12,6 +12,22 @@ function readFixture(filename: string): string {
 }
 
 // ─── Valid Full Task ──────────────────────────────────────────────
+
+describe("TASK-1336-C bare task identity", () => {
+  it.each(["TASK-1402-A", "TASK-100-B", "TASK-1402", "SAURUS-REM-001"])(
+    "keeps the complete declared ID %s before parsing a title separator",
+    (id) => {
+      expect(matchTaskHeading(id)).toEqual({ id, title: "" });
+      expect(matchTaskHeading(`${id}: Named task`)).toEqual({ id, title: "Named task" });
+    },
+  );
+  it("retains the hyphen title separator when the heading is not a bare ID", () => {
+    expect(matchTaskHeading("TASK-1402 - Named task")).toEqual({
+      id: "TASK-1402",
+      title: "Named task",
+    });
+  });
+});
 
 describe("parseTaskFile — valid full task", () => {
   let task: ParsedTask;

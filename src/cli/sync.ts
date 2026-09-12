@@ -25,7 +25,7 @@ export async function handleSync(options: SyncOptions): Promise<void> {
   try {
     if (options.status) {
       // Show sync status
-      const status = await getSyncStatus(adapter.config);
+      const status = await getSyncStatus(adapter.config, adapter.projectRoot);
 
       console.log(`\n📊 GitHub Sync Status`);
       console.log(`Total mapped tasks: ${status.totalEntries}`);
@@ -48,7 +48,7 @@ export async function handleSync(options: SyncOptions): Promise<void> {
     } else if (options.github) {
       // Force full sync
       console.log("Syncing all mapped tasks to GitHub...");
-      const outcome = await syncAllTasks(adapter.config);
+      const outcome = await syncAllTasks(adapter.config, adapter.projectRoot);
       const skipped = outcome.outcomes.filter((row) => row.outcome === "skipped");
       if (skipped.length > 0) {
         for (const row of skipped) {

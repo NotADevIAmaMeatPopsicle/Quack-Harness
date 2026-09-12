@@ -20,16 +20,20 @@ import {
 
 let capturedCommands: string[] = [];
 let failingIssue: number | undefined;
+let labelsByIssue = new Map<number, Set<string>>();
+let commentsByIssue = new Map<number, Array<{ url: string; body: string }>>();
+let nextCommentId = 1;
+type RunBoundGitHubCommand =
+  typeof import("../../../src/integrations/github/trusted-github").runBoundGitHubCommand;
+const mockRunBoundGitHubCommand = jest.fn<
+  ReturnType<RunBoundGitHubCommand>,
+  Parameters<RunBoundGitHubCommand>
+>();
 
-jest.mock("../../../src/integrations/github/gh-cli", () => ({
-  runGh: jest.fn((args: string[]) => {
-    const command = ["gh", ...args].join(" ");
-    capturedCommands.push(command);
-    if (failingIssue !== undefined && command.includes(`issue edit ${failingIssue} `)) {
-      return Promise.reject(new Error("injected status gh failure"));
-    }
-    return Promise.resolve({ stdout: "", stderr: "" });
-  }),
+jest.mock("../../../src/integrations/github/trusted-github", () => ({
+  ...jest.requireActual<object>("../../../src/integrations/github/trusted-github"),
+  runBoundGitHubCommand: (...args: Parameters<RunBoundGitHubCommand>) =>
+    mockRunBoundGitHubCommand(...args),
 }));
 
 const INITIAL_SYNC = "2026-08-18T00:00:00.000Z";
@@ -38,6 +42,53 @@ describe("TASK-1338-E: status sync duplicate outcomes", () => {
   beforeEach(() => {
     capturedCommands = [];
     failingIssue = undefined;
+    labelsByIssue = new Map();
+    commentsByIssue = new Map();
+    nextCommentId = 1;
+    mockRunBoundGitHubCommand.mockReset();
+    mockRunBoundGitHubCommand.mockImplementation(
+      (
+        _root: string,
+        _config: { owner: string; repo: string },
+        args: readonly string[],
+        options?: { input?: string },
+      ) => {
+        const issueNumber = Number(args[2]);
+        const repository = { host: "github.com", owner: "fixture", repo: "repo" };
+        const labels = labelsByIssue.get(issueNumber) ?? new Set<string>();
+        labelsByIssue.set(issueNumber, labels);
+        const comments = commentsByIssue.get(issueNumber) ?? [];
+        commentsByIssue.set(issueNumber, comments);
+        if (args[0] === "issue" && args[1] === "edit") {
+          capturedCommands.push(args.join(" "));
+          if (failingIssue === issueNumber) {
+            return Promise.reject(new Error("injected status gh failure"));
+          }
+          for (const arg of args) {
+            if (arg.startsWith("--add-label=")) labels.add(arg.slice(12));
+            if (arg.startsWith("--remove-label=")) labels.delete(arg.slice(15));
+          }
+          return Promise.resolve({ exitCode: 0, stdout: "", stderr: "", repository });
+        }
+        if (args[0] === "issue" && args[1] === "comment") {
+          capturedCommands.push(args.join(" "));
+          const url = `https://github.com/fixture/repo/issues/${issueNumber}#issuecomment-${nextCommentId++}`;
+          comments.push({ url, body: options?.input ?? "" });
+          return Promise.resolve({ exitCode: 0, stdout: `${url}\n`, stderr: "", repository });
+        }
+        return Promise.resolve({
+          exitCode: 0,
+          stdout: JSON.stringify({
+            number: issueNumber,
+            url: `https://github.com/fixture/repo/issues/${issueNumber}`,
+            labels: [...labels].map((name) => ({ name })),
+            comments,
+          }),
+          stderr: "",
+          repository,
+        });
+      },
+    );
   });
 
   afterEach(() => {
@@ -65,7 +116,7 @@ describe("TASK-1338-E: status sync duplicate outcomes", () => {
     ]);
     try {
       const adapter = await loadAdapter(fixture.root);
-      const outcome = await syncAllTasks(adapter.config);
+      const outcome = await syncAllTasks(adapter.config, adapter.projectRoot);
       expect(outcome).toEqual({
         outcomes: [
           {
@@ -106,7 +157,7 @@ describe("TASK-1338-E: status sync duplicate outcomes", () => {
     ]);
     try {
       const adapter = await loadAdapter(fixture.root);
-      await expect(syncAllTasks(adapter.config)).resolves.toEqual({
+      await expect(syncAllTasks(adapter.config, adapter.projectRoot)).resolves.toEqual({
         outcomes: [
           {
             taskId: fixture.taskId,
@@ -147,7 +198,7 @@ describe("TASK-1338-E: status sync duplicate outcomes", () => {
     failingIssue = 62;
     try {
       const adapter = await loadAdapter(fixture.root);
-      const outcome = await syncAllTasks(adapter.config);
+      const outcome = await syncAllTasks(adapter.config, adapter.projectRoot);
       expect(outcome).toEqual({
         outcomes: [
           {
@@ -237,22 +288,35 @@ describe("TASK-1338-E: status sync duplicate outcomes", () => {
         capturedCommands = [];
         try {
           if (mutator === "dispatch_started") {
-            await syncDispatchStarted(fixture.taskId, "fixture-model", 2, adapter.config);
+            await syncDispatchStarted(
+              fixture.taskId,
+              "fixture-model",
+              2,
+              adapter.config,
+              adapter.projectRoot,
+            );
           } else if (mutator === "dispatch_complete") {
             await syncDispatchComplete(
               fixture.taskId,
               "approved",
               "fixture feedback",
               adapter.config,
+              adapter.projectRoot,
             );
           } else if (mutator === "pr_created") {
             await syncPRCreated(
               fixture.taskId,
               "https://github.com/fixture/repo/pull/1",
               adapter.config,
+              adapter.projectRoot,
             );
           } else {
-            await syncTaskStatusToIssue(fixture.taskId, "COMPLETE", adapter.config);
+            await syncTaskStatusToIssue(
+              fixture.taskId,
+              "COMPLETE",
+              adapter.config,
+              adapter.projectRoot,
+            );
           }
           return {
             commands: [...capturedCommands],

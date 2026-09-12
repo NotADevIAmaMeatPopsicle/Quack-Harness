@@ -43,7 +43,8 @@ async function start(fixture: { root: string; taskDir: string }): Promise<{
   stop: () => Promise<void>;
 }> {
   const server = createMonitorServer({
-    port: 30_000 + Math.floor(Math.random() * 10_000),
+    port: 0,
+    host: "127.0.0.1",
     projectRoot: fixture.root,
     taskDir: fixture.taskDir,
     quackRoot: fixture.root,
