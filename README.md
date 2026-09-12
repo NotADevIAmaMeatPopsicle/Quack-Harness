@@ -268,6 +268,7 @@ Secrets belong in environment variables or an external secret store. Do not comm
 
 ## Documentation
 
+- [Changelog](CHANGELOG.md)
 - [Getting Started](docs/GETTING-STARTED.md)
 - [Architecture](ARCHITECTURE.md)
 - [CLI Reference](docs/CLI_REFERENCE.md)
