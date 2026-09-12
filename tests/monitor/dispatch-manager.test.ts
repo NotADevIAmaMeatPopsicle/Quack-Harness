@@ -1292,6 +1292,8 @@ describe("DispatchManager", () => {
 
       try {
         const job = mgr.start("TASK-LOCAL-READ-CHILD", { skipGate: true });
+        // Observe the active worktree before yielding to successful exit cleanup.
+        const expectedWorktreeRoot = fs.realpathSync(job.worktreePath!);
         await waitForFile(environmentFile);
         expect(fs.readFileSync(sessionFile, "utf8")).toBe(job.sessionId);
         const authorization = JSON.parse(fs.readFileSync(environmentFile, "utf8")) as {
@@ -1300,11 +1302,11 @@ describe("DispatchManager", () => {
         };
 
         expect(authorization).toEqual({
-          projectRoot: fs.realpathSync(job.worktreePath!),
+          projectRoot: expectedWorktreeRoot,
           paths: [originDir],
         });
       } finally {
-        mgr.killAll();
+        await mgr.shutdownAll({ gracefulTimeoutMs: 1_000, forceTimeoutMs: 1_000 });
         if (previousAuthorization === undefined) {
           delete process.env.QUACK_TRUSTED_LOCAL_READ_REMOTES;
         } else {
@@ -2796,82 +2798,96 @@ describe("DispatchManager", () => {
       }
     });
 
-    test("does not carry Windows tree confirmation into a same-millisecond shared resume", async () => {
-      const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
-      Object.defineProperty(process, "platform", { value: "win32", configurable: true });
-      const fixedNow = 1_789_000_000_000;
-      const nowSpy = jest.spyOn(Date, "now").mockReturnValue(fixedNow);
-      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-win-aba-"));
-      const logDir = path.join(tmpDir, ".quack", "logs");
-      const scriptPath = path.join(tmpDir, "quick-exit.cjs");
-      fs.writeFileSync(scriptPath, "setTimeout(() => process.exit(0), 25);\n", "utf-8");
-      const mgr = new DispatchManager(tmpDir, scriptPath, undefined, undefined, logDir);
-      const oldJob = makeJob({
-        taskId: "TASK-WIN-ABA",
-        sessionId: `quack-TASK-WIN-ABA-${fixedNow}`,
-        status: "stopped",
-        pid: 0,
-      });
-      const internals = mgr as unknown as {
-        jobs: Map<string, DispatchJob>;
-        confirmedWindowsTreeKills: Map<string, string>;
-        persistSharedCheckoutPause(job: DispatchJob, status: "stopped"): void;
-      };
-      internals.confirmedWindowsTreeKills.set(oldJob.taskId, oldJob.sessionId);
-      internals.persistSharedCheckoutPause(oldJob, "stopped");
-      internals.jobs.set(oldJob.taskId, oldJob);
-      const oldOwnershipId = oldJob.sharedCheckoutOwnershipId;
+    // These cases launch real children and resolve the native Git executable.
+    // A mocked Windows platform on POSIX cannot provide that native contract.
+    const nativeWindowsTest = process.platform === "win32" ? test : test.skip;
 
-      try {
-        const resumed = mgr.start(oldJob.taskId, { skipGate: true, resume: true });
-        nowSpy.mockRestore();
-        const marker = JSON.parse(
-          fs.readFileSync(path.join(logDir, "shared-checkout-pause.json"), "utf-8"),
-        ) as { sessionId: string; ownershipId: string; processTreeStatus: string };
-        expect(resumed.sessionId).not.toBe(oldJob.sessionId);
-        expect(resumed.sessionId).toMatch(/^quack-TASK-WIN-ABA-[a-f0-9-]+$/);
-        expect(marker.ownershipId).not.toBe(oldOwnershipId);
-        expect(marker.processTreeStatus).toBe("unconfirmed");
-        expect(internals.confirmedWindowsTreeKills.has(oldJob.taskId)).toBe(false);
-        await waitForCondition(() => resumed.status !== "running", "same-millisecond fixture exit");
-      } finally {
-        nowSpy.mockRestore();
-        Object.defineProperty(process, "platform", originalPlatform);
-        await mgr.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-      }
-    });
+    nativeWindowsTest(
+      "does not carry Windows tree confirmation into a same-millisecond shared resume",
+      async () => {
+        const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+        Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+        const fixedNow = 1_789_000_000_000;
+        const nowSpy = jest.spyOn(Date, "now").mockReturnValue(fixedNow);
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-win-aba-"));
+        const logDir = path.join(tmpDir, ".quack", "logs");
+        const scriptPath = path.join(tmpDir, "quick-exit.cjs");
+        fs.writeFileSync(scriptPath, "setTimeout(() => process.exit(0), 25);\n", "utf-8");
+        const mgr = new DispatchManager(tmpDir, scriptPath, undefined, undefined, logDir);
+        const oldJob = makeJob({
+          taskId: "TASK-WIN-ABA",
+          sessionId: `quack-TASK-WIN-ABA-${fixedNow}`,
+          status: "stopped",
+          pid: 0,
+        });
+        const internals = mgr as unknown as {
+          jobs: Map<string, DispatchJob>;
+          confirmedWindowsTreeKills: Map<string, string>;
+          persistSharedCheckoutPause(job: DispatchJob, status: "stopped"): void;
+        };
+        internals.confirmedWindowsTreeKills.set(oldJob.taskId, oldJob.sessionId);
+        internals.persistSharedCheckoutPause(oldJob, "stopped");
+        internals.jobs.set(oldJob.taskId, oldJob);
+        const oldOwnershipId = oldJob.sharedCheckoutOwnershipId;
 
-    test("clears a stale Windows tree confirmation before an isolated child starts", async () => {
-      const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
-      Object.defineProperty(process, "platform", { value: "win32", configurable: true });
-      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-worktree-win-session-"));
-      const scriptPath = path.join(tmpDir, "quick-exit.cjs");
-      fs.writeFileSync(scriptPath, "setTimeout(() => process.exit(0), 25);\n", "utf-8");
-      const mgr = new DispatchManager(tmpDir, scriptPath);
-      const worktreePath = path.join(tmpDir, ".quack", "worktrees", "TASK-WIN-SESSION");
-      fs.mkdirSync(worktreePath, { recursive: true });
-      const internals = mgr as unknown as {
-        startWorktree(taskId: string): DispatchJob;
-        createWorktree(taskId: string): string;
-        ensureWorktreeAdapterFreshness(worktreePath: string): undefined;
-        removeWorktree(worktreePath: string): void;
-        confirmedWindowsTreeKills: Map<string, string>;
-      };
-      internals.createWorktree = () => worktreePath;
-      internals.ensureWorktreeAdapterFreshness = () => undefined;
-      internals.removeWorktree = jest.fn();
-      internals.confirmedWindowsTreeKills.set("TASK-WIN-SESSION", "old-session");
-      try {
-        const job = internals.startWorktree("TASK-WIN-SESSION");
-        expect(job.worktreePath).toBe(worktreePath);
-        expect(internals.confirmedWindowsTreeKills.has("TASK-WIN-SESSION")).toBe(false);
-        await waitForCondition(() => job.status !== "running", "isolated Windows fixture exit");
-      } finally {
-        Object.defineProperty(process, "platform", originalPlatform);
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-      }
-    });
+        try {
+          const resumed = mgr.start(oldJob.taskId, { skipGate: true, resume: true });
+          nowSpy.mockRestore();
+          const marker = JSON.parse(
+            fs.readFileSync(path.join(logDir, "shared-checkout-pause.json"), "utf-8"),
+          ) as { sessionId: string; ownershipId: string; processTreeStatus: string };
+          expect(resumed.sessionId).not.toBe(oldJob.sessionId);
+          expect(resumed.sessionId).toMatch(/^quack-TASK-WIN-ABA-[a-f0-9-]+$/);
+          expect(marker.ownershipId).not.toBe(oldOwnershipId);
+          expect(marker.processTreeStatus).toBe("unconfirmed");
+          expect(internals.confirmedWindowsTreeKills.has(oldJob.taskId)).toBe(false);
+          await waitForCondition(
+            () => resumed.status !== "running",
+            "same-millisecond fixture exit",
+          );
+        } finally {
+          nowSpy.mockRestore();
+          Object.defineProperty(process, "platform", originalPlatform);
+          await mgr.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+      },
+    );
+
+    nativeWindowsTest(
+      "clears a stale Windows tree confirmation before an isolated child starts",
+      async () => {
+        const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+        Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-worktree-win-session-"));
+        const scriptPath = path.join(tmpDir, "quick-exit.cjs");
+        fs.writeFileSync(scriptPath, "setTimeout(() => process.exit(0), 25);\n", "utf-8");
+        const mgr = new DispatchManager(tmpDir, scriptPath);
+        const worktreePath = path.join(tmpDir, ".quack", "worktrees", "TASK-WIN-SESSION");
+        fs.mkdirSync(worktreePath, { recursive: true });
+        const internals = mgr as unknown as {
+          startWorktree(taskId: string): DispatchJob;
+          createWorktree(taskId: string): string;
+          ensureWorktreeAdapterFreshness(worktreePath: string): undefined;
+          removeWorktree(worktreePath: string): void;
+          confirmedWindowsTreeKills: Map<string, string>;
+        };
+        internals.createWorktree = () => worktreePath;
+        internals.ensureWorktreeAdapterFreshness = () => undefined;
+        internals.removeWorktree = jest.fn();
+        internals.confirmedWindowsTreeKills.set("TASK-WIN-SESSION", "old-session");
+        try {
+          const job = internals.startWorktree("TASK-WIN-SESSION");
+          expect(job.worktreePath).toBe(worktreePath);
+          expect(internals.confirmedWindowsTreeKills.has("TASK-WIN-SESSION")).toBe(false);
+          await waitForCondition(() => job.status !== "running", "isolated Windows fixture exit");
+        } finally {
+          Object.defineProperty(process, "platform", originalPlatform);
+          await mgr.shutdownAll({ gracefulTimeoutMs: 0, forceTimeoutMs: 1_000 });
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+      },
+    );
 
     test("never expires an unverified shared-checkout mutation lock by age", () => {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-shared-lock-"));
