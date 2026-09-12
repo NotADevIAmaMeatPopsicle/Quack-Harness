@@ -25,4 +25,22 @@ describe("project resources registry", () => {
     expect(paths.has("SECURITY.md")).toBe(true);
     expect(paths.has("docs/GETTING-STARTED.md")).toBe(true);
   });
+
+  it("explicitly includes every registered public resource in the distribution", async () => {
+    const manifest = JSON.parse(await fs.readFile(path.join(repoRoot, "package.json"), "utf8")) as {
+      files: string[];
+    };
+    expect(RESOURCES.map((resource) => resource.relativePath).sort()).toEqual([
+      "ARCHITECTURE.md",
+      "README.md",
+      "SECURITY.md",
+      "docs/ADAPTER_CONFIG_REFERENCE.md",
+      "docs/API_REFERENCE.md",
+      "docs/CLI_REFERENCE.md",
+      "docs/GETTING-STARTED.md",
+      "docs/TROUBLESHOOTING.md",
+    ]);
+    for (const resource of RESOURCES) expect(manifest.files).toContain(resource.relativePath);
+    expect(manifest.files).not.toContain("docs/");
+  });
 });

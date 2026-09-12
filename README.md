@@ -154,7 +154,7 @@ The monitor serves a React/Vite operator interface backed by an Express API, SQL
 
 ## Prerequisites
 
-- Node.js 20.19 or newer
+- Node.js 20.19 or later in the 20.x series, or 22.12 or later in the 22.x series
 - npm
 - Git
 - An Anthropic API key for the implementation worker, planning, enrichment, and judge operations
@@ -175,6 +175,13 @@ The root `npm ci` also installs the locked packages in `frontend/`. This is
 required because the top-level build compiles both the TypeScript service and
 the Vite monitor UI. Use `--ignore-scripts` only when you do not intend to run
 the full build.
+
+A packed artifact contains the prebuilt CLI, both monitor interfaces, and the
+public reference documents. Install a downloaded or locally built tarball with
+`npm install --prefix ./quack-install --omit=dev /absolute/path/to/quack-harness-0.3.0.tgz`,
+then run `node ./quack-install/node_modules/quack-harness/dist/index.js --help`.
+The packed install does not compile the frontend or need its development
+dependencies. See [Getting Started](docs/GETTING-STARTED.md) for both routes.
 
 Set `ANTHROPIC_API_KEY` in `.env`, then build and inspect the CLI:
 
@@ -264,6 +271,7 @@ Secrets belong in environment variables or an external secret store. Do not comm
 - Codex cross-model review requires a separately installed and authenticated Codex CLI.
 - Docker verification is adapter-dependent and requires a working Docker installation.
 - Distributed mode requires explicit network, authentication, repository-access, and worker-enrollment configuration.
+- Windows worker installation requires a stopped target runtime. Active or unscoped legacy listeners cause an actionable refusal; installation does not stop other processes.
 - Hardware-specific, production-deployment, and multi-host behavior must be validated in the environment where it will run.
 
 ## Documentation

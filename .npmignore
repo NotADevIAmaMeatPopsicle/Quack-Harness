@@ -1,23 +1,19 @@
+# package.json files is the distribution allowlist.
+# Retain these exclusions as a second barrier against local/runtime data.
+.git/
+.dev/
+.agents/
+.claude/
+.codex/
+.quack/
+.github/
 src/
 tests/
-coverage/
-docs/
-adapters/
-scripts/
-.github/
-.claude/
-.quack/
 frontend/
+coverage/
 output/
-.editorconfig
-.eslintrc.json
-.prettierrc
-tsconfig.json
-tsconfig.eslint.json
-jest.config.js
-ARCHITECTURE.md
-CONTRIBUTING.md
-CLAUDE.md
-*.tsbuildinfo
+test-results/
 .env
 .env.*
+*.log
+*.tsbuildinfo

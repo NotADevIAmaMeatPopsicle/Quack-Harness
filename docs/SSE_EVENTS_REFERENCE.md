@@ -46,28 +46,34 @@ Fields may be added over time. `timestamp` is an ISO 8601 string. IDs are opaque
 
 ## Event groups
 
+These are examples of declared stages, not an exhaustive inventory.
+
 ### Session lifecycle
 
 - `session_start`
 - `session_complete`
 - `session_error`
+- `dispatch_child_exit`
 - `agent_stuck_warning`
-- `cost_update`
+- `cost_alert`
 
 ### Readiness and planning
 
-- `gate_start`
+- `gate_schema`
+- `gate_depth`
 - `gate_result`
-- `enrichment_start`
-- `enrichment_complete`
+- `prep_job_completed`
+- `prep_failed`
+- `preflight_complete`
 - `blueprint_start`
-- `blueprint_complete`
-- `blueprint_awaiting_approval`
+- `blueprint_generated`
+- `blueprint_pending_approval`
 
 ### Execution and verification
 
-- `worker_start`
-- `worker_progress`
+- `agent_turn`
+- `agent_tool_use`
+- `agent_complete`
 - `verification_start`
 - `verification_result`
 - `judge_start`
@@ -76,20 +82,52 @@ Fields may be added over time. `timestamp` is an ISO 8601 string. IDs are opaque
 
 ### Queue and federation
 
-- `queue_update`
+- `dispatch_queue_started`
+- `dispatch_queue_task_awaiting_approval`
+- `dispatch_queue_task_completed`
+- `dispatch_queue_task_blocked`
+- `federated_job_submitted`
+- `federated_job_assigned`
 - `federated_job_status`
-- `federated_worker_event`
-- `listener_status`
-- `lease_update`
+- `federated_job_event`
 
 ### Review and judgment
 
-- `review_started`
-- `review_completed`
+- `loop_brief_review`
+- `loop_diff_review`
+- `blueprint_approved`
+- `blueprint_rejected`
+- `judge_pending_approval`
+- `judge_approved`
+- `judge_rejected`
 - `judgment_evaluation`
 - `judgment_decision`
 
-The exact payload depends on the stage. Read it defensively and use the TypeScript definitions in `src/monitor/event-types.ts` and `src/judgment/judgment-events.ts` as the authoritative contracts for the installed version.
+The exact payload depends on the stage. The TypeScript definitions in
+`src/monitor/event-types.ts` and `src/judgment/judgment-events.ts` are the
+authoritative contracts for the installed version.
+
+## Terminal evidence
+
+`prep_job_completed` and `prep_failed` carry the terminal `PrepJob` as their
+payload. Its `jobId` identifies the attempt; the event's session identity uses
+that job ID and its timestamp uses `completedAt`. Payload fields include
+`taskId`, `status`, `exitCode`, `signal`, a validated `result` or `error`, and
+bounded sanitized stdout/stderr diagnostics with truncation flags. A recorded
+`persistenceError` means durable storage needs attention.
+
+Preparation remains running until child stdio closes. A completed child can
+return `result.outcome: "rejected"`; completion alone is not task readiness.
+After reconnecting or restarting, read `GET /api/tasks/:id/prep/job` for the
+latest durable observation and the prep endpoint for current readiness.
+
+`dispatch_child_exit` records how a child stopped, including `exitCode`,
+`signal`, `killed`, `operatorRequested` and `at`. An exit event does not by itself
+establish completed verification, merge or cleanup. For federated worker
+completion, match the exact project/task/job/host/lease/session identity and
+read the dispatch observation endpoint's `settled` result. Never borrow evidence
+from the latest same-task session. Durable observations do not restore active
+process ownership.
 
 ## Reconnection
 

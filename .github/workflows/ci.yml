@@ -10,6 +10,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -40,12 +41,51 @@ jobs:
       - name: Run tests
         env:
           NODE_OPTIONS: --max-old-space-size=3072
-        # A few integration suites intentionally exercise long-lived servers.
-        # Jest reports the completed result before an inherited handle can linger.
-        run: npm test -- --maxWorkers=1 --forceExit --shard=${{ matrix.shard }}/2
+        run: npm test -- --maxWorkers=1 --workerIdleMemoryLimit=1024MB --shard=${{ matrix.shard }}/2
 
       - name: Lint
         run: npm run lint
 
       - name: Format check
         run: npm run format:check
+
+  package:
+    name: Package (${{ matrix.os }}, Node ${{ matrix.node-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node-version: [20.19.0, 22.12.0]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+      - name: Install source dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Check installation contracts
+        run: node node_modules/jest/bin/jest.js --runInBand --runTestsByPath tests/install-contract.test.ts tests/package-scripts.test.ts tests/monitor/agent-resources.test.ts tests/scripts/install-windows-worker.test.ts
+      - name: Pack and install the consumer artifact
+        shell: pwsh
+        env:
+          NODE_OPTIONS: --max-old-space-size=2048
+        run: |
+          $artifactDir = Join-Path $env:RUNNER_TEMP 'quack-package-artifact'
+          $consumerDir = Join-Path $env:RUNNER_TEMP 'quack-package-consumer'
+          New-Item -ItemType Directory -Path $artifactDir, $consumerDir | Out-Null
+          npm pack --pack-destination $artifactDir
+          if ($LASTEXITCODE -ne 0) { throw 'Package build failed.' }
+          $tarballs = @(Get-ChildItem -LiteralPath $artifactDir -Filter '*.tgz')
+          if ($tarballs.Count -ne 1) { throw 'Expected exactly one built tarball.' }
+          npm install --prefix $consumerDir --omit=dev --no-audit --no-fund $tarballs[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Consumer installation failed.' }
+          $installedPackage = Join-Path $consumerDir 'node_modules/quack-harness'
+          node scripts/check-packed-consumer.cjs $installedPackage $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Installed package smoke failed.' }
+          Get-FileHash -LiteralPath $tarballs[0].FullName -Algorithm SHA256

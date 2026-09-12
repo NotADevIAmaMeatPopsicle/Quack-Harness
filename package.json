@@ -1,6 +1,6 @@
 {
   "name": "quack-harness",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Codebase-agnostic harness for isolated coding-agent tasks and verification",
   "author": "Quack Harness contributors",
   "license": "AGPL-3.0-only",
@@ -27,13 +27,13 @@
     "quack": "dist/index.js"
   },
   "scripts": {
-    "postinstall": "npm --prefix frontend ci --no-audit --no-fund",
-    "prepack": "npm run build",
+    "postinstall": "node scripts/postinstall.cjs",
+    "prepack": "node scripts/prepack.cjs",
     "build": "tsc && npm run build:frontend && npm run build:copy:legacy-ui && npm run build:copy:frontend-ui && npm run build:build-info",
     "build:frontend": "npm --prefix frontend run build",
     "build:copy:legacy-ui": "node -e \"require('fs').cpSync('src/monitor/public','dist/monitor/public',{recursive:true})\"",
     "build:copy:frontend-ui": "node -e \"const fs=require('fs');fs.rmSync('dist/monitor/ui',{recursive:true,force:true});fs.cpSync('frontend/dist','dist/monitor/ui',{recursive:true})\"",
-    "build:build-info": "node -e \"const{execSync}=require('child_process');const git=(cmd)=>{try{return execSync(cmd,{stdio:['ignore','pipe','ignore']}).toString().trim()||'unknown'}catch{return'unknown'}};const pkg=require('./package.json');require('fs').writeFileSync('dist/build-info.json',JSON.stringify({version:pkg.version,commit:git('git rev-parse --short HEAD'),branch:git('git branch --show-current'),builtAt:new Date().toISOString()},null,2))\"",
+    "build:build-info": "node -e \"const{execSync}=require('child_process');const git=(cmd)=>{try{return execSync(cmd,{stdio:['ignore','pipe','ignore']}).toString().trim()||'unknown'}catch{return'unknown'}};const pkg=require('./package.json');require('fs').writeFileSync('dist/build-info.json',JSON.stringify({version:pkg.version,commit:git('git rev-parse HEAD'),branch:git('git branch --show-current'),builtAt:new Date().toISOString()},null,2))\"",
     "dev": "tsc --watch",
     "test": "jest",
     "test:watch": "jest --watch",
@@ -69,9 +69,40 @@
     "typescript": "^5.7.3"
   },
   "engines": {
-    "node": ">=20.19.0"
+    "node": "^20.19.0 || ^22.12.0"
   },
   "overrides": {
     "qs": "6.16.0"
-  }
+  },
+  "files": [
+    "dist/",
+    "scripts/postinstall.cjs",
+    "scripts/package-assets.cjs",
+    "scripts/quack-listener.mjs",
+    "scripts/quack-verify.mjs",
+    "scripts/admin/install-windows-worker.ps1",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "ARCHITECTURE.md",
+    "SECURITY.md",
+    "STATUS.md",
+    "CONTRIBUTING.md",
+    "docs/GETTING-STARTED.md",
+    "docs/ADAPTER_CONFIG_REFERENCE.md",
+    "docs/CLI_REFERENCE.md",
+    "docs/API_REFERENCE.md",
+    "docs/TROUBLESHOOTING.md",
+    "docs/MONITOR_GUIDE.md",
+    "docs/SSE_EVENTS_REFERENCE.md",
+    "docs/assets/screenshots/overview.png",
+    "docs/assets/screenshots/tasks.png",
+    "docs/assets/screenshots/testing.png",
+    "docs/assets/screenshots/documentation.png",
+    "docs/assets/screenshots/mobile-tasks.png",
+    "adapters/examples/node-typescript/README.md",
+    "adapters/examples/node-typescript/adapter.json",
+    "adapters/examples/node-typescript/conventions.md",
+    "adapters/examples/node-typescript/judge-criteria.md"
+  ]
 }
