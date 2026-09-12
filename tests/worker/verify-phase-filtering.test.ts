@@ -60,8 +60,8 @@ jest.mock("../../src/testing/docker-test-runner.js", () => ({
   run: jest.fn(() => ({ exitCode: 0, stdout: "", stderr: "", timedOut: false })),
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-require-imports
 const { runVerification } =
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
   require("../../src/worker/tools/verify") as typeof import("../../src/worker/tools/verify");
 
 import type { ProjectAdapter } from "../../src/core/adapter-loader";

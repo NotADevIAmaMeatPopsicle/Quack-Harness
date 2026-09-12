@@ -1,8 +1,8 @@
 import type { TaskPriority, FileModification } from "../../src/core/types";
 import type { TaskSummary } from "../../src/dispatcher/dependency-resolver";
 
-// eslint-disable-next-line @typescript-eslint/no-require-imports
 const taskSelector =
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
   require("../../src/dispatcher/task-selector") as typeof import("../../src/dispatcher/task-selector");
 const { parseEffort, estimateAgentFit, computeReadinessScore, selectTasks } = taskSelector;
 
