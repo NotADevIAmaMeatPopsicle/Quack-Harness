@@ -17,6 +17,20 @@ interface Fixture {
   journalBytes: Buffer;
 }
 
+interface OwnedFixture {
+  root: string;
+  testName: string;
+  startedAt: number;
+  stages: Array<{ stage: string; elapsedMs: number }>;
+  body: Promise<void>;
+  settled: boolean;
+  passed: boolean;
+  preserve: boolean;
+  error?: string;
+}
+
+const ownedFixtures = new Set<OwnedFixture>();
+
 function removeOwnedRoot(root: string): void {
   const target = path.resolve(root);
   if (
@@ -28,39 +42,121 @@ function removeOwnedRoot(root: string): void {
   fs.rmSync(target, { recursive: true, force: true });
 }
 
-async function withFixture(operation: (fixture: Fixture) => Promise<void>): Promise<void> {
+function withFixture(operation: (fixture: Fixture) => Promise<void>): Promise<void> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "quack-native-publication-lock-"));
-  let passed = false;
+  const owned: OwnedFixture = {
+    root,
+    testName: expect.getState().currentTestName ?? "unknown native lock test",
+    startedAt: Date.now(),
+    stages: [],
+    body: Promise.resolve(),
+    settled: false,
+    passed: false,
+    preserve: false,
+  };
+  const recordStage = (stage: string) => {
+    owned.stages.push({ stage, elapsedMs: Date.now() - owned.startedAt });
+  };
+  ownedFixtures.add(owned);
+  owned.body = (async () => {
+    try {
+      recordStage("setup-start");
+      const executable = trustedGit.resolveTrustedExecutable(
+        "git",
+        root,
+        "native publication fixture Git",
+      );
+      execFileSync(executable, ["-C", root, "init", "--initial-branch=main"], {
+        cwd: path.dirname(executable),
+        env: trustedGit.buildTrustedGitEnvironment(executable),
+        encoding: "utf8",
+        windowsHide: true,
+        timeout: 15_000,
+        stdio: "pipe",
+      });
+      const publicationId = randomUUID();
+      const recoveryPath = path.join(root, `${publicationId}.json`);
+      const journalBytes = Buffer.from("publication journal sentinel\n");
+      fs.writeFileSync(recoveryPath, journalBytes);
+      recordStage("operation-start");
+      await operation({
+        root,
+        recoveryPath,
+        publicationId,
+        lockRef: `refs/quack/docker-publication-lock/TASK-990002/${publicationId}`,
+        sealedRef: `refs/quack/docker-publication/TASK-990002/${publicationId}`,
+        journalBytes,
+      });
+      owned.passed = true;
+    } catch (error: unknown) {
+      owned.error = error instanceof Error ? error.message : String(error);
+      throw error;
+    } finally {
+      owned.settled = true;
+      recordStage("operation-settled");
+    }
+  })();
+  return owned.body;
+}
+
+async function settleFixtures(): Promise<void> {
+  const fixtures = [...ownedFixtures];
+  const pending = fixtures.filter((fixture) => !fixture.settled);
+  // Jest stops awaiting a timed-out test, but its native work keeps running.
+  // Keep subsequent tests out until that complete body has settled, and retain
+  // its evidence even if the body eventually satisfies every assertion.
+  for (const fixture of pending) {
+    fixture.preserve = true;
+    fixture.stages.push({
+      stage: "teardown-found-running-body",
+      elapsedMs: Date.now() - fixture.startedAt,
+    });
+  }
+  let deadline: NodeJS.Timeout | undefined;
   try {
-    const executable = trustedGit.resolveTrustedExecutable(
-      "git",
-      root,
-      "native publication fixture Git",
-    );
-    execFileSync(executable, ["-C", root, "init", "--initial-branch=main"], {
-      cwd: path.dirname(executable),
-      env: trustedGit.buildTrustedGitEnvironment(executable),
-      encoding: "utf8",
-      windowsHide: true,
-      timeout: 15_000,
-      stdio: "pipe",
-    });
-    const publicationId = randomUUID();
-    const recoveryPath = path.join(root, `${publicationId}.json`);
-    const journalBytes = Buffer.from("publication journal sentinel\n");
-    fs.writeFileSync(recoveryPath, journalBytes);
-    await operation({
-      root,
-      recoveryPath,
-      publicationId,
-      lockRef: `refs/quack/docker-publication-lock/TASK-990002/${publicationId}`,
-      sealedRef: `refs/quack/docker-publication/TASK-990002/${publicationId}`,
-      journalBytes,
-    });
-    passed = true;
+    if (pending.length > 0) {
+      await Promise.race([
+        Promise.allSettled(pending.map((fixture) => fixture.body)),
+        new Promise<void>((resolve) => {
+          deadline = setTimeout(resolve, 25_000);
+        }),
+      ]);
+    }
   } finally {
-    if (passed) removeOwnedRoot(root);
-    else console.warn(`Native publication lock fixture retained at ${root}`);
+    if (deadline) clearTimeout(deadline);
+  }
+  for (const fixture of fixtures) {
+    const evidence = {
+      root: fixture.root,
+      testName: fixture.testName,
+      startedAt: fixture.startedAt,
+      stages: fixture.stages,
+      settled: fixture.settled,
+      passed: fixture.passed,
+      preserve: fixture.preserve,
+      error: fixture.error,
+    };
+    const contents = JSON.stringify(evidence, null, 2) + "\n";
+    const diagnosticDirectory = process.env.QUACK_NATIVE_LOCK_DIAGNOSTIC_DIR;
+    if (diagnosticDirectory) {
+      fs.mkdirSync(diagnosticDirectory, { recursive: true });
+      fs.writeFileSync(
+        path.join(diagnosticDirectory, `${path.basename(fixture.root)}.json`),
+        contents,
+      );
+    }
+    if (fixture.settled && fixture.passed && !fixture.preserve) {
+      removeOwnedRoot(fixture.root);
+    } else {
+      fs.writeFileSync(path.join(fixture.root, "fixture-outcome.json"), contents);
+      console.warn(`Native publication lock fixture retained at ${fixture.root}`);
+    }
+    if (fixture.settled) ownedFixtures.delete(fixture);
+  }
+  if (ownedFixtures.size > 0) {
+    throw new Error(
+      "Native publication fixture is still running; preserving its ownership and files",
+    );
   }
 }
 
@@ -68,6 +164,14 @@ const git = (root: string, args: string[]) =>
   runActualGit(root, args, { timeoutMs: 15_000, maxBuffer: 1024 * 1024 });
 
 describe("Docker publication locks with native Git", () => {
+  beforeEach(() => {
+    if (ownedFixtures.size > 0) {
+      throw new Error("Previous native publication fixture has not settled");
+    }
+  });
+  afterEach(settleFixtures, 30_000);
+  afterAll(settleFixtures, 30_000);
+
   test("retains recovery ownership after a failed delete and timed-out readback", async () => {
     await withFixture(async (fixture) => {
       // No input is sent, so real Git waits on its owned stdin pipe until the
@@ -139,6 +243,8 @@ describe("Docker publication locks with native Git", () => {
     });
   });
 
+  // Two audited acquisition/release cycles run 101 native Git invocations.
+  // This is a cumulative fixture budget; production command limits stay intact.
   test("acquires an absent lock, exposes its exact owner, and releases for reacquisition", async () => {
     await withFixture(async (fixture) => {
       const operation = jest.fn(async () => {
@@ -173,7 +279,7 @@ describe("Docker publication locks with native Git", () => {
         [],
       );
     });
-  });
+  }, 30_000);
 
   test.each([
     ["malformed", "not-a-git-object\n"],
