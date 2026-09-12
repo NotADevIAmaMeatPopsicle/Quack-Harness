@@ -223,6 +223,39 @@ diff --git a/src/sync.ts b/src/sync.ts
   });
 
   describe("cross-reference checks", () => {
+    test("does not require Set/Map operations for a pinned package dependency", async () => {
+      const task = makeTask([
+        "The exact dependency `@playwright/test@1.63.0` is locked, without a semver range, browser download, or install lifecycle script.",
+      ]);
+      const diff = `
+diff --git a/package.json b/package.json
++    "@playwright/test": "1.63.0"
+diff --git a/package-lock.json b/package-lock.json
++    "node_modules/@playwright/test": { "version": "1.63.0" }
+`;
+
+      const results = await runSpecComplianceChecks(task, diff, [
+        "package.json",
+        "package-lock.json",
+      ]);
+
+      expect(results).toEqual([]);
+    });
+
+    test("still flags an explicit dependency-existence check without lookup evidence", async () => {
+      const task = makeTask(["Checks dependency exists before processing"]);
+      const diff = `
+diff --git a/src/deps.ts b/src/deps.ts
++processDependency(depId);
+`;
+
+      const results = await runSpecComplianceChecks(task, diff, ["src/deps.ts"]);
+
+      expect(results).toHaveLength(1);
+      expect(results[0]).toMatchObject({ found: false, severity: "flag" });
+      expect(results[0]?.description).toContain("Set/Map");
+    });
+
     test("should detect Set.has() as cross-reference check", async () => {
       const task = makeTask(["Checks dependency exists before processing"]);
       const diff = `

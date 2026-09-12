@@ -183,12 +183,7 @@ const BUILT_IN_PATTERNS: CompliancePattern[] = [
     severity: "flag",
   },
   {
-    triggers: [
-      /\breferences?\b/i,
-      /\bdependency\b/i,
-      /\bcross-valid/i,
-      /\bchecks?\s+\w+\s+exists?/i,
-    ],
+    triggers: [/\breferences?\b/i, /\bcross-valid/i, /\bchecks?\s+\w+\s+exists?/i],
     codePatterns: [
       /\.has\(/,
       /\.includes?\(/,

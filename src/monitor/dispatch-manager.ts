@@ -343,6 +343,8 @@ interface DurableSharedCheckoutPause {
   /** Git state that must be restored before shared-checkout ownership is released. */
   originalBranch?: string;
   originalStatus?: string;
+  /** Successful exit recorded for this ownership generation, pending tree confirmation. */
+  successfulExitAt?: string;
 }
 
 interface SharedCheckoutBaseline {
@@ -1417,7 +1419,12 @@ export class DispatchManager {
         ((parsed as { originalBranch?: unknown }).originalBranch !== undefined &&
           typeof (parsed as { originalBranch?: unknown }).originalBranch !== "string") ||
         ((parsed as { originalStatus?: unknown }).originalStatus !== undefined &&
-          typeof (parsed as { originalStatus?: unknown }).originalStatus !== "string")
+          typeof (parsed as { originalStatus?: unknown }).originalStatus !== "string") ||
+        ((parsed as { successfulExitAt?: unknown }).successfulExitAt !== undefined &&
+          (typeof (parsed as { successfulExitAt?: unknown }).successfulExitAt !== "string" ||
+            !Number.isFinite(
+              Date.parse(String((parsed as { successfulExitAt?: unknown }).successfulExitAt)),
+            )))
       ) {
         throw new Error("invalid marker shape");
       }
@@ -1498,6 +1505,7 @@ export class DispatchManager {
     job: DispatchJob,
     status: "running" | "awaiting_approval" | "stopped" | "failed" = "awaiting_approval",
     allowOwnershipTransfer = false,
+    successfulExit = false,
   ): void {
     this.withSharedCheckoutMutationLock(() => {
       const markerPath = this.sharedCheckoutPausePath();
@@ -1536,6 +1544,16 @@ export class DispatchManager {
         startedAt: job.startedAt,
         pausedAt: new Date().toISOString(),
         status,
+        ...(successfulExit &&
+        exactOwner &&
+        status === "stopped" &&
+        job.status === "completed" &&
+        job.exitCode === 0 &&
+        !job.killedBySignal &&
+        !job.stopRequestedAt &&
+        !job.operatorStopRequestedAt
+          ? { successfulExitAt: job.completedAt ?? new Date().toISOString() }
+          : {}),
         ...(status === "running" && job.pid > 0 ? { processId: job.pid } : {}),
         ...(process.platform === "win32"
           ? {
@@ -1601,10 +1619,11 @@ export class DispatchManager {
   private preserveInterruptedSharedCheckout(
     job: DispatchJob,
     status: "running" | "stopped" | "failed",
+    successfulExit = false,
   ): void {
     if (job.worktreePath || job.containerId) return;
     try {
-      this.persistSharedCheckoutPause(job, status);
+      this.persistSharedCheckoutPause(job, status, false, successfulExit);
     } catch (error: unknown) {
       const detail = error instanceof Error ? error.message : String(error);
       job.output.push(
@@ -5248,7 +5267,7 @@ export class DispatchManager {
             job.output.push(
               "[dispatch] Shared-checkout root exited, but descendant termination is unconfirmed on Windows; ownership remains blocked pending reconciliation.",
             );
-            this.preserveInterruptedSharedCheckout(job, "stopped");
+            this.preserveInterruptedSharedCheckout(job, "stopped", exitFactsDurable && !signal);
           } else if (!this.restoreAndReleaseSharedCheckout(job)) {
             job.status = "failed";
             this.preserveInterruptedSharedCheckout(job, "failed");
@@ -6442,6 +6461,98 @@ export class DispatchManager {
    * operator verification. Session and token checks prevent stale recovery
    * requests from releasing a newer owner.
    */
+  private completedSharedCheckoutOwner(
+    marker: DurableSharedCheckoutPause,
+  ): DispatchJob | undefined {
+    if (
+      marker.status !== "stopped" ||
+      !marker.ownershipId ||
+      !marker.successfulExitAt ||
+      !/^[A-Za-z0-9._-]+$/.test(marker.sessionId) ||
+      resolvePausedRunState(this.logDir, marker.taskId)
+    )
+      return undefined;
+    const started = Date.parse(marker.startedAt);
+    const completed = Date.parse(marker.successfulExitAt);
+    if (!Number.isFinite(started) || !Number.isFinite(completed) || completed < started)
+      return undefined;
+    const current = this.jobs.get(marker.taskId);
+    if (
+      current &&
+      (current.sessionId !== marker.sessionId ||
+        current.sharedCheckoutOwnershipId !== marker.ownershipId ||
+        current.worktreePath ||
+        current.containerId ||
+        current.status !== "completed" ||
+        current.exitCode !== 0 ||
+        current.killedBySignal ||
+        current.stopRequestedAt ||
+        current.operatorStopRequestedAt ||
+        (this.observationExitHandlers.get(current) ?? 0) > 0)
+    )
+      return undefined;
+    try {
+      const eventPath = path.join(this.logDir, `events-${marker.sessionId}.jsonl`);
+      const stat = fs.lstatSync(eventPath);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) return undefined;
+      const events = fs
+        .readFileSync(eventPath, "utf8")
+        .split("\n")
+        .filter((line) => line.trim())
+        .map(
+          (line) =>
+            JSON.parse(line) as {
+              stage?: string;
+              taskId?: string;
+              sessionId?: string;
+              payload?: {
+                taskId?: string;
+                exitCode?: number;
+                signal?: unknown;
+                killed?: boolean;
+                operatorRequested?: boolean;
+                worktreePath?: unknown;
+                at?: string;
+              };
+            },
+        );
+      const exits = events.filter((event) => event?.stage === "dispatch_child_exit");
+      if (exits.length !== 1) return undefined;
+      const event = exits[0];
+      const payload = event.payload;
+      const at = Date.parse(payload?.at ?? "");
+      if (
+        event.taskId !== marker.taskId ||
+        event.sessionId !== marker.sessionId ||
+        payload?.taskId !== marker.taskId ||
+        payload.exitCode !== 0 ||
+        payload.signal !== null ||
+        payload.killed !== false ||
+        payload.operatorRequested !== false ||
+        payload.worktreePath !== null ||
+        !Number.isFinite(at) ||
+        at < started ||
+        at > completed
+      )
+        return undefined;
+    } catch {
+      return undefined;
+    }
+    return {
+      taskId: marker.taskId,
+      sessionId: marker.sessionId,
+      pid: marker.processId ?? 0,
+      startedAt: marker.startedAt,
+      completedAt: marker.successfulExitAt,
+      status: "completed",
+      exitCode: 0,
+      output: current?.output ?? [],
+      sharedCheckoutOwnershipId: marker.ownershipId,
+      sharedCheckoutOriginalBranch: marker.originalBranch,
+      sharedCheckoutOriginalStatus: marker.originalStatus,
+    };
+  }
+
   reconcileSharedCheckoutShutdownSurvivor(
     taskId: string,
     sessionId: string,
@@ -6450,6 +6561,8 @@ export class DispatchManager {
     processTreeConfirmedStopped: boolean,
   ): boolean {
     if (!processTreeConfirmedStopped || this.processes.has(taskId)) return false;
+    const activeOwner = this.jobs.get(taskId);
+    if (activeOwner && (this.observationExitHandlers.get(activeOwner) ?? 0) > 0) return false;
     try {
       return this.withSharedCheckoutMutationLock(() => {
         const marker = this.readSharedCheckoutPause(true);
@@ -6459,11 +6572,12 @@ export class DispatchManager {
           marker.sessionId !== sessionId ||
           marker.ownershipId !== ownershipId ||
           !marker.reconciliationToken ||
-          marker.reconciliationToken !== reconciliationToken ||
-          marker.processTreeStatus === "confirmed-stopped"
+          marker.reconciliationToken !== reconciliationToken
         ) {
           return false;
         }
+        const completedOwner = this.completedSharedCheckoutOwner(marker);
+        if (marker.processTreeStatus === "confirmed-stopped" && !completedOwner) return false;
         const reconciled: DurableSharedCheckoutPause = {
           ...marker,
           pausedAt: new Date().toISOString(),
@@ -6475,6 +6589,12 @@ export class DispatchManager {
           `${JSON.stringify(reconciled, null, 2)}\n`,
           "utf-8",
         );
+        if (completedOwner) {
+          // The ownership lock is already held. Do not acquire it again through
+          // restoreAndReleaseSharedCheckout; restore and release are one mutation.
+          if (!this.restoreSharedCheckout(completedOwner)) return false;
+          fs.rmSync(this.sharedCheckoutPausePath());
+        }
         if (process.platform === "win32") {
           this.confirmedWindowsTreeKills.set(taskId, marker.sessionId);
         }

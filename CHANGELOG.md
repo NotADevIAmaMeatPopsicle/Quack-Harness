@@ -1,6 +1,22 @@
 # Changelog
 
-Notable changes to Quack Harness, newest first. Entries describe changes merged into public `main`.
+Notable changes to Quack Harness, newest first. Released entries describe changes merged into public `main`; Unreleased describes the current release candidate.
+
+## Unreleased — 0.3.0
+
+- Source installs now install the frontend dependencies needed by the build.
+  Packed installs validate and use their included CLI, dashboard and runtime
+  assets without requiring the source checkout or frontend development files.
+- Package verification covers source and packed-consumer installation on the
+  supported Node.js lines: 20.19 or newer in Node 20, and 22.12 or newer in Node 22.
+- Added a Windows worker installer and documented recovery, drain, monitoring
+  and event contracts used by operators.
+- Successful shared-checkout jobs release deferred ownership after reconciliation
+  confirms that their processes have stopped and the original Git state has been
+  restored. Exact durable completion evidence supports recovery after restart;
+  paused, failed and ambiguous work retains its protection.
+- Package dependency criteria no longer incorrectly demand Set/Map lookup code.
+  Explicit cross-reference and dependency-existence checks still apply.
 
 ## 2026-09-12 — Core lifecycle and publication recovery
 
