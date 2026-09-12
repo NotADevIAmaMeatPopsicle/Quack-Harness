@@ -31,15 +31,26 @@ The fresh-clone validation on 2026-09-10 passed 5,258 tests in 356 suites, with
 10 tests in 2 suites intentionally skipped. Both root and frontend dependency
 audits reported zero known vulnerabilities.
 
-## 0.3.0 candidate verification
+## 0.3.0 verification
 
-The next version remains a candidate until its accepted source projection,
-natural full-suite result, source install, packed consumer install, and exact
-tag/artifact readback are recorded. The historical checklist above is not
-acceptance of this candidate. The new installation checks cover the declared
-Node floors, compiled UI and documentation assets, native SQLite, and CLI
-identity. Published evidence must identify the tested commit and artifact
-checksum; packaging preparation alone is not a completed release.
+Source and packed-consumer installation checks passed on Windows Node 20.19.0
+and 22.12.0. Linux package checks passed on those Node floors in CI and on
+Node 20.20.2 in an isolated host checkout. Consumer checks cover native SQLite,
+CLI version/help from an unrelated directory, all 21 required packaged files,
+eight documentation resources and compiled dashboard assets.
+
+The runtime and package changes received independent review. Ten focused suites
+passed 251 tests with one Windows platform skip. A follow-up test-fixture
+correction passed the complete affected dispatch suite on Windows (115 tests,
+one skip) and Linux (109 tests, seven platform skips), with natural completion.
+The GitHub release identifies the final source commit and artifact checksum.
+
+The broad CI matrix is not wholly green. The earlier Node 22 shard snapshot
+recorded 6,701 passing tests, 49 failures and 39 skips; it is diagnostic evidence,
+not a successful full-suite result. Hosted Windows Node 20 also lacked a usable
+native compilation toolchain, while the corresponding local installation passed.
+These limitations remain visible; the historical verification above does not
+replace current focused and package checks.
 
 ## Known limitations
 

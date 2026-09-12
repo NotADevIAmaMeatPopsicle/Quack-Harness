@@ -1,8 +1,9 @@
 # Changelog
 
-Notable changes to Quack Harness, newest first. Released entries describe changes merged into public `main`; Unreleased describes the current release candidate.
+Notable changes to Quack Harness, newest first. Release tags and downloadable
+artifacts are listed on the repository's GitHub Releases page.
 
-## Unreleased — 0.3.0
+## 0.3.0 — Source and packed installation
 
 - Source installs now install the frontend dependencies needed by the build.
   Packed installs validate and use their included CLI, dashboard and runtime
