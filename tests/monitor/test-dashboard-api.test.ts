@@ -390,6 +390,7 @@ describe("test dashboard API", () => {
 
         // First call - should hit disk
         handlers["/api/testing/dashboard"](req, res);
+        // Retention pruning and aggregation each enumerate the result directory.
         expect(mockReaddirSync).toHaveBeenCalledTimes(2);
 
         jest.clearAllMocks();

@@ -151,6 +151,60 @@ describe("blueprint-agent", () => {
       expect(blueprint.verificationPatterns).toHaveLength(1);
       expect(blueprint.antiPatterns).toHaveLength(1);
       expect(blueprint.preconditions).toHaveLength(1);
+      expect(blueprint.producerProvenance).toEqual({
+        runner: "claude-sdk",
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+      });
+    });
+
+    it("audits mandate fidelity against the authoritative task, not the model echo", async () => {
+      const mandate = "`npm test -- --runInBand` expect: exactly-0";
+      const softened = "`npm test -- --runInBand` expect: 0+";
+      const mockQueryFn = async function* () {
+        await Promise.resolve();
+        yield {
+          type: "result",
+          subtype: "success",
+          result: JSON.stringify({
+            taskId: "TASK-001",
+            fileAnalyses: [
+              {
+                filePath: "src/feature-x.ts",
+                action: "Create",
+                currentStructure: "[new file]",
+                integrationPoints: "new module",
+                patternToFollow: "none",
+              },
+            ],
+            codeExamples: [],
+            verificationPatterns: [
+              {
+                criterion: "Exact-zero verification",
+                checkType: "grep",
+                pattern: "npm test",
+                fileGlob: "package.json",
+                mandatedCheck: softened,
+              },
+            ],
+            antiPatterns: [],
+            preconditions: [],
+            mandatedChecks: [softened],
+          }),
+        };
+      };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument
+      _setQueryFn(mockQueryFn as any);
+
+      const blueprint = await generateBlueprint(
+        { ...mockTask, mandatedChecks: [mandate] },
+        mockAdapter,
+      );
+
+      expect(blueprint.fidelity?.status).toBe("failed");
+      expect(blueprint.fidelity?.violations).toEqual(
+        expect.arrayContaining([expect.objectContaining({ kind: "mandated_check_softened" })]),
+      );
     });
 
     it("should fall back to minimal blueprint on JSON parse error", async () => {

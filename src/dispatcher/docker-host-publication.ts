@@ -11,12 +11,10 @@ import { isDeepStrictEqual, promisify } from "node:util";
 import { loadAdapter, type ProjectAdapter } from "../core/adapter-loader.js";
 import { resolveTaskFile } from "../core/task-file-resolver.js";
 import { resolveTargetBranch } from "./branch-resolver.js";
-import { BOUND_GIT_REMOTE, runBoundGitCommand } from "./bound-git-command.js";
 import {
   buildBranchName,
   deleteAfterMerge,
   mergeBranchToTarget,
-  type PreparedTargetMerge,
   updateTaskFileStatus,
 } from "./branch-manager.js";
 import type { DockerResumeGitBinding, DockerResumeSourceBinding } from "./docker-runtime-bridge.js";
@@ -34,11 +32,16 @@ import {
   isGitOriginBinding,
   persistentOriginRepositoryBinding,
   resolveBoundOriginRepository,
-  resolveBoundOriginGitHubRepository,
   resolveOriginRepository,
   type GitOriginBinding,
 } from "./github-repository.js";
-import { createPullRequest } from "./pr-creator.js";
+import {
+  createPullRequest,
+  recoverPullRequestCandidate,
+  type PullRequestBinding,
+  type PullRequestCandidate,
+} from "./pr-creator.js";
+import { runTrustedGitResult, type TrustedGitHubRepository } from "../worker/trusted-executable.js";
 
 export interface DockerHostPublicationRecoveryInput {
   rootDir: string;
@@ -70,15 +73,25 @@ interface PublicationRequirements {
 interface PublicationProgress {
   promotedAt?: string;
   pushedAt?: string;
+  pullRequestCandidate?: PullRequestCandidate & { recordedAt: string };
   pullRequestAt?: string;
   prUrl?: string;
-  preparedMerge?: PreparedTargetMerge & { preparedAt: string };
+  preparedMerge?: DockerPreparedTargetMerge & { preparedAt: string };
   mergedAt?: string;
   mergeCommitSha?: string;
   statusAt?: string;
   cleanupLocalAt?: string;
   cleanupAt?: string;
   cleanupOutcome?: string;
+}
+
+/** Durable no-PR merge preparation contract consumed by branch-manager integration. */
+export interface DockerPreparedTargetMerge {
+  strategy: "merge" | "rebase" | "squash";
+  candidateHead: string;
+  targetHead: string;
+  resultHead: string;
+  preparedRef: string;
 }
 
 export interface DockerPublicationJournal {
@@ -90,6 +103,7 @@ export interface DockerPublicationJournal {
   targetBranch: string;
   parentTaskId?: string;
   sharedBranchName?: string;
+  /** Exact origin identity persisted without credential-bearing URL text. */
   repository?: GitOriginBinding;
   gitState: DockerResumeGitBinding;
   worktreePath: string;
@@ -280,6 +294,7 @@ function validateProgress(value: unknown): value is PublicationProgress {
       [
         "promotedAt",
         "pushedAt",
+        "pullRequestCandidate",
         "pullRequestAt",
         "prUrl",
         "preparedMerge",
@@ -311,6 +326,8 @@ function validateProgress(value: unknown): value is PublicationProgress {
     }
   }
   return (
+    (value.pullRequestCandidate === undefined ||
+      validatePullRequestCandidate(value.pullRequestCandidate)) &&
     (value.prUrl === undefined ||
       (typeof value.prUrl === "string" && /^https?:\/\//i.test(value.prUrl))) &&
     (value.preparedMerge === undefined || validatePreparedMerge(value.preparedMerge)) &&
@@ -321,9 +338,41 @@ function validateProgress(value: unknown): value is PublicationProgress {
   );
 }
 
+function validatePullRequestCandidate(
+  value: unknown,
+): value is PullRequestCandidate & { recordedAt: string } {
+  if (
+    !isRecord(value) ||
+    Object.keys(value).length !== 4 ||
+    !Object.keys(value).every((key) =>
+      ["url", "ownershipMarker", "state", "recordedAt"].includes(key),
+    ) ||
+    typeof value.url !== "string" ||
+    typeof value.ownershipMarker !== "string" ||
+    !["pending", "accepted", "closed"].includes(String(value.state)) ||
+    typeof value.recordedAt !== "string" ||
+    !Number.isFinite(Date.parse(value.recordedAt))
+  ) {
+    return false;
+  }
+  try {
+    const url = new URL(value.url);
+    return (
+      url.protocol === "https:" &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash &&
+      /^\/[^/]+\/[^/]+\/pull\/[1-9][0-9]*\/?$/u.test(url.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
 function validatePreparedMerge(
   value: unknown,
-): value is PreparedTargetMerge & { preparedAt: string } {
+): value is DockerPreparedTargetMerge & { preparedAt: string } {
   return (
     isRecord(value) &&
     Object.keys(value).length === 6 &&
@@ -439,6 +488,22 @@ function readJournal(filePath: string): DockerPublicationJournal {
     [journal.requirements.status, "statusAt"],
     [journal.requirements.cleanup, "cleanupAt"],
   ];
+  const expectedOwnershipMarker = publicationOwnershipMarker(journal.publicationId);
+  const candidate = journal.progress.pullRequestCandidate;
+  const candidateMatchesRepository = (() => {
+    if (!candidate || !journal.repository?.github) return candidate === undefined;
+    try {
+      const parsed = new URL(candidate.url);
+      return (
+        parsed.host.toLowerCase() === journal.repository.github.host.toLowerCase() &&
+        parsed.pathname
+          .toLowerCase()
+          .startsWith(`/${journal.repository.github.nameWithOwner.toLowerCase()}/pull/`)
+      );
+    } catch {
+      return false;
+    }
+  })();
   if (
     journal.publicationId !== journal.worktreeOwnershipId ||
     Boolean(journal.repository) !== requiresRemote ||
@@ -448,6 +513,16 @@ function readJournal(filePath: string): DockerPublicationJournal {
       ? journal.previousDigest !== undefined
       : journal.previousDigest === undefined) ||
     journal.gitState.authoritativeRef !== `refs/heads/${journal.branch}` ||
+    Boolean(journal.progress.pullRequestAt) !== Boolean(journal.progress.prUrl) ||
+    (journal.progress.prUrl !== undefined && !journal.requirements.pullRequest) ||
+    (candidate !== undefined &&
+      (!journal.requirements.pullRequest ||
+        candidate.ownershipMarker !== expectedOwnershipMarker ||
+        !candidateMatchesRepository ||
+        (journal.requirements.push && journal.progress.pushedAt === undefined))) ||
+    (journal.progress.prUrl !== undefined &&
+      candidate !== undefined &&
+      (candidate.state !== "accepted" || candidate.url !== journal.progress.prUrl)) ||
     (journal.state === "complete" &&
       requiredProgress.some(
         ([required, key]) => required && journal.progress[key] === undefined,
@@ -505,60 +580,96 @@ export function clearDockerPublicationRecovery(filePath: string, publicationId: 
   }
 }
 
-async function runGit(projectRoot: string, args: readonly string[]): Promise<string> {
-  const { stdout } = await execFileAsync("git", [...args], {
-    cwd: projectRoot,
-    timeout: GIT_TIMEOUT_MS,
-    maxBuffer: 1024 * 1024,
-  });
-  return stdout.trim();
-}
-
-async function runBoundGit(
+async function runGit(
   projectRoot: string,
   args: readonly string[],
-  pushUrl: string,
+  trustedLocalReadRemotePaths?: readonly string[],
+  expectedRepository?: TrustedGitHubRepository,
 ): Promise<string> {
-  const result = await runBoundGitCommand(args, projectRoot, pushUrl);
+  const result = await runTrustedGitResult(projectRoot, args, {
+    timeoutMs: GIT_TIMEOUT_MS,
+    maxBuffer: 1024 * 1024,
+    ...(trustedLocalReadRemotePaths ? { trustedLocalReadRemotePaths } : {}),
+    ...(expectedRepository ? { expectedRepository } : {}),
+  });
   if (result.exitCode !== 0) {
-    throw new Error(`Bound Git command failed: ${result.stderr || "Unknown Git command failure"}`);
+    throw Object.assign(
+      new Error(result.stderr.trim() || result.stdout.trim() || "Git command failed"),
+      { code: result.exitCode, stdout: result.stdout, stderr: result.stderr },
+    );
   }
   return result.stdout.trim();
 }
 
-async function readRef(projectRoot: string, ref: string): Promise<string> {
-  const value = await runGit(projectRoot, ["rev-parse", "--verify", ref]);
+function trustedGitHubRepository(
+  repository: GitOriginBinding,
+): TrustedGitHubRepository | undefined {
+  const github = repository.github;
+  if (!github) return undefined;
+  const [owner, repo, ...rest] = github.nameWithOwner.split("/");
+  if (!owner || !repo || rest.length > 0) {
+    throw new Error("Persisted GitHub repository identity is invalid");
+  }
+  return { host: github.host, owner, repo };
+}
+
+async function readRef(
+  projectRoot: string,
+  ref: string,
+  trustedLocalReadRemotePaths?: readonly string[],
+): Promise<string> {
+  const value = await runGit(
+    projectRoot,
+    ["rev-parse", "--verify", ref],
+    trustedLocalReadRemotePaths,
+  );
   if (!HASH_PATTERN.test(value)) throw new Error(`Git ref ${ref} did not resolve to a commit`);
   return value;
 }
 
-async function readOptionalRef(projectRoot: string, ref: string): Promise<string | undefined> {
-  try {
-    const value = await runGit(projectRoot, ["rev-parse", "--verify", "--quiet", ref]);
-    if (!HASH_PATTERN.test(value)) {
-      throw new Error(`Git ref ${ref} returned an invalid commit id`);
-    }
-    return value;
-  } catch (error: unknown) {
-    const code =
-      typeof error === "object" && error !== null && "code" in error
-        ? Number((error as { code?: unknown }).code)
-        : undefined;
-    if (code === 1) return undefined;
-    throw error;
+async function readOptionalRef(
+  projectRoot: string,
+  ref: string,
+  trustedLocalReadRemotePaths?: readonly string[],
+): Promise<string | undefined> {
+  // show-ref --hash exits 128 for absence as well as corruption. Its quiet
+  // variant silently conflates absence with malformed/dangling symbolic refs.
+  const probe = await runTrustedGitResult(
+    projectRoot,
+    ["rev-parse", "--verify", "--quiet", "--end-of-options", ref],
+    {
+      timeoutMs: GIT_TIMEOUT_MS,
+      maxBuffer: 1024 * 1024,
+      ...(trustedLocalReadRemotePaths ? { trustedLocalReadRemotePaths } : {}),
+    },
+  );
+  if (probe.exitCode === 1 && probe.stdout === "" && probe.stderr === "") return undefined;
+  if (probe.exitCode !== 0 || probe.stderr !== "" || !HASH_PATTERN.test(probe.stdout.trim())) {
+    throw new Error(probe.stderr.trim() || probe.stdout.trim() || `Git ref ${ref} is unreadable`);
   }
+  // rev-parse alone accepts an OID whose object is missing. Retain the exact
+  // object-existence check, including refusal if the ref disappears meanwhile.
+  const value = await runGit(
+    projectRoot,
+    ["show-ref", "--verify", "--hash", ref],
+    trustedLocalReadRemotePaths,
+  );
+  if (!HASH_PATTERN.test(value)) throw new Error(`Git ref ${ref} returned an invalid commit id`);
+  return value;
 }
 
 async function remoteBranchHead(
   projectRoot: string,
   branch: string,
   repository: GitOriginBinding,
+  trustedLocalReadRemotePaths?: readonly string[],
 ): Promise<string | undefined> {
   const current = await resolveBoundOriginRepository(projectRoot, repository);
-  const output = await runBoundGit(
+  const output = await runGit(
     projectRoot,
-    ["ls-remote", "--heads", BOUND_GIT_REMOTE, `refs/heads/${branch}`],
-    current.pushUrl,
+    ["ls-remote", "--heads", current.pushUrl, `refs/heads/${branch}`],
+    trustedLocalReadRemotePaths,
+    trustedGitHubRepository(repository),
   );
   const match = /^([a-f0-9]{40,64})\s+refs\/heads\/(.+)$/i.exec(output);
   return match?.[2] === branch ? match[1] : undefined;
@@ -567,18 +678,32 @@ async function remoteBranchHead(
 async function pushExactBranch(
   branch: string,
   candidateHead: string,
-  projectRoot: string,
+  adapter: ProjectAdapter,
   repository: GitOriginBinding,
+  trustedLocalReadRemotePaths?: readonly string[],
 ): Promise<void> {
-  const existing = await remoteBranchHead(projectRoot, branch, repository);
-  if (existing === candidateHead) return;
+  const projectRoot = adapter.projectRoot;
   const current = await resolveBoundOriginRepository(projectRoot, repository);
-  await runBoundGit(
+  const expectedRepository = trustedGitHubRepository(repository);
+  const existing = await remoteBranchHead(
     projectRoot,
-    ["push", BOUND_GIT_REMOTE, `${candidateHead}:refs/heads/${branch}`],
-    current.pushUrl,
+    branch,
+    repository,
+    trustedLocalReadRemotePaths,
   );
-  const confirmed = await remoteBranchHead(projectRoot, branch, repository);
+  if (existing === candidateHead) return;
+  await runGit(
+    projectRoot,
+    ["push", current.pushUrl, `${candidateHead}:refs/heads/${branch}`],
+    trustedLocalReadRemotePaths,
+    expectedRepository,
+  );
+  const confirmed = await remoteBranchHead(
+    projectRoot,
+    branch,
+    repository,
+    trustedLocalReadRemotePaths,
+  );
   if (confirmed !== candidateHead) {
     throw new Error(`remote branch ${branch} was not confirmed at ${candidateHead}`);
   }
@@ -642,6 +767,10 @@ function publicationBody(taskId: string, rawTask: string): string {
     "---",
     "*Generated by Quack Agent*",
   ].join("\n");
+}
+
+function publicationOwnershipMarker(publicationId: string): string {
+  return `<!-- quack-publication:${publicationId} -->`;
 }
 
 function requiredSteps(
@@ -723,10 +852,6 @@ function persistJournalUpdate(
   try {
     writeJsonAtomic(recoveryPath, advanced);
   } catch (error: unknown) {
-    // A rename/move can become visible before its final durability barrier
-    // reports failure. Reconcile and compare the exact next generation. On
-    // Windows, repeat the native write-through replacement because merely
-    // flushing the visible file cannot establish namespace durability.
     try {
       let recovered = readJournal(recoveryPath);
       if (!isDeepStrictEqual(recovered, advanced)) throw error;
@@ -875,7 +1000,8 @@ async function readProcessIncarnation(pid: number): Promise<string | undefined> 
   }
   if (process.platform === "darwin" || process.platform === "freebsd") {
     try {
-      const { stdout } = await execFileAsync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      const executable = fs.existsSync("/bin/ps") ? "/bin/ps" : "/usr/bin/ps";
+      const { stdout } = await execFileAsync(executable, ["-o", "lstart=", "-p", String(pid)], {
         timeout: 5_000,
         maxBuffer: 16_384,
       });
@@ -916,7 +1042,7 @@ async function createRecoveryLockObject(
     return { objectId: objectId.toLowerCase(), owner };
   } finally {
     try {
-      fs.rmSync(temporary);
+      removeFileDurably(temporary);
     } catch {
       // Git object creation errors remain the primary failure.
     }
@@ -973,9 +1099,6 @@ async function acquireRecoveryLock(
               "another publisher owns the durable recovery lock",
             );
           }
-          // The same OS process incarnation is live. Only this module's own
-          // retained, inactive token may be replaced; the map guard above
-          // excludes a concurrently active invocation in this process.
           if (
             liveIncarnation === owner.processIncarnation &&
             (owner.pid !== process.pid ||
@@ -987,17 +1110,12 @@ async function acquireRecoveryLock(
               "another publisher owns the durable recovery lock",
             );
           }
-          // A live PID with a different incarnation is PID reuse, not the
-          // recorded owner, so its stale token remains eligible for exact CAS.
         }
       }
       const expected = observed ?? "0".repeat(objectId.length);
       try {
         await runGit(identity.projectRoot, ["update-ref", lockRef, objectId, expected]);
       } catch (error: unknown) {
-        // The exact CAS may have succeeded before its wrapper reported a
-        // timeout/error. Read back the ref before retrying: our unique object
-        // proves ownership, while any other token remains untouched.
         try {
           const installed = await readOptionalRef(identity.projectRoot, lockRef);
           if (installed === objectId) {
@@ -1005,8 +1123,6 @@ async function acquireRecoveryLock(
             return { lockRef, objectId, attemptKey, localAttemptId };
           }
         } catch (readbackError: unknown) {
-          // Preserve the exact possible token so a later same-process retry
-          // can reclaim it after transient readback failure.
           retainedInactiveRecoveryLocks.set(attemptKey, objectId);
           throw new DockerPublicationIncompleteError(
             "validation",
@@ -1014,8 +1130,6 @@ async function acquireRecoveryLock(
             `could not confirm durable recovery lock acquisition: ${readbackError instanceof Error ? readbackError.message : String(readbackError)}; update reported ${error instanceof Error ? error.message : String(error)}`,
           );
         }
-        // Another contender won or the ref is still absent. Re-evaluate its
-        // exact state at the top of the loop.
         continue;
       }
       let confirmed: string | undefined;
@@ -1068,10 +1182,7 @@ async function releaseRecoveryLock(
       `could not verify durable recovery lock release: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
-  if (retained === undefined) return;
-  // A different exact token means our compare-and-swap lease is gone and a
-  // later contender has already acquired the ref. Never touch that token.
-  if (retained !== lock.objectId) return;
+  if (retained === undefined || retained !== lock.objectId) return;
   const detail = deleteError instanceof Error ? `: ${deleteError.message}` : "";
   throw new DockerPublicationIncompleteError(
     "validation",
@@ -1110,9 +1221,6 @@ export async function withDockerPublicationRecoveryLock<T>(
       retainedInactiveRecoveryLocks.delete(lock.attemptKey);
     }
   } catch (error: unknown) {
-    // This invocation is ending. Record its exact token as inactive so a
-    // later call in this same process can reclaim it without treating every
-    // same-PID token as stale.
     retainedInactiveRecoveryLocks.set(lock.attemptKey, lock.objectId);
     releaseFailure = { error };
   } finally {
@@ -1177,15 +1285,16 @@ async function resolvePublicationContext(
   const finalSharedDispatch = sharedDispatch
     ? isFinalSharedSubtask(resolved.task?.successCriteria ?? [])
     : false;
+  const requirements = requiredSteps(
+    adapter,
+    sharedDispatch,
+    finalSharedDispatch,
+    options.skipPr === true,
+  );
   return {
     adapter,
     targetBranch,
-    requirements: requiredSteps(
-      adapter,
-      sharedDispatch,
-      finalSharedDispatch,
-      options.skipPr === true,
-    ),
+    requirements,
     rawTask: resolved.content,
     title: resolved.task?.title ?? taskId,
   };
@@ -1257,11 +1366,6 @@ function isCanonicalTimestampPrefix(value: string): boolean {
   return true;
 }
 
-/**
- * Initial journal timestamps are generated per attempt. Match a strict prefix
- * against the stable ownership payload, then bind both timestamp fields to the
- * same canonical value before allowing removal of a crash-truncated artifact.
- */
 function matchesInitialJournalPrefix(
   observed: Buffer,
   expectedJournal: DockerPublicationJournal,
@@ -1272,16 +1376,13 @@ function matchesInitialJournalPrefix(
   const markerOffset = expected.indexOf(Buffer.from(marker, "utf-8"));
   if (markerOffset < 0) return false;
   const timestampOffset = markerOffset + `"createdAt": "`.length;
-  // Refuse to remove a partial artifact until its complete immutable
-  // ownership payload is present. A shorter prefix could belong to an
-  // unrelated writer that happened to claim the same filename.
   if (observed.length < timestampOffset) return false;
-  if (observed.length === timestampOffset)
+  if (observed.length === timestampOffset) {
     return observed.equals(expected.subarray(0, observed.length));
+  }
   if (!observed.subarray(0, timestampOffset).equals(expected.subarray(0, timestampOffset))) {
     return false;
   }
-
   const timestampAvailable = Math.min(
     ISO_TIMESTAMP_SHAPE.length,
     observed.length - timestampOffset,
@@ -1291,7 +1392,6 @@ function matchesInitialJournalPrefix(
     .toString("utf-8");
   if (!isCanonicalTimestampPrefix(timestampPrefix)) return false;
   if (timestampAvailable < ISO_TIMESTAMP_SHAPE.length) return true;
-
   let timestamp: string;
   try {
     timestamp = new Date(timestampPrefix).toISOString();
@@ -1299,12 +1399,11 @@ function matchesInitialJournalPrefix(
     return false;
   }
   if (timestamp !== timestampPrefix) return false;
-  const matchingJournal: DockerPublicationJournal = {
+  const matchingBytes = initialJournalBytes({
     ...expectedJournal,
     createdAt: timestamp,
     updatedAt: timestamp,
-  };
-  const matchingBytes = initialJournalBytes(matchingJournal);
+  });
   return (
     (allowComplete
       ? observed.length <= matchingBytes.length
@@ -1487,6 +1586,7 @@ async function executePublication(
 ): Promise<DockerHostPublicationResult> {
   const { adapter, requirements, rawTask, title } = context;
   const projectRoot = fs.realpathSync.native(adapter.projectRoot);
+  const trustedLocalReadRemotePaths = adapter.trustedLocalReadRemotePaths;
   if (
     journal.projectRoot !== projectRoot ||
     journal.branch !== journal.gitState.authoritativeRef.slice("refs/heads/".length) ||
@@ -1517,24 +1617,35 @@ async function executePublication(
   if (!journal.progress.promotedAt) {
     try {
       await ensureSealedPublicationCandidate(projectRoot, journal);
-      await runGit(projectRoot, [
-        "merge-base",
-        "--is-ancestor",
-        journal.gitState.baseHead,
-        journal.gitState.candidateHead,
-      ]);
-      const current = await readRef(projectRoot, journal.gitState.authoritativeRef);
+      await runGit(
+        projectRoot,
+        ["merge-base", "--is-ancestor", journal.gitState.baseHead, journal.gitState.candidateHead],
+        trustedLocalReadRemotePaths,
+      );
+      const current = await readRef(
+        projectRoot,
+        journal.gitState.authoritativeRef,
+        trustedLocalReadRemotePaths,
+      );
       if (current === journal.gitState.baseHead) {
-        await runGit(projectRoot, [
-          "update-ref",
-          journal.gitState.authoritativeRef,
-          journal.gitState.candidateHead,
-          journal.gitState.baseHead,
-        ]);
+        await runGit(
+          projectRoot,
+          [
+            "update-ref",
+            journal.gitState.authoritativeRef,
+            journal.gitState.candidateHead,
+            journal.gitState.baseHead,
+          ],
+          trustedLocalReadRemotePaths,
+        );
       } else if (current !== journal.gitState.candidateHead) {
         throw new Error("authoritative branch changed before publication promotion");
       }
-      const confirmed = await readRef(projectRoot, journal.gitState.authoritativeRef);
+      const confirmed = await readRef(
+        projectRoot,
+        journal.gitState.authoritativeRef,
+        trustedLocalReadRemotePaths,
+      );
       if (confirmed !== journal.gitState.candidateHead) {
         throw new Error("authoritative branch promotion was not confirmed");
       }
@@ -1549,8 +1660,9 @@ async function executePublication(
       await pushExactBranch(
         journal.branch,
         journal.gitState.candidateHead,
-        projectRoot,
+        adapter,
         journal.repository!,
+        trustedLocalReadRemotePaths,
       );
       recordProgress(recoveryPath, journal, { pushedAt: new Date().toISOString() });
     } catch (error: unknown) {
@@ -1560,27 +1672,85 @@ async function executePublication(
 
   if (requirements.pullRequest && !journal.progress.pullRequestAt) {
     try {
-      const repository = await resolveBoundOriginGitHubRepository(projectRoot, journal.repository!);
-      const created = await createPullRequest(
-        {
-          taskId: journal.taskId,
-          title: `[${journal.taskId}] ${title}`,
-          body: publicationBody(journal.taskId, rawTask),
-          baseBranch: journal.targetBranch,
-          headBranch: journal.branch,
-          headCommitSha: journal.gitState.candidateHead,
-        },
-        adapter,
-        repository,
+      if (!journal.repository?.github) {
+        throw new Error("GitHub repository identity was not pinned");
+      }
+      await resolveBoundOriginRepository(projectRoot, journal.repository);
+      const githubRepository = trustedGitHubRepository(journal.repository);
+      if (!githubRepository) throw new Error("GitHub repository identity was not pinned");
+      const remoteHead = await remoteBranchHead(
+        projectRoot,
+        journal.branch,
+        journal.repository,
+        trustedLocalReadRemotePaths,
       );
-      if (!created.success || !created.prUrl) {
-        throw new Error(
-          created.error ?? `Pull request URL was not confirmed for ${journal.taskId}`,
+      if (remoteHead !== journal.gitState.candidateHead) {
+        throw new Error("remote pull-request branch no longer matches the sealed commit");
+      }
+      const binding: PullRequestBinding = {
+        repository: githubRepository,
+        headBranch: journal.branch,
+        baseBranch: journal.targetBranch,
+        headOid: journal.gitState.candidateHead,
+      };
+      const ownershipMarker = publicationOwnershipMarker(journal.publicationId);
+      const recordCandidate = (candidate: PullRequestCandidate): void => {
+        const existing = journal.progress.pullRequestCandidate;
+        recordProgress(recoveryPath, journal, {
+          pullRequestCandidate: {
+            ...candidate,
+            recordedAt:
+              existing?.url === candidate.url &&
+              existing.ownershipMarker === candidate.ownershipMarker
+                ? existing.recordedAt
+                : new Date().toISOString(),
+          },
+        });
+      };
+      let prUrl: string;
+      const pendingCandidate = journal.progress.pullRequestCandidate;
+      if (pendingCandidate && pendingCandidate.state !== "closed") {
+        const recovered = await recoverPullRequestCandidate(projectRoot, pendingCandidate, binding);
+        recordCandidate(recovered);
+        if (recovered.state !== "accepted") {
+          throw new Error(
+            "The invalid Quack-owned pull request was closed; retry publication to create a replacement",
+          );
+        }
+        prUrl = recovered.url;
+      } else {
+        const created = await createPullRequest(
+          {
+            taskId: journal.taskId,
+            title: `[${journal.taskId}] ${title}`,
+            body: publicationBody(journal.taskId, rawTask),
+            baseBranch: journal.targetBranch,
+            headBranch: journal.branch,
+            expectedHeadOid: journal.gitState.candidateHead,
+            repository: githubRepository,
+            ownershipMarker,
+            onCandidate: recordCandidate,
+          },
+          adapter,
         );
+        if (!created.success || !created.prUrl) {
+          throw new Error(
+            created.error ?? `Pull request URL was not confirmed for ${journal.taskId}`,
+          );
+        }
+        const acceptedCandidate = journal.progress.pullRequestCandidate;
+        if (
+          acceptedCandidate?.state !== "accepted" ||
+          acceptedCandidate.url !== created.prUrl ||
+          acceptedCandidate.ownershipMarker !== ownershipMarker
+        ) {
+          throw new Error("Pull request candidate was not durably accepted before publication");
+        }
+        prUrl = created.prUrl;
       }
       recordProgress(recoveryPath, journal, {
         pullRequestAt: new Date().toISOString(),
-        prUrl: created.prUrl,
+        prUrl,
       });
     } catch (error: unknown) {
       throw recordFailure(recoveryPath, journal, "pull-request", error);
@@ -1589,7 +1759,27 @@ async function executePublication(
 
   if (requirements.merge && !journal.progress.mergedAt) {
     try {
-      const repository = await resolveBoundOriginRepository(projectRoot, journal.repository!);
+      if (
+        requirements.pullRequest &&
+        (!journal.progress.pullRequestAt || !journal.progress.prUrl)
+      ) {
+        throw new Error("Pull-request publication was not durably confirmed before merge");
+      }
+      if (!journal.repository) throw new Error("Git origin identity was not pinned");
+      const origin = await resolveBoundOriginRepository(projectRoot, journal.repository);
+      const githubRepository = trustedGitHubRepository(journal.repository);
+      if (!githubRepository) {
+        throw new Error("Current branch-manager publication requires a GitHub repository identity");
+      }
+      let pullRequestBinding: PullRequestBinding | undefined;
+      if (journal.progress.prUrl) {
+        pullRequestBinding = {
+          repository: githubRepository,
+          headBranch: journal.branch,
+          baseBranch: journal.targetBranch,
+          headOid: journal.gitState.candidateHead,
+        };
+      }
       const preparedMerge = journal.progress.preparedMerge;
       const merged = await mergeBranchToTarget(
         journal.taskId,
@@ -1598,7 +1788,9 @@ async function executePublication(
         journal.targetBranch,
         undefined,
         journal.branch,
+        pullRequestBinding,
         journal.gitState.candidateHead,
+        githubRepository,
         journal.progress.prUrl
           ? undefined
           : {
@@ -1620,7 +1812,7 @@ async function executePublication(
                 });
               },
             },
-        repository,
+        origin,
       );
       if (!merged.success) {
         throw new Error(merged.error ?? `Failed to auto-merge ${journal.branch}`);
@@ -1651,12 +1843,17 @@ async function executePublication(
 
   if (requirements.status && !journal.progress.statusAt) {
     try {
-      const repository = await resolveBoundOriginRepository(projectRoot, journal.repository!);
+      if (!journal.repository) throw new Error("Git origin identity was not pinned");
+      await resolveBoundOriginRepository(projectRoot, journal.repository);
+      const githubRepository = trustedGitHubRepository(journal.repository);
+      if (!githubRepository) {
+        throw new Error("Current task-status publication requires a GitHub repository identity");
+      }
       const status = await updateTaskFileStatus(
         journal.taskId,
         adapter,
         journal.targetBranch,
-        repository.pushUrl,
+        githubRepository,
       );
       if (!status.success) {
         throw new Error(status.error ?? `Failed to update ${journal.taskId} status`);
@@ -1678,18 +1875,20 @@ async function executePublication(
           cleanupOutcome: outcome,
         });
       } else {
-        const repository = await resolveBoundOriginRepository(projectRoot, journal.repository!);
+        if (!journal.repository) throw new Error("Git origin identity was not pinned");
+        const cleanupOrigin = await resolveBoundOriginRepository(projectRoot, journal.repository);
+        const githubRepository = trustedGitHubRepository(journal.repository);
+        if (!githubRepository) {
+          throw new Error("Current branch cleanup requires a GitHub repository identity");
+        }
         await restoreMissingLocalCandidateForCleanup(journal);
         const cleanup = await deleteAfterMerge(journal.branch, adapter, {
           baseBranch: journal.targetBranch,
-          expectedHeadCommit: journal.gitState.candidateHead,
-          ...(journal.progress.preparedMerge?.resultHead || journal.progress.mergeCommitSha
-            ? {
-                expectedMergedCommit:
-                  journal.progress.preparedMerge?.resultHead ?? journal.progress.mergeCommitSha,
-              }
-            : {}),
-          expectedOriginPushUrl: repository.pushUrl,
+          expectedRepository: githubRepository,
+          expectedSourceOid: journal.gitState.candidateHead,
+          expectedMergedCommit:
+            journal.progress.preparedMerge?.resultHead ?? journal.progress.mergeCommitSha,
+          expectedOriginPushUrl: cleanupOrigin.pushUrl,
         });
         if (cleanup.deleted && cleanup.localDeleted) {
           recordProgress(recoveryPath, journal, { cleanupLocalAt: new Date().toISOString() });
@@ -1697,6 +1896,7 @@ async function executePublication(
         if (
           cleanup.reason === "delete-failed" ||
           cleanup.reason === "head-mismatch" ||
+          cleanup.reason === "origin-mismatch" ||
           cleanup.reason === "not-merged" ||
           (cleanup.deleted && cleanup.remoteDeleted === false)
         ) {

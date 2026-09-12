@@ -63,6 +63,7 @@ describe("dashboard API contracts", () => {
         queued: 0,
         ready: 0,
         running: 0,
+        awaitingApproval: 0,
         completed: 0,
         failed: 0,
         blocked: 0,

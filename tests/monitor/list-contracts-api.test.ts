@@ -172,13 +172,17 @@ describe("monitor list API contracts", () => {
   });
 
   it("returns paged and sorted task list metadata while keeping parse metadata", async () => {
-    const port = 33000 + Math.floor(Math.random() * 10000);
-    const server = createMonitorServer({ port, projectAdapters: [makeAdapter(projectRoot)] });
+    const server = createMonitorServer({
+      port: 0,
+      host: "127.0.0.1",
+      projectAdapters: [makeAdapter(projectRoot)],
+    });
     const started = await server.start();
     stopServer = started.stop;
+    const { port } = started;
 
     const res = await httpGet(
-      `http://localhost:${port}/api/tasks?page=1&perPage=2&sort=id&order=desc`,
+      `http://127.0.0.1:${port}/api/tasks?page=1&perPage=2&sort=id&order=desc`,
     );
     expect(res.status).toBe(200);
     const body = JSON.parse(res.body) as {
@@ -209,13 +213,17 @@ describe("monitor list API contracts", () => {
   });
 
   it("filters task lists by excluded effective status", async () => {
-    const port = 33000 + Math.floor(Math.random() * 10000);
-    const server = createMonitorServer({ port, projectAdapters: [makeAdapter(projectRoot)] });
+    const server = createMonitorServer({
+      port: 0,
+      host: "127.0.0.1",
+      projectAdapters: [makeAdapter(projectRoot)],
+    });
     const started = await server.start();
     stopServer = started.stop;
+    const { port } = started;
 
     const res = await httpGet(
-      `http://localhost:${port}/api/tasks?excludeStatus=COMPLETE,VERIFIED&sort=id&order=asc`,
+      `http://127.0.0.1:${port}/api/tasks?excludeStatus=COMPLETE,VERIFIED&sort=id&order=asc`,
     );
     expect(res.status).toBe(200);
     const body = JSON.parse(res.body) as {
@@ -276,12 +284,16 @@ describe("monitor list API contracts", () => {
       "utf-8",
     );
 
-    const port = 33000 + Math.floor(Math.random() * 10000);
-    const server = createMonitorServer({ port, projectAdapters: [makeAdapter(projectRoot)] });
+    const server = createMonitorServer({
+      port: 0,
+      host: "127.0.0.1",
+      projectAdapters: [makeAdapter(projectRoot)],
+    });
     const started = await server.start();
     stopServer = started.stop;
+    const { port } = started;
 
-    const inventory = await httpGet(`http://localhost:${port}/api/tasks`);
+    const inventory = await httpGet(`http://127.0.0.1:${port}/api/tasks`);
     expect(inventory.status).toBe(200);
     const inventoryBody = JSON.parse(inventory.body) as {
       hygiene?: {
@@ -298,7 +310,7 @@ describe("monitor list API contracts", () => {
       ]),
     );
 
-    const hygiene = await httpGet(`http://localhost:${port}/api/tasks/hygiene`);
+    const hygiene = await httpGet(`http://127.0.0.1:${port}/api/tasks/hygiene`);
     expect(hygiene.status).toBe(200);
     const hygieneBody = JSON.parse(hygiene.body) as {
       duplicateIds: Array<{ taskId: string }>;
@@ -313,10 +325,14 @@ describe("monitor list API contracts", () => {
   });
 
   it("keeps legacy sessions array mode and adds explicit paged sessions mode", async () => {
-    const port = 33000 + Math.floor(Math.random() * 10000);
-    const server = createMonitorServer({ port, projectAdapters: [makeAdapter(projectRoot)] });
+    const server = createMonitorServer({
+      port: 0,
+      host: "127.0.0.1",
+      projectAdapters: [makeAdapter(projectRoot)],
+    });
     const started = await server.start();
     stopServer = started.stop;
+    const { port } = started;
 
     const ctx = server.registry?.getActiveProject();
     expect(ctx).toBeDefined();
@@ -357,14 +373,14 @@ describe("monitor list API contracts", () => {
       turns_used: 6,
     });
 
-    const legacy = await httpGet(`http://localhost:${port}/api/sessions?limit=2`);
+    const legacy = await httpGet(`http://127.0.0.1:${port}/api/sessions?limit=2`);
     expect(legacy.status).toBe(200);
     const legacyBody = JSON.parse(legacy.body) as Array<{ sessionId: string }>;
     expect(Array.isArray(legacyBody)).toBe(true);
     expect(legacyBody).toHaveLength(2);
 
     const paged = await httpGet(
-      `http://localhost:${port}/api/sessions?paged=true&page=1&perPage=2&excludeStatus=error&sort=taskId&order=asc`,
+      `http://127.0.0.1:${port}/api/sessions?paged=true&page=1&perPage=2&excludeStatus=error&sort=taskId&order=asc`,
     );
     expect(paged.status).toBe(200);
     const pagedBody = JSON.parse(paged.body) as {
@@ -381,10 +397,14 @@ describe("monitor list API contracts", () => {
   });
 
   it("returns task-specific runs from SQLite before file-backed session logs", async () => {
-    const port = 33000 + Math.floor(Math.random() * 10000);
-    const server = createMonitorServer({ port, projectAdapters: [makeAdapter(projectRoot)] });
+    const server = createMonitorServer({
+      port: 0,
+      host: "127.0.0.1",
+      projectAdapters: [makeAdapter(projectRoot)],
+    });
     const started = await server.start();
     stopServer = started.stop;
+    const { port } = started;
 
     const ctx = server.registry?.getActiveProject();
     expect(ctx).toBeDefined();
@@ -413,7 +433,7 @@ describe("monitor list API contracts", () => {
       turns_used: 4,
     });
 
-    const res = await httpGet(`http://localhost:${port}/api/tasks/TASK-001/runs`);
+    const res = await httpGet(`http://127.0.0.1:${port}/api/tasks/TASK-001/runs`);
     expect(res.status).toBe(200);
     const body = JSON.parse(res.body) as Array<{
       sessionId: string;
@@ -441,12 +461,16 @@ describe("monitor list API contracts", () => {
   });
 
   it("updates task status through the dashboard status endpoint", async () => {
-    const port = 33000 + Math.floor(Math.random() * 10000);
-    const server = createMonitorServer({ port, projectAdapters: [makeAdapter(projectRoot)] });
+    const server = createMonitorServer({
+      port: 0,
+      host: "127.0.0.1",
+      projectAdapters: [makeAdapter(projectRoot)],
+    });
     const started = await server.start();
     stopServer = started.stop;
+    const { port } = started;
 
-    const update = await httpPostJson(`http://localhost:${port}/api/tasks/TASK-001/status`, {
+    const update = await httpPostJson(`http://127.0.0.1:${port}/api/tasks/TASK-001/status`, {
       status: "IN_PROGRESS",
     });
     expect(update.status).toBe(200);
@@ -456,7 +480,7 @@ describe("monitor list API contracts", () => {
       status: "IN_PROGRESS",
     });
 
-    const tasks = await httpGet(`http://localhost:${port}/api/tasks?status=IN_PROGRESS`);
+    const tasks = await httpGet(`http://127.0.0.1:${port}/api/tasks?status=IN_PROGRESS`);
     const body = JSON.parse(tasks.body) as {
       tasks: Array<{ id: string; effectiveStatus: string }>;
     };
@@ -466,16 +490,20 @@ describe("monitor list API contracts", () => {
   });
 
   it("returns quiet batch prep and preflight cache lookups for dashboard startup", async () => {
-    const port = 33000 + Math.floor(Math.random() * 10000);
-    const server = createMonitorServer({ port, projectAdapters: [makeAdapter(projectRoot)] });
+    const server = createMonitorServer({
+      port: 0,
+      host: "127.0.0.1",
+      projectAdapters: [makeAdapter(projectRoot)],
+    });
     const started = await server.start();
     stopServer = started.stop;
+    const { port } = started;
 
-    const prep = await httpGet(`http://localhost:${port}/api/tasks/prep-cache`);
+    const prep = await httpGet(`http://127.0.0.1:${port}/api/tasks/prep-cache`);
     expect(prep.status).toBe(200);
     expect(JSON.parse(prep.body)).toEqual({ results: {} });
 
-    const preflight = await httpGet(`http://localhost:${port}/api/tasks/preflight-cache`);
+    const preflight = await httpGet(`http://127.0.0.1:${port}/api/tasks/preflight-cache`);
     expect(preflight.status).toBe(200);
     expect(JSON.parse(preflight.body)).toEqual({ results: {} });
   });

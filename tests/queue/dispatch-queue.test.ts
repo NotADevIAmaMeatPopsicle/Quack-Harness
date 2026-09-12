@@ -4,16 +4,30 @@ import * as os from "node:os";
 
 import { DispatchQueue } from "../../src/queue/dispatch-queue";
 import type { DispatchQueueConfig } from "../../src/queue/queue-types";
-import type { DispatchManager, DispatchJob } from "../../src/monitor/dispatch-manager";
+import { DispatchManager, type DispatchJob } from "../../src/monitor/dispatch-manager";
 import type { TaskService, TaskSummary } from "../../src/monitor/task-service";
 import type { EventReader } from "../../src/monitor/event-reader";
 import type { SessionEntry } from "../../src/monitor/event-types";
 import type { ParsedTask } from "../../src/core/types";
+import type { DecompositionDispatchAdmission } from "../../src/preflight/decomposition-transaction-journal";
 
 // ─── Mock Helpers ──────────────────────────────────────────────────
 
 function makeTempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "quack-test-dq-"));
+}
+
+async function waitForCondition(
+  predicate: () => boolean,
+  description: string,
+  timeoutMs = 2000,
+): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${description}`);
 }
 
 function makeConfig(overrides: Partial<DispatchQueueConfig> = {}): DispatchQueueConfig {
@@ -91,7 +105,7 @@ function createMockDispatchManager(): jest.Mocked<
 > {
   return {
     start: jest.fn().mockReturnValue(makeJob("TASK-001")),
-    stop: jest.fn(),
+    stop: jest.fn().mockReturnValue(true),
     getActiveJob: jest.fn().mockReturnValue(undefined),
     getJob: jest.fn().mockReturnValue(undefined),
     getActiveJobs: jest.fn().mockReturnValue([]),
@@ -149,7 +163,13 @@ describe("DispatchQueue", () => {
     }
   });
 
-  function createQueue(configOverrides: Partial<DispatchQueueConfig> = {}): DispatchQueue {
+  function createQueue(
+    configOverrides: Partial<DispatchQueueConfig> = {},
+    dispatchAdmissionFence?: <T>(
+      taskId: string,
+      dispatch: (admission: DecompositionDispatchAdmission) => T,
+    ) => Promise<T>,
+  ): DispatchQueue {
     const queue = new DispatchQueue(
       dispatchManager as unknown as DispatchManager,
       taskService as unknown as TaskService,
@@ -159,6 +179,8 @@ describe("DispatchQueue", () => {
       (stage, taskId, payload) => {
         events.push({ stage, taskId, payload });
       },
+      undefined,
+      dispatchAdmissionFence,
     );
     activeQueue = queue;
     return queue;
@@ -479,9 +501,813 @@ describe("DispatchQueue", () => {
     });
   });
 
+  describe("human approval pauses", () => {
+    async function checkCompletion(queue: DispatchQueue, taskId: string): Promise<void> {
+      await (
+        queue as unknown as { checkTaskCompletion(id: string): Promise<void> }
+      ).checkTaskCompletion(taskId);
+    }
+
+    function runningLaneCount(queue: DispatchQueue): number {
+      return (
+        queue as unknown as {
+          guard: { getState(): { runningCount: number } };
+        }
+      ).guard.getState().runningCount;
+    }
+
+    it.each([
+      ["reject", "rejected"],
+      ["replan", "blueprint_replan_requested"],
+    ] as const)(
+      "releases a maxConcurrent=1 lane after blueprint %s so the next item starts",
+      async (_decision, outcome) => {
+        const currentJobs = new Map<string, DispatchJob>();
+        dispatchManager.start.mockImplementation((taskId) => {
+          const job = makeJob(taskId, "running");
+          currentJobs.set(taskId, job);
+          return job;
+        });
+        dispatchManager.getJob.mockImplementation((taskId) => currentJobs.get(taskId));
+        taskService.getTask.mockImplementation((taskId) => Promise.resolve(makeParsedTask(taskId)));
+        taskService.listTasks.mockResolvedValue({
+          tasks: [makeTaskSummary("TASK-001"), makeTaskSummary("TASK-002")],
+          parseErrors: [],
+          parseWarnings: [],
+        });
+
+        const queue = createQueue({
+          maxConcurrent: 1,
+          cooldownBetweenTasksMs: 0,
+          persistState: true,
+        });
+        const first = queue.enqueue("TASK-001");
+        const second = queue.enqueue("TASK-002");
+        await waitForCondition(
+          () => first.status === "ready" && second.status === "ready",
+          "both queue items to become ready",
+        );
+        await queue.start();
+        await waitForCondition(() => first.status === "running", "the first queue item to start");
+        expect(dispatchManager.start).toHaveBeenCalledTimes(1);
+        expect(runningLaneCount(queue)).toBe(1);
+
+        const paused = makeJob("TASK-001", "awaiting_approval");
+        paused.exitCode = 1;
+        currentJobs.set("TASK-001", paused);
+        await checkCompletion(queue, "TASK-001");
+        expect(first.status).toBe("awaiting_approval");
+
+        // The rejection route releases the manager job first. Without an
+        // explicit queue transition, getJob() returns undefined forever and
+        // this maxConcurrent=1 slot strands TASK-002.
+        currentJobs.delete("TASK-001");
+        expect(
+          queue.settleApprovalRejection("TASK-001", `Blueprint ${_decision} requested`, outcome),
+        ).toBe(true);
+
+        await waitForCondition(
+          () => dispatchManager.start.mock.calls.some(([taskId]) => taskId === "TASK-002"),
+          "the second queue item to start",
+        );
+        expect(first).toMatchObject({
+          status: "failed",
+          outcome,
+          error: `Blueprint ${_decision} requested`,
+        });
+        expect(second.status).toBe("running");
+        expect(runningLaneCount(queue)).toBe(1);
+        expect(
+          (
+            queue as unknown as {
+              pollTimers: Map<string, ReturnType<typeof setInterval>>;
+            }
+          ).pollTimers.has("TASK-001"),
+        ).toBe(false);
+        expect(fs.readFileSync(path.join(tmpDir, "dispatch-queue.jsonl"), "utf-8")).toContain(
+          `"outcome":"${outcome}"`,
+        );
+        const firstTaskStopCalls = dispatchManager.stop.mock.calls.filter(
+          ([taskId]) => taskId === "TASK-001",
+        ).length;
+        expect(queue.cancel("TASK-001")).toBe(true);
+        expect(
+          dispatchManager.stop.mock.calls.filter(([taskId]) => taskId === "TASK-001"),
+        ).toHaveLength(firstTaskStopCalls);
+      },
+    );
+
+    it("settles a still-running queue row only with proof that the real manager released its pause", async () => {
+      const realManager = new DispatchManager(
+        tmpDir,
+        path.join(tmpDir, "quack.js"),
+        undefined,
+        undefined,
+        tmpDir,
+      );
+      const realQueue = new DispatchQueue(
+        realManager,
+        taskService as unknown as TaskService,
+        eventReader as unknown as EventReader,
+        makeConfig({ maxConcurrent: 1, cooldownBetweenTasksMs: 0, persistState: true }),
+        tmpDir,
+      );
+      const managerJobs = (realManager as unknown as { jobs: Map<string, DispatchJob> }).jobs;
+      const queueInternals = realQueue as unknown as {
+        running: boolean;
+        guard: { onTaskStart(): void; getState(): { runningCount: number } };
+        pollTimers: Map<string, ReturnType<typeof setInterval>>;
+      };
+
+      try {
+        taskService.getTask.mockImplementation((taskId) => Promise.resolve(makeParsedTask(taskId)));
+        taskService.listTasks.mockResolvedValue({
+          tasks: [makeTaskSummary("TASK-001"), makeTaskSummary("TASK-002")],
+          parseErrors: [],
+          parseWarnings: [],
+        });
+        const first = realQueue.enqueue("TASK-001");
+        const second = realQueue.enqueue("TASK-002");
+        await waitForCondition(
+          () => first.status === "ready" && second.status === "ready",
+          "real queue items to become ready",
+        );
+
+        first.status = "running";
+        second.status = "ready";
+        queueInternals.running = true;
+        queueInternals.guard.onTaskStart();
+
+        const startedAt = new Date(Date.now() - 60_000).toISOString();
+        const approvalCreatedAt = new Date().toISOString();
+        managerJobs.set("TASK-001", {
+          taskId: "TASK-001",
+          sessionId: "real-manager-paused",
+          pid: 4242,
+          startedAt,
+          status: "awaiting_approval",
+          exitCode: 1,
+          output: [],
+        });
+        fs.mkdirSync(path.join(tmpDir, "approvals"), { recursive: true });
+        fs.writeFileSync(
+          path.join(tmpDir, "approvals", "TASK-001.json"),
+          JSON.stringify({
+            taskId: "TASK-001",
+            state: "pending",
+            createdAt: approvalCreatedAt,
+            blueprint: {},
+          }),
+          "utf-8",
+        );
+
+        const startSpy = jest.spyOn(realManager, "start").mockImplementation((taskId) => {
+          const job = makeJob(taskId, "running");
+          managerJobs.set(taskId, job);
+          return job;
+        });
+        const resolution = await realManager.resolveApprovalPauseDecision(
+          "TASK-001",
+          "blueprint",
+          "rejected",
+          () => {
+            fs.writeFileSync(
+              path.join(tmpDir, "approvals", "TASK-001.json"),
+              JSON.stringify({
+                taskId: "TASK-001",
+                state: "rejected",
+                createdAt: approvalCreatedAt,
+                decidedAt: new Date().toISOString(),
+                blueprint: {},
+              }),
+              "utf-8",
+            );
+            return Promise.resolve();
+          },
+        );
+
+        expect(first.status).toBe("running");
+        expect(resolution.released).toBe(true);
+        expect(realManager.getJob("TASK-001")).toBeUndefined();
+        expect(
+          realQueue.settleApprovalRejection(
+            "TASK-001",
+            "Blueprint rejected",
+            "rejected",
+            resolution.released,
+          ),
+        ).toBe(true);
+
+        await waitForCondition(
+          () => startSpy.mock.calls.some(([taskId]) => taskId === "TASK-002"),
+          "the next real queue item to start",
+        );
+        expect(first).toMatchObject({ status: "failed", outcome: "rejected" });
+        expect(second.status).toBe("running");
+        expect(queueInternals.guard.getState().runningCount).toBe(1);
+      } finally {
+        realQueue.stop();
+        for (const timer of queueInternals.pollTimers.values()) clearInterval(timer);
+        queueInternals.pollTimers.clear();
+        managerJobs.clear();
+      }
+    });
+
+    it("does not settle a running queue row without an exact manager release proof", () => {
+      const queue = createQueue();
+      const item = queue.enqueue("TASK-001");
+      item.status = "running";
+
+      expect(queue.settleApprovalRejection("TASK-001", "Rejected", "rejected")).toBe(false);
+      expect(item.status).toBe("running");
+    });
+
+    it("write-ahead records approval resume when the queue poll lags a real manager release", async () => {
+      const realManager = new DispatchManager(
+        tmpDir,
+        path.join(tmpDir, "quack.js"),
+        undefined,
+        undefined,
+        tmpDir,
+      );
+      const realQueue = new DispatchQueue(
+        realManager,
+        taskService as unknown as TaskService,
+        eventReader as unknown as EventReader,
+        makeConfig({ maxConcurrent: 1, cooldownBetweenTasksMs: 0, persistState: true }),
+        tmpDir,
+      );
+      let recoveredQueue: DispatchQueue | undefined;
+      const managerJobs = (realManager as unknown as { jobs: Map<string, DispatchJob> }).jobs;
+      const queueInternals = realQueue as unknown as {
+        running: boolean;
+        guard: { onTaskStart(): void; getState(): { runningCount: number } };
+        pollTimers: Map<string, ReturnType<typeof setInterval>>;
+      };
+
+      try {
+        taskService.getTask.mockImplementation((taskId) => Promise.resolve(makeParsedTask(taskId)));
+        taskService.listTasks.mockResolvedValue({
+          tasks: [makeTaskSummary("TASK-001"), makeTaskSummary("TASK-002")],
+          parseErrors: [],
+          parseWarnings: [],
+        });
+        const first = realQueue.enqueue("TASK-001");
+        const second = realQueue.enqueue("TASK-002");
+        await waitForCondition(
+          () => first.status === "ready" && second.status === "ready",
+          "real queue items to become ready",
+        );
+        first.status = "running";
+        queueInternals.running = true;
+        queueInternals.guard.onTaskStart();
+
+        // The child has exited at the gate, but the queue's three-second poll
+        // has not yet observed that transition: its row is still `running`.
+        const approvalCreatedAt = new Date().toISOString();
+        managerJobs.set("TASK-001", {
+          taskId: "TASK-001",
+          sessionId: "real-manager-approve-paused",
+          pid: 4242,
+          startedAt: new Date(Date.now() - 60_000).toISOString(),
+          status: "awaiting_approval",
+          exitCode: 1,
+          output: [],
+        });
+        fs.mkdirSync(path.join(tmpDir, "approvals"), { recursive: true });
+        fs.writeFileSync(
+          path.join(tmpDir, "approvals", "TASK-001.json"),
+          JSON.stringify({
+            taskId: "TASK-001",
+            state: "pending",
+            createdAt: approvalCreatedAt,
+            blueprint: {},
+          }),
+          "utf-8",
+        );
+        const resolution = await realManager.resolveApprovalPauseDecision(
+          "TASK-001",
+          "blueprint",
+          "approved",
+          () => {
+            fs.writeFileSync(
+              path.join(tmpDir, "approvals", "TASK-001.json"),
+              JSON.stringify({
+                taskId: "TASK-001",
+                state: "approved",
+                createdAt: approvalCreatedAt,
+                blueprint: {},
+              }),
+              "utf-8",
+            );
+            return Promise.resolve();
+          },
+        );
+
+        expect(first.status).toBe("running");
+        expect(resolution.released).toBe(true);
+        expect(realQueue.recordApprovalResume("TASK-001")).toBe(false);
+        expect(realQueue.recordApprovalResume("TASK-001", resolution.released)).toBe(true);
+        expect(first).toMatchObject({ status: "running", dispatchOptions: { resume: true } });
+        expect(queueInternals.guard.getState().runningCount).toBe(1);
+        expect(fs.readFileSync(path.join(tmpDir, "dispatch-queue.jsonl"), "utf-8")).toContain(
+          '"type":"task_resumed"',
+        );
+
+        // Simulate a monitor death before the route starts the replacement.
+        // Replay must resume TASK-001 and keep TASK-002 behind the same lane.
+        queueInternals.running = false;
+        const startSpy = jest.spyOn(realManager, "start").mockImplementation((taskId) => {
+          const job = makeJob(taskId, "running");
+          managerJobs.set(taskId, job);
+          return job;
+        });
+        recoveredQueue = new DispatchQueue(
+          realManager,
+          taskService as unknown as TaskService,
+          eventReader as unknown as EventReader,
+          makeConfig({ maxConcurrent: 1, cooldownBetweenTasksMs: 0, persistState: true }),
+          tmpDir,
+        );
+        await recoveredQueue.start();
+        await waitForCondition(() => startSpy.mock.calls.length === 1, "approval resume replay");
+
+        expect(startSpy).toHaveBeenCalledWith(
+          "TASK-001",
+          expect.objectContaining({ resume: true }),
+          expect.objectContaining({ taskId: "TASK-001", claimants: [] }),
+        );
+        expect(startSpy.mock.calls.some(([taskId]) => taskId === "TASK-002")).toBe(false);
+        expect(recoveredQueue.getItem("TASK-001")?.status).toBe("running");
+      } finally {
+        realQueue.stop();
+        recoveredQueue?.stop();
+        for (const timer of queueInternals.pollTimers.values()) clearInterval(timer);
+        queueInternals.pollTimers.clear();
+        managerJobs.clear();
+      }
+    });
+
+    it.each(["blueprint", "judge"] as const)(
+      "keeps a %s gate pause nonterminal and finishes after the approval restart",
+      async (gate) => {
+        let currentJob = makeJob("TASK-001", "running");
+        currentJob.sessionId = `${gate}-initial`;
+        dispatchManager.start.mockImplementation(() => currentJob);
+        dispatchManager.getJob.mockImplementation(() => currentJob);
+        taskService.getTask.mockResolvedValue(makeParsedTask("TASK-001"));
+
+        const queue = createQueue({
+          maxConcurrent: 1,
+          cooldownBetweenTasksMs: 0,
+          persistState: true,
+        });
+        const item = queue.enqueue("TASK-001");
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        await queue.start();
+
+        expect(dispatchManager.start).toHaveBeenCalledTimes(1);
+        expect(item.status).toBe("running");
+        expect(runningLaneCount(queue)).toBe(1);
+
+        currentJob = makeJob("TASK-001", "awaiting_approval");
+        currentJob.sessionId = `${gate}-pending`;
+        currentJob.output = [`[dispatch] ${gate} approval pending`];
+        eventReader.getExecutionSessions.mockReturnValue([
+          {
+            sessionId: `${gate}-pending`,
+            taskId: "TASK-001",
+            project: "test",
+            startTime: "2026-09-08T11:00:00.000Z",
+            status: "completed",
+            outcome: gate === "blueprint" ? "awaiting_approval" : "awaiting_judge_approval",
+          } as SessionEntry,
+        ]);
+        await checkCompletion(queue, "TASK-001");
+
+        expect(item).toMatchObject({
+          status: "awaiting_approval",
+          retryCount: 0,
+        });
+        expect(item.completedAt).toBeUndefined();
+        expect(queue.getStats()).toMatchObject({
+          awaitingApproval: 1,
+          running: 0,
+          failed: 0,
+        });
+        expect(queue.retry("TASK-001")).toBe(false);
+        expect(runningLaneCount(queue)).toBe(1);
+        expect(
+          events.some(
+            (event) => event.stage === "dispatch_queue_task_failed" && event.taskId === "TASK-001",
+          ),
+        ).toBe(false);
+        expect(
+          events.some(
+            (event) =>
+              event.stage === "dispatch_queue_task_awaiting_approval" &&
+              event.taskId === "TASK-001",
+          ),
+        ).toBe(true);
+
+        const persistedPause = fs.readFileSync(path.join(tmpDir, "dispatch-queue.jsonl"), "utf-8");
+        expect(persistedPause).toContain('"type":"task_awaiting_approval"');
+
+        // The approval route owns the DispatchManager restart. The queue only
+        // observes it and must not invoke start() a second time or claim a new lane.
+        currentJob = makeJob("TASK-001", "running");
+        currentJob.sessionId = `${gate}-resumed`;
+        await checkCompletion(queue, "TASK-001");
+
+        expect(item.status).toBe("running");
+        expect(dispatchManager.start).toHaveBeenCalledTimes(1);
+        expect(runningLaneCount(queue)).toBe(1);
+        expect(
+          events.some(
+            (event) => event.stage === "dispatch_queue_task_resumed" && event.taskId === "TASK-001",
+          ),
+        ).toBe(true);
+
+        currentJob = makeJob("TASK-001", "completed");
+        currentJob.sessionId = `${gate}-resumed`;
+        eventReader.getExecutionSessions.mockReturnValue([
+          {
+            sessionId: `${gate}-resumed`,
+            taskId: "TASK-001",
+            project: "test",
+            startTime: "2026-09-08T12:00:00.000Z",
+            status: "completed",
+            outcome: "approved",
+            totalCostUsd: 1.25,
+            durationMs: 5000,
+          } as SessionEntry,
+        ]);
+        await checkCompletion(queue, "TASK-001");
+
+        expect(item).toMatchObject({
+          status: "completed",
+          outcome: "approved",
+          retryCount: 0,
+          costUsd: 1.25,
+        });
+        expect(runningLaneCount(queue)).toBe(0);
+        expect(dispatchManager.start).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it("rehydrates a persisted approval pause with its lane and completion watcher", async () => {
+      const logPath = path.join(tmpDir, "dispatch-queue.jsonl");
+      fs.writeFileSync(
+        logPath,
+        [
+          {
+            ts: "2026-09-08T10:00:00.000Z",
+            type: "task_enqueued",
+            taskId: "TASK-001",
+            priority: 2,
+            blockedBy: [],
+          },
+          { ts: "2026-09-08T10:01:00.000Z", type: "task_started", taskId: "TASK-001" },
+          { ts: "2026-09-08T10:02:00.000Z", type: "task_awaiting_approval", taskId: "TASK-001" },
+        ]
+          .map((event) => JSON.stringify(event))
+          .join("\n") + "\n",
+        "utf-8",
+      );
+
+      let currentJob: DispatchJob | undefined;
+      dispatchManager.getJob.mockImplementation(() => currentJob);
+      const queue = createQueue({
+        maxConcurrent: 1,
+        cooldownBetweenTasksMs: 0,
+        persistState: true,
+      });
+
+      expect(queue.getItem("TASK-001")).toMatchObject({
+        status: "awaiting_approval",
+        retryCount: 0,
+      });
+      expect(runningLaneCount(queue)).toBe(1);
+      expect(dispatchManager.start).not.toHaveBeenCalled();
+
+      currentJob = makeJob("TASK-001", "running");
+      currentJob.sessionId = "resumed-after-restart";
+      await checkCompletion(queue, "TASK-001");
+      expect(queue.getItem("TASK-001")?.status).toBe("running");
+      expect(runningLaneCount(queue)).toBe(1);
+      expect(dispatchManager.start).not.toHaveBeenCalled();
+
+      currentJob = makeJob("TASK-001", "completed");
+      currentJob.sessionId = "resumed-after-restart";
+      eventReader.getExecutionSessions.mockReturnValue([
+        {
+          sessionId: "resumed-after-restart",
+          taskId: "TASK-001",
+          project: "test",
+          startTime: "2026-09-08T12:00:00.000Z",
+          status: "completed",
+          outcome: "approved",
+        } as SessionEntry,
+      ]);
+      await checkCompletion(queue, "TASK-001");
+
+      expect(queue.getItem("TASK-001")?.status).toBe("completed");
+      expect(runningLaneCount(queue)).toBe(0);
+      expect(dispatchManager.start).not.toHaveBeenCalled();
+    });
+
+    it("restarts an interrupted post-approval dispatch in resume mode", async () => {
+      const logPath = path.join(tmpDir, "dispatch-queue.jsonl");
+      fs.writeFileSync(
+        logPath,
+        [
+          {
+            ts: "2026-09-08T10:00:00.000Z",
+            type: "task_enqueued",
+            taskId: "TASK-001",
+            priority: 2,
+            blockedBy: [],
+          },
+          { ts: "2026-09-08T10:01:00.000Z", type: "task_started", taskId: "TASK-001" },
+          { ts: "2026-09-08T10:02:00.000Z", type: "task_awaiting_approval", taskId: "TASK-001" },
+          {
+            ts: "2026-09-08T10:03:00.000Z",
+            type: "task_resumed",
+            taskId: "TASK-001",
+            dispatchOptions: { resume: true },
+          },
+        ]
+          .map((event) => JSON.stringify(event))
+          .join("\n") + "\n",
+        "utf-8",
+      );
+      taskService.getTask.mockResolvedValue(makeParsedTask("TASK-001"));
+
+      const queue = createQueue({
+        maxConcurrent: 1,
+        cooldownBetweenTasksMs: 0,
+        persistState: true,
+      });
+      await queue.start();
+
+      expect(dispatchManager.start).toHaveBeenCalledTimes(1);
+      expect(dispatchManager.start).toHaveBeenCalledWith(
+        "TASK-001",
+        expect.objectContaining({ resume: true }),
+        expect.objectContaining({ taskId: "TASK-001", claimants: [] }),
+      );
+      expect(queue.getItem("TASK-001")?.status).toBe("running");
+      expect(runningLaneCount(queue)).toBe(1);
+    });
+
+    it("writes resume intent before a replacement child starts so a crash cannot restore the gate pause", async () => {
+      const logPath = path.join(tmpDir, "dispatch-queue.jsonl");
+      fs.writeFileSync(
+        logPath,
+        [
+          {
+            ts: "2026-09-08T10:00:00.000Z",
+            type: "task_enqueued",
+            taskId: "TASK-001",
+            priority: 2,
+            blockedBy: [],
+          },
+          { ts: "2026-09-08T10:01:00.000Z", type: "task_started", taskId: "TASK-001" },
+          { ts: "2026-09-08T10:02:00.000Z", type: "task_awaiting_approval", taskId: "TASK-001" },
+        ]
+          .map((event) => JSON.stringify(event))
+          .join("\n") + "\n",
+        "utf-8",
+      );
+
+      const pausedQueue = createQueue({
+        maxConcurrent: 1,
+        cooldownBetweenTasksMs: 0,
+        persistState: true,
+      });
+      expect(pausedQueue.recordApprovalResume("TASK-001")).toBe(true);
+      expect(dispatchManager.start).not.toHaveBeenCalled();
+      expect(pausedQueue.getItem("TASK-001")).toMatchObject({
+        status: "running",
+        dispatchOptions: { resume: true },
+      });
+      expect(fs.readFileSync(logPath, "utf-8")).toContain('"type":"task_resumed"');
+
+      // Simulate a process death at this exact boundary: the route has
+      // durably recorded resume intent, but has not started the child yet.
+      const timers = (
+        pausedQueue as unknown as {
+          pollTimers: Map<string, ReturnType<typeof setInterval>>;
+        }
+      ).pollTimers;
+      for (const timer of timers.values()) clearInterval(timer);
+      timers.clear();
+
+      taskService.getTask.mockResolvedValue(makeParsedTask("TASK-001"));
+      const recoveredQueue = createQueue({
+        maxConcurrent: 1,
+        cooldownBetweenTasksMs: 0,
+        persistState: true,
+      });
+      await recoveredQueue.start();
+
+      expect(dispatchManager.start).toHaveBeenCalledTimes(1);
+      expect(dispatchManager.start).toHaveBeenCalledWith(
+        "TASK-001",
+        expect.objectContaining({ resume: true }),
+        expect.objectContaining({ taskId: "TASK-001", claimants: [] }),
+      );
+      expect(recoveredQueue.getItem("TASK-001")?.status).toBe("running");
+      expect(runningLaneCount(recoveredQueue)).toBe(1);
+    });
+
+    it("requeues a write-ahead resume when the replacement start throws", async () => {
+      const logPath = path.join(tmpDir, "dispatch-queue.jsonl");
+      fs.writeFileSync(
+        logPath,
+        [
+          {
+            ts: "2026-09-08T10:00:00.000Z",
+            type: "task_enqueued",
+            taskId: "TASK-001",
+            priority: 2,
+            blockedBy: [],
+          },
+          { ts: "2026-09-08T10:01:00.000Z", type: "task_started", taskId: "TASK-001" },
+          { ts: "2026-09-08T10:02:00.000Z", type: "task_awaiting_approval", taskId: "TASK-001" },
+        ]
+          .map((event) => JSON.stringify(event))
+          .join("\n") + "\n",
+        "utf-8",
+      );
+
+      const queue = createQueue({
+        maxConcurrent: 1,
+        cooldownBetweenTasksMs: 0,
+        persistState: true,
+      });
+      expect(runningLaneCount(queue)).toBe(1);
+      expect(queue.recordApprovalResume("TASK-001")).toBe(true);
+
+      expect(queue.requeueApprovalResume("TASK-001", "spawn refused")).toBe(true);
+      expect(queue.getItem("TASK-001")).toMatchObject({
+        status: "ready",
+        retryCount: 0,
+        dispatchOptions: { resume: true },
+      });
+      expect(runningLaneCount(queue)).toBe(0);
+
+      const eventsOnDisk = fs
+        .readFileSync(logPath, "utf-8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { type: string; reason?: string });
+      expect(eventsOnDisk.at(-2)?.type).toBe("task_resumed");
+      expect(eventsOnDisk.at(-1)?.type).toBe("task_ready");
+      expect(eventsOnDisk.at(-1)?.reason).toContain("spawn refused");
+
+      taskService.getTask.mockResolvedValue(makeParsedTask("TASK-001"));
+      await queue.start();
+      expect(dispatchManager.start).toHaveBeenCalledWith(
+        "TASK-001",
+        expect.objectContaining({ resume: true }),
+        expect.objectContaining({ taskId: "TASK-001", claimants: [] }),
+      );
+      expect(queue.getItem("TASK-001")?.status).toBe("running");
+      expect(runningLaneCount(queue)).toBe(1);
+    });
+  });
+
   // ─── Lifecycle Tests ──────────────────────────────────────────
 
   describe("start / pause / resume", () => {
+    it("holds queued dispatch inside the configured admission fence", async () => {
+      let releaseFence!: () => void;
+      const held = new Promise<void>((resolve) => {
+        releaseFence = resolve;
+      });
+      const fenceCalls: string[] = [];
+      const fence = async <T>(
+        taskId: string,
+        dispatch: (admission: DecompositionDispatchAdmission) => T,
+      ): Promise<T> => {
+        fenceCalls.push(taskId);
+        await held;
+        return dispatch({ taskId, fileName: `${taskId}.md`, contentHash: "admitted-hash" });
+      };
+      taskService.getTask.mockResolvedValue(makeParsedTask("TASK-001"));
+      const queue = createQueue({}, fence);
+      queue.enqueue("TASK-001");
+
+      const starting = queue.start();
+      await waitForCondition(() => fenceCalls.length === 1, "admission fence");
+      expect(fenceCalls).toEqual(["TASK-001"]);
+      expect(dispatchManager.start).not.toHaveBeenCalled();
+
+      releaseFence();
+      await starting;
+      expect(dispatchManager.start).toHaveBeenCalledTimes(1);
+      expect(dispatchManager.start).toHaveBeenCalledWith(
+        "TASK-001",
+        expect.objectContaining({ admittedTaskContentHash: "admitted-hash" }),
+        expect.anything(),
+      );
+    });
+
+    it("does not dispatch an item cancelled while its admission fence is waiting", async () => {
+      let releaseFence!: () => void;
+      const held = new Promise<void>((resolve) => {
+        releaseFence = resolve;
+      });
+      const fence = async <T>(
+        taskId: string,
+        dispatch: (admission: DecompositionDispatchAdmission) => T,
+      ): Promise<T> => {
+        await held;
+        return dispatch({ taskId, fileName: `${taskId}.md`, contentHash: "admitted-hash" });
+      };
+      taskService.getTask.mockResolvedValue(makeParsedTask("TASK-001"));
+      const queue = createQueue({}, fence);
+      queue.enqueue("TASK-001");
+
+      const starting = queue.start();
+      await waitForCondition(() => queue.getItem("TASK-001")?.status === "ready", "ready item");
+      expect(queue.cancel("TASK-001")).toBe(true);
+      releaseFence();
+      await starting;
+
+      expect(dispatchManager.start).not.toHaveBeenCalled();
+      expect(queue.getItem("TASK-001")?.status).toBe("stopped");
+    });
+
+    it.each(["abort", "cancel"] as const)(
+      "%s stops a job started inside the fence before reservation release",
+      async (lifecycle) => {
+        let releaseFence!: () => void;
+        let dispatchStarted!: () => void;
+        const held = new Promise<void>((resolve) => {
+          releaseFence = resolve;
+        });
+        const started = new Promise<void>((resolve) => {
+          dispatchStarted = resolve;
+        });
+        const fence = async <T>(
+          taskId: string,
+          dispatch: (admission: DecompositionDispatchAdmission) => T,
+        ): Promise<T> => {
+          const result = dispatch({
+            taskId,
+            fileName: `${taskId}.md`,
+            contentHash: "admitted-hash",
+          });
+          dispatchStarted();
+          await held;
+          return result;
+        };
+        taskService.getTask.mockResolvedValue(makeParsedTask("TASK-001"));
+        const queue = createQueue({}, fence);
+        queue.enqueue("TASK-001");
+
+        const starting = queue.start();
+        await started;
+        expect(queue.getItem("TASK-001")?.status).toBe("running");
+        expect(dispatchManager.start).toHaveBeenCalledTimes(1);
+
+        expect(lifecycle === "abort" ? queue.abort() : queue.cancel("TASK-001")).toBe(true);
+        expect(dispatchManager.stop).toHaveBeenCalledWith("TASK-001");
+        releaseFence();
+        await starting;
+        expect(queue.getItem("TASK-001")?.status).toBe("stopped");
+      },
+    );
+
+    it("skips a parent decomposed at admission without recording a dispatch failure", async () => {
+      const refusal = Object.assign(new Error("parent is now decomposed"), {
+        details: { admissionDisposition: "decomposed" },
+      });
+      const fence = <T>(
+        _taskId: string,
+        _dispatch: (admission: DecompositionDispatchAdmission) => T,
+      ): Promise<T> => Promise.reject(refusal);
+      taskService.getTask.mockResolvedValue(makeParsedTask("TASK-001"));
+      const queue = createQueue({}, fence);
+      queue.enqueue("TASK-001");
+
+      await queue.start();
+      await waitForCondition(
+        () => queue.getItem("TASK-001")?.status === "skipped",
+        "decomposed admission skip",
+      );
+
+      expect(dispatchManager.start).not.toHaveBeenCalled();
+      expect(queue.getItem("TASK-001")).toMatchObject({
+        status: "skipped",
+        outcome: "decomposed",
+        blockedReason: "parent is now decomposed",
+      });
+      expect(events.some((event) => event.stage === "dispatch_queue_task_failed")).toBe(false);
+    });
+
     it("start sets running state", async () => {
       const queue = createQueue();
       // Enqueue a task first so the queue has something to process
@@ -536,6 +1362,20 @@ describe("DispatchQueue", () => {
 
       expect(queue.isRunning()).toBe(false);
     });
+
+    it("reports an incomplete abort and retains the active lane when stop is refused", () => {
+      const queue = createQueue();
+      const item = queue.enqueue("TASK-001");
+      (item as { status: string }).status = "running";
+      dispatchManager.stop.mockReturnValue(false);
+
+      expect(queue.abort()).toBe(false);
+      expect(queue.isRunning()).toBe(false);
+      expect(queue.getItem("TASK-001")?.status).toBe("running");
+
+      dispatchManager.stop.mockReturnValue(true);
+      expect(queue.abort()).toBe(true);
+    });
   });
 
   // ─── Cancel / Retry / Remove Tests ────────────────────────────
@@ -554,6 +1394,19 @@ describe("DispatchQueue", () => {
     it("returns false for non-existent task", () => {
       const queue = createQueue();
       expect(queue.cancel("TASK-999")).toBe(false);
+    });
+
+    it("retains a running task and its lane when durable stop is refused", () => {
+      const queue = createQueue();
+      const item = queue.enqueue("TASK-001");
+      (item as { status: string }).status = "running";
+      dispatchManager.stop.mockReturnValue(false);
+
+      expect(queue.cancel("TASK-001")).toBe(false);
+      expect(queue.getItem("TASK-001")?.status).toBe("running");
+
+      dispatchManager.stop.mockReturnValue(true);
+      expect(queue.cancel("TASK-001")).toBe(true);
     });
   });
 

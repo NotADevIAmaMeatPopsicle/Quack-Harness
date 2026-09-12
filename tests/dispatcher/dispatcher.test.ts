@@ -1,4 +1,5 @@
-/* eslint-disable @typescript-eslint/no-unsafe-return, @typescript-eslint/no-require-imports */
+/* eslint-disable @typescript-eslint/no-unsafe-return */
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as fsSync from "node:fs";
 import * as path from "node:path";
@@ -15,6 +16,8 @@ import type {
   ParsedTask,
 } from "../../src/core/types";
 import type { JudgmentDecision } from "../../src/judgment/judgment-types";
+import { computeSpecIdentity } from "../../src/core/spec-identity";
+import { saveJudgeApproval } from "../../src/dispatcher/judge-approval";
 
 // ─── Mock child_process.exec ──────────────────────────────────────────
 
@@ -26,7 +29,33 @@ type MockExecResult = {
 };
 
 let mockGitResults: Record<string, MockExecResult> = {};
-let mockExecutedChildCommands: string[] = [];
+
+const MOCK_HEAD_COMMIT_SHA = "a".repeat(40);
+const MOCK_BASE_COMMIT_SHA = "b".repeat(40);
+const MOCK_EVIDENCE_RANGE = `${MOCK_BASE_COMMIT_SHA}...${MOCK_HEAD_COMMIT_SHA}`;
+const MOCK_REPOSITORY = { host: "github.com", owner: "org", repo: "repo" } as const;
+const MOCK_ORIGIN_PUSH_URL = "git@github.com:org/repo.git";
+const MOCK_ORIGIN = {
+  pushUrl: MOCK_ORIGIN_PUSH_URL,
+  pushUrlHash: createHash("sha256").update(MOCK_ORIGIN_PUSH_URL).digest("hex"),
+  github: {
+    selector: "github.com/org/repo",
+    host: "github.com",
+    nameWithOwner: "org/repo",
+  },
+};
+
+function publicationGitResults(headOid: string): Record<string, MockExecResult> {
+  return {
+    "remote get-url --push --all origin": { stdout: `${MOCK_ORIGIN_PUSH_URL}\n` },
+    [`push -u ${MOCK_ORIGIN_PUSH_URL} ${headOid}:refs/heads/quack/TASK-042`]: {
+      stdout: "Branch pushed",
+    },
+    [`ls-remote --heads ${MOCK_ORIGIN_PUSH_URL} refs/heads/quack/TASK-042`]: {
+      stdout: `${headOid}\trefs/heads/quack/TASK-042\n`,
+    },
+  };
+}
 
 function findGitResult(command: string): MockExecResult | undefined {
   for (const [pattern, result] of Object.entries(mockGitResults)) {
@@ -44,27 +73,8 @@ jest.mock("node:child_process", () => {
     command: string,
     _options: Record<string, unknown>,
   ): Promise<{ stdout: string; stderr: string }> => {
-    command = command.replace(
-      /^git --config-env=remote\.(quack-bound-[0-9a-f-]+)\.url=QUACK_PUBLICATION_REMOTE_URL --config-env=remote\.\1\.pushurl=QUACK_PUBLICATION_REMOTE_URL /iu,
-      "git ",
-    );
-    command = command.replace(/quack-bound-[0-9a-f-]+/giu, "origin");
-    mockExecutedChildCommands.push(command);
     const matchedResult = findGitResult(command);
     if (!matchedResult) {
-      if (command === "git remote get-url --push --all origin") {
-        return Promise.resolve({ stdout: "git@github.com:org/repo.git\n", stderr: "" });
-      }
-      if (
-        command.startsWith("git rev-parse --verify refs/heads/quack/") &&
-        command.endsWith("^{commit}")
-      ) {
-        return Promise.resolve({ stdout: `${"d".repeat(40)}\n`, stderr: "" });
-      }
-      if (command.startsWith("git ls-remote --heads origin refs/heads/quack/")) {
-        const branchRef = command.slice("git ls-remote --heads origin ".length);
-        return Promise.resolve({ stdout: `${"d".repeat(40)}\t${branchRef}\n`, stderr: "" });
-      }
       return Promise.resolve({ stdout: "", stderr: "" });
     }
 
@@ -88,16 +98,6 @@ jest.mock("node:child_process", () => {
   const mockExec = jest.fn();
   (mockExec as unknown as Record<symbol, unknown>)[promisify.custom] = customPromisified;
 
-  const customPromisifiedExecFile = (
-    file: string,
-    args: readonly string[],
-    _options: Record<string, unknown>,
-  ): Promise<{ stdout: string; stderr: string }> =>
-    customPromisified([file, ...args].join(" "), _options);
-  const mockExecFile = jest.fn();
-  (mockExecFile as unknown as Record<symbol, unknown>)[promisify.custom] =
-    customPromisifiedExecFile;
-
   const mockExecSync = jest.fn().mockImplementation((command: string) => {
     const matchedResult = findGitResult(command);
     if (!matchedResult) {
@@ -113,13 +113,76 @@ jest.mock("node:child_process", () => {
     return matchedResult.stdout ?? "";
   });
 
+  const mockExecFileSync = jest
+    .fn()
+    .mockImplementation((command: string, args: string[] = [], options?: { encoding?: string }) => {
+      const executable = ["git", "git.exe"].includes(path.basename(command).toLowerCase())
+        ? "git"
+        : command;
+      const rendered = [executable, ...args].join(" ");
+      const matchedResult = findGitResult(rendered);
+      if (matchedResult?.error) {
+        throw Object.assign(new Error("Command failed"), {
+          status: matchedResult.code ?? 1,
+          stdout: Buffer.from(matchedResult.stdout ?? ""),
+          stderr: Buffer.from(matchedResult.stderr ?? ""),
+        });
+      }
+      const stdout = matchedResult?.stdout ?? "";
+      return options?.encoding ? stdout : Buffer.from(stdout);
+    });
+
   return {
     ...actual,
     exec: mockExec,
-    execFile: mockExecFile,
     execSync: mockExecSync,
+    execFileSync: mockExecFileSync,
   };
 });
+
+// Branch-manager routes Git through the trusted-executable boundary. Keep this
+// dispatcher unit suite deterministic while preserving its existing command
+// result table semantics.
+const mockReadTrustedCoreWorktree = jest.fn<string | undefined, [string]>();
+const mockUnsetTrustedCoreWorktree = jest.fn<boolean, [string, string]>();
+jest.mock("../../src/worker/trusted-executable", () => ({
+  ...jest.requireActual<typeof import("../../src/worker/trusted-executable")>(
+    "../../src/worker/trusted-executable",
+  ),
+  runTrustedGitResult: (_projectRoot: string, args: readonly string[]) => {
+    const commitRef = args[0] === "rev-parse" && args[1] === "--verify" ? args[2] : undefined;
+    const defaultCommitIdentity = commitRef?.endsWith("^{commit}")
+      ? commitRef === "HEAD^{commit}"
+        ? MOCK_HEAD_COMMIT_SHA
+        : MOCK_BASE_COMMIT_SHA
+      : "";
+    // Explicit commit-peel fixtures override defaults; broad branch-existence
+    // patterns must not accidentally supply a different output identity.
+    const exactCommitResult = defaultCommitIdentity
+      ? mockGitResults[["git", ...args].join(" ")]
+      : undefined;
+    if (defaultCommitIdentity && !exactCommitResult) {
+      return Promise.resolve({
+        exitCode: 0,
+        stdout: `${defaultCommitIdentity}\n`,
+        stderr: "",
+      });
+    }
+    const matchedResult = exactCommitResult ?? findGitResult(["git", ...args].join(" "));
+    const defaultBranchIdentity = commitRef?.startsWith("refs/heads/")
+      ? `${MOCK_HEAD_COMMIT_SHA}\n`
+      : "";
+    return Promise.resolve({
+      exitCode: matchedResult?.error ? (matchedResult.code ?? 1) : 0,
+      stdout: matchedResult?.stdout ?? defaultBranchIdentity,
+      stderr: matchedResult?.stderr ?? "",
+    });
+  },
+  resolveTrustedGitHubRepository: () => Promise.resolve(MOCK_REPOSITORY),
+  readTrustedCoreWorktree: (projectRoot: string) => mockReadTrustedCoreWorktree(projectRoot),
+  unsetTrustedCoreWorktree: (projectRoot: string, value: string) =>
+    mockUnsetTrustedCoreWorktree(projectRoot, value),
+}));
 
 // ─── Mock gate, worker, and judge ──────────────────────────────────────
 
@@ -169,6 +232,7 @@ jest.mock("../../src/judgment/runner/intent-judgment-runner", () => ({
 
 const mockEvaluateLoopReview = jest.fn();
 jest.mock("../../src/review/loop-gate", () => ({
+  ...jest.requireActual<typeof import("../../src/review/loop-gate")>("../../src/review/loop-gate"),
   evaluateLoopReview: (...args: unknown[]) => mockEvaluateLoopReview(...args),
 }));
 
@@ -251,19 +315,26 @@ jest.mock("../../src/dispatcher/checkpoint-manager", () => {
         }),
       rewindFrom: (...args: unknown[]) => mockCheckpointRewindFrom(...args),
       getResumeStage: jest.fn().mockReturnValue("gate"),
+      isUsable: jest.fn().mockReturnValue(true),
     })),
   };
 });
 
 // ─── Import dispatcher after mocking ────────────────────────────────
 
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const { dispatchTask, ensureDiffOrAutoCommit } =
-  require("../../src/dispatcher/dispatcher") as typeof import("../../src/dispatcher/dispatcher");
+/* eslint-disable @typescript-eslint/no-require-imports */
+const {
+  dispatchTask,
+  ensureDiffOrAutoCommit,
+  resolveDispatchJudgeModel,
+  resolveInlineBlueprintTimeoutPolicy,
+} = require("../../src/dispatcher/dispatcher") as typeof import("../../src/dispatcher/dispatcher");
+const { _setWorktreeInitCommandRunner, WORKTREE_INIT_FRESH_ENV } =
+  require("../../src/dispatcher/worktree-init") as typeof import("../../src/dispatcher/worktree-init");
+const prCreatorModule =
+  require("../../src/dispatcher/pr-creator") as typeof import("../../src/dispatcher/pr-creator");
 const branchManagerModule =
   require("../../src/dispatcher/branch-manager") as typeof import("../../src/dispatcher/branch-manager");
-const githubRepositoryModule =
-  require("../../src/dispatcher/github-repository") as typeof import("../../src/dispatcher/github-repository");
 
 // Handle to the module-level post-judge mock so safety-stop tests can
 // assert it was never reached (TASK-1313 F2 unreachability proof).
@@ -272,6 +343,7 @@ const { runPostJudgeVerification: mockRunPostJudgeVerification } =
   require("../../src/dispatcher/post-judge-verifier") as {
     runPostJudgeVerification: jest.Mock;
   };
+/* eslint-enable @typescript-eslint/no-require-imports */
 
 // ─── Test helpers ──────────────────────────────────────────────────────
 
@@ -377,6 +449,49 @@ function makeLoopAdapter(projectRoot: string): ProjectAdapter {
   });
 }
 
+describe("resolveDispatchJudgeModel", () => {
+  test("prefers the configured Codex judge evaluator over the legacy agent judge model", () => {
+    const base = makeLoopAdapter("/fake/project");
+    const adapter = makeAdapter({
+      projectRoot: base.projectRoot,
+      config: {
+        ...base.config,
+        evaluationProviders: {
+          judge: {
+            runner: "codex-cli",
+            model: "gpt-5.6-terra",
+            maxTurns: 30,
+            timeoutMs: 900_000,
+            codex: { binaryPath: "codex", sandbox: "read-only" },
+          },
+        },
+      },
+    });
+
+    expect(resolveDispatchJudgeModel(adapter)).toBe("gpt-5.6-terra");
+  });
+
+  test("keeps an explicit loop judge model as the highest-priority override", () => {
+    const adapter = makeLoopAdapter("/fake/project");
+    adapter.config.loop!.models = {
+      investigate: "investigate-model",
+      build: "build-model",
+      judge: "loop-judge-model",
+    };
+    adapter.config.evaluationProviders = {
+      judge: {
+        runner: "codex-cli",
+        model: "provider-judge-model",
+        maxTurns: 30,
+        timeoutMs: 900_000,
+        codex: { binaryPath: "codex", sandbox: "read-only" },
+      },
+    };
+
+    expect(resolveDispatchJudgeModel(adapter)).toBe("loop-judge-model");
+  });
+});
+
 function makeTaskContent(taskId: string, title: string): string {
   return `# ${taskId}: ${title}
 
@@ -477,10 +592,23 @@ let tmpDir: string;
 
 beforeEach(async () => {
   jest.clearAllMocks();
+  delete process.env[WORKTREE_INIT_FRESH_ENV];
   _mockCheckpoints.clear();
   mockCheckpointRewindFrom.mockResolvedValue(null);
   mockGitResults = {};
-  mockExecutedChildCommands = [];
+  mockReadTrustedCoreWorktree.mockReturnValue(undefined);
+  mockUnsetTrustedCoreWorktree.mockReturnValue(false);
+  _setWorktreeInitCommandRunner((input) => {
+    const command = input.command ?? [input.executable, ...(input.args ?? [])].join(" ");
+    const result = findGitResult(command);
+    return Promise.resolve({
+      exitCode: result?.error ? (result.code ?? 1) : 0,
+      stdout: result?.stdout ?? "",
+      stderr: result?.stderr ?? "",
+      timedOut: false,
+      descendantsContained: true,
+    });
+  });
 
   // Mock blueprint generation by default (returns minimal blueprint)
   mockGenerateBlueprint.mockResolvedValue({
@@ -528,6 +656,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  delete process.env[WORKTREE_INIT_FRESH_ENV];
+  _setWorktreeInitCommandRunner(undefined);
   await fs.rm(tmpDir, { recursive: true, force: true });
 });
 
@@ -547,8 +677,10 @@ describe("ensureDiffOrAutoCommit", () => {
     mockGitResults = {
       "status --short": { stdout: "M  src/retry-fix.ts\n" },
       "diff --cached --name-only": { stdout: "src/retry-fix.ts\n" },
-      "commit -m": { stdout: "[quack/TASK-042 abc123] auto-commit" },
-      "diff main...HEAD": { stdout: "diff --git a/src/retry-fix.ts b/src/retry-fix.ts\n" },
+      "commit --only -m": { stdout: "[quack/TASK-042 abc123] auto-commit" },
+      [`diff ${MOCK_EVIDENCE_RANGE}`]: {
+        stdout: "diff --git a/src/retry-fix.ts b/src/retry-fix.ts\n",
+      },
     };
 
     const diff = await ensureDiffOrAutoCommit("TASK-042", adapter, events);
@@ -577,8 +709,8 @@ describe("ensureDiffOrAutoCommit", () => {
     mockGitResults = {
       "status --short": { stdout: "M  src/retry-fix.ts\n" },
       "diff --cached --name-only": { stdout: "src/retry-fix.ts\n" },
-      "commit -m": { error: true, stderr: "commit failed" },
-      "diff main...HEAD": { stdout: "diff --git a/src/old.ts b/src/old.ts\n" },
+      "commit --only -m": { error: true, stderr: "commit failed" },
+      [`diff ${MOCK_EVIDENCE_RANGE}`]: { stdout: "diff --git a/src/old.ts b/src/old.ts\n" },
     };
 
     await expect(ensureDiffOrAutoCommit("TASK-042", adapter, events)).rejects.toThrow(
@@ -592,6 +724,375 @@ describe("ensureDiffOrAutoCommit", () => {
 });
 
 describe("dispatchTask", () => {
+  describe("worktree initialization", () => {
+    function makeInitAdapter(command: string, label: string): ProjectAdapter {
+      const base = makeAdapter({ projectRoot: tmpDir });
+      return makeAdapter({
+        projectRoot: tmpDir,
+        config: {
+          ...base.config,
+          dispatch: {
+            worktreeInit: [{ command, label }],
+          },
+        },
+      });
+    }
+
+    function arrangeWorkerStop(): void {
+      mockRunReadinessGate.mockResolvedValue({
+        outcome: "pass",
+        task: {} as ParsedTask,
+      });
+      mockAssembleContext.mockResolvedValue(makeContext());
+      mockRunAgent.mockResolvedValue(
+        makeAgentResult("TASK-042", {
+          outcome: "failure",
+        }),
+      );
+    }
+
+    test("refuses a fresh task branch that collides with a protected ref", async () => {
+      const adapter = makeInitAdapter("npm ci --ignore-scripts --no-audit --no-fund", "safe init");
+      adapter.config.git.protectedBranches = ["quack/TASK-042"];
+      const stages: string[] = [];
+      arrangeWorkerStop();
+
+      const result = await dispatchTask("TASK-042", adapter, {
+        skipGate: true,
+        skipPr: true,
+        onEvent: (stage) => stages.push(stage),
+      });
+
+      expect(result.outcome).toBe("error");
+      expect(result.error).toContain("collides with a protected/base branch");
+      expect(stages).not.toContain("branch_created");
+      expect(stages).not.toContain("branch_reused");
+      expect(mockRunAgent).not.toHaveBeenCalled();
+    });
+
+    test("refuses a checkpoint resume whose branch collides with a protected ref", async () => {
+      const adapter = makeInitAdapter("npm ci --ignore-scripts --no-audit --no-fund", "safe init");
+      adapter.config.git.protectedBranches = ["quack/TASK-042"];
+      _mockCheckpoints.set("TASK-042", {
+        taskId: "TASK-042",
+        sessionId: "resume-protected-branch",
+        completedStages: ["branch"],
+        branchName: "quack/TASK-042",
+        totalCostUsd: 0,
+        retriesUsed: 0,
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      arrangeWorkerStop();
+
+      const result = await dispatchTask("TASK-042", adapter, {
+        skipGate: true,
+        skipPr: true,
+        resumeFromCheckpoint: true,
+      });
+
+      expect(result.outcome).toBe("error");
+      expect(result.error).toContain("collides with a protected/base branch");
+      expect(mockRunAgent).not.toHaveBeenCalled();
+    });
+
+    test("runs after branch creation and before context and worker execution", async () => {
+      const adapter = makeInitAdapter("init-ok", "initialize demo dependencies");
+      const stages: string[] = [];
+      process.env[WORKTREE_INIT_FRESH_ENV] = "1";
+      arrangeWorkerStop();
+      mockGitResults = {
+        "rev-parse --verify quack/TASK-042": { error: true },
+      };
+
+      const result = await dispatchTask("TASK-042", adapter, {
+        skipGate: true,
+        skipPr: true,
+        onEvent: (stage) => stages.push(stage),
+      });
+
+      expect(result.outcome).toBe("agent_failed");
+      expect(stages.indexOf("branch_created")).toBeGreaterThanOrEqual(0);
+      expect(stages.indexOf("branch_created")).toBeLessThan(stages.indexOf("worktree_init_start"));
+      expect(stages.indexOf("worktree_init_start")).toBeLessThan(
+        stages.indexOf("worktree_init_complete"),
+      );
+      expect(stages.indexOf("worktree_init_complete")).toBeLessThan(
+        stages.indexOf("context_assembled"),
+      );
+      expect(mockRunAgent).toHaveBeenCalledTimes(1);
+    });
+
+    test("fails closed before context assembly or worker execution", async () => {
+      const adapter = makeInitAdapter("init-fail", "npm ci (demo)");
+      const stages: string[] = [];
+      process.env[WORKTREE_INIT_FRESH_ENV] = "1";
+      arrangeWorkerStop();
+      mockGitResults = {
+        "rev-parse --verify quack/TASK-042": { error: true },
+        "init-fail": {
+          error: true,
+          code: 1,
+          stderr: "npm ERR! simulated registry failure",
+        },
+      };
+
+      const result = await dispatchTask("TASK-042", adapter, {
+        skipGate: true,
+        skipPr: true,
+        onEvent: (stage) => stages.push(stage),
+      });
+
+      expect(result.outcome).toBe("error");
+      expect(result.error).toContain("Worktree init failed");
+      expect(result.error).toContain("npm ci (demo)");
+      expect(result.error).toContain("simulated registry failure");
+      expect(stages).toContain("worktree_init_failed");
+      expect(stages).not.toContain("context_assembled");
+      expect(mockAssembleContext).not.toHaveBeenCalled();
+      expect(mockRunAgent).not.toHaveBeenCalled();
+    });
+
+    test("initializes a reused task branch before resuming work", async () => {
+      const adapter = makeInitAdapter(
+        "npm ci --ignore-scripts --no-audit --no-fund",
+        "refresh demo dependencies",
+      );
+      const stages: string[] = [];
+      await fs.writeFile(path.join(tmpDir, "package.json"), "{}");
+      await fs.writeFile(path.join(tmpDir, "package-lock.json"), "{}");
+      arrangeWorkerStop();
+
+      const result = await dispatchTask("TASK-042", adapter, {
+        skipGate: true,
+        skipPr: true,
+        onEvent: (stage) => stages.push(stage),
+      });
+
+      expect(result.outcome).toBe("agent_failed");
+      expect(stages).toContain("branch_reused");
+      expect(stages).toContain("worktree_init_step_complete");
+      expect(stages.indexOf("worktree_init_complete")).toBeLessThan(
+        stages.indexOf("context_assembled"),
+      );
+      expect(mockRunAgent).toHaveBeenCalledTimes(1);
+    });
+
+    test("rejects worker-controlled npm configuration before reused-branch init", async () => {
+      const adapter = makeInitAdapter(
+        "npm ci --ignore-scripts --no-audit --no-fund",
+        "refresh demo dependencies",
+      );
+      await fs.writeFile(path.join(tmpDir, "package.json"), "{}");
+      await fs.writeFile(path.join(tmpDir, "package-lock.json"), "{}");
+      await fs.writeFile(path.join(tmpDir, ".npmrc"), "cache=C:\\\\outside\\\\cache\n");
+      arrangeWorkerStop();
+
+      const result = await dispatchTask("TASK-042", adapter, {
+        skipGate: true,
+        skipPr: true,
+      });
+
+      expect(result.outcome).toBe("error");
+      expect(result.error).toContain("Project .npmrc is not allowed");
+      expect(mockRunAgent).not.toHaveBeenCalled();
+    });
+
+    test("accepts trusted shell policy only for a monitor-attested fresh worktree", async () => {
+      const adapter = makeInitAdapter("custom-init", "trusted fresh-worktree hook");
+      const previousAttestation = process.env[WORKTREE_INIT_FRESH_ENV];
+      process.env[WORKTREE_INIT_FRESH_ENV] = "1";
+      arrangeWorkerStop();
+
+      try {
+        const result = await dispatchTask("TASK-042", adapter, {
+          skipGate: true,
+          skipPr: true,
+        });
+
+        expect(result.outcome).toBe("agent_failed");
+        expect(mockRunAgent).toHaveBeenCalledTimes(1);
+      } finally {
+        if (previousAttestation === undefined) delete process.env[WORKTREE_INIT_FRESH_ENV];
+        else process.env[WORKTREE_INIT_FRESH_ENV] = previousAttestation;
+      }
+    });
+
+    test("refuses an arbitrary shell init step on a reused model-mutated branch", async () => {
+      const adapter = makeInitAdapter("node project-script.js", "unsafe existing hook");
+      const initRunner = jest.fn().mockResolvedValue({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+        descendantsContained: true,
+      });
+      _setWorktreeInitCommandRunner(initRunner);
+      arrangeWorkerStop();
+
+      const result = await dispatchTask("TASK-042", adapter, {
+        skipGate: true,
+        skipPr: true,
+      });
+
+      expect(result.outcome).toBe("error");
+      expect(result.error).toContain("Refusing shell worktree-init step");
+      expect(initRunner).not.toHaveBeenCalled();
+      expect(mockRunAgent).not.toHaveBeenCalled();
+    });
+
+    test("refuses shell init on an un-attested newly created branch", async () => {
+      const adapter = makeInitAdapter("node project-script.js", "unsafe shared-checkout hook");
+      const initRunner = jest.fn().mockResolvedValue({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+        descendantsContained: true,
+      });
+      _setWorktreeInitCommandRunner(initRunner);
+      mockGitResults = {
+        "rev-parse --verify quack/TASK-042": { error: true },
+      };
+      arrangeWorkerStop();
+
+      const result = await dispatchTask("TASK-042", adapter, {
+        skipGate: true,
+        skipPr: true,
+      });
+
+      expect(result.outcome).toBe("error");
+      expect(result.error).toContain("Refusing shell worktree-init step");
+      expect(initRunner).not.toHaveBeenCalled();
+      expect(mockRunAgent).not.toHaveBeenCalled();
+    });
+
+    test("restores and verifies a completed checkpoint branch before init", async () => {
+      const branchName = "quack/TASK-042";
+      const adapter = makeInitAdapter(
+        "npm ci --ignore-scripts --no-audit --no-fund",
+        "resume dependencies",
+      );
+      const stages: string[] = [];
+      await fs.writeFile(path.join(tmpDir, "package.json"), "{}");
+      await fs.writeFile(path.join(tmpDir, "package-lock.json"), "{}");
+      _mockCheckpoints.set("TASK-042", {
+        taskId: "TASK-042",
+        sessionId: "prior-session",
+        completedStages: ["branch"],
+        branchName,
+        totalCostUsd: 0,
+        retriesUsed: 0,
+        updatedAt: new Date().toISOString(),
+        startedAt: new Date().toISOString(),
+      });
+      mockGitResults = {
+        "branch --show-current": { stdout: `${branchName}\n` },
+      };
+      arrangeWorkerStop();
+
+      const result = await dispatchTask("TASK-042", adapter, {
+        skipGate: true,
+        skipPr: true,
+        resumeFromCheckpoint: true,
+        onEvent: (stage) => stages.push(stage),
+      });
+
+      expect(result.outcome).toBe("agent_failed");
+      expect(stages).toContain("branch_resumed");
+      expect(stages.indexOf("branch_resumed")).toBeLessThan(stages.indexOf("worktree_init_start"));
+      expect(mockRunAgent).toHaveBeenCalledTimes(1);
+    });
+
+    test("fails closed when a completed checkpoint has no branch identity", async () => {
+      const adapter = makeInitAdapter("npm ci", "must not initialize");
+      const initRunner = jest.fn().mockResolvedValue({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+        descendantsContained: true,
+      });
+      _setWorktreeInitCommandRunner(initRunner);
+      _mockCheckpoints.set("TASK-042", {
+        taskId: "TASK-042",
+        sessionId: "prior-session",
+        completedStages: ["branch"],
+        totalCostUsd: 0,
+        retriesUsed: 0,
+        updatedAt: new Date().toISOString(),
+        startedAt: new Date().toISOString(),
+      });
+      arrangeWorkerStop();
+
+      const result = await dispatchTask("TASK-042", adapter, {
+        skipGate: true,
+        skipPr: true,
+        resumeFromCheckpoint: true,
+      });
+
+      expect(result.outcome).toBe("error");
+      expect(result.error).toContain("has no branchName");
+      expect(initRunner).not.toHaveBeenCalled();
+      expect(mockRunAgent).not.toHaveBeenCalled();
+    });
+
+    test("treats a shared-branch checkout failure as fatal before init", async () => {
+      const sharedBranch = "quack/shared-demo";
+      const adapter = makeInitAdapter("npm ci", "must not initialize");
+      const initRunner = jest.fn().mockResolvedValue({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+        descendantsContained: true,
+      });
+      _setWorktreeInitCommandRunner(initRunner);
+      mockGitResults = {
+        "git branch --show-current": { stdout: "wrong-branch\n" },
+        [`git checkout ${sharedBranch}`]: { error: true, stderr: "checkout refused" },
+      };
+      arrangeWorkerStop();
+
+      const result = await dispatchTask("TASK-042", adapter, {
+        skipGate: true,
+        skipPr: true,
+        sharedBranchName: sharedBranch,
+      });
+
+      expect(result.outcome).toBe("error");
+      expect(result.error).toContain("Failed to checkout shared branch");
+      expect(initRunner).not.toHaveBeenCalled();
+      expect(mockRunAgent).not.toHaveBeenCalled();
+    });
+
+    test("honors skipBranch as an explicit use-the-checkout-as-is mode", async () => {
+      const adapter = makeInitAdapter("init-must-not-run", "forbidden init");
+      const stages: string[] = [];
+      arrangeWorkerStop();
+      mockGitResults = {
+        "init-must-not-run": {
+          error: true,
+          code: 1,
+          stderr: "must not execute",
+        },
+      };
+
+      const result = await dispatchTask("TASK-042", adapter, {
+        skipGate: true,
+        skipBranch: true,
+        skipPr: true,
+        onEvent: (stage) => stages.push(stage),
+      });
+
+      expect(result.outcome).toBe("agent_failed");
+      expect(stages).not.toContain("worktree_init_start");
+      expect(stages).not.toContain("worktree_init_complete");
+      expect(stages).not.toContain("worktree_init_failed");
+      expect(mockRunAgent).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe("gate -> branch -> agent -> judge -> PR (happy path)", () => {
     test("should complete full pipeline and return approved result", async () => {
       const adapter = makeAdapter({ projectRoot: tmpDir });
@@ -616,7 +1117,7 @@ describe("dispatchTask", () => {
       mockGitResults = {
         "fetch origin": { stdout: "" },
         "checkout -b": { stdout: "Switched to branch" },
-        "diff main": { stdout: "diff content" },
+        [`diff ${MOCK_EVIDENCE_RANGE}`]: { stdout: "diff content" },
         "push -u origin": { stdout: "Branch pushed" },
         "gh pr create": { stdout: "https://github.com/org/repo/pull/42" },
       };
@@ -633,6 +1134,188 @@ describe("dispatchTask", () => {
       expect(mockEvaluateLoopReview).not.toHaveBeenCalled();
       expect(stages).not.toContain("loop_brief_review");
       expect(stages).not.toContain("loop_diff_review");
+    }, 15000);
+
+    test("carries the create-time repository and commit binding into auto-merge", async () => {
+      const base = makeAdapter({ projectRoot: tmpDir });
+      const adapter = makeAdapter({
+        projectRoot: tmpDir,
+        config: {
+          ...base.config,
+          git: { ...base.config.git, autoCreatePr: true, autoMerge: true },
+        },
+      });
+      const repository = { host: "github.com", owner: "org", repo: "repo" };
+      const headOid = "c".repeat(40);
+      mockRunReadinessGate.mockResolvedValue({ outcome: "pass", task: {} as ParsedTask });
+      mockAssembleContext.mockResolvedValue(makeContext());
+      mockRunAgent.mockResolvedValue(makeAgentResult("TASK-042"));
+      mockRunJudge.mockResolvedValue(makeJudgeResult());
+      mockGitResults = {
+        ...publicationGitResults(headOid),
+        "rev-parse --verify quack/TASK-042": { error: true, stderr: "missing" },
+        "rev-parse --verify refs/heads/quack/TASK-042": { stdout: `${headOid}\n` },
+        [`diff ${MOCK_EVIDENCE_RANGE}`]: { stdout: "diff content" },
+        "git log --oneline main..quack/TASK-042": { stdout: `${headOid} implementation\n` },
+      };
+      const repositorySpy = jest
+        .spyOn(prCreatorModule, "resolvePullRequestRepository")
+        .mockResolvedValue(repository);
+      const createSpy = jest.spyOn(prCreatorModule, "createPullRequest").mockResolvedValue({
+        success: true,
+        prUrl: "https://github.com/org/repo/pull/42",
+      });
+      const sealSpy = jest.spyOn(branchManagerModule, "resolveBranchPublicationBinding");
+      const pushSpy = jest.spyOn(branchManagerModule, "pushBranch");
+      const mergeSpy = jest
+        .spyOn(branchManagerModule, "mergeBranchToTarget")
+        .mockResolvedValue({ success: true, mergeCommitSha: "d".repeat(40) });
+      const deleteSpy = jest.spyOn(branchManagerModule, "deleteAfterMerge").mockResolvedValue({
+        deleted: true,
+        localDeleted: true,
+        remoteDeleted: false,
+      });
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => undefined);
+
+      try {
+        const result = await dispatchTask("TASK-042", adapter, { skipGate: true });
+
+        expect(result.autoMerged).toBe(true);
+        expect(createSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            repository,
+            headBranch: "quack/TASK-042",
+            baseBranch: "main",
+            expectedHeadOid: headOid,
+          }),
+          adapter,
+        );
+        expect(pushSpy).toHaveBeenCalledWith("TASK-042", adapter, {
+          repository,
+          origin: MOCK_ORIGIN,
+          branchName: "quack/TASK-042",
+          headOid,
+        });
+        expect(sealSpy.mock.invocationCallOrder[0]).toBeLessThan(
+          pushSpy.mock.invocationCallOrder[0],
+        );
+        expect(mergeSpy).toHaveBeenCalledWith(
+          "TASK-042",
+          adapter,
+          "https://github.com/org/repo/pull/42",
+          "main",
+          expect.anything(),
+          "quack/TASK-042",
+          {
+            repository,
+            headBranch: "quack/TASK-042",
+            baseBranch: "main",
+            headOid,
+          },
+          headOid,
+          repository,
+        );
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringContaining("remote branch was not deleted"),
+        );
+      } finally {
+        warnSpy.mockRestore();
+        deleteSpy.mockRestore();
+        mergeSpy.mockRestore();
+        pushSpy.mockRestore();
+        sealSpy.mockRestore();
+        createSpy.mockRestore();
+        repositorySpy.mockRestore();
+      }
+    }, 15000);
+
+    test("does not fall through to local merge when required PR identity is rejected", async () => {
+      const base = makeAdapter({ projectRoot: tmpDir });
+      const adapter = makeAdapter({
+        projectRoot: tmpDir,
+        config: {
+          ...base.config,
+          git: { ...base.config.git, autoCreatePr: true, autoMerge: true },
+        },
+      });
+      const headOid = "c".repeat(40);
+      mockRunReadinessGate.mockResolvedValue({ outcome: "pass", task: {} as ParsedTask });
+      mockAssembleContext.mockResolvedValue(makeContext());
+      mockRunAgent.mockResolvedValue(makeAgentResult("TASK-042"));
+      mockRunJudge.mockResolvedValue(makeJudgeResult());
+      mockGitResults = {
+        ...publicationGitResults(headOid),
+        "rev-parse --verify quack/TASK-042": { error: true, stderr: "missing" },
+        "rev-parse --verify refs/heads/quack/TASK-042": { stdout: `${headOid}\n` },
+        [`diff ${MOCK_EVIDENCE_RANGE}`]: { stdout: "diff content" },
+        "git log --oneline main..quack/TASK-042": { stdout: `${headOid} implementation\n` },
+      };
+      const repositorySpy = jest
+        .spyOn(prCreatorModule, "resolvePullRequestRepository")
+        .mockResolvedValue({ host: "github.com", owner: "org", repo: "repo" });
+      const createSpy = jest.spyOn(prCreatorModule, "createPullRequest").mockResolvedValue({
+        success: false,
+        error: "pull request head does not match the sealed commit",
+      });
+      const mergeSpy = jest.spyOn(branchManagerModule, "mergeBranchToTarget");
+
+      try {
+        const result = await dispatchTask("TASK-042", adapter, { skipGate: true });
+
+        expect(result.outcome).toBe("approved");
+        expect(result.autoMerged).toBeUndefined();
+        expect(result.prUrl).toBeUndefined();
+        expect(createSpy).toHaveBeenCalledTimes(1);
+        expect(mergeSpy).not.toHaveBeenCalled();
+      } finally {
+        mergeSpy.mockRestore();
+        createSpy.mockRestore();
+        repositorySpy.mockRestore();
+      }
+    }, 15000);
+
+    test("does not auto-merge when the trusted repository cannot be resolved", async () => {
+      const base = makeAdapter({ projectRoot: tmpDir });
+      const adapter = makeAdapter({
+        projectRoot: tmpDir,
+        config: {
+          ...base.config,
+          git: { ...base.config.git, autoCreatePr: true, autoMerge: true },
+        },
+      });
+      const headOid = "c".repeat(40);
+      mockRunReadinessGate.mockResolvedValue({ outcome: "pass", task: {} as ParsedTask });
+      mockAssembleContext.mockResolvedValue(makeContext());
+      mockRunAgent.mockResolvedValue(makeAgentResult("TASK-042"));
+      mockRunJudge.mockResolvedValue(makeJudgeResult());
+      mockGitResults = {
+        "rev-parse --verify quack/TASK-042": { error: true, stderr: "missing" },
+        "rev-parse --verify refs/heads/quack/TASK-042": { stdout: `${headOid}\n` },
+        [`diff ${MOCK_EVIDENCE_RANGE}`]: { stdout: "diff content" },
+        "git log --oneline main..quack/TASK-042": { stdout: `${headOid} implementation\n` },
+      };
+      const repositorySpy = jest
+        .spyOn(prCreatorModule, "resolvePullRequestRepository")
+        .mockRejectedValue(new Error("origin identity changed"));
+      const createSpy = jest.spyOn(prCreatorModule, "createPullRequest");
+      const pushSpy = jest.spyOn(branchManagerModule, "pushBranch");
+      const mergeSpy = jest.spyOn(branchManagerModule, "mergeBranchToTarget");
+
+      try {
+        const result = await dispatchTask("TASK-042", adapter, { skipGate: true });
+
+        expect(result.outcome).toBe("error");
+        expect(result.autoMerged).toBeUndefined();
+        expect(result.prUrl).toBeUndefined();
+        expect(pushSpy).not.toHaveBeenCalled();
+        expect(createSpy).not.toHaveBeenCalled();
+        expect(mergeSpy).not.toHaveBeenCalled();
+      } finally {
+        mergeSpy.mockRestore();
+        pushSpy.mockRestore();
+        createSpy.mockRestore();
+        repositorySpy.mockRestore();
+      }
     }, 15000);
 
     test("refuses a contest introduced after blueprint approval but before the judge approval save", async () => {
@@ -661,7 +1344,9 @@ describe("dispatchTask", () => {
       mockAssembleContext.mockResolvedValueOnce(makeContext());
       mockRunAgent.mockResolvedValueOnce(makeAgentResult("TASK-042"));
       mockGitResults = {
-        "diff main": { stdout: "diff --git a/src/test.ts b/src/test.ts\n+changed" },
+        [`diff ${MOCK_EVIDENCE_RANGE}`]: {
+          stdout: "diff --git a/src/test.ts b/src/test.ts\n+changed",
+        },
       };
       const events: Array<{ stage: string; payload: Record<string, unknown> }> = [];
       const crossClaimant = path.join(tmpDir, "docs", "tasks", "TASK-999-cross.md");
@@ -696,6 +1381,52 @@ describe("dispatchTask", () => {
       expect(mockRunJudge).not.toHaveBeenCalled();
     }, 15000);
 
+    test("does not skip an enabled judge gate with an approved clearance from an older contract", async () => {
+      const adapter = makeAdapter({ projectRoot: tmpDir });
+      adapter.config.preflight = {
+        ...adapter.config.preflight,
+        judgeApproval: {
+          enabled: true,
+          autoApproveWhen: {
+            requireVerificationPass: true,
+            maxFilesChanged: 0,
+            maxDiffLines: 0,
+          },
+        },
+      } as NonNullable<AdapterConfig["preflight"]>;
+      mockRunReadinessGate.mockResolvedValue({ outcome: "pass", task: {} as ParsedTask });
+      mockAssembleContext.mockResolvedValue(makeContext());
+      mockRunAgent.mockResolvedValue(makeAgentResult("TASK-042"));
+      mockRunJudge.mockResolvedValue(makeJudgeResult());
+      mockGitResults = { [`diff ${MOCK_EVIDENCE_RANGE}`]: { stdout: "diff content" } };
+
+      const oldContract = makeTaskContent("TASK-042", "Old Contract");
+      await saveJudgeApproval(
+        "TASK-042",
+        "old diff",
+        ["src/test.ts"],
+        true,
+        path.join(tmpDir, ".quack", "logs"),
+        "approved",
+        undefined,
+        undefined,
+        computeSpecIdentity(oldContract),
+      );
+      await fs.writeFile(
+        path.join(tmpDir, "docs", "tasks", "TASK-042-test.md"),
+        makeTaskContent("TASK-042", "Current Contract"),
+      );
+
+      const result = await dispatchTask("TASK-042", adapter, {
+        skipBranch: true,
+        skipPr: true,
+      });
+
+      expect(result.outcome).toBe("spec_changed");
+      expect(result.error).toContain("POST /api/tasks/TASK-042/judge/recycle");
+      expect(mockRunJudge).not.toHaveBeenCalled();
+    }, 15000);
+
     test("emits an ordered judge trace followed by one final post-judge decision", async () => {
       const adapter = makeAdapter({ projectRoot: tmpDir });
       const decisions: Array<Record<string, unknown>> = [];
@@ -717,7 +1448,7 @@ describe("dispatchTask", () => {
           ],
         }),
       );
-      mockGitResults = { "diff main": { stdout: "diff content" } };
+      mockGitResults = { [`diff ${MOCK_EVIDENCE_RANGE}`]: { stdout: "diff content" } };
 
       const result = await dispatchTask("TASK-042", adapter, {
         skipBranch: true,
@@ -779,7 +1510,7 @@ describe("dispatchTask", () => {
           },
         }),
       );
-      mockGitResults = { "diff main": { stdout: "diff content" } };
+      mockGitResults = { [`diff ${MOCK_EVIDENCE_RANGE}`]: { stdout: "diff content" } };
 
       const result = await dispatchTask("TASK-042", adapter, {
         skipBranch: true,
@@ -844,7 +1575,7 @@ describe("dispatchTask", () => {
             ],
           }),
         );
-      mockGitResults = { "diff main": { stdout: "diff content" } };
+      mockGitResults = { [`diff ${MOCK_EVIDENCE_RANGE}`]: { stdout: "diff content" } };
 
       const result = await dispatchTask("TASK-042", adapter, {
         skipBranch: true,
@@ -929,11 +1660,12 @@ describe("dispatchTask", () => {
       mockGitResults = {
         "status --short": { stdout: " M src/test.ts\n" },
         "diff --cached --name-only": { stdout: "src/test.ts\n" },
-        "commit -m": { stdout: "[quack/TASK-042 abc123] sealed output" },
-        "rev-parse --verify": { stdout: "abc123\n" },
+        "commit --only -m": { stdout: "[quack/TASK-042 abc123] sealed output" },
         "diff --name-status": { stdout: "M\tsrc/test.ts\n" },
-        "diff --stat main...HEAD": { stdout: " src/test.ts | 2 +-\n" },
-        "diff main...HEAD": { stdout: "diff --git a/src/test.ts b/src/test.ts\n" },
+        [`diff --stat ${MOCK_EVIDENCE_RANGE}`]: { stdout: " src/test.ts | 2 +-\n" },
+        [`diff ${MOCK_EVIDENCE_RANGE}`]: {
+          stdout: "diff --git a/src/test.ts b/src/test.ts\n",
+        },
       };
 
       const result = await dispatchTask("TASK-042", adapter, {
@@ -963,6 +1695,8 @@ describe("dispatchTask", () => {
         // carries no fidelity stamp, so it arrives undefined — the
         // assertion was left one argument short when 1324 landed.
         undefined,
+        // Legacy/minimal mocked brief has no stamped producer identity.
+        undefined,
       );
       expect(mockEvaluateLoopReview).toHaveBeenNthCalledWith(
         2,
@@ -979,6 +1713,12 @@ describe("dispatchTask", () => {
         undefined,
         [],
         { mode: "off", runnerConfig: undefined },
+        undefined,
+        {
+          runner: "claude-sdk",
+          provider: "anthropic",
+          model: "build-model",
+        },
       );
       expect(mockGenerateBlueprint).toHaveBeenCalledWith(expect.anything(), expect.anything(), {
         model: "investigate-model",
@@ -1090,11 +1830,12 @@ describe("dispatchTask", () => {
       mockGitResults = {
         "status --short": { stdout: " M src/test.ts\n" },
         "diff --cached --name-only": { stdout: "src/test.ts\n" },
-        "commit -m": { stdout: "[quack/TASK-042 abc123] sealed output" },
-        "rev-parse --verify": { stdout: "abc123\n" },
+        "commit --only -m": { stdout: "[quack/TASK-042 abc123] sealed output" },
         "diff --name-status": { stdout: "M\tsrc/test.ts\n" },
-        "diff --stat main...HEAD": { stdout: " src/test.ts | 2 +-\n" },
-        "diff main...HEAD": { stdout: "diff --git a/src/test.ts b/src/test.ts\n" },
+        [`diff --stat ${MOCK_EVIDENCE_RANGE}`]: { stdout: " src/test.ts | 2 +-\n" },
+        [`diff ${MOCK_EVIDENCE_RANGE}`]: {
+          stdout: "diff --git a/src/test.ts b/src/test.ts\n",
+        },
       };
 
       const result = await dispatchTask("TASK-042", adapter, {
@@ -1266,16 +2007,15 @@ describe("dispatchTask", () => {
       mockGitResults = {
         "status --short": { stdout: " M src/test.ts\n" },
         "diff --cached --name-only": { stdout: "src/test.ts\n" },
-        "commit -m": { stdout: "[quack/TASK-042 abc123] sealed output" },
-        "rev-parse --verify": { stdout: "abc123\n" },
-        // sealAgentOutputAttempt receives diffBase=dispatchBaseBranch ("main"),
-        // so resolveDiffRef short-circuits to diffRef="main" — NOT
-        // "origin/main". The mocks must match `git diff main...HEAD`, not
-        // `git diff origin/main...HEAD`, or the diff is empty and the
-        // dispatcher returns no_changes instead of approved.
+        "commit --only -m": { stdout: "[quack/TASK-042 abc123] sealed output" },
+        // The sealer resolves HEAD and the base to immutable commit identities
+        // before collecting any evidence, so all three diff views must use the
+        // exact sealed range rather than mutable branch names.
         "diff --name-status": { stdout: "M\tsrc/test.ts\n" },
-        "diff --stat main...HEAD": { stdout: " src/test.ts | 2 +-\n" },
-        "diff main...HEAD": { stdout: "diff --git a/src/test.ts b/src/test.ts\n" },
+        [`diff --stat ${MOCK_EVIDENCE_RANGE}`]: { stdout: " src/test.ts | 2 +-\n" },
+        [`diff ${MOCK_EVIDENCE_RANGE}`]: {
+          stdout: "diff --git a/src/test.ts b/src/test.ts\n",
+        },
       };
 
       const result = await dispatchTask("TASK-042", adapter, {
@@ -1303,11 +2043,10 @@ describe("dispatchTask", () => {
     const SEAL_GIT = {
       "status --short": { stdout: " M src/test.ts\n" },
       "diff --cached --name-only": { stdout: "src/test.ts\n" },
-      "commit -m": { stdout: "[quack/TASK-042 abc123] sealed output" },
-      "rev-parse --verify": { stdout: "abc123\n" },
+      "commit --only -m": { stdout: "[quack/TASK-042 abc123] sealed output" },
       "diff --name-status": { stdout: "M\tsrc/test.ts\n" },
-      "diff --stat main...HEAD": { stdout: " src/test.ts | 2 +-\n" },
-      "diff main...HEAD": { stdout: "diff --git a/src/test.ts b/src/test.ts\n" },
+      [`diff --stat ${MOCK_EVIDENCE_RANGE}`]: { stdout: " src/test.ts | 2 +-\n" },
+      [`diff ${MOCK_EVIDENCE_RANGE}`]: { stdout: "diff --git a/src/test.ts b/src/test.ts\n" },
     };
 
     /** A judge result carrying the trace the cutover reads. */
@@ -1562,6 +2301,51 @@ describe("dispatchTask", () => {
       expect(mockIntentRunnerRun).toHaveBeenCalledTimes(1);
     }, 20000);
 
+    test("an approved hold for the same diff is refused after the spec contract changes", async () => {
+      intentReturns("human_review");
+      mockRunJudge.mockResolvedValue(judged());
+      const logDir = path.join(tmpDir, ".quack", "logs");
+      const approvalPath = path.join(logDir, "approvals", "TASK-042-judge.json");
+
+      const held = await dispatchTask("TASK-042", adapterWithJudgeMode("enforce"), {
+        skipBranch: true,
+        skipPr: true,
+      });
+      expect(held.outcome).toBe("awaiting_judge_approval");
+
+      const pending = JSON.parse(await fs.readFile(approvalPath, "utf-8")) as Record<
+        string,
+        unknown
+      >;
+      await fs.writeFile(
+        approvalPath,
+        JSON.stringify({ ...pending, state: "approved", approvedBy: "operator" }),
+      );
+
+      // Let the second pass build/approve a fresh blueprint so the stale
+      // artifact under test is specifically the judge clearance.
+      await fs.rm(path.join(logDir, "approvals", "TASK-042.json"), { force: true });
+      await fs.writeFile(
+        path.join(tmpDir, "docs", "tasks", "TASK-042-test.md"),
+        makeTaskContent("TASK-042", "Amended Contract"),
+      );
+
+      const stages: string[] = [];
+      const refused = await dispatchTask("TASK-042", adapterWithJudgeMode("enforce"), {
+        skipBranch: true,
+        skipPr: true,
+        onEvent: (stage) => stages.push(stage),
+      });
+
+      expect(refused.outcome).toBe("spec_changed");
+      expect(refused.error).toContain("POST /api/tasks/TASK-042/judge/recycle");
+      expect(stages).toContain("spec_identity_stale");
+      expect(stages).not.toContain("judgment_hold_cleared");
+      // No second intent decision means the stale clearance neither released
+      // nor re-opened the same gate in an infinite approve/refuse cycle.
+      expect(mockIntentRunnerRun).toHaveBeenCalledTimes(1);
+    }, 20000);
+
     test("an approved hold does NOT carry over to a different diff", async () => {
       intentReturns("human_review");
       mockRunJudge.mockResolvedValue(judged());
@@ -1652,11 +2436,10 @@ describe("dispatchTask", () => {
     const SEAL_GIT_MOCKS = {
       "status --short": { stdout: " M src/test.ts\n" },
       "diff --cached --name-only": { stdout: "src/test.ts\n" },
-      "commit -m": { stdout: "[quack/TASK-042 abc123] sealed output" },
-      "rev-parse --verify": { stdout: "abc123\n" },
+      "commit --only -m": { stdout: "[quack/TASK-042 abc123] sealed output" },
       "diff --name-status": { stdout: "M\tsrc/test.ts\n" },
-      "diff --stat main...HEAD": { stdout: " src/test.ts | 2 +-\n" },
-      "diff main...HEAD": { stdout: "diff --git a/src/test.ts b/src/test.ts\n" },
+      [`diff --stat ${MOCK_EVIDENCE_RANGE}`]: { stdout: " src/test.ts | 2 +-\n" },
+      [`diff ${MOCK_EVIDENCE_RANGE}`]: { stdout: "diff --git a/src/test.ts b/src/test.ts\n" },
     };
 
     async function writeEnforceSignalsConfig(): Promise<void> {
@@ -2793,7 +3576,7 @@ describe("dispatchTask", () => {
         "status --short": { stdout: " M src/test.ts\n" },
         "add -A": { stdout: "" },
         "diff --cached --name-only": { stdout: "src/test.ts\n" },
-        "commit -m": { stdout: "1 file changed" },
+        "commit --only -m": { stdout: "1 file changed" },
       };
 
       // Override diff to return empty first, then content
@@ -2814,6 +3597,35 @@ describe("dispatchTask", () => {
   });
 
   describe("error handling", () => {
+    test("refuses a task whose bytes changed after decomposition-safe admission", async () => {
+      const adapter = makeAdapter({ projectRoot: tmpDir });
+
+      const result = await dispatchTask("TASK-042", adapter, {
+        skipGate: true,
+        admittedTaskContentHash: "0".repeat(64),
+      });
+
+      expect(result.outcome).toBe("error");
+      expect(result.error).toContain("changed after decomposition-safe dispatch admission");
+      expect(mockRunAgent).not.toHaveBeenCalled();
+    });
+
+    test("refuses a decomposed parent at the authoritative task-load seam", async () => {
+      const adapter = makeAdapter({ projectRoot: tmpDir });
+      const taskPath = path.join(tmpDir, "docs", "tasks", "TASK-042-test.md");
+      const current = await fs.readFile(taskPath, "utf-8");
+      await fs.writeFile(
+        taskPath,
+        current.replace("**Status:** BACKLOG", "**Status:** DECOMPOSED"),
+      );
+
+      const result = await dispatchTask("TASK-042", adapter, { skipGate: true });
+
+      expect(result.outcome).toBe("error");
+      expect(result.error).toContain("is DECOMPOSED and cannot be dispatched");
+      expect(mockRunAgent).not.toHaveBeenCalled();
+    });
+
     test("should return error when task file not found", async () => {
       const adapter = makeAdapter({ projectRoot: tmpDir });
 
@@ -2844,8 +3656,10 @@ describe("dispatchTask", () => {
       mockGitResults = {
         "status --short": { stdout: " M src/test.ts\n" },
         "diff --cached --name-only": { stdout: "src/test.ts\n" },
-        "commit -m": { error: true, stderr: "commit failed" },
-        "diff main...HEAD": { stdout: "diff --git a/src/old.ts b/src/old.ts\n" },
+        "commit --only -m": { error: true, stderr: "commit failed" },
+        [`diff ${MOCK_EVIDENCE_RANGE}`]: {
+          stdout: "diff --git a/src/old.ts b/src/old.ts\n",
+        },
       };
 
       const result = await dispatchTask("TASK-042", adapter, {
@@ -3030,14 +3844,16 @@ describe("dispatchTask", () => {
       // hasSealableProgress is actually wired, not the old diff check.
       mockGitResults = {
         "fetch origin": { stdout: "" },
-        "rev-parse --verify": { stdout: "abc123\n" },
+        "rev-parse --verify origin/main": { stdout: `${MOCK_BASE_COMMIT_SHA}\n` },
         "diff origin/main...HEAD": { stdout: "" },
         "status --short": { stdout: " M src/test.ts\n" },
         "diff --cached --name-only": { stdout: "src/test.ts\n" },
-        "commit -m": { stdout: "[quack/TASK-042 abc123] sealed output" },
+        "commit --only -m": { stdout: "[quack/TASK-042 abc123] sealed output" },
         "diff --name-status": { stdout: "M\tsrc/test.ts\n" },
-        "diff --stat main...HEAD": { stdout: " src/test.ts | 2 +-\n" },
-        "diff main...HEAD": { stdout: "diff --git a/src/test.ts b/src/test.ts\n" },
+        [`diff --stat ${MOCK_EVIDENCE_RANGE}`]: { stdout: " src/test.ts | 2 +-\n" },
+        [`diff ${MOCK_EVIDENCE_RANGE}`]: {
+          stdout: "diff --git a/src/test.ts b/src/test.ts\n",
+        },
       };
 
       const result = await dispatchTask("TASK-042", adapter, {
@@ -3495,9 +4311,9 @@ describe("dispatchTask", () => {
       mockRunJudge.mockResolvedValue(makeJudgeResult());
 
       mockGitResults = {
+        ...publicationGitResults(MOCK_HEAD_COMMIT_SHA),
         "checkout -b": { stdout: "Switched to branch" },
-        "diff quack/TASK-040": { stdout: "diff content" },
-        "push -u origin": { stdout: "Branch pushed" },
+        [`diff ${MOCK_EVIDENCE_RANGE}`]: { stdout: "diff content" },
         // Feature branch: rev-parse fails (doesn't exist), branch creation succeeds
         "rev-parse --verify quack/TASK-040": { error: true, stderr: "unknown revision" },
         "branch quack/TASK-040 main": { stdout: "" },
@@ -3545,7 +4361,7 @@ describe("dispatchTask", () => {
       mockRunJudge.mockResolvedValue(makeJudgeResult());
       mockGitResults = {
         "checkout -b": { stdout: "Switched to branch" },
-        "diff main": { stdout: "diff content" },
+        [`diff ${MOCK_EVIDENCE_RANGE}`]: { stdout: "diff content" },
         "rev-parse --verify quack/TASK-040": { error: true, stderr: "unknown revision" },
         "branch quack/TASK-040 main": { stdout: "" },
         "push -u origin": { error: true, stderr: "child has no remote" },
@@ -3601,8 +4417,9 @@ describe("dispatchTask", () => {
       mockRunJudge.mockResolvedValue(makeJudgeResult());
 
       mockGitResults = {
+        "remote get-url --push --all origin": { stdout: `${MOCK_ORIGIN_PUSH_URL}\n` },
         "checkout -b": { stdout: "Switched to branch" },
-        "diff main": { stdout: "diff content" },
+        [`diff ${MOCK_EVIDENCE_RANGE}`]: { stdout: "diff content" },
         // Content validation: zero commits (empty log)
         "log --oneline": { stdout: "" },
       };
@@ -3644,155 +4461,45 @@ describe("dispatchTask", () => {
       mockRunJudge.mockResolvedValue(makeJudgeResult());
 
       mockGitResults = {
+        ...publicationGitResults(MOCK_HEAD_COMMIT_SHA),
         "checkout -b": { stdout: "Switched to branch" },
-        "diff main": { stdout: "diff content" },
+        [`diff ${MOCK_EVIDENCE_RANGE}`]: { stdout: "diff content" },
         "log --oneline": { stdout: "abc123 commit\n" },
-        "push -u origin": { stdout: "Branch pushed" },
-        // Merge fails
-        "fetch origin staging": { error: true, stderr: "fetch failed" },
+        "git rev-parse --verify refs/heads/quack/TASK-042^{commit}": {
+          stdout: `${MOCK_HEAD_COMMIT_SHA}\n`,
+        },
+        // Merge fails at the exact sealed target fetch.
+        [`fetch ${MOCK_ORIGIN_PUSH_URL} staging:refs/remotes/origin/staging`]: {
+          error: true,
+          stderr: "fetch failed",
+        },
       };
 
       const emitted: Array<{ stage: string; payload: Record<string, unknown> }> = [];
-      const result = await dispatchTask("TASK-042", adapter, {
-        skipGate: true,
-        skipPr: true,
-        onEvent: (stage: string, payload: Record<string, unknown>) => {
-          emitted.push({ stage, payload });
-        },
-      });
-
-      expect(result.outcome).toBe("approved");
-
-      // Should have emitted auto_merge_failed with worktreePath
-      const failEvent = emitted.find((e) => e.stage === "auto_merge_failed");
-      expect(failEvent).toBeDefined();
-      expect(failEvent!.payload.worktreePath).toBe(tmpDir);
-    }, 15000);
-  });
-
-  describe("PR-gated auto-merge", () => {
-    test("carries one origin binding through no-PR merge, status, and cleanup", async () => {
-      const adapter = makeAdapter({
-        projectRoot: tmpDir,
-        config: {
-          ...makeAdapter().config,
-          git: {
-            ...makeAdapter().config.git,
-            autoCreatePr: false,
-            autoPush: false,
-            autoMerge: true,
-            autoMergeTarget: "main",
-          },
-        },
-      });
-      const repositoryBinding = {
-        pushUrl: "file:///trusted/repository.git",
-        pushUrlHash: "f".repeat(64),
-      };
-      const resolveOrigin = jest
-        .spyOn(githubRepositoryModule, "resolveOriginRepository")
-        .mockResolvedValue(repositoryBinding);
-      const merge = jest
-        .spyOn(branchManagerModule, "mergeBranchToTarget")
-        .mockResolvedValue({ success: true, mergeCommitSha: "e".repeat(40) });
-      const updateStatus = jest
-        .spyOn(branchManagerModule, "updateTaskFileStatus")
-        .mockResolvedValue({ success: true });
-      const cleanup = jest
-        .spyOn(branchManagerModule, "deleteAfterMerge")
-        .mockResolvedValue({ deleted: true, localDeleted: true, remoteDeleted: true });
-
-      mockRunReadinessGate.mockResolvedValue({ outcome: "pass", task: {} as ParsedTask });
-      mockAssembleContext.mockResolvedValue(makeContext());
-      mockRunAgent.mockResolvedValue(makeAgentResult("TASK-042"));
-      mockRunJudge.mockResolvedValue(makeJudgeResult());
-      mockGitResults = {
-        "checkout -b": { stdout: "Switched to branch" },
-        "diff main": { stdout: "diff content" },
-      };
-
+      const mergeSpy = jest.spyOn(branchManagerModule, "mergeBranchToTarget");
       try {
-        const result = await dispatchTask("TASK-042", adapter, { skipGate: true });
+        const result = await dispatchTask("TASK-042", adapter, {
+          skipGate: true,
+          skipPr: true,
+          onEvent: (stage: string, payload: Record<string, unknown>) => {
+            emitted.push({ stage, payload });
+          },
+        });
 
         expect(result.outcome).toBe("approved");
-        expect(result.autoMerged).toBe(true);
-        expect(resolveOrigin).toHaveBeenCalledWith(tmpDir);
-        expect(merge).toHaveBeenCalledWith(
-          "TASK-042",
-          adapter,
-          undefined,
-          "main",
-          expect.anything(),
-          expect.any(String),
-          "d".repeat(40),
-          undefined,
-          repositoryBinding,
-        );
-        expect(updateStatus).toHaveBeenCalledWith(
-          "TASK-042",
-          adapter,
-          "main",
-          repositoryBinding.pushUrl,
-        );
-        expect(cleanup).toHaveBeenCalledWith(
-          expect.any(String),
-          adapter,
-          expect.objectContaining({ expectedOriginPushUrl: repositoryBinding.pushUrl }),
-        );
-        expect(mockExecutedChildCommands.some((command) => command.startsWith("gh "))).toBe(false);
+        expect(mergeSpy).toHaveBeenCalledTimes(1);
+        await expect(mergeSpy.mock.results[0]?.value).resolves.toMatchObject({
+          success: false,
+          error: "Failed to fetch staging: fetch failed",
+        });
+
+        // Should have emitted auto_merge_failed with worktreePath
+        const failEvent = emitted.find((e) => e.stage === "auto_merge_failed");
+        expect(failEvent).toBeDefined();
+        expect(failEvent!.payload.worktreePath).toBe(tmpDir);
       } finally {
-        resolveOrigin.mockRestore();
-        merge.mockRestore();
-        updateStatus.mockRestore();
-        cleanup.mockRestore();
+        mergeSpy.mockRestore();
       }
-    }, 15000);
-
-    test("does not fall through to the local merge path when PR creation has no confirmed URL", async () => {
-      const adapter = makeAdapter({
-        projectRoot: tmpDir,
-        config: {
-          ...makeAdapter().config,
-          git: {
-            ...makeAdapter().config.git,
-            autoCreatePr: true,
-            autoPush: true,
-            autoMerge: true,
-            autoMergeTarget: "main",
-          },
-        },
-      });
-
-      mockRunReadinessGate.mockResolvedValue({ outcome: "pass", task: {} as ParsedTask });
-      mockAssembleContext.mockResolvedValue(makeContext());
-      mockRunAgent.mockResolvedValue(makeAgentResult("TASK-042"));
-      mockRunJudge.mockResolvedValue(makeJudgeResult());
-      mockGitResults = {
-        "fetch origin main": { stdout: "" },
-        "checkout -b": { stdout: "Switched to branch" },
-        "diff main": { stdout: "diff content" },
-        "log --oneline": { stdout: "abc123 some commit\n" },
-        "push -u origin": { stdout: "Branch pushed" },
-        "gh repo view": {
-          stdout: JSON.stringify({ nameWithOwner: "org/repo", url: "https://github.com/org/repo" }),
-        },
-        "gh pr create": { stdout: "", stderr: "Pull request created" },
-      };
-
-      const result = await dispatchTask("TASK-042", adapter, { skipGate: true });
-
-      expect(result.outcome).toBe("approved");
-      expect(result.prUrl).toBeUndefined();
-      expect(result.autoMerged).toBeUndefined();
-      expect(mockExecutedChildCommands.some((command) => command.startsWith("gh pr create "))).toBe(
-        true,
-      );
-      expect(mockExecutedChildCommands.some((command) => command.startsWith("gh pr merge "))).toBe(
-        false,
-      );
-      expect(
-        mockExecutedChildCommands.some((command) => command.includes("worktree add --detach")),
-      ).toBe(false);
     }, 15000);
   });
 
@@ -4023,7 +4730,7 @@ describe("dispatchTask", () => {
       mockRunJudge.mockResolvedValue(makeJudgeResult());
 
       mockGitResults = {
-        "diff main": { stdout: "diff content" },
+        [`diff ${MOCK_EVIDENCE_RANGE}`]: { stdout: "diff content" },
       };
 
       const emitted: Array<{ stage: string; payload: Record<string, unknown> }> = [];
@@ -4064,11 +4771,11 @@ describe("dispatchTask", () => {
       mockRunJudge.mockResolvedValue(makeJudgeResult());
 
       // Simulate a leaked core.worktree value pointing inside .quack/worktrees/
-      const leakedPath = "/fake/project/.quack/worktrees/TASK-893-A";
+      const leakedPath = path.join(tmpDir, ".quack", "worktrees", "TASK-893-A");
+      mockReadTrustedCoreWorktree.mockReturnValue(leakedPath);
+      mockUnsetTrustedCoreWorktree.mockReturnValue(true);
       mockGitResults = {
         diff: { stdout: "diff content" },
-        "config --local --get core.worktree": { stdout: leakedPath + "\n" },
-        "config --local --unset core.worktree": { stdout: "" },
       };
 
       const emitted: Array<{ stage: string; payload: Record<string, unknown> }> = [];
@@ -4103,11 +4810,9 @@ describe("dispatchTask", () => {
       mockRunAgent.mockRejectedValue(new Error("Process killed (simulated SIGTERM)"));
 
       // Set up leaked core.worktree
-      const leakedPath = "/fake/project/.quack/worktrees/TASK-042-impl";
-      mockGitResults = {
-        "config --local --get core.worktree": { stdout: leakedPath + "\n" },
-        "config --local --unset core.worktree": { stdout: "" },
-      };
+      const leakedPath = path.join(tmpDir, ".quack", "worktrees", "TASK-042-impl");
+      mockReadTrustedCoreWorktree.mockReturnValue(leakedPath);
+      mockUnsetTrustedCoreWorktree.mockReturnValue(true);
 
       const emitted: Array<{ stage: string; payload: Record<string, unknown> }> = [];
       const result = await dispatchTask("TASK-042", adapter, {
@@ -4136,11 +4841,132 @@ describe("dispatchTask", () => {
     const ORIGINAL_TIMEOUT_MS = process.env.QUACK_BLUEPRINT_TIMEOUT_MS;
 
     afterEach(() => {
+      jest.restoreAllMocks();
+      jest.useRealTimers();
       if (ORIGINAL_WARNING_MS === undefined) delete process.env.QUACK_BLUEPRINT_WARNING_MS;
       else process.env.QUACK_BLUEPRINT_WARNING_MS = ORIGINAL_WARNING_MS;
       if (ORIGINAL_TIMEOUT_MS === undefined) delete process.env.QUACK_BLUEPRINT_TIMEOUT_MS;
       else process.env.QUACK_BLUEPRINT_TIMEOUT_MS = ORIGINAL_TIMEOUT_MS;
     });
+
+    test("uses a configured Codex provider timeout plus cleanup grace instead of the legacy 300s watchdog", () => {
+      delete process.env.QUACK_BLUEPRINT_TIMEOUT_MS;
+      const base = makeAdapter({ projectRoot: tmpDir });
+      const adapter = makeAdapter({
+        projectRoot: tmpDir,
+        config: {
+          ...base.config,
+          evaluationProviders: {
+            blueprint: {
+              runner: "codex-cli",
+              model: "gpt-5.6-terra",
+              maxTurns: 30,
+              timeoutMs: 900_000,
+              codex: { binaryPath: "codex", sandbox: "read-only" },
+            },
+          },
+        },
+      });
+
+      expect(resolveInlineBlueprintTimeoutPolicy(adapter)).toEqual({
+        watchdogTimeoutMs: 930_000,
+        timeoutSource: "provider",
+        providerTimeoutMs: 900_000,
+        cleanupGraceMs: 30_000,
+      });
+    });
+
+    test("keeps the legacy 300s watchdog when no override or provider is configured", () => {
+      delete process.env.QUACK_BLUEPRINT_TIMEOUT_MS;
+
+      expect(resolveInlineBlueprintTimeoutPolicy(makeAdapter({ projectRoot: tmpDir }))).toEqual({
+        watchdogTimeoutMs: 300_000,
+        timeoutSource: "legacy",
+        cleanupGraceMs: 0,
+      });
+    });
+
+    test("gives an explicit environment timeout precedence over the configured provider timeout", () => {
+      process.env.QUACK_BLUEPRINT_TIMEOUT_MS = "200000";
+      const base = makeAdapter({ projectRoot: tmpDir });
+      const adapter = makeAdapter({
+        projectRoot: tmpDir,
+        config: {
+          ...base.config,
+          evaluationProviders: {
+            blueprint: {
+              runner: "codex-cli",
+              model: "gpt-5.6-terra",
+              maxTurns: 30,
+              timeoutMs: 900_000,
+              codex: { binaryPath: "codex", sandbox: "read-only" },
+            },
+          },
+        },
+      });
+
+      expect(resolveInlineBlueprintTimeoutPolicy(adapter)).toEqual({
+        watchdogTimeoutMs: 200_000,
+        timeoutSource: "environment",
+        providerTimeoutMs: 900_000,
+        cleanupGraceMs: 0,
+      });
+    });
+
+    test("does not arm a 300s fallback and clears the provider-aware watchdog after completion", async () => {
+      delete process.env.QUACK_BLUEPRINT_TIMEOUT_MS;
+      const base = makeAdapter({ projectRoot: tmpDir });
+      const adapter = makeAdapter({
+        projectRoot: tmpDir,
+        config: {
+          ...base.config,
+          evaluationProviders: {
+            blueprint: {
+              runner: "codex-cli",
+              model: "gpt-5.6-terra",
+              maxTurns: 30,
+              timeoutMs: 900_000,
+              codex: { binaryPath: "codex", sandbox: "read-only" },
+            },
+          },
+        },
+      });
+      mockRunReadinessGate.mockResolvedValue({ outcome: "pass", task: {} as ParsedTask });
+      mockAssembleContext.mockResolvedValue(makeContext());
+      mockRunAgent.mockResolvedValue(makeAgentResult("TASK-042"));
+      mockRunJudge.mockResolvedValue(makeJudgeResult());
+      const timeoutSpy = jest.spyOn(global, "setTimeout");
+      const clearTimeoutSpy = jest.spyOn(global, "clearTimeout");
+
+      const emitted: Array<{ stage: string; payload: Record<string, unknown> }> = [];
+      await dispatchTask("TASK-042", adapter, {
+        skipBranch: true,
+        skipPr: true,
+        onEvent: (stage, payload) => emitted.push({ stage, payload }),
+      });
+
+      expect(emitted.find((event) => event.stage === "blueprint_start")?.payload).toMatchObject({
+        timeoutMs: 930_000,
+        watchdogTimeoutMs: 930_000,
+        providerTimeoutMs: 900_000,
+        cleanupGraceMs: 30_000,
+        timeoutSource: "provider",
+      });
+      expect(timeoutSpy.mock.calls.some(([, delay]) => delay === 300_000)).toBe(false);
+      const watchdogIndex = timeoutSpy.mock.calls.findIndex(([, delay]) => delay === 930_000);
+      expect(watchdogIndex).toBeGreaterThanOrEqual(0);
+      expect(clearTimeoutSpy).toHaveBeenCalledWith(timeoutSpy.mock.results[watchdogIndex].value);
+      expect(emitted.find((event) => event.stage === "blueprint_fallback")).toBeUndefined();
+
+      // Even if a stale callback were delivered after success, resolving the
+      // losing promise cannot execute the fallback branch a second time.
+      const watchdogCallback = timeoutSpy.mock.calls[watchdogIndex][0] as () => void;
+      watchdogCallback();
+      await Promise.resolve();
+      expect(emitted.find((event) => event.stage === "blueprint_fallback")).toBeUndefined();
+      timeoutSpy.mockRestore();
+      clearTimeoutSpy.mockRestore();
+    }, 15000);
 
     test("emits blueprint_start before generateBlueprint and blueprint_generated after (happy path)", async () => {
       const adapter = makeAdapter({ projectRoot: tmpDir });
@@ -4222,7 +5048,7 @@ describe("dispatchTask", () => {
       expect(emitted.find((e) => e.stage === "blueprint_generated")).toBeDefined();
     }, 15000);
 
-    test("falls back to createMinimalBlueprint and emits blueprint_fallback when generateBlueprint exceeds timeoutMs", async () => {
+    test("fails closed on the empty timeout fallback before checkpoint or review", async () => {
       const adapter = makeAdapter({ projectRoot: tmpDir });
       process.env.QUACK_BLUEPRINT_WARNING_MS = "50";
       process.env.QUACK_BLUEPRINT_TIMEOUT_MS = "150";
@@ -4249,13 +5075,152 @@ describe("dispatchTask", () => {
         reason: "dispatch_timeout_minimal_blueprint",
       });
       expect(fallback!.payload.elapsedMs).toBeGreaterThanOrEqual(150);
-      // Dispatch must still reach blueprint_generated and the rest of the
-      // pipeline — that's the whole point: don't block on the stall.
-      // The eventual outcome depends on whether the agent produces changes
-      // off the minimal blueprint (skipBranch/skipPr mode here), but the
-      // pipeline must NOT remain stuck at blueprint.
-      expect(emitted.find((e) => e.stage === "blueprint_generated")).toBeDefined();
-      expect(result.outcome).not.toBe("error");
+      const fidelityFailure = emitted.find((e) => e.stage === "blueprint_fidelity_failed");
+      expect(fidelityFailure?.payload).toMatchObject({
+        taskId: "TASK-042",
+        reason: "empty_brief",
+        retryable: true,
+        recovery: "replan_or_retry",
+        producerProvenancePresent: false,
+      });
+      expect(result).toMatchObject({
+        outcome: "error",
+        retriesUsed: 0,
+      });
+      expect(result.error).toContain("retry dispatch or request a replan");
+      expect(emitted.find((e) => e.stage === "blueprint_generated")).toBeUndefined();
+      expect(
+        emitted.find((e) => e.stage === "checkpoint_saved" && e.payload.stage === "blueprint"),
+      ).toBeUndefined();
+      expect(mockEvaluateLoopReview).not.toHaveBeenCalled();
+      expect(mockRunAgent).not.toHaveBeenCalled();
     }, 15000);
+
+    test("fails closed on a fresh empty fidelity-failed brief before loop review", async () => {
+      const adapter = makeLoopAdapter(tmpDir);
+      mockRunReadinessGate.mockResolvedValue({ outcome: "pass", task: {} as ParsedTask });
+      mockGenerateBlueprint.mockResolvedValueOnce({
+        taskId: "TASK-042",
+        fileAnalyses: [],
+        codeExamples: [],
+        verificationPatterns: [],
+        antiPatterns: [],
+        preconditions: [],
+        fidelity: {
+          status: "failed",
+          violations: [
+            {
+              kind: "empty_brief",
+              detail: "Brief has zero fileAnalyses and zero typed directives",
+            },
+          ],
+          checkedAt: "2026-09-08T00:00:00.000Z",
+          scope: "typed-surface+file-existence+mandated-checks",
+        },
+      });
+
+      const emitted: Array<{ stage: string; payload: Record<string, unknown> }> = [];
+      const result = await dispatchTask("TASK-042", adapter, {
+        skipBranch: true,
+        skipPr: true,
+        onEvent: (stage, payload) => emitted.push({ stage, payload }),
+      });
+
+      expect(result.outcome).toBe("error");
+      expect(mockEvaluateLoopReview).not.toHaveBeenCalled();
+      expect(mockRunAgent).not.toHaveBeenCalled();
+      expect(emitted.some((e) => e.stage === "loop_brief_review")).toBe(false);
+      expect(emitted.some((e) => e.stage === "blueprint_pending_approval")).toBe(false);
+      expect(
+        emitted.some((e) => e.stage === "checkpoint_saved" && e.payload.stage === "blueprint"),
+      ).toBe(false);
+      expect(
+        fsSync.existsSync(path.join(tmpDir, ".quack", "logs", "approvals", "TASK-042.json")),
+      ).toBe(false);
+      expect(emitted.find((e) => e.stage === "session_error")?.payload).toMatchObject({
+        failedStage: "blueprint",
+      });
+    });
+
+    test("keeps substantive fidelity failures reviewable and pending", async () => {
+      const adapter = makeLoopAdapter(tmpDir);
+      mockRunReadinessGate.mockResolvedValue({ outcome: "pass", task: {} as ParsedTask });
+      mockEvaluateLoopReview.mockResolvedValueOnce({
+        runnerKind: "codex-cli",
+        result: {
+          status: "completed",
+          verdict: "SHIP",
+          findings: [],
+          summary: "Substantive deterministic finding requires a human decision",
+          rawText: "{}",
+          runner: "codex-cli",
+          durationMs: 10,
+          anchorsAudit: { total: 0, missing: [] },
+          treeDirtyAfterReview: false,
+        },
+        reviewGate: {
+          crossModelSatisfied: true,
+          anchorAuditPassed: true,
+          treeClean: true,
+          fidelityPassed: false,
+          eligibleForAutoApproval: false,
+          reasons: ["brief fidelity audit failed"],
+        },
+      });
+      mockGenerateBlueprint.mockResolvedValueOnce({
+        taskId: "TASK-042",
+        fileAnalyses: [
+          {
+            filePath: "src/test.ts",
+            action: "Modify",
+            currentStructure: "existing function",
+            integrationPoints: "update the function",
+            patternToFollow: "existing pattern",
+          },
+        ],
+        codeExamples: [],
+        verificationPatterns: [],
+        antiPatterns: [],
+        preconditions: [],
+        producerProvenance: {
+          runner: "codex-cli",
+          provider: "openai",
+          model: "gpt-5.6-terra",
+        },
+        fidelity: {
+          status: "failed",
+          violations: [
+            {
+              kind: "missing_file",
+              detail: "fileAnalyses Modify target does not exist: src/test.ts",
+              anchor: "src/test.ts",
+            },
+          ],
+          checkedAt: "2026-09-08T00:00:00.000Z",
+          scope: "typed-surface+file-existence+mandated-checks",
+        },
+      });
+
+      const emitted: Array<{ stage: string; payload: Record<string, unknown> }> = [];
+      const result = await dispatchTask("TASK-042", adapter, {
+        skipBranch: true,
+        skipPr: true,
+        onEvent: (stage, payload) => emitted.push({ stage, payload }),
+      });
+
+      expect(result.outcome).toBe("awaiting_approval");
+      expect(mockEvaluateLoopReview).toHaveBeenCalledTimes(1);
+      expect(emitted.some((e) => e.stage === "blueprint_fidelity_failed")).toBe(false);
+      expect(emitted.some((e) => e.stage === "loop_brief_review")).toBe(true);
+      expect(emitted.some((e) => e.stage === "blueprint_pending_approval")).toBe(true);
+      const savedApproval = JSON.parse(
+        await fs.readFile(
+          path.join(tmpDir, ".quack", "logs", "approvals", "TASK-042.json"),
+          "utf-8",
+        ),
+      ) as { state?: string; blueprint?: { fidelity?: { status?: string } } };
+      expect(savedApproval.state).toBe("pending");
+      expect(savedApproval.blueprint?.fidelity?.status).toBe("failed");
+    });
   });
 });

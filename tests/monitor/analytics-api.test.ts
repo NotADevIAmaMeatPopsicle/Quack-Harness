@@ -78,12 +78,12 @@ function writeAnalyticsData(projectRoot: string): void {
 
 describe("Analytics API", () => {
   let logDir: string;
-  let projectRoots: string[];
+  let projectRoot: string;
   let stopServer: (() => Promise<void>) | undefined;
 
   beforeEach(() => {
     logDir = makeTempDir();
-    projectRoots = [];
+    projectRoot = makeTempDir();
   });
 
   afterEach(async () => {
@@ -91,29 +91,34 @@ describe("Analytics API", () => {
       await stopServer();
       stopServer = undefined;
     }
-    for (const projectRoot of projectRoots) {
-      fs.rmSync(projectRoot, { recursive: true, force: true });
-    }
+    fs.rmSync(projectRoot, { recursive: true, force: true });
     fs.rmSync(logDir, { recursive: true, force: true });
   });
 
+  async function startServer(): Promise<number> {
+    const serverObj = createMonitorServer({
+      logDir,
+      port: 0,
+      host: "127.0.0.1",
+      projectRoot,
+    });
+    const started = await serverObj.start();
+    stopServer = started.stop;
+    return started.port;
+  }
+
   it("GET /api/analytics/summary vs /api/analytics/patterns return different shapes", async () => {
-    const projectRoot = makeTempDir();
-    projectRoots.push(projectRoot);
     writeAnalyticsData(projectRoot);
 
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port, projectRoot });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    const port = await startServer();
 
     // Get summary
-    const summaryRes = await httpGet(`http://localhost:${port}/api/analytics/summary`);
+    const summaryRes = await httpGet(`http://127.0.0.1:${port}/api/analytics/summary`);
     expect(summaryRes.status).toBe(200);
     const summary = JSON.parse(summaryRes.body) as Record<string, unknown>;
 
     // Get patterns
-    const patternsRes = await httpGet(`http://localhost:${port}/api/analytics/patterns`);
+    const patternsRes = await httpGet(`http://127.0.0.1:${port}/api/analytics/patterns`);
     expect(patternsRes.status).toBe(200);
     const patterns = JSON.parse(patternsRes.body) as Record<string, unknown>;
 
@@ -134,16 +139,11 @@ describe("Analytics API", () => {
   });
 
   it("GET /api/analytics/by-tag with valid tag returns filtered results", async () => {
-    const projectRoot = makeTempDir();
-    projectRoots.push(projectRoot);
     writeAnalyticsData(projectRoot);
 
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port, projectRoot });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    const port = await startServer();
 
-    const { status, body } = await httpGet(`http://localhost:${port}/api/analytics/by-tag?tag=api`);
+    const { status, body } = await httpGet(`http://127.0.0.1:${port}/api/analytics/by-tag?tag=api`);
     expect(status).toBe(200);
 
     const data = JSON.parse(body) as { tag: string; data: { runs: number; rate: number } };
@@ -153,16 +153,11 @@ describe("Analytics API", () => {
   });
 
   it("GET /api/analytics/by-tag returns all tags when no filter", async () => {
-    const projectRoot = makeTempDir();
-    projectRoots.push(projectRoot);
     writeAnalyticsData(projectRoot);
 
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port, projectRoot });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    const port = await startServer();
 
-    const { status, body } = await httpGet(`http://localhost:${port}/api/analytics/by-tag`);
+    const { status, body } = await httpGet(`http://127.0.0.1:${port}/api/analytics/by-tag`);
     expect(status).toBe(200);
 
     const data = JSON.parse(body) as Record<string, { runs: number }>;
@@ -172,17 +167,12 @@ describe("Analytics API", () => {
   });
 
   it("GET /api/analytics/by-tag returns null data for unknown tag", async () => {
-    const projectRoot = makeTempDir();
-    projectRoots.push(projectRoot);
     writeAnalyticsData(projectRoot);
 
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port, projectRoot });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    const port = await startServer();
 
     const { status, body } = await httpGet(
-      `http://localhost:${port}/api/analytics/by-tag?tag=nonexistent`,
+      `http://127.0.0.1:${port}/api/analytics/by-tag?tag=nonexistent`,
     );
     expect(status).toBe(200);
 
@@ -192,17 +182,12 @@ describe("Analytics API", () => {
   });
 
   it("GET /api/analytics/by-file with valid file returns filtered results", async () => {
-    const projectRoot = makeTempDir();
-    projectRoots.push(projectRoot);
     writeAnalyticsData(projectRoot);
 
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port, projectRoot });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    const port = await startServer();
 
     const { status, body } = await httpGet(
-      `http://localhost:${port}/api/analytics/by-file?file=${encodeURIComponent("src/monitor/server.ts")}`,
+      `http://127.0.0.1:${port}/api/analytics/by-file?file=${encodeURIComponent("src/monitor/server.ts")}`,
     );
     expect(status).toBe(200);
 
@@ -213,16 +198,11 @@ describe("Analytics API", () => {
   });
 
   it("GET /api/analytics/by-file returns all files when no filter", async () => {
-    const projectRoot = makeTempDir();
-    projectRoots.push(projectRoot);
     writeAnalyticsData(projectRoot);
 
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port, projectRoot });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    const port = await startServer();
 
-    const { status, body } = await httpGet(`http://localhost:${port}/api/analytics/by-file`);
+    const { status, body } = await httpGet(`http://127.0.0.1:${port}/api/analytics/by-file`);
     expect(status).toBe(200);
 
     const data = JSON.parse(body) as Record<string, { runs: number }>;
@@ -231,15 +211,9 @@ describe("Analytics API", () => {
   });
 
   it("GET /api/analytics/summary returns empty stats when no analytics data", async () => {
-    const projectRoot = makeTempDir();
-    projectRoots.push(projectRoot);
+    const port = await startServer();
 
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port, projectRoot });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
-
-    const { status, body } = await httpGet(`http://localhost:${port}/api/analytics/summary`);
+    const { status, body } = await httpGet(`http://127.0.0.1:${port}/api/analytics/summary`);
     expect(status).toBe(200);
 
     const data = JSON.parse(body) as { totalRuns: number; successRate: number };

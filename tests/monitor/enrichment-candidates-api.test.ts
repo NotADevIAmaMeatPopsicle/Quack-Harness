@@ -25,10 +25,6 @@ function removeTempDir(dir: string): void {
   fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 }
 
-function randomPort(): number {
-  return 30000 + Math.floor(Math.random() * 10000);
-}
-
 function request(method: string, url: string, body?: unknown): Promise<HttpResult> {
   const payload = body === undefined ? undefined : JSON.stringify(body);
   return new Promise((resolve, reject) => {
@@ -186,24 +182,27 @@ describe("external enrichment candidate intake", () => {
     const taskPath = path.join(taskDir, "TASK-921-B-enrichment-candidate-test.md");
     fs.writeFileSync(taskPath, initialContent, "utf-8");
 
-    const port = randomPort();
     const server = createMonitorServer({
-      port,
+      port: 0,
+      host: "127.0.0.1",
       quackRoot,
       projectRoot,
       taskDir,
     });
     const started = await server.start();
     stopServer = started.stop;
-    return { baseUrl: `http://localhost:${port}`, projectRoot, taskPath };
+    return { baseUrl: `http://127.0.0.1:${started.port}`, projectRoot, taskPath };
   }
 
   afterEach(async () => {
-    if (stopServer) {
-      await stopServer();
+    try {
+      if (stopServer) {
+        await stopServer();
+      }
+    } finally {
       stopServer = undefined;
+      for (const tempDir of tempDirs.splice(0)) removeTempDir(tempDir);
     }
-    for (const tempDir of tempDirs.splice(0)) removeTempDir(tempDir);
   });
 
   it("accepts a materially better candidate and records an accepted effective spec", async () => {

@@ -7,11 +7,15 @@ import type { FileModification } from "../core/types.js";
 /** Refusal codes for staged decomposition — all callers must handle these */
 export const DECOMPOSE_REFUSAL_CODES = {
   PARENT_NOT_READY: "DECOMPOSE_PARENT_NOT_READY",
+  PARENT_CHANGED: "DECOMPOSE_PARENT_CHANGED",
+  PLAN_INVALID: "DECOMPOSE_PLAN_INVALID",
   COVERAGE_GAP: "DECOMPOSE_COVERAGE_GAP",
   DRAFT_INVALID: "DECOMPOSE_DRAFT_INVALID",
   DRAFT_BELOW_THRESHOLD: "DECOMPOSE_DRAFT_BELOW_THRESHOLD",
   REVIEW_REQUIRED: "DECOMPOSE_REVIEW_REQUIRED",
   WRITE_LOCKED: "DECOMPOSE_WRITE_LOCKED",
+  COMMIT_INDETERMINATE: "DECOMPOSE_COMMIT_INDETERMINATE",
+  WRITE_FAILED: "DECOMPOSE_WRITE_FAILED",
 } as const;
 
 export type DecomposeRefusalCode =
@@ -66,7 +70,20 @@ export interface CoverageReport {
   unmappedCriteria: string[];
   /** Files assigned to more than one subtask (duplication) */
   duplicatedFiles: string[];
-  /** True when any unmappedFiles or unmappedCriteria remain */
+  /** Criteria assigned more than once, including repeats within one child. */
+  duplicatedCriteria?: string[];
+  /** Child-owned paths that are not present in the parent scope. */
+  unexpectedFiles?: string[];
+  /** Parent paths whose child action does not match the parent action. */
+  mismatchedFileActions?: Array<{
+    filePath: string;
+    expectedAction: FileModification["action"];
+    actualAction: FileModification["action"];
+    ownedBy: string;
+  }>;
+  /** Child criteria outside the parent contract (except the final verification marker). */
+  unexpectedCriteria?: string[];
+  /** True when ownership is missing, duplicated, widened, or action-mismatched. */
   hasCoverageGap: boolean;
 }
 
@@ -80,6 +97,10 @@ export interface ParentReadiness {
 /** Topology result from plan mode — side-effect free */
 export interface DecompositionTopology {
   parentTaskId: string;
+  /** SHA-256 of the exact parent bytes this plan was produced from. */
+  parentContentHash?: string;
+  /** Adapter-capped child-count bound resolved when this topology was planned. */
+  maxSubtasks?: number;
   subtasks: SubtaskDefinition[];
   coverageReport: CoverageReport;
   parentReadiness?: ParentReadiness;
@@ -114,7 +135,7 @@ export interface ChildDraft {
 export interface DecomposeRequest {
   /** Operation mode — determines what side-effects occur */
   mode: "plan" | "materialize" | "finalize";
-  /** Maximum child tasks to produce (plan and materialize only) */
+  /** Requested child maximum (2-6); capped by adapter maxSubtasks, default 4. */
   maxSubtasks?: number;
   /** Topology result from a previous plan call (materialize and finalize) */
   plan?: DecompositionTopology;
@@ -139,6 +160,14 @@ export interface DecomposeResponse {
   writtenPaths?: string[];
   enqueuedItems?: Array<{ taskId: string; status: string }>;
   parentStatusUpdated?: boolean;
+  /** The Git commit exists, but recovery/authoritative status projection still gates scheduling. */
+  recoveryPending?: boolean;
+  /** Exact durable transaction projection identity, when available. */
+  statusProjectionId?: string;
+  /** Non-fatal diagnostics when a committed transaction still needs recovery. */
+  warnings?: string[];
+  /** False only for an indeterminate ref update that must not be retried. */
+  retryable?: boolean;
   /** Refusal code when ok=false */
   refusalCode?: DecomposeRefusalCode;
   /** Human-readable refusal message */

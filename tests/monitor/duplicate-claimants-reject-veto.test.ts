@@ -26,7 +26,8 @@ describe.each(DUPLICATE_FIXTURE_CASES)("reject duplicate claimant veto (%s, %s)"
     let stop: (() => Promise<void>) | undefined;
     try {
       const server = createMonitorServer({
-        port: 30_000 + Math.floor(Math.random() * 10_000),
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: fixture.root,
         taskDir: "docs/tasks",
         adapterPath,
@@ -55,7 +56,8 @@ it("reject still passes through for one claimant", async () => {
   let stop: (() => Promise<void>) | undefined;
   try {
     const server = createMonitorServer({
-      port: 30_000 + Math.floor(Math.random() * 10_000),
+      port: 0,
+      host: "127.0.0.1",
       projectRoot: fixture.root,
       taskDir: "docs/tasks",
       adapterPath,
@@ -81,7 +83,8 @@ it("already rejected remains the original no-write response when contested", asy
   let stop: (() => Promise<void>) | undefined;
   try {
     const server = createMonitorServer({
-      port: 30_000 + Math.floor(Math.random() * 10_000),
+      port: 0,
+      host: "127.0.0.1",
       projectRoot: fixture.root,
       taskDir: "docs/tasks",
       adapterPath,

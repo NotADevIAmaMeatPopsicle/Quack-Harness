@@ -3,6 +3,7 @@
 // to resume from the last completed stage instead of starting over.
 
 import type { AgentOutputSnapshot, AgentResult, GateResult, JudgeResult } from "../core/types.js";
+import type { ModelProvenance } from "../review/reviewer-types.js";
 
 /** Pipeline stages in dispatch order */
 export type PipelineStage =
@@ -29,6 +30,12 @@ export interface DispatchCheckpoint {
   claudeSessionId?: string;
   /** Agent result (if agent stage completed) */
   agentResult?: AgentResult;
+  /**
+   * Pipeline-stamped identity of the implementation producer. Optional for
+   * legacy checkpoints; absence must fail closed when cross-model review is
+   * required rather than being reconstructed from possibly changed config.
+   */
+  implementationProvenance?: ModelProvenance;
   /** Judge result (if judge stage completed) */
   judgeResult?: JudgeResult;
   /** Gate result (if gate stage completed) */

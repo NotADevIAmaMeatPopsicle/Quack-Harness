@@ -1,7 +1,7 @@
 // ─── CLI: quack wave ─────────────────────────────────────────────────
 // Execute the current dependency-ready frontier with bounded concurrency.
-// Each task is started through DispatchManager, which normally creates an
-// isolated worktree and safely serializes its shared-checkout fallback.
+// Each task is started through DispatchManager, which creates an isolated
+// worktree and launches the established `quack run` child process.
 
 import * as fsSync from "node:fs";
 import * as path from "node:path";
@@ -13,13 +13,16 @@ import { listDuplicateClaimants } from "../core/task-file-resolver.js";
 import { loadStatusOverlay, resolveDependencies } from "../dispatcher/dependency-resolver.js";
 import { selectTasks } from "../dispatcher/task-selector.js";
 import {
-  DegradedSharedCheckoutBusyError,
   DispatchManager,
   type DispatchJob,
   type DispatchShutdownOptions,
   type DispatchShutdownResult,
   type StartOptions,
 } from "../monitor/dispatch-manager.js";
+import {
+  withDecompositionAdmissionFence,
+  type DecompositionDispatchAdmission,
+} from "../preflight/decomposition-transaction-journal.js";
 
 export type WaveSignal = "SIGINT" | "SIGTERM";
 type WaveSignalListener = () => void;
@@ -31,7 +34,7 @@ export interface WaveDispatchManager {
     claimantCheck?: DuplicateClaimantCheck,
   ): DispatchJob;
   getJob(taskId: string): DispatchJob | undefined;
-  getSharedCheckoutOccupants(): DispatchJob[];
+  getActiveJobs(): DispatchJob[];
   isWorktreeDegraded(): boolean;
   shutdownAll(options?: DispatchShutdownOptions): Promise<DispatchShutdownResult>;
   startWatchdog(): void;
@@ -60,7 +63,13 @@ export interface WaveCommandRuntime {
 
 export type WaveRunOutcome =
   | { interrupted: false; results: WaveTaskResult[] }
-  | { interrupted: true; signal: WaveSignal; cleanupTimedOut: boolean };
+  | {
+      interrupted: true;
+      signal: WaveSignal;
+      cleanupTimedOut: boolean;
+      /** True only when shutdownAll returned durable worker/resource accounting. */
+      forceExitSafe: boolean;
+    };
 
 function parsePositiveInteger(value: string, label: string): number {
   if (!/^\d+$/.test(value)) {
@@ -140,23 +149,14 @@ export async function executeSelectedWaveTasks(
   waveNumber: string,
   pollIntervalMs = 250,
   resolveClaimantCheck?: (taskId: string) => Promise<DuplicateClaimantCheck>,
+  dispatchAdmissionFence?: (
+    taskId: string,
+    operation: (admission: DecompositionDispatchAdmission) => DispatchJob,
+  ) => Promise<DispatchJob>,
   shouldStop?: () => boolean,
 ): Promise<WaveTaskResult[]> {
   const results = new Array<WaveTaskResult>(selections.length);
   let nextIndex = 0;
-
-  const waitForSafeStart = async (taskId: string): Promise<void> => {
-    while (manager.isWorktreeDegraded()) {
-      if (shouldStop?.()) return;
-      const occupants = manager.getSharedCheckoutOccupants();
-      const unresolved = occupants.filter((job) => job.status !== "running");
-      if (unresolved.length > 0) {
-        throw new DegradedSharedCheckoutBusyError(taskId, occupants);
-      }
-      if (occupants.length === 0) return;
-      await delay(pollIntervalMs);
-    }
-  };
 
   const runWorker = async (): Promise<void> => {
     while (nextIndex < selections.length) {
@@ -167,55 +167,34 @@ export async function executeSelectedWaveTasks(
       try {
         // DispatchManager deliberately falls back to the shared directory
         // when worktree creation fails. In that degraded state it exposes a
-        // guard that forbids parallel starts. Wait for a live child; an
-        // approval-paused shared checkout fails later admission immediately.
-        await waitForSafeStart(selection.taskId);
+        // guard that forbids parallel starts; wait instead of turning every
+        // remaining task into a synthetic failure.
+        while (manager.isWorktreeDegraded() && manager.getActiveJobs().length > 0) {
+          if (shouldStop?.()) return;
+          await delay(pollIntervalMs);
+        }
+
         if (shouldStop?.()) return;
 
-        let job: DispatchJob | undefined;
-        while (!job) {
-          await waitForSafeStart(selection.taskId);
-          if (shouldStop?.()) return;
-
-          // Refresh this evidence on every retry. Another worker can hold the
-          // degraded checkout while task files change, so reusing the scan
-          // that preceded the wait would make duplicate-claimant admission
-          // stale at the exact point start() finally proceeds.
-          const claimantCheck = resolveClaimantCheck
-            ? await resolveClaimantCheck(selection.taskId)
-            : undefined;
-          if (shouldStop?.()) return;
-
-          // The claimant scan is asynchronous. Another worker can degrade the
-          // manager while this worker is awaiting it, so re-check immediately
-          // before the synchronous start call.
-          await waitForSafeStart(selection.taskId);
-          if (shouldStop?.()) return;
-          try {
-            job = manager.start(
-              selection.taskId,
-              {
-                provenance: {
-                  channel: "cli",
-                  principal: `quack-wave:${waveNumber}`,
-                },
+        const claimantCheck = resolveClaimantCheck
+          ? await resolveClaimantCheck(selection.taskId)
+          : undefined;
+        if (shouldStop?.()) return;
+        const start = (admission?: DecompositionDispatchAdmission) =>
+          manager.start(
+            selection.taskId,
+            {
+              provenance: {
+                channel: "cli",
+                principal: `quack-wave:${waveNumber}`,
               },
-              claimantCheck,
-            );
-            break;
-          } catch (err: unknown) {
-            // The precheck and start() are separated by an async boundary.
-            // If a sibling degrades isolation in that gap, the manager's
-            // typed refusal is authoritative. A live occupant is retryable;
-            // an approval pause requires operator action and fails promptly.
-            if (err instanceof DegradedSharedCheckoutBusyError && !err.hasUnresolvedOccupant) {
-              await delay(pollIntervalMs);
-              if (shouldStop?.()) return;
-              continue;
-            }
-            throw err;
-          }
-        }
+              admittedTaskContentHash: admission?.contentHash,
+            },
+            claimantCheck,
+          );
+        const job = dispatchAdmissionFence
+          ? await dispatchAdmissionFence(selection.taskId, start)
+          : start();
         results[index] = await waitForTerminalJob(manager, job, pollIntervalMs, shouldStop);
       } catch (err: unknown) {
         results[index] = {
@@ -305,10 +284,8 @@ export async function runWaveWithSignalCleanup(
     if (first.kind === "completed") return { interrupted: false, results: first.results };
     if (first.kind === "failed") throw first.error;
 
-    // Bound only the cooperative wave workers here. DispatchManager owns the
-    // bounded TERM/KILL/Docker cleanup sequence and must always reach its
-    // durable survivor/ownership writes before this function can authorize a
-    // forced process exit.
+    // DispatchManager owns the bounded TERM/KILL/Docker sequence and must
+    // persist survivor ownership before a forced process exit is authorized.
     let operationTimer: ReturnType<typeof setTimeout> | undefined;
     const operationSettlement = Promise.race([
       operationResult,
@@ -327,6 +304,8 @@ export async function runWaveWithSignalCleanup(
         operationOutcome.kind === "timeout" ||
         shutdown.kind === "shutdown_failed" ||
         managerTimedOut,
+      forceExitSafe:
+        shutdown.kind === "shutdown" && shutdown.result.durableAccountingComplete === true,
     };
   } finally {
     removeSignalListener("SIGINT", onSigint);
@@ -354,7 +333,10 @@ function formatResult(result: WaveTaskResult): string[] {
   return lines;
 }
 
-function defaultManager(adapter: ProjectAdapter, taskDir: string): WaveDispatchManager {
+export function createWaveDispatchManager(
+  adapter: ProjectAdapter,
+  taskDir: string,
+): WaveDispatchManager {
   const quackBin = path.resolve(__dirname, "..", "index.js");
   const logDir = path.resolve(adapter.projectRoot, adapter.config.logging.dir);
   return new DispatchManager(
@@ -367,6 +349,7 @@ function defaultManager(adapter: ProjectAdapter, taskDir: string): WaveDispatchM
       taskId,
       claimants: await listDuplicateClaimants(taskDir, taskId),
     }),
+    adapter.trustedLocalReadRemotePaths,
   );
 }
 
@@ -441,7 +424,7 @@ export async function waveCommand(
     plan.push("");
     writeStdout(plan.join("\n"));
 
-    const manager = (runtime.createManager ?? defaultManager)(adapter, taskDir);
+    const manager = (runtime.createManager ?? createWaveDispatchManager)(adapter, taskDir);
     const outcome = await runWaveWithSignalCleanup(
       manager,
       (isCancelled) =>
@@ -455,6 +438,7 @@ export async function waveCommand(
             taskId,
             claimants: await listDuplicateClaimants(taskDir, taskId),
           }),
+          (taskId, dispatch) => withDecompositionAdmissionFence(adapter, taskId, dispatch),
           isCancelled,
         ),
       runtime,
@@ -468,7 +452,7 @@ export async function waveCommand(
       );
       const signalExitCode = outcome.signal === "SIGINT" ? 130 : 143;
       setExitCode(signalExitCode);
-      if (outcome.cleanupTimedOut) {
+      if (outcome.cleanupTimedOut && outcome.forceExitSafe) {
         (runtime.exitProcess ?? ((code: number) => process.exit(code)))(signalExitCode);
       }
       return;

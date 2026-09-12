@@ -6,31 +6,9 @@ import * as path from "node:path";
 import { promisify } from "node:util";
 import type { ProjectAdapter } from "../../src/core/adapter-loader";
 import type { DockerResumeSourceBinding } from "../../src/dispatcher/docker-runtime-bridge";
-import { findDockerPublicationRecovery } from "../../src/dispatcher/docker-publication-recovery";
 
-const execFileCalls: Array<{
-  file: string;
-  args: readonly string[];
-  rawArgs: readonly string[];
-  cwd?: string;
-  env?: NodeJS.ProcessEnv;
-}> = [];
-let pushFailure: Error | undefined;
-const recoveryPreparedRefs = new Map<string, string>();
-const recoveryLockRefs = new Map<string, string>();
-const recoveryLockObjects = new Map<string, string>();
-let recoveryLockObjectCounter = 0;
-let recoveryLockReleaseFailures = 0;
-let recoveryLockDeleteThenFail = 0;
-let recoveryLockInstallThenFail = 0;
-let recoveryLockConfirmationReadFailures = 0;
-let recoveryLockReplacementOnRelease: string | undefined;
-let durableMoveAfterRenameFailures = 0;
-let recoveryGit:
-  | { base: string; candidate: string; current: string; sealed?: string; remote?: string }
-  | undefined;
+const trustedRepository = { host: "github.com", owner: "org", repo: "repo" };
 const ORIGIN_PUSH_URL = "https://github.com/org/repo.git";
-let currentOriginPushUrl = ORIGIN_PUSH_URL;
 const ORIGIN_BINDING = {
   pushUrlHash: createHash("sha256").update(ORIGIN_PUSH_URL).digest("hex"),
   github: {
@@ -39,14 +17,38 @@ const ORIGIN_BINDING = {
     nameWithOwner: "org/repo",
   },
 };
+const execFileCalls: Array<{
+  file: string;
+  args: readonly string[];
+  cwd?: string;
+  expectedRepository?: typeof trustedRepository;
+}> = [];
+let pushFailure: Error | undefined;
+let remoteHeadOverrides: Array<string | undefined> = [];
+const recoveryLockRefs = new Map<string, string>();
+const recoveryLockObjects = new Map<string, string>();
+const recoveryPreparedRefs = new Map<string, string>();
+let recoveryLockObjectCounter = 0;
+let recoveryLockReplacementOnRelease: string | undefined;
+let recoveryGit:
+  | { base: string; candidate: string; current: string; sealed?: string; remote?: string }
+  | undefined;
 
 jest.mock("node:child_process", () => {
   const actualFs = jest.requireActual<typeof import("node:fs")>("node:fs");
-  const mockExecFile = jest.fn();
-  const mockExecFileSync = jest.fn(
+  const execFile = jest.fn();
+  (execFile as unknown as Record<symbol, unknown>)[promisify.custom] = (
+    file: string,
+  ): Promise<{ stdout: string; stderr: string }> => {
+    if (!file.toLowerCase().endsWith("powershell.exe")) {
+      return Promise.reject(new Error(`unexpected process-incarnation command ${file}`));
+    }
+    return Promise.resolve({ stdout: "638930000000000000", stderr: "" });
+  };
+  const execFileSync = jest.fn(
     (file: string, _args: readonly string[], options: { env?: NodeJS.ProcessEnv }): Buffer => {
       if (!file.toLowerCase().endsWith("powershell.exe")) {
-        throw new Error(`unexpected synchronous command ${file}`);
+        throw new Error(`unexpected durable namespace command ${file}`);
       }
       const source = options.env?.QUACK_DURABLE_SOURCE;
       const target = options.env?.QUACK_DURABLE_TARGET;
@@ -57,172 +59,173 @@ jest.mock("node:child_process", () => {
       }
       if (replace) actualFs.rmSync(target, { force: true });
       actualFs.renameSync(source, target);
-      if (durableMoveAfterRenameFailures > 0) {
-        durableMoveAfterRenameFailures -= 1;
-        throw Object.assign(new Error("simulated post-rename durability failure"), {
-          code: "EIO",
-        });
-      }
       return Buffer.alloc(0);
     },
   );
-  (mockExecFile as unknown as Record<symbol, unknown>)[promisify.custom] = (
-    file: string,
+  return { execFile, execFileSync };
+});
+
+jest.mock("../../src/worker/trusted-executable", () => ({
+  runTrustedGitResult: (
+    projectRoot: string,
     args: readonly string[],
-    options: { cwd?: string; env?: NodeJS.ProcessEnv },
-  ): Promise<{ stdout: string; stderr: string }> => {
-    const rawArgs = args;
-    execFileCalls.push({ file, args, rawArgs, cwd: options.cwd, env: options.env });
-    if (file.toLowerCase().endsWith("powershell.exe")) {
-      return Promise.resolve({ stdout: "638930000000000000", stderr: "" });
-    }
-    if (file === "git" && args[0] === "remote" && args[1] === "get-url") {
-      return Promise.resolve({ stdout: `${currentOriginPushUrl}\n`, stderr: "" });
-    }
-    if (file === "git" && recoveryGit) {
+    options?: { expectedRepository?: typeof trustedRepository },
+  ): Promise<{ exitCode: number; stdout: string; stderr: string }> => {
+    execFileCalls.push({
+      file: "git",
+      args,
+      cwd: projectRoot,
+      ...(options?.expectedRepository ? { expectedRepository: options.expectedRepository } : {}),
+    });
+    if (recoveryGit) {
       if (args[0] === "hash-object") {
         recoveryLockObjectCounter += 1;
         const objectId = recoveryLockObjectCounter.toString(16).padStart(40, "0");
-        recoveryLockObjects.set(objectId, actualFs.readFileSync(String(args.at(-1)), "utf-8"));
-        return Promise.resolve({ stdout: `${objectId}\n`, stderr: "" });
+        recoveryLockObjects.set(objectId, fs.readFileSync(String(args.at(-1)), "utf-8"));
+        return Promise.resolve({ exitCode: 0, stdout: `${objectId}\n`, stderr: "" });
       }
       if (args[0] === "cat-file" && args[1] === "blob") {
         const value = recoveryLockObjects.get(String(args[2]));
-        return value === undefined
-          ? Promise.reject(Object.assign(new Error("missing object"), { code: 128 }))
-          : Promise.resolve({ stdout: value, stderr: "" });
+        return Promise.resolve(
+          value === undefined
+            ? { exitCode: 128, stdout: "", stderr: "missing object" }
+            : { exitCode: 0, stdout: value, stderr: "" },
+        );
       }
       if (args[0] === "rev-parse") {
-        const ref = args.at(-1);
-        const exactRef = String(ref).replace(/\^\{commit\}$/u, "");
-        if (exactRef.startsWith("refs/quack/docker-publication-lock/")) {
-          const lockObject = recoveryLockRefs.get(exactRef);
-          if (lockObject && recoveryLockConfirmationReadFailures > 0) {
-            recoveryLockConfirmationReadFailures -= 1;
-            return Promise.reject(
-              Object.assign(new Error("transient lock confirmation failure"), { code: 128 }),
-            );
-          }
-          return lockObject
-            ? Promise.resolve({ stdout: `${lockObject}\n`, stderr: "" })
-            : Promise.reject(Object.assign(new Error("missing ref"), { code: 1 }));
+        const ref = String(args.at(-1)).replace(/\^\{commit\}$/u, "");
+        if (args.includes("--quiet")) {
+          const value = ref.startsWith("refs/quack/docker-publication-lock/")
+            ? recoveryLockRefs.get(ref)
+            : ref.startsWith("refs/quack/docker-publication-prepared/")
+              ? recoveryPreparedRefs.get(ref)
+              : ref.startsWith("refs/quack/docker-publication/")
+                ? recoveryGit.sealed
+                : recoveryGit.current;
+          return Promise.resolve(
+            value
+              ? { exitCode: 0, stdout: `${value}\n`, stderr: "" }
+              : { exitCode: 1, stdout: "", stderr: "" },
+          );
         }
-        if (exactRef.startsWith("refs/quack/docker-publication-prepared/")) {
-          const preparedHead = recoveryPreparedRefs.get(exactRef);
-          return preparedHead
-            ? Promise.resolve({ stdout: `${preparedHead}\n`, stderr: "" })
-            : Promise.reject(Object.assign(new Error("missing ref"), { code: 1 }));
+        if (/^[a-f0-9]{40,64}$/iu.test(ref)) {
+          return Promise.resolve({ exitCode: 0, stdout: `${ref}\n`, stderr: "" });
         }
-        if (/^[a-f0-9]{40,64}$/iu.test(exactRef)) {
-          return Promise.resolve({ stdout: `${exactRef}\n`, stderr: "" });
-        }
-        const stdout = exactRef.startsWith("refs/quack/docker-publication/")
+        const stdout = ref.startsWith("refs/quack/docker-publication/")
           ? recoveryGit.sealed
           : recoveryGit.current;
-        if (!stdout) {
-          return Promise.reject(Object.assign(new Error("missing ref"), { code: 1 }));
-        }
-        return Promise.resolve({ stdout: `${stdout}\n`, stderr: "" });
+        return Promise.resolve({ exitCode: 0, stdout: `${stdout}\n`, stderr: "" });
       }
       if (args[0] === "show-ref") {
-        const exactRef = String(args.at(-1));
-        if (exactRef.startsWith("refs/quack/docker-publication-lock/")) {
-          const lockObject = recoveryLockRefs.get(exactRef);
-          return lockObject
-            ? Promise.resolve({ stdout: `${lockObject}\n`, stderr: "" })
-            : Promise.reject(Object.assign(new Error("missing ref"), { code: 1 }));
+        const ref = String(args.at(-1));
+        if (ref.startsWith("refs/quack/docker-publication-lock/")) {
+          const value = recoveryLockRefs.get(ref);
+          return Promise.resolve(
+            value
+              ? { exitCode: 0, stdout: `${value}\n`, stderr: "" }
+              : { exitCode: 1, stdout: "", stderr: "missing ref" },
+          );
         }
-        if (exactRef.startsWith("refs/quack/docker-publication-prepared/")) {
-          const preparedHead = recoveryPreparedRefs.get(exactRef);
-          return preparedHead
-            ? Promise.resolve({ stdout: `${preparedHead}\n`, stderr: "" })
-            : Promise.reject(Object.assign(new Error("missing ref"), { code: 1 }));
+        if (ref.startsWith("refs/quack/docker-publication/")) {
+          return Promise.resolve(
+            recoveryGit.sealed
+              ? { exitCode: 0, stdout: `${recoveryGit.sealed}\n`, stderr: "" }
+              : { exitCode: 1, stdout: "", stderr: "missing ref" },
+          );
+        }
+        if (ref.startsWith("refs/quack/docker-publication-prepared/")) {
+          const value = recoveryPreparedRefs.get(ref);
+          return Promise.resolve(
+            value
+              ? { exitCode: 0, stdout: `${value}\n`, stderr: "" }
+              : { exitCode: 1, stdout: "", stderr: "missing ref" },
+          );
         }
         if (recoveryGit.current) {
-          return Promise.resolve({ stdout: `${recoveryGit.current}\n`, stderr: "" });
+          return Promise.resolve({ exitCode: 0, stdout: `${recoveryGit.current}\n`, stderr: "" });
         }
-        return Promise.reject(Object.assign(new Error("missing ref"), { code: 1 }));
+        return Promise.resolve({ exitCode: 1, stdout: "", stderr: "missing ref" });
       }
       if (args[0] === "update-ref") {
-        const exactRef = args[1] === "-d" ? String(args[2]) : String(args[1]);
-        if (exactRef.startsWith("refs/quack/docker-publication-lock/")) {
-          const deleting = args[1] === "-d";
-          const next = deleting ? undefined : String(args[2]);
-          const expected = String(args[3]);
-          const current = recoveryLockRefs.get(exactRef);
-          const expectedMissing = /^0+$/u.test(expected);
-          if (
-            (expectedMissing && current !== undefined) ||
-            (!expectedMissing && current !== expected)
-          ) {
-            return Promise.reject(
-              Object.assign(new Error("compare-and-swap failed"), { code: 128 }),
-            );
-          }
-          if (deleting && recoveryLockReleaseFailures > 0) {
-            recoveryLockReleaseFailures -= 1;
-            return Promise.reject(
-              Object.assign(new Error("transient lock release failure"), { code: 128 }),
-            );
-          }
-          if (deleting && recoveryLockDeleteThenFail > 0) {
-            recoveryLockDeleteThenFail -= 1;
-            recoveryLockRefs.delete(exactRef);
-            return Promise.reject(
-              Object.assign(new Error("ambiguous lock release result"), { code: 128 }),
-            );
-          }
-          if (!deleting && recoveryLockInstallThenFail > 0) {
-            recoveryLockInstallThenFail -= 1;
-            recoveryLockRefs.set(exactRef, next!);
-            return Promise.reject(
-              Object.assign(new Error("ambiguous lock acquisition result"), { code: 128 }),
-            );
-          }
-          if (deleting) {
-            recoveryLockRefs.delete(exactRef);
+        const ref = args[1] === "-d" ? String(args[2]) : String(args[1]);
+        if (ref.startsWith("refs/quack/docker-publication-lock/")) {
+          if (args[1] === "-d") {
+            recoveryLockRefs.delete(ref);
             if (recoveryLockReplacementOnRelease) {
-              recoveryLockRefs.set(exactRef, recoveryLockReplacementOnRelease);
+              recoveryLockRefs.set(ref, recoveryLockReplacementOnRelease);
             }
-          } else recoveryLockRefs.set(exactRef, next!);
-          return Promise.resolve({ stdout: "", stderr: "" });
+          } else recoveryLockRefs.set(ref, String(args[2]));
+          return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
         }
-        if (exactRef.startsWith("refs/quack/docker-publication-prepared/")) {
-          if (args[1] === "-d") recoveryPreparedRefs.delete(exactRef);
-          else recoveryPreparedRefs.set(exactRef, String(args[2]));
-          return Promise.resolve({ stdout: "", stderr: "" });
+        if (ref.startsWith("refs/quack/docker-publication-prepared/")) {
+          if (args[1] === "-d") recoveryPreparedRefs.delete(ref);
+          else recoveryPreparedRefs.set(ref, String(args[2]));
+          return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
         }
-        if (exactRef.startsWith("refs/quack/docker-publication/")) {
-          if (args[1] === "-d") recoveryGit.sealed = undefined;
+        if (ref.startsWith("refs/quack/docker-publication/")) {
+          if (args[1] === "-d") recoveryGit.sealed = "";
           else recoveryGit.sealed = String(args[2]);
-          return Promise.resolve({ stdout: "", stderr: "" });
+          return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
         }
         recoveryGit.current = String(args[2]);
-        return Promise.resolve({ stdout: "", stderr: "" });
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
       }
-      if (args[0] === "merge-base") return Promise.resolve({ stdout: "", stderr: "" });
+      if (args[0] === "merge-base") {
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+      }
       if (args[0] === "ls-remote") {
+        const remoteHead =
+          remoteHeadOverrides.length > 0 ? remoteHeadOverrides.shift() : recoveryGit.remote;
         return Promise.resolve({
-          stdout: recoveryGit.remote
-            ? `${recoveryGit.remote}\trefs/heads/${String(args.at(-1)).replace("refs/heads/", "")}\n`
+          exitCode: 0,
+          stdout: remoteHead
+            ? `${remoteHead}\trefs/heads/${String(args.at(-1)).replace("refs/heads/", "")}\n`
             : "",
           stderr: "",
         });
       }
       if (args[0] === "push") {
-        if (pushFailure) return Promise.reject(pushFailure);
-        const deletesBranch =
-          args.includes("--delete") || args.some((argument) => argument.startsWith(":refs/heads/"));
-        recoveryGit.remote = deletesBranch ? undefined : recoveryGit.candidate;
-        return Promise.resolve({ stdout: "", stderr: "" });
+        if (pushFailure) {
+          return Promise.resolve({ exitCode: 1, stdout: "", stderr: pushFailure.message });
+        }
+        recoveryGit.remote =
+          args.includes("--delete") || args.some((arg) => arg.startsWith(":refs/heads/"))
+            ? undefined
+            : recoveryGit.candidate;
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
       }
     }
-    return pushFailure && args[0] === "push"
-      ? Promise.reject(pushFailure)
-      : Promise.resolve({ stdout: "", stderr: "" });
-  };
-  return { execFile: mockExecFile, execFileSync: mockExecFileSync };
-});
+    return Promise.resolve({
+      exitCode: pushFailure && args[0] === "push" ? 1 : 0,
+      stdout: "",
+      stderr: pushFailure && args[0] === "push" ? pushFailure.message : "",
+    });
+  },
+  runTrustedGitHubResult: (
+    projectRoot: string,
+    args: readonly string[],
+  ): Promise<{ exitCode: number; stdout: string; stderr: string }> => {
+    execFileCalls.push({ file: "gh", args, cwd: projectRoot });
+    return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
+  },
+}));
+
+const resolveOriginRepository = jest.fn(() =>
+  Promise.resolve({ ...ORIGIN_BINDING, pushUrl: ORIGIN_PUSH_URL }),
+);
+const resolveBoundOriginRepository = jest.fn(() =>
+  Promise.resolve({ ...ORIGIN_BINDING, pushUrl: ORIGIN_PUSH_URL }),
+);
+jest.mock("../../src/dispatcher/github-repository", () => ({
+  isGitOriginBinding: (value: unknown) =>
+    typeof value === "object" && value !== null && "pushUrlHash" in value,
+  persistentOriginRepositoryBinding: (value: { pushUrlHash: string; github?: unknown }) => ({
+    pushUrlHash: value.pushUrlHash,
+    ...(value.github ? { github: value.github } : {}),
+  }),
+  resolveBoundOriginRepository,
+  resolveOriginRepository,
+}));
 
 const loadAdapter = jest.fn();
 jest.mock("../../src/core/adapter-loader", () => ({ loadAdapter }));
@@ -242,11 +245,15 @@ jest.mock("../../src/dispatcher/branch-manager", () => ({
 }));
 
 const createPullRequest = jest.fn();
-jest.mock("../../src/dispatcher/pr-creator", () => ({ createPullRequest }));
+const recoverPullRequestCandidate = jest.fn();
+jest.mock("../../src/dispatcher/pr-creator", () => ({
+  createPullRequest,
+  recoverPullRequestCandidate,
+}));
 
 const {
-  publishDockerPromotedResult,
   initializeDockerPublicationRecovery,
+  publishDockerPromotedResult,
   readDockerPublicationRecovery,
   resumeDockerPromotedResult,
   withDockerPublicationRecoveryLock,
@@ -368,29 +375,57 @@ function initialJournalFixture(
   };
 }
 
+async function successfulPullRequestCreation(input: {
+  ownershipMarker?: string;
+  onCandidate?: (candidate: {
+    url: string;
+    ownershipMarker: string;
+    state: "pending" | "accepted" | "closed";
+  }) => void | Promise<void>;
+}): Promise<{ success: true; prUrl: string }> {
+  const prUrl = "https://github.com/org/repo/pull/1";
+  if (input.ownershipMarker && input.onCandidate) {
+    await input.onCandidate({
+      url: prUrl,
+      ownershipMarker: input.ownershipMarker,
+      state: "pending",
+    });
+    await input.onCandidate({
+      url: prUrl,
+      ownershipMarker: input.ownershipMarker,
+      state: "accepted",
+    });
+  }
+  return { success: true, prUrl };
+}
+
 describe("Docker host publication", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     execFileCalls.splice(0);
     pushFailure = undefined;
-    recoveryPreparedRefs.clear();
+    remoteHeadOverrides = [];
     recoveryLockRefs.clear();
     recoveryLockObjects.clear();
+    recoveryPreparedRefs.clear();
     recoveryLockObjectCounter = 0;
-    recoveryLockReleaseFailures = 0;
-    recoveryLockDeleteThenFail = 0;
-    recoveryLockInstallThenFail = 0;
-    recoveryLockConfirmationReadFailures = 0;
     recoveryLockReplacementOnRelease = undefined;
-    durableMoveAfterRenameFailures = 0;
-    currentOriginPushUrl = ORIGIN_PUSH_URL;
     recoveryGit = undefined;
     loadAdapter.mockResolvedValue(adapter());
     resolveTaskFile.mockResolvedValue(resolvedTask());
-    createPullRequest.mockResolvedValue({
-      success: true,
-      prUrl: "https://example.test/pull/1",
+    resolveOriginRepository.mockResolvedValue({
+      ...ORIGIN_BINDING,
+      pushUrl: ORIGIN_PUSH_URL,
     });
+    resolveBoundOriginRepository.mockResolvedValue({
+      ...ORIGIN_BINDING,
+      pushUrl: ORIGIN_PUSH_URL,
+    });
+    createPullRequest.mockImplementation(successfulPullRequestCreation);
+    recoverPullRequestCandidate.mockImplementation(
+      (_projectRoot: string, candidate: { url: string; ownershipMarker: string }) =>
+        Promise.resolve({ ...candidate, state: "accepted" as const }),
+    );
     mergeBranchToTarget.mockResolvedValue({ success: true, mergeCommitSha: "c".repeat(40) });
     updateTaskFileStatus.mockResolvedValue({ success: true });
     deleteAfterMerge.mockResolvedValue({ deleted: true });
@@ -407,43 +442,34 @@ describe("Docker host publication", () => {
 
     expect(execFileCalls.some((call) => call.args[0] === "update-ref")).toBe(true);
     expect(execFileCalls.some((call) => call.args[0] === "push")).toBe(true);
-    const boundPush = execFileCalls.find((call) => call.args[0] === "push");
-    const boundRemote = String(boundPush?.args[1]);
-    expect(boundRemote).toMatch(
-      /^quack-bound-[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu,
-    );
-    expect(boundPush?.rawArgs.join(" ")).not.toContain(ORIGIN_PUSH_URL);
-    expect(boundPush?.env?.GIT_CONFIG_COUNT).toBe("4");
-    expect(
-      Object.entries(boundPush?.env ?? {}).filter(([key]) => /^GIT_CONFIG_KEY_[0-9]+$/u.test(key)),
-    ).toEqual(
-      expect.arrayContaining([
-        expect.arrayContaining([expect.any(String), `remote.${boundRemote}.url`]),
-        expect.arrayContaining([expect.any(String), `remote.${boundRemote}.pushurl`]),
-        expect.arrayContaining([expect.any(String), `url.${ORIGIN_PUSH_URL}.insteadOf`]),
-        expect.arrayContaining([expect.any(String), `url.${ORIGIN_PUSH_URL}.pushInsteadOf`]),
-      ]),
+    expect(execFileCalls.find((call) => call.args[0] === "push")?.expectedRepository).toEqual(
+      trustedRepository,
     );
     expect(createPullRequest).toHaveBeenCalledWith(
       expect.objectContaining({
         taskId: "TASK-101",
         baseBranch: "main",
         headBranch: "quack/TASK-101",
-        headCommitSha: fixture.options.recovery.gitState.candidateHead,
       }),
       expect.any(Object),
-      expect.objectContaining({ selector: "github.com/org/repo" }),
     );
     expect(mergeBranchToTarget).toHaveBeenCalledWith(
       "TASK-101",
       expect.any(Object),
-      "https://example.test/pull/1",
+      "https://github.com/org/repo/pull/1",
       "main",
       undefined,
       "quack/TASK-101",
-      fixture.options.recovery.gitState.candidateHead,
+      {
+        repository: trustedRepository,
+        headBranch: "quack/TASK-101",
+        baseBranch: "main",
+        headOid: "b".repeat(40),
+      },
+      "b".repeat(40),
+      trustedRepository,
       undefined,
-      expect.objectContaining({ pushUrlHash: ORIGIN_BINDING.pushUrlHash }),
+      expect.objectContaining({ pushUrl: ORIGIN_PUSH_URL }),
     );
     expect(result).toEqual(
       expect.objectContaining({ autoMerged: true, mergeCommitSha: "c".repeat(40) }),
@@ -451,34 +477,29 @@ describe("Docker host publication", () => {
     fs.rmSync(fixture.root, { recursive: true, force: true });
   });
 
-  test.each(["before", "after"] as const)(
-    "recovers a fresh journal when the process stops %s the candidate seal",
-    async (boundary) => {
-      const fixture = durablePublication("TASK-101");
-      recoveryGit!.sealed = undefined;
-      const recoveryPath = await initializeDockerPublicationRecovery(
-        "TASK-101",
-        fixture.root,
-        "quack/TASK-101",
-        fixture.options,
-      );
-      expect(findDockerPublicationRecovery(fixture.recoveryRoot, "TASK-101")?.path).toBe(
-        recoveryPath,
-      );
-      expect(recoveryLockRefs.size).toBe(0);
-      if (boundary === "after") {
-        recoveryGit!.sealed = fixture.options.recovery.gitState.candidateHead;
-      }
+  test("initializes recovery before sealing and later reconstructs the exact candidate seal", async () => {
+    const fixture = durablePublication("TASK-101");
+    recoveryGit!.sealed = undefined;
 
-      await expect(
-        publishDockerPromotedResult("TASK-101", fixture.root, "quack/TASK-101", fixture.options),
-      ).resolves.toEqual(expect.objectContaining({ recoveryPath }));
+    const recoveryPath = await initializeDockerPublicationRecovery(
+      "TASK-101",
+      fixture.root,
+      "quack/TASK-101",
+      fixture.options,
+    );
+    expect(readDockerPublicationRecovery(recoveryPath)).toEqual(
+      expect.objectContaining({ state: "pending", generation: 0, repository: ORIGIN_BINDING }),
+    );
 
-      expect(recoveryGit!.sealed).toBe(fixture.options.recovery.gitState.candidateHead);
-      expect(readDockerPublicationRecovery(recoveryPath).state).toBe("complete");
-      fs.rmSync(fixture.root, { recursive: true, force: true });
-    },
-  );
+    await expect(
+      publishDockerPromotedResult("TASK-101", fixture.root, "quack/TASK-101", fixture.options),
+    ).resolves.toEqual(expect.objectContaining({ recoveryPath }));
+    expect(recoveryGit!.sealed).toBe(fixture.options.recovery.gitState.candidateHead);
+    const completed = readDockerPublicationRecovery(recoveryPath);
+    expect(completed.generation).toBeGreaterThan(0);
+    expect(completed.previousDigest).toMatch(/^[a-f0-9]{64}$/u);
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  });
 
   test("replaces only an identity-matching crash-truncated initial journal", async () => {
     const fixture = durablePublication("TASK-101");
@@ -487,242 +508,165 @@ describe("Docker host publication", () => {
     const cut = artifact.bytes.indexOf(Buffer.from('"updatedAt": "', "utf-8")) + 19;
     fs.writeFileSync(artifact.recoveryPath, artifact.bytes.subarray(0, cut));
 
-    const result = await publishDockerPromotedResult(
-      "TASK-101",
-      fixture.root,
-      "quack/TASK-101",
-      fixture.options,
-    );
-
-    expect(result.recoveryPath).toBe(artifact.recoveryPath);
+    await expect(
+      publishDockerPromotedResult("TASK-101", fixture.root, "quack/TASK-101", fixture.options),
+    ).resolves.toEqual(expect.objectContaining({ recoveryPath: artifact.recoveryPath }));
     expect(readDockerPublicationRecovery(artifact.recoveryPath).state).toBe("complete");
     fs.rmSync(fixture.root, { recursive: true, force: true });
   });
 
-  test("refuses to replace a crash-truncated journal with different ownership", async () => {
+  test("serializes concurrent publishers with the durable Git-ref recovery lock", async () => {
     const fixture = durablePublication("TASK-101");
     const artifact = initialJournalFixture(fixture);
     fs.mkdirSync(fixture.recoveryRoot, { recursive: true });
-    const foreign = Buffer.from(artifact.bytes);
-    const candidateOffset = foreign.indexOf(Buffer.from("b".repeat(40), "utf-8"));
-    foreign[candidateOffset] = "c".charCodeAt(0);
-    fs.writeFileSync(artifact.recoveryPath, foreign.subarray(0, candidateOffset + 2));
-
-    await expect(
-      publishDockerPromotedResult("TASK-101", fixture.root, "quack/TASK-101", fixture.options),
-    ).rejects.toThrow(/JSON|schema/);
-    expect(fs.readFileSync(artifact.recoveryPath)).toEqual(
-      foreign.subarray(0, candidateOffset + 2),
-    );
-    fs.rmSync(fixture.root, { recursive: true, force: true });
-  });
-
-  test("refuses to remove a truncated journal before its ownership is complete", async () => {
-    const fixture = durablePublication("TASK-101");
-    const artifact = initialJournalFixture(fixture);
-    fs.mkdirSync(fixture.recoveryRoot, { recursive: true });
-    const partial = artifact.bytes.subarray(0, artifact.bytes.indexOf(Buffer.from('"gitState"')));
-    fs.writeFileSync(artifact.recoveryPath, partial);
-
-    await expect(
-      publishDockerPromotedResult("TASK-101", fixture.root, "quack/TASK-101", fixture.options),
-    ).rejects.toThrow(/JSON|schema/);
-    expect(fs.readFileSync(artifact.recoveryPath)).toEqual(partial);
-    fs.rmSync(fixture.root, { recursive: true, force: true });
-  });
-
-  test("reconciles the exact hard-link crash window before resuming publication", async () => {
-    const fixture = durablePublication("TASK-101");
-    const artifact = initialJournalFixture(fixture);
-    fs.mkdirSync(fixture.recoveryRoot, { recursive: true });
-    const temporary = `${artifact.recoveryPath}.123.${randomUUID()}.tmp`;
-    fs.writeFileSync(temporary, artifact.bytes);
-    fs.linkSync(temporary, artifact.recoveryPath);
-    expect(fs.lstatSync(artifact.recoveryPath).nlink).toBe(2);
-
-    await expect(
-      publishDockerPromotedResult("TASK-101", fixture.root, "quack/TASK-101", fixture.options),
-    ).resolves.toEqual(expect.objectContaining({ recoveryPath: artifact.recoveryPath }));
-
-    expect(fs.existsSync(temporary)).toBe(false);
-    expect(fs.lstatSync(artifact.recoveryPath).nlink).toBe(1);
-    fs.rmSync(fixture.root, { recursive: true, force: true });
-  });
-
-  test("removes an identity-matching orphan install temp before retrying initial creation", async () => {
-    const fixture = durablePublication("TASK-101");
-    const artifact = initialJournalFixture(fixture);
-    fs.mkdirSync(fixture.recoveryRoot, { recursive: true });
-    const temporary = `${artifact.recoveryPath}.123.${randomUUID()}.tmp`;
-    fs.writeFileSync(temporary, artifact.bytes);
-
-    await expect(
-      publishDockerPromotedResult("TASK-101", fixture.root, "quack/TASK-101", fixture.options),
-    ).resolves.toEqual(expect.objectContaining({ recoveryPath: artifact.recoveryPath }));
-
-    expect(fs.existsSync(temporary)).toBe(false);
-    expect(readDockerPublicationRecovery(artifact.recoveryPath).state).toBe("complete");
-    fs.rmSync(fixture.root, { recursive: true, force: true });
-  });
-
-  test("reclaims an inactive same-process lock after transient exact release failure", async () => {
-    const fixture = durablePublication("TASK-101");
-    const recoveryPath = initialJournalFixture(fixture).recoveryPath;
-    const identity = {
-      projectRoot: fixture.root,
-      publicationId: fixture.options.recovery.publicationId,
-      gitState: { sealedRef: fixture.options.recovery.gitState.sealedRef },
-    };
-    recoveryLockReleaseFailures = 1;
-
-    await expect(
-      withDockerPublicationRecoveryLock(recoveryPath, identity, () => Promise.resolve("first")),
-    ).rejects.toThrow(/release was not confirmed/);
-    expect(recoveryLockRefs.size).toBe(1);
-
-    const retryOperation = jest.fn(() => Promise.resolve("second"));
-    await expect(
-      withDockerPublicationRecoveryLock(recoveryPath, identity, retryOperation),
-    ).resolves.toBe("second");
-    expect(retryOperation).toHaveBeenCalledTimes(1);
-    expect(recoveryLockRefs.size).toBe(0);
-    fs.rmSync(fixture.root, { recursive: true, force: true });
-  });
-
-  test("does not remove a different lock token installed after exact release", async () => {
-    const fixture = durablePublication("TASK-101");
-    const recoveryPath = initialJournalFixture(fixture).recoveryPath;
-    const replacement = "f".repeat(40);
-    recoveryLockReplacementOnRelease = replacement;
-
-    await expect(
-      withDockerPublicationRecoveryLock(
-        recoveryPath,
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      void withDockerPublicationRecoveryLock(
+        artifact.recoveryPath,
         {
           projectRoot: fixture.root,
           publicationId: fixture.options.recovery.publicationId,
           gitState: { sealedRef: fixture.options.recovery.gitState.sealedRef },
         },
-        () => Promise.resolve("published"),
-      ),
-    ).resolves.toBe("published");
+        async () => {
+          resolve();
+          await held;
+        },
+      ).then(() => undefined);
+    });
+    await entered;
 
+    await expect(
+      withDockerPublicationRecoveryLock(
+        artifact.recoveryPath,
+        {
+          projectRoot: fixture.root,
+          publicationId: fixture.options.recovery.publicationId,
+          gitState: { sealedRef: fixture.options.recovery.gitState.sealedRef },
+        },
+        () => Promise.resolve(),
+      ),
+    ).rejects.toThrow(/another publisher owns/);
+    release();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(recoveryLockRefs.size).toBe(0);
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  });
+
+  test("never removes a different lock token installed after exact release", async () => {
+    const fixture = durablePublication("TASK-101");
+    const replacement = "f".repeat(40);
+    recoveryLockReplacementOnRelease = replacement;
+    await expect(
+      withDockerPublicationRecoveryLock(
+        initialJournalFixture(fixture).recoveryPath,
+        {
+          projectRoot: fixture.root,
+          publicationId: fixture.options.recovery.publicationId,
+          gitState: { sealedRef: fixture.options.recovery.gitState.sealedRef },
+        },
+        () => Promise.resolve("done"),
+      ),
+    ).resolves.toBe("done");
     expect([...recoveryLockRefs.values()]).toEqual([replacement]);
     fs.rmSync(fixture.root, { recursive: true, force: true });
   });
 
-  test("accepts an ambiguous release error only after exact readback proves absence", async () => {
+  test("reclaims a lock whose PID belongs to a different process incarnation", async () => {
     const fixture = durablePublication("TASK-101");
-    const recoveryPath = initialJournalFixture(fixture).recoveryPath;
-    recoveryLockDeleteThenFail = 1;
-
-    await expect(
-      withDockerPublicationRecoveryLock(
-        recoveryPath,
-        {
-          projectRoot: fixture.root,
-          publicationId: fixture.options.recovery.publicationId,
-          gitState: { sealedRef: fixture.options.recovery.gitState.sealedRef },
-        },
-        () => Promise.resolve("published"),
-      ),
-    ).resolves.toBe("published");
-
-    expect(recoveryLockRefs.size).toBe(0);
-    fs.rmSync(fixture.root, { recursive: true, force: true });
-  });
-
-  test("accepts an ambiguous lock acquisition only after exact token readback", async () => {
-    const fixture = durablePublication("TASK-101");
-    const recoveryPath = initialJournalFixture(fixture).recoveryPath;
-    recoveryLockInstallThenFail = 1;
-    const operation = jest.fn(() => Promise.resolve("published"));
-
-    await expect(
-      withDockerPublicationRecoveryLock(
-        recoveryPath,
-        {
-          projectRoot: fixture.root,
-          publicationId: fixture.options.recovery.publicationId,
-          gitState: { sealedRef: fixture.options.recovery.gitState.sealedRef },
-        },
-        operation,
-      ),
-    ).resolves.toBe("published");
-
-    expect(operation).toHaveBeenCalledTimes(1);
-    expect(recoveryLockRefs.size).toBe(0);
-    fs.rmSync(fixture.root, { recursive: true, force: true });
-  });
-
-  test("reclaims an exact lock after its successful acquisition confirmation fails", async () => {
-    const fixture = durablePublication("TASK-101");
-    const recoveryPath = initialJournalFixture(fixture).recoveryPath;
-    const identity = {
-      projectRoot: fixture.root,
-      publicationId: fixture.options.recovery.publicationId,
-      gitState: { sealedRef: fixture.options.recovery.gitState.sealedRef },
-    };
-    recoveryLockConfirmationReadFailures = 1;
-
-    await expect(
-      withDockerPublicationRecoveryLock(recoveryPath, identity, () => Promise.resolve("first")),
-    ).rejects.toThrow(/could not confirm durable recovery lock acquisition/);
-    expect(recoveryLockRefs.size).toBe(1);
-
-    await expect(
-      withDockerPublicationRecoveryLock(recoveryPath, identity, () => Promise.resolve("retry")),
-    ).resolves.toBe("retry");
-    expect(recoveryLockRefs.size).toBe(0);
-    fs.rmSync(fixture.root, { recursive: true, force: true });
-  });
-
-  test("blocks an untracked live incarnation but reclaims the same PID after reuse", async () => {
-    const fixture = durablePublication("TASK-101");
-    const recoveryPath = initialJournalFixture(fixture).recoveryPath;
-    const identity = {
-      projectRoot: fixture.root,
-      publicationId: fixture.options.recovery.publicationId,
-      gitState: { sealedRef: fixture.options.recovery.gitState.sealedRef },
-    };
-    const lockRef = identity.gitState.sealedRef.replace(
+    const staleObject = "e".repeat(40);
+    const lockRef = fixture.options.recovery.gitState.sealedRef.replace(
       "refs/quack/docker-publication/",
       "refs/quack/docker-publication-lock/",
     );
-    recoveryLockReleaseFailures = 1;
-    await expect(
-      withDockerPublicationRecoveryLock(recoveryPath, identity, () => Promise.resolve("first")),
-    ).rejects.toThrow(/release was not confirmed/);
-    const retainedObject = recoveryLockRefs.get(lockRef)!;
-    const retainedOwner = JSON.parse(recoveryLockObjects.get(retainedObject)!) as Record<
-      string,
-      unknown
-    >;
-
-    const unknownLiveObject = "e".repeat(40);
     recoveryLockObjects.set(
-      unknownLiveObject,
-      JSON.stringify({ ...retainedOwner, nonce: randomUUID() }),
-    );
-    recoveryLockRefs.set(lockRef, unknownLiveObject);
-    await expect(
-      withDockerPublicationRecoveryLock(recoveryPath, identity, () => Promise.resolve("unsafe")),
-    ).rejects.toThrow(/another publisher owns/);
-
-    const reusedPidObject = "d".repeat(40);
-    recoveryLockObjects.set(
-      reusedPidObject,
+      staleObject,
       JSON.stringify({
-        ...retainedOwner,
-        processIncarnation: `stale:${String(retainedOwner.processIncarnation)}`,
+        version: 1,
+        publicationId: fixture.options.recovery.publicationId,
+        pid: process.pid,
+        processStartedAt: "2020-01-01T00:00:00.000Z",
+        processIncarnation: "win32:stale-incarnation",
+        acquiredAt: "2020-01-01T00:00:00.000Z",
         nonce: randomUUID(),
       }),
     );
-    recoveryLockRefs.set(lockRef, reusedPidObject);
+    recoveryLockRefs.set(lockRef, staleObject);
+
     await expect(
-      withDockerPublicationRecoveryLock(recoveryPath, identity, () => Promise.resolve("reclaimed")),
+      withDockerPublicationRecoveryLock(
+        initialJournalFixture(fixture).recoveryPath,
+        {
+          projectRoot: fixture.root,
+          publicationId: fixture.options.recovery.publicationId,
+          gitState: { sealedRef: fixture.options.recovery.gitState.sealedRef },
+        },
+        () => Promise.resolve("reclaimed"),
+      ),
     ).resolves.toBe("reclaimed");
     expect(recoveryLockRefs.size).toBe(0);
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  });
+
+  test("retains a merged branch when its Docker worktree is preserved", async () => {
+    const fixture = durablePublication("TASK-KEEP");
+    fixture.options.recovery.preserveWorktree = true;
+    const result = await publishDockerPromotedResult(
+      "TASK-KEEP",
+      fixture.root,
+      "quack/TASK-KEEP",
+      fixture.options,
+    );
+    expect(result.warnings).toContain("retained-with-worktree");
+    expect(deleteAfterMerge).not.toHaveBeenCalled();
+    expect(readDockerPublicationRecovery(result.recoveryPath!).progress.cleanupOutcome).toBe(
+      "retained-with-worktree",
+    );
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  });
+
+  test("rejects shell-significant branch characters before resolving publication credentials", async () => {
+    const fixture = durablePublication("TASK-UNSAFE", "quack/TASK-UNSAFE;touch-pwned");
+    buildBranchName.mockReturnValueOnce("quack/TASK-UNSAFE;touch-pwned");
+    await expect(
+      publishDockerPromotedResult(
+        "TASK-UNSAFE",
+        fixture.root,
+        "quack/TASK-UNSAFE;touch-pwned",
+        fixture.options,
+      ),
+    ).rejects.toThrow(/refused branch/);
+    expect(resolveOriginRepository).not.toHaveBeenCalled();
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  });
+
+  test("retains the journal when the remote branch advances before PR creation", async () => {
+    const fixture = durablePublication("TASK-ADVANCED");
+    remoteHeadOverrides = [undefined, "b".repeat(40), "d".repeat(40)];
+
+    await expect(
+      publishDockerPromotedResult(
+        "TASK-ADVANCED",
+        fixture.root,
+        "quack/TASK-ADVANCED",
+        fixture.options,
+      ),
+    ).rejects.toEqual(
+      expect.objectContaining({
+        name: "DockerPublicationIncompleteError",
+        step: "pull-request",
+      }),
+    );
+    expect(createPullRequest).not.toHaveBeenCalled();
+    const journalPath = fs
+      .readdirSync(fixture.recoveryRoot)
+      .map((name) => path.join(fixture.recoveryRoot, name))
+      .find((candidatePath) => candidatePath.endsWith(".json"));
+    expect(journalPath).toBeDefined();
+    expect(readDockerPublicationRecovery(journalPath!).repository).toEqual(ORIGIN_BINDING);
     fs.rmSync(fixture.root, { recursive: true, force: true });
   });
 
@@ -739,6 +683,14 @@ describe("Docker host publication", () => {
     expect(mergeBranchToTarget).not.toHaveBeenCalled();
     expect(deleteAfterMerge).not.toHaveBeenCalled();
     expect(result).toEqual(expect.objectContaining({ warnings: [] }));
+    expect(readDockerPublicationRecovery(result.recoveryPath!).repository).toEqual(ORIGIN_BINDING);
+
+    const pushCount = execFileCalls.filter((call) => call.args[0] === "push").length;
+    resolveBoundOriginRepository.mockRejectedValueOnce(new Error("Git origin changed"));
+    await expect(resumeDockerPromotedResult(fixture.root, result.recoveryPath!)).rejects.toEqual(
+      expect.objectContaining({ name: "DockerPublicationIncompleteError", step: "validation" }),
+    );
+    expect(execFileCalls.filter((call) => call.args[0] === "push")).toHaveLength(pushCount);
     fs.rmSync(fixture.root, { recursive: true, force: true });
   });
 
@@ -817,71 +769,34 @@ describe("Docker host publication", () => {
     });
 
     expect(createPullRequest).toHaveBeenCalledWith(
-      expect.objectContaining({
-        headBranch: "quack/TASK-018",
-        baseBranch: "main",
-        headCommitSha: fixture.options.recovery.gitState.candidateHead,
-      }),
+      expect.objectContaining({ headBranch: "quack/TASK-018", baseBranch: "main" }),
       expect.any(Object),
-      expect.objectContaining({ selector: "github.com/org/repo" }),
     );
     expect(mergeBranchToTarget).toHaveBeenCalledWith(
       "TASK-018-C",
       expect.any(Object),
-      "https://example.test/pull/1",
+      "https://github.com/org/repo/pull/1",
       "main",
       undefined,
       "quack/TASK-018",
-      fixture.options.recovery.gitState.candidateHead,
-      undefined,
-      expect.objectContaining({ pushUrlHash: ORIGIN_BINDING.pushUrlHash }),
-    );
-    expect(deleteAfterMerge).toHaveBeenCalledWith(
-      "quack/TASK-018",
-      expect.any(Object),
-      expect.objectContaining({
+      {
+        repository: trustedRepository,
+        headBranch: "quack/TASK-018",
         baseBranch: "main",
-        expectedHeadCommit: fixture.options.recovery.gitState.candidateHead,
-      }),
+        headOid: "b".repeat(40),
+      },
+      "b".repeat(40),
+      trustedRepository,
+      undefined,
+      expect.objectContaining({ pushUrl: ORIGIN_PUSH_URL }),
     );
-    fs.rmSync(fixture.root, { recursive: true, force: true });
-  });
-
-  test("checks cleanup against the journal's non-default merge target", async () => {
-    const fixture = durablePublication("TASK-101");
-
-    await publishDockerPromotedResult("TASK-101", fixture.root, "quack/TASK-101", {
-      ...fixture.options,
-      mergeTargetBranch: "release",
+    expect(deleteAfterMerge).toHaveBeenCalledWith("quack/TASK-018", expect.any(Object), {
+      baseBranch: "main",
+      expectedRepository: trustedRepository,
+      expectedSourceOid: "b".repeat(40),
+      expectedMergedCommit: "c".repeat(40),
+      expectedOriginPushUrl: ORIGIN_PUSH_URL,
     });
-
-    expect(deleteAfterMerge).toHaveBeenCalledWith(
-      "quack/TASK-101",
-      expect.any(Object),
-      expect.objectContaining({
-        baseBranch: "release",
-        expectedHeadCommit: fixture.options.recovery.gitState.candidateHead,
-      }),
-    );
-    fs.rmSync(fixture.root, { recursive: true, force: true });
-  });
-
-  test("retains the source ref when its Docker worktree is intentionally preserved", async () => {
-    const fixture = durablePublication("TASK-101");
-    fixture.options.recovery.preserveWorktree = true;
-
-    const result = await publishDockerPromotedResult(
-      "TASK-101",
-      fixture.root,
-      "quack/TASK-101",
-      fixture.options,
-    );
-
-    expect(deleteAfterMerge).not.toHaveBeenCalled();
-    expect(result.warnings).toContain("retained-with-worktree");
-    expect(readDockerPublicationRecovery(result.recoveryPath!).progress.cleanupOutcome).toBe(
-      "retained-with-worktree",
-    );
     fs.rmSync(fixture.root, { recursive: true, force: true });
   });
 
@@ -896,6 +811,100 @@ describe("Docker host publication", () => {
     ).rejects.toThrow(/expected quack\/TASK-018/);
     expect(execFileCalls).toHaveLength(0);
     expect(createPullRequest).not.toHaveBeenCalled();
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  });
+
+  test("passes the sealed candidate commit to a deliberate no-PR auto-merge", async () => {
+    const fixture = durablePublication("TASK-NO-PR");
+    loadAdapter.mockResolvedValue({
+      ...adapter({ autoCreatePr: false, autoMerge: true }),
+      projectRoot: fixture.root,
+    });
+
+    await publishDockerPromotedResult(
+      "TASK-NO-PR",
+      fixture.root,
+      "quack/TASK-NO-PR",
+      fixture.options,
+    );
+
+    expect(createPullRequest).not.toHaveBeenCalled();
+    expect(mergeBranchToTarget).toHaveBeenCalledWith(
+      "TASK-NO-PR",
+      expect.any(Object),
+      undefined,
+      "main",
+      undefined,
+      "quack/TASK-NO-PR",
+      undefined,
+      "b".repeat(40),
+      trustedRepository,
+      expect.any(Object),
+      expect.objectContaining({ pushUrl: ORIGIN_PUSH_URL }),
+    );
+    const mergeCalls = mergeBranchToTarget.mock.calls as unknown as unknown[][];
+    const recovery = mergeCalls[0]?.[9] as {
+      preparedRef?: string;
+      onPrepared?: unknown;
+    };
+    expect(recovery.preparedRef).toMatch(/^refs\/quack\/docker-publication-prepared\//u);
+    expect(typeof recovery.onPrepared).toBe("function");
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  });
+
+  test("durably resumes an exact prepared no-PR merge after losing the merge response", async () => {
+    const fixture = durablePublication("TASK-PREPARED");
+    loadAdapter.mockResolvedValue({
+      ...adapter({ autoCreatePr: false, autoMerge: true }),
+      projectRoot: fixture.root,
+    });
+    const prepared = {
+      strategy: "squash" as const,
+      candidateHead: "b".repeat(40),
+      targetHead: "d".repeat(40),
+      resultHead: "c".repeat(40),
+      preparedRef: fixture.options.recovery.gitState.sealedRef.replace(
+        "refs/quack/docker-publication/",
+        "refs/quack/docker-publication-prepared/",
+      ),
+    };
+    mergeBranchToTarget.mockImplementationOnce((...args: unknown[]) => {
+      const recovery = args[9] as {
+        onPrepared?: (value: typeof prepared) => void;
+      };
+      recoveryPreparedRefs.set(prepared.preparedRef, prepared.resultHead);
+      recovery.onPrepared?.(prepared);
+      return Promise.reject(new Error("lost merge response"));
+    });
+
+    let recoveryPath: string | undefined;
+    try {
+      await publishDockerPromotedResult(
+        "TASK-PREPARED",
+        fixture.root,
+        "quack/TASK-PREPARED",
+        fixture.options,
+      );
+    } catch (error: unknown) {
+      recoveryPath =
+        typeof error === "object" && error !== null && "recoveryPath" in error
+          ? String((error as { recoveryPath?: unknown }).recoveryPath)
+          : undefined;
+    }
+    expect(recoveryPath).toBeDefined();
+    expect(readDockerPublicationRecovery(recoveryPath!).progress.preparedMerge).toEqual(
+      expect.objectContaining(prepared),
+    );
+
+    mergeBranchToTarget.mockImplementationOnce((...args: unknown[]) => {
+      const recovery = args[9] as { prepared?: typeof prepared };
+      expect(recovery.prepared).toEqual(prepared);
+      return Promise.resolve({ success: true, mergeCommitSha: prepared.resultHead });
+    });
+    await expect(resumeDockerPromotedResult(fixture.root, recoveryPath!)).resolves.toEqual(
+      expect.objectContaining({ mergeCommitSha: prepared.resultHead }),
+    );
+    expect(recoveryPreparedRefs.has(prepared.preparedRef)).toBe(false);
     fs.rmSync(fixture.root, { recursive: true, force: true });
   });
 
@@ -935,226 +944,6 @@ describe("Docker host publication", () => {
       ),
     ).toHaveLength(1);
     fs.rmSync(fixture.root, { recursive: true, force: true });
-  });
-
-  test("restart fails closed when origin changes after the journal is bound", async () => {
-    const fixture = durablePublication("TASK-101");
-    pushFailure = new Error("push unavailable");
-    let recoveryPath: string | undefined;
-
-    try {
-      await publishDockerPromotedResult(
-        "TASK-101",
-        fixture.root,
-        "quack/TASK-101",
-        fixture.options,
-      );
-    } catch (error: unknown) {
-      expect(error).toEqual(expect.objectContaining({ step: "push" }));
-      recoveryPath =
-        typeof error === "object" && error !== null && "recoveryPath" in error
-          ? String((error as { recoveryPath?: unknown }).recoveryPath)
-          : undefined;
-    }
-
-    expect(recoveryPath).toBeDefined();
-    const persisted = fs.readFileSync(recoveryPath!, "utf-8");
-    expect(persisted).not.toContain(ORIGIN_PUSH_URL);
-    const pushCount = execFileCalls.filter((call) => call.args[0] === "push").length;
-    pushFailure = undefined;
-    currentOriginPushUrl = "https://github.com/attacker/redirect.git";
-
-    let resumeError: unknown;
-    try {
-      await resumeDockerPromotedResult(fixture.root, recoveryPath!);
-    } catch (error: unknown) {
-      resumeError = error;
-    }
-    expect(resumeError).toBeInstanceOf(Error);
-    if (!(resumeError instanceof Error)) throw new Error("Expected Docker recovery to fail");
-    expect(resumeError.name).toBe("DockerPublicationIncompleteError");
-    expect((resumeError as { step?: unknown }).step).toBe("validation");
-    expect(resumeError.message).toContain("Git origin changed");
-    expect(execFileCalls.filter((call) => call.args[0] === "push")).toHaveLength(pushCount);
-    fs.rmSync(fixture.root, { recursive: true, force: true });
-  });
-
-  test("persists a no-PR prepared target result before the effect and resumes that exact result", async () => {
-    const fixture = durablePublication("TASK-101");
-    loadAdapter.mockResolvedValue({
-      ...adapter({
-        autoPush: true,
-        autoCreatePr: false,
-        autoMerge: true,
-        autoMergeStrategy: "squash",
-      }),
-      projectRoot: fixture.root,
-    });
-    const prepared = {
-      strategy: "squash" as const,
-      candidateHead: fixture.options.recovery.gitState.candidateHead,
-      targetHead: "c".repeat(40),
-      resultHead: "d".repeat(40),
-      preparedRef: fixture.options.recovery.gitState.sealedRef.replace(
-        "refs/quack/docker-publication/",
-        "refs/quack/docker-publication-prepared/",
-      ),
-    };
-    mergeBranchToTarget.mockImplementationOnce((...args: unknown[]) => {
-      const recovery = args[7] as {
-        onPrepared?: (value: typeof prepared) => void;
-      };
-      recoveryPreparedRefs.set(prepared.preparedRef, prepared.resultHead);
-      recovery.onPrepared?.(prepared);
-      // Model the process dying after the remote accepted the exact prepared
-      // result but before executePublication could record mergedAt.
-      if (recoveryGit) recoveryGit.remote = prepared.resultHead;
-      throw new Error("simulated crash after target push");
-    });
-
-    let recoveryPath: string | undefined;
-    try {
-      await publishDockerPromotedResult(
-        "TASK-101",
-        fixture.root,
-        "quack/TASK-101",
-        fixture.options,
-      );
-    } catch (error: unknown) {
-      expect(error).toEqual(
-        expect.objectContaining({ name: "DockerPublicationIncompleteError", step: "merge" }),
-      );
-      recoveryPath =
-        typeof error === "object" && error !== null && "recoveryPath" in error
-          ? String((error as { recoveryPath?: unknown }).recoveryPath)
-          : undefined;
-    }
-
-    expect(recoveryPath).toBeDefined();
-    const interrupted = readDockerPublicationRecovery(recoveryPath!);
-    expect(interrupted.progress.preparedMerge).toMatchObject(prepared);
-    expect(typeof interrupted.progress.preparedMerge?.preparedAt).toBe("string");
-    expect(interrupted.progress.mergedAt).toBeUndefined();
-
-    mergeBranchToTarget.mockImplementationOnce((...args: unknown[]) => {
-      const recovery = args[7] as { prepared?: typeof prepared };
-      expect(recovery.prepared).toEqual(prepared);
-      return Promise.resolve({ success: true, mergeCommitSha: prepared.resultHead });
-    });
-    await expect(resumeDockerPromotedResult(fixture.root, recoveryPath!)).resolves.toEqual(
-      expect.objectContaining({
-        autoMerged: true,
-        mergeCommitSha: prepared.resultHead,
-        recoveryPath,
-      }),
-    );
-    expect(deleteAfterMerge).toHaveBeenCalledWith(
-      "quack/TASK-101",
-      expect.any(Object),
-      expect.objectContaining({
-        baseBranch: "main",
-        expectedHeadCommit: prepared.candidateHead,
-        expectedMergedCommit: prepared.resultHead,
-      }),
-    );
-    expect(recoveryPreparedRefs.has(prepared.preparedRef)).toBe(false);
-    fs.rmSync(fixture.root, { recursive: true, force: true });
-  });
-
-  test("retains an installed preparedMerge and its ref across repeated durability failures", async () => {
-    const fixture = durablePublication("TASK-101");
-    const recoveryPath = initialJournalFixture(fixture).recoveryPath;
-    loadAdapter.mockResolvedValue({
-      ...adapter({
-        autoPush: true,
-        autoCreatePr: false,
-        autoMerge: true,
-        autoMergeStrategy: "squash",
-      }),
-      projectRoot: fixture.root,
-    });
-    const prepared = {
-      strategy: "squash" as const,
-      candidateHead: fixture.options.recovery.gitState.candidateHead,
-      targetHead: "c".repeat(40),
-      resultHead: "d".repeat(40),
-      preparedRef: fixture.options.recovery.gitState.sealedRef.replace(
-        "refs/quack/docker-publication/",
-        "refs/quack/docker-publication-prepared/",
-      ),
-    };
-    const actualFs = jest.requireActual<typeof import("node:fs")>("node:fs");
-    const realFsync = actualFs.fsyncSync;
-    let posixBarrierFailures = 0;
-    let observedFailures = 0;
-    let installedBeforePreparation: ReturnType<typeof actualFs.statSync> | undefined;
-    const sync =
-      process.platform === "win32"
-        ? undefined
-        : jest.spyOn(actualFs, "fsyncSync").mockImplementation((fd) => {
-            if (
-              posixBarrierFailures > 0 &&
-              installedBeforePreparation !== undefined &&
-              actualFs.existsSync(recoveryPath)
-            ) {
-              const opened = actualFs.fstatSync(fd);
-              const installed = actualFs.statSync(recoveryPath);
-              if (
-                opened.isFile() &&
-                opened.dev === installed.dev &&
-                opened.ino === installed.ino &&
-                (opened.dev !== installedBeforePreparation.dev ||
-                  opened.ino !== installedBeforePreparation.ino)
-              ) {
-                posixBarrierFailures -= 1;
-                observedFailures += 1;
-                throw Object.assign(new Error("simulated post-rename durability failure"), {
-                  code: "EIO",
-                });
-              }
-            }
-            return realFsync(fd);
-          });
-    mergeBranchToTarget.mockImplementationOnce((...args: unknown[]) => {
-      const recovery = args[7] as { onPrepared?: (value: typeof prepared) => void };
-      recoveryPreparedRefs.set(prepared.preparedRef, prepared.resultHead);
-      if (process.platform === "win32") durableMoveAfterRenameFailures = 2;
-      else {
-        installedBeforePreparation = actualFs.statSync(recoveryPath);
-        posixBarrierFailures = 2;
-      }
-      recovery.onPrepared?.(prepared);
-      return Promise.resolve({ success: true, mergeCommitSha: prepared.resultHead });
-    });
-
-    try {
-      await expect(
-        publishDockerPromotedResult("TASK-101", fixture.root, "quack/TASK-101", fixture.options),
-      ).rejects.toEqual(
-        expect.objectContaining({ name: "DockerPublicationIncompleteError", step: "merge" }),
-      );
-      if (process.platform === "win32") expect(durableMoveAfterRenameFailures).toBe(0);
-      else expect(observedFailures).toBe(2);
-      const interrupted = readDockerPublicationRecovery(recoveryPath);
-      expect(interrupted.progress.preparedMerge).toMatchObject(prepared);
-      expect(recoveryPreparedRefs.get(prepared.preparedRef)).toBe(prepared.resultHead);
-
-      mergeBranchToTarget.mockImplementationOnce((...args: unknown[]) => {
-        const recovery = args[7] as { prepared?: typeof prepared };
-        expect(recovery.prepared).toEqual(prepared);
-        return Promise.resolve({ success: true, mergeCommitSha: prepared.resultHead });
-      });
-      await expect(resumeDockerPromotedResult(fixture.root, recoveryPath)).resolves.toEqual(
-        expect.objectContaining({ autoMerged: true, mergeCommitSha: prepared.resultHead }),
-      );
-      const completed = readDockerPublicationRecovery(recoveryPath);
-      expect(completed.progress.preparedMerge).toMatchObject(prepared);
-      expect(completed.state).toBe("complete");
-      expect(recoveryPreparedRefs.has(prepared.preparedRef)).toBe(false);
-    } finally {
-      sync?.mockRestore();
-      fs.rmSync(fixture.root, { recursive: true, force: true });
-    }
   });
 
   test("refuses host publication without a durable retry ownership binding", async () => {
@@ -1216,17 +1005,12 @@ describe("Docker host publication", () => {
     expect(recoveryGit.current).toBe(candidate);
     expect(recoveryGit.remote).toBe(candidate);
 
-    createPullRequest.mockResolvedValue({ success: true, prUrl: "https://example.test/pull/1" });
+    createPullRequest.mockImplementation(successfulPullRequestCreation);
     mergeBranchToTarget.mockRejectedValueOnce(new Error("merge unavailable"));
     await expect(resumeDockerPromotedResult(root, recoveryPath!)).rejects.toEqual(
       expect.objectContaining({ name: "DockerPublicationIncompleteError", step: "merge" }),
     );
-    expect(
-      execFileCalls.filter(
-        (call) =>
-          call.args[0] === "push" && call.args.includes(`${candidate}:refs/heads/quack/TASK-101`),
-      ),
-    ).toHaveLength(1);
+    expect(execFileCalls.filter((call) => call.args[0] === "push")).toHaveLength(1);
 
     mergeBranchToTarget.mockResolvedValue({ success: true, mergeCommitSha: "c".repeat(40) });
     updateTaskFileStatus.mockRejectedValueOnce(new Error("status unavailable"));
@@ -1244,16 +1028,12 @@ describe("Docker host publication", () => {
     await expect(resumeDockerPromotedResult(root, recoveryPath!)).rejects.toEqual(
       expect.objectContaining({ name: "DockerPublicationIncompleteError", step: "cleanup" }),
     );
-    const partialCleanup = readDockerPublicationRecovery(recoveryPath!).progress;
-    expect(typeof partialCleanup.cleanupLocalAt).toBe("string");
-    expect(partialCleanup.cleanupAt).toBeUndefined();
     expect(mergeBranchToTarget).toHaveBeenCalledTimes(2);
-    recoveryGit.current = "";
 
     deleteAfterMerge.mockResolvedValue({ deleted: true, remoteDeleted: true });
     await expect(resumeDockerPromotedResult(root, recoveryPath!)).resolves.toEqual(
       expect.objectContaining({
-        prUrl: "https://example.test/pull/1",
+        prUrl: "https://github.com/org/repo/pull/1",
         autoMerged: true,
         mergeCommitSha: "c".repeat(40),
         recoveryPath,
@@ -1262,72 +1042,134 @@ describe("Docker host publication", () => {
     expect(readDockerPublicationRecovery(recoveryPath!).state).toBe("complete");
     expect(
       execFileCalls.filter(
-        (call) =>
-          call.args[0] === "push" && call.args.includes(`${candidate}:refs/heads/quack/TASK-101`),
+        (call) => call.args[0] === "push" && !call.args.some((arg) => arg.startsWith(":")),
       ),
     ).toHaveLength(1);
     expect(deleteAfterMerge).toHaveBeenCalledTimes(2);
-    expect(deleteAfterMerge).toHaveBeenLastCalledWith(
-      "quack/TASK-101",
-      expect.any(Object),
-      expect.objectContaining({
-        baseBranch: "main",
-        expectedHeadCommit: candidate,
-        expectedMergedCommit: "c".repeat(40),
-      }),
-    );
+    expect(readDockerPublicationRecovery(recoveryPath!).repository).toEqual(ORIGIN_BINDING);
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  test("keeps the journal and remote source when a partial-cleanup retry no longer proves the target", async () => {
-    const fixture = durablePublication("TASK-101");
-    deleteAfterMerge.mockResolvedValueOnce({
-      deleted: true,
-      localDeleted: true,
-      remoteDeleted: false,
+  test("recovers a durably recorded pending PR candidate before creating another", async () => {
+    const fixture = durablePublication("TASK-PENDING-PR");
+    const prUrl = "https://github.com/org/repo/pull/77";
+    const recoveryPath = path.join(
+      fixture.recoveryRoot,
+      `TASK-PENDING-PR-${fixture.options.recovery.publicationId}.json`,
+    );
+    createPullRequest.mockImplementationOnce(
+      async (input: {
+        ownershipMarker: string;
+        onCandidate: (candidate: {
+          url: string;
+          ownershipMarker: string;
+          state: "pending";
+        }) => void | Promise<void>;
+      }) => {
+        await input.onCandidate({
+          url: prUrl,
+          ownershipMarker: input.ownershipMarker,
+          state: "pending",
+        });
+        throw new Error("host stopped after candidate persistence");
+      },
+    );
+
+    await expect(
+      publishDockerPromotedResult(
+        "TASK-PENDING-PR",
+        fixture.root,
+        "quack/TASK-PENDING-PR",
+        fixture.options,
+      ),
+    ).rejects.toMatchObject({
+      name: "DockerPublicationIncompleteError",
+      step: "pull-request",
     });
+    expect(readDockerPublicationRecovery(recoveryPath).progress.pullRequestCandidate).toEqual(
+      expect.objectContaining({ url: prUrl, state: "pending" }),
+    );
+
+    recoverPullRequestCandidate.mockRejectedValueOnce(
+      new Error("Pull request does not contain the unique Quack ownership marker"),
+    );
+    await expect(resumeDockerPromotedResult(fixture.root, recoveryPath)).rejects.toMatchObject({
+      name: "DockerPublicationIncompleteError",
+      step: "pull-request",
+    });
+    expect(createPullRequest).toHaveBeenCalledTimes(1);
+    expect(readDockerPublicationRecovery(recoveryPath).progress.pullRequestCandidate).toEqual(
+      expect.objectContaining({ url: prUrl, state: "pending" }),
+    );
+
+    recoverPullRequestCandidate.mockResolvedValueOnce({
+      url: prUrl,
+      ownershipMarker: `<!-- quack-publication:${fixture.options.recovery.publicationId} -->`,
+      state: "accepted",
+    });
+    await expect(resumeDockerPromotedResult(fixture.root, recoveryPath)).resolves.toEqual(
+      expect.objectContaining({ prUrl, autoMerged: true }),
+    );
+    expect(createPullRequest).toHaveBeenCalledTimes(1);
+    expect(recoverPullRequestCandidate).toHaveBeenCalledTimes(2);
+    const completed = readDockerPublicationRecovery(recoveryPath);
+    expect(completed.progress.prUrl).toBe(prUrl);
+    expect(completed.progress.pullRequestCandidate?.state).toBe("accepted");
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  });
+
+  test("rejects a journal that records pullRequestAt without a PR URL", () => {
+    const fixture = durablePublication("TASK-BAD-PR-TUPLE");
+    const artifact = initialJournalFixture(fixture, "TASK-BAD-PR-TUPLE");
+    fs.mkdirSync(fixture.recoveryRoot, { recursive: true });
+    fs.writeFileSync(artifact.recoveryPath, artifact.bytes);
+    const journal = readDockerPublicationRecovery(artifact.recoveryPath);
+    journal.progress = {
+      promotedAt: "2020-01-01T00:00:01.000Z",
+      pushedAt: "2020-01-01T00:00:02.000Z",
+      pullRequestAt: "2020-01-01T00:00:03.000Z",
+    };
+    fs.writeFileSync(artifact.recoveryPath, `${JSON.stringify(journal, null, 2)}\n`, "utf-8");
+
+    expect(() => readDockerPublicationRecovery(artifact.recoveryPath)).toThrow(
+      /inconsistent progress or ownership/,
+    );
+    expect(mergeBranchToTarget).not.toHaveBeenCalled();
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  });
+
+  test("refuses a changed origin binding after the journal has pushed", async () => {
+    const fixture = durablePublication("TASK-LEGACY-PUSHED");
+    createPullRequest.mockRejectedValueOnce(new Error("pause after push"));
 
     let recoveryPath: string | undefined;
     try {
       await publishDockerPromotedResult(
-        "TASK-101",
+        "TASK-LEGACY-PUSHED",
         fixture.root,
-        "quack/TASK-101",
+        "quack/TASK-LEGACY-PUSHED",
         fixture.options,
       );
     } catch (error: unknown) {
-      expect(error).toEqual(
-        expect.objectContaining({ name: "DockerPublicationIncompleteError", step: "cleanup" }),
-      );
       recoveryPath =
         typeof error === "object" && error !== null && "recoveryPath" in error
           ? String((error as { recoveryPath?: unknown }).recoveryPath)
           : undefined;
     }
     expect(recoveryPath).toBeDefined();
-    const retainedGit = recoveryGit;
-    if (!retainedGit) throw new Error("expected recovery Git fixture state");
-    retainedGit.current = "";
-    deleteAfterMerge.mockResolvedValueOnce({ deleted: false, reason: "not-merged" });
+    resolveBoundOriginRepository.mockRejectedValueOnce(new Error("Git origin changed"));
 
     await expect(resumeDockerPromotedResult(fixture.root, recoveryPath!)).rejects.toEqual(
-      expect.objectContaining({ name: "DockerPublicationIncompleteError", step: "cleanup" }),
-    );
-
-    const retained = readDockerPublicationRecovery(recoveryPath!);
-    expect(retained.state).toBe("pending");
-    expect(retained.progress.cleanupAt).toBeUndefined();
-    expect(retainedGit.current).toBe(fixture.options.recovery.gitState.candidateHead);
-    expect(retainedGit.remote).toBe(fixture.options.recovery.gitState.candidateHead);
-    expect(deleteAfterMerge).toHaveBeenLastCalledWith(
-      "quack/TASK-101",
-      expect.any(Object),
       expect.objectContaining({
-        baseBranch: "main",
-        expectedHeadCommit: fixture.options.recovery.gitState.candidateHead,
-        expectedMergedCommit: "c".repeat(40),
+        name: "DockerPublicationIncompleteError",
+        step: "validation",
       }),
     );
+    expect(readDockerPublicationRecovery(recoveryPath!).lastError?.detail).toContain(
+      "Git origin changed",
+    );
+    expect(createPullRequest).toHaveBeenCalledTimes(1);
+    expect(mergeBranchToTarget).not.toHaveBeenCalled();
     fs.rmSync(fixture.root, { recursive: true, force: true });
   });
 });

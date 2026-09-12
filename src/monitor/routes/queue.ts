@@ -64,6 +64,7 @@ function summarizeQueueItem(item: QueueItem): Record<string, unknown> {
     priorityWeight: item.priority,
     enqueuedAt: item.enqueuedAt,
     startedAt: item.startedAt,
+    awaitingApprovalAt: item.awaitingApprovalAt,
     completedAt: item.completedAt,
     blockedBy: item.blockedBy,
     blockedReason: item.blockedReason,
@@ -79,7 +80,13 @@ function summarizeQueueItem(item: QueueItem): Record<string, unknown> {
 }
 
 function hasPendingWork(stats: QueueStats): boolean {
-  return stats.recoveredPendingScan > 0 || stats.queued > 0 || stats.ready > 0 || stats.running > 0;
+  return (
+    stats.recoveredPendingScan > 0 ||
+    stats.queued > 0 ||
+    stats.ready > 0 ||
+    stats.running > 0 ||
+    stats.awaitingApproval > 0
+  );
 }
 
 function deriveQueueState(
@@ -88,6 +95,9 @@ function deriveQueueState(
 ): "idle" | "waiting" | "running" | "paused" | "stopped" | "done" {
   if (queue.isPaused()) {
     return "paused";
+  }
+  if (stats.awaitingApproval > 0 && stats.running === 0) {
+    return "waiting";
   }
   if (queue.isRunning()) {
     return stats.running > 0 ? "running" : "waiting";
@@ -236,7 +246,16 @@ export function registerQueueRoutes(app: Express, deps: QueueRouteDeps): void {
       return;
     }
 
-    p.dispatchQueue.abort();
+    const stopped = p.dispatchQueue.abort();
+    if (!stopped) {
+      res.status(409).json({
+        ok: false,
+        code: "QUEUE_ABORT_STOP_REFUSED",
+        error:
+          "Queue stopped scheduling, but one or more active tasks could not be durably stopped",
+      });
+      return;
+    }
     res.json({ ok: true, message: "Queue aborted" });
   });
 
@@ -251,7 +270,7 @@ export function registerQueueRoutes(app: Express, deps: QueueRouteDeps): void {
     const qConfig = p.dispatchQueue.getConfig();
     const items = p.dispatchQueue.getItems();
     const activeTaskIds = items
-      .filter((item) => item.status === "running")
+      .filter((item) => item.status === "running" || item.status === "awaiting_approval")
       .map((item) => item.taskId);
 
     res.json({
@@ -287,10 +306,17 @@ export function registerQueueRoutes(app: Express, deps: QueueRouteDeps): void {
     }
 
     const taskId = req.params.id as string;
+    const existing = p.dispatchQueue.getItem(taskId);
     const success = p.dispatchQueue.cancel(taskId);
 
     if (success) {
       res.json({ ok: true, message: `Task ${taskId} cancelled` });
+    } else if (existing) {
+      res.status(409).json({
+        ok: false,
+        code: "QUEUE_TASK_STOP_REFUSED",
+        error: `Task ${taskId} could not be durably stopped and remains active`,
+      });
     } else {
       res.status(404).json({ error: `Task ${taskId} not found in queue` });
     }

@@ -3,8 +3,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { generateValidationSpec } from "../../src/intake/validation-spec-generator.js";
+import { parseTaskFile } from "../../src/core/task-parser.js";
 import type { ProjectAdapter } from "../../src/core/adapter-loader.js";
 import type { ValidationIntakePayload } from "../../src/intake/task-intake.js";
+import { taskSpec } from "../helpers/duplicate-claimants-fixture.js";
 
 // ─── Test fixtures ──────────────────────────────────────────────────
 
@@ -33,7 +35,7 @@ function basePayload(overrides: Partial<ValidationIntakePayload> = {}): Validati
       "Auth refactor is NOT touched by this branch",
     ],
     knownRisks: ["Bedrock client cache not invalidated on this path"],
-    submitter: "contributor@example.test",
+    submitter: "contributor@example.invalid",
     submittedAt: "2026-05-31T13:54:00-04:00",
     ...overrides,
   };
@@ -120,6 +122,25 @@ describe("generateValidationSpec", () => {
     await cleanup(projectRoot);
   });
 
+  // TASK-1336-C: the reservation refused this old allocator collision;
+  // declaration-based allocation now progresses without weakening that guard.
+  it("allocates above a differently named declared owner and preserves it", async () => {
+    const taskDir = path.join(projectRoot, "docs", "tasks");
+    await fs.mkdir(taskDir, { recursive: true });
+    const ownerName = "TASK-0001-misleading-stem.md";
+    const owner = taskSpec("TASK-0002", { title: "Declared owner" });
+    await fs.writeFile(path.join(taskDir, ownerName), owner, "utf-8");
+    const result = await generateValidationSpec({
+      projectRoot,
+      adapter: buildAdapter(projectRoot),
+      intakeId: "intake-declared-next-id",
+      payload: basePayload({ tests: [], screenshots: [] }),
+    });
+    expect(result.taskId).toBe("TASK-0003");
+    expect(await fs.readFile(path.join(taskDir, ownerName), "utf-8")).toBe(owner);
+    expect(parseTaskFile(await fs.readFile(result.specPath, "utf-8")).id).toBe("TASK-0003");
+  });
+
   it("places the generated spec under the Quack-shape adapter task dir", async () => {
     const adapter = buildAdapter(projectRoot, { taskDir: "docs/tasks" });
     const intakeId = "intake-test0000000000001";
@@ -172,7 +193,7 @@ describe("generateValidationSpec", () => {
     expect(content).toContain("**Intake Type:** validation");
     expect(content).toContain("**Status:** VERIFYING");
     expect(content).toContain("**Schema Version:** 1");
-    expect(content).toContain("**Submitter:** contributor@example.test");
+    expect(content).toContain("**Submitter:** contributor@example.invalid");
   });
 
   it("renders Already Built with branch, commitRange, and scope verbatim", async () => {
@@ -251,7 +272,7 @@ describe("generateValidationSpec", () => {
     const taskDirAbs = path.join(projectRoot, "docs", "tasks");
     await fs.mkdir(taskDirAbs, { recursive: true });
     // Existing high-water mark: TASK-1108 sits in the dir.
-    await fs.writeFile(path.join(taskDirAbs, "TASK-1108-prior.md"), "# TASK-1108: prior\n");
+    await fs.writeFile(path.join(taskDirAbs, "TASK-1108-prior.md"), taskSpec("TASK-1108"));
 
     const result = await generateValidationSpec({
       projectRoot,
@@ -282,6 +303,7 @@ describe("generateValidationSpec", () => {
       payload,
     });
 
+    expect(parseTaskFile(await fs.readFile(first.specPath, "utf-8")).id).toBe(first.taskId);
     expect(second.taskId).toBe(first.taskId);
     expect(second.specPath).toBe(first.specPath);
 
@@ -472,6 +494,7 @@ describe("generateValidationSpec", () => {
       payload,
     });
 
+    expect(parseTaskFile(await fs.readFile(first.specPath, "utf-8")).id).toBe(first.taskId);
     expect(second.taskId).toBe(first.taskId);
     expect(second.specPath).toBe(first.specPath);
     // Different intakeIds should produce different evidence dirs, however.
@@ -498,5 +521,85 @@ describe("generateValidationSpec", () => {
 
     expect(second.taskId).not.toBe(first.taskId);
     expect(second.specPath).not.toBe(first.specPath);
+  });
+});
+
+// TASK-1336-C: the fingerprint reader is shared by the optimistic lookup and
+// its in-reservation late check. These real-file proofs cover that reader's
+// declared result and malformed-file exclusion in both creation orders.
+describe.each(["forward", "reverse"])("TASK-1336-C validation declarations (%s)", (order) => {
+  let projectRoot: string;
+  beforeEach(async () => {
+    projectRoot = await mkTmpProject();
+  });
+  afterEach(async () => {
+    await cleanup(projectRoot);
+  });
+  async function write(entries: Array<[string, string]>): Promise<string> {
+    const taskDir = path.join(projectRoot, "docs", "tasks");
+    await fs.mkdir(taskDir, { recursive: true });
+    for (const [name, content] of order === "forward" ? entries : [...entries].reverse())
+      await fs.writeFile(path.join(taskDir, name), content);
+    return taskDir;
+  }
+  it("allocates above declared numbers and ignores filename extremes and malformed specs", async () => {
+    await write([
+      ["TASK-0001-low.md", taskSpec("TASK-1402")],
+      ["TASK-9999-high.md", taskSpec("TASK-0001")],
+      ["TASK-99999-malformed.md", "# TASK-88888: incomplete\n"],
+    ]);
+    const result = await generateValidationSpec({
+      projectRoot,
+      adapter: buildAdapter(projectRoot),
+      intakeId: "declared-inventory",
+      payload: basePayload(),
+    });
+    expect(result.taskId).toBe("TASK-1403");
+    expect(parseTaskFile(await fs.readFile(result.specPath, "utf8")).id).toBe(result.taskId);
+  });
+  it("includes child-only declared IDs in numeric high-water allocation", async () => {
+    const child = taskSpec("TASK-1402-A");
+    const taskDir = await write([
+      ["TASK-0001-low.md", child],
+      ["TASK-9999-high.md", taskSpec("TASK-0001-B")],
+    ]);
+    const result = await generateValidationSpec({
+      projectRoot,
+      adapter: buildAdapter(projectRoot),
+      intakeId: "child-only-declared-inventory",
+      payload: basePayload(),
+    });
+    expect(result.taskId).toBe("TASK-1403");
+    expect(parseTaskFile(await fs.readFile(result.specPath, "utf8")).id).toBe("TASK-1403");
+    expect(await fs.readFile(path.join(taskDir, "TASK-0001-low.md"), "utf8")).toBe(child);
+  });
+  it("replays the declared ID under a divergent stem and skips a malformed fingerprint claimant", async () => {
+    const adapter = buildAdapter(projectRoot);
+    const payload = basePayload();
+    const first = await generateValidationSpec({
+      projectRoot,
+      adapter,
+      intakeId: "declaration-original",
+      payload,
+    });
+    const generated = await fs.readFile(first.specPath, "utf8");
+    await fs.unlink(first.specPath);
+    const fingerprint = generated.match(/<!-- validation-fingerprint: [^>]+ -->/)?.[0];
+    expect(fingerprint).toBeDefined();
+    const declared = generated.replace(`# ${first.taskId}:`, "# TASK-1402:");
+    const taskDir = await write([
+      ["TASK-0001-malformed.md", `# TASK-9999: invalid\n${fingerprint}\n`],
+      ["TASK-9000-divergent.md", declared],
+    ]);
+    const result = await generateValidationSpec({
+      projectRoot,
+      adapter,
+      intakeId: "declaration-replay",
+      payload,
+    });
+    expect(result.taskId).toBe("TASK-1402");
+    expect(result.specPath).toBe(path.join(taskDir, "TASK-9000-divergent.md"));
+    expect(await fs.readFile(result.specPath, "utf8")).toBe(declared);
+    expect((await fs.readdir(taskDir)).filter((file) => file.endsWith(".md"))).toHaveLength(2);
   });
 });

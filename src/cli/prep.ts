@@ -46,7 +46,13 @@ export async function prepCommand(taskId: string, options: PrepOptions): Promise
       outcome = "rejected";
     } else {
       // Depth evaluation (slow, LLM-based)
-      const depthResult = await evaluateTaskDepth(task, adapter.conventionsDoc);
+      const depthEvaluator = adapter.config.evaluationProviders?.readinessDepth;
+      const depthResult = await evaluateTaskDepth(task, adapter.conventionsDoc, {
+        model: depthEvaluator?.model,
+        evaluator: depthEvaluator,
+        projectRoot: adapter.projectRoot,
+        apiKeys: adapter.config.agent.apiKeys,
+      });
       depthScore = depthResult.overallScore;
       depthReady = depthResult.ready;
       deficiencies = depthResult.deficiencies;

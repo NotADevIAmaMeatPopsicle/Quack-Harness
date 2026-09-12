@@ -7,7 +7,7 @@ import { loadAdapter } from "../core/adapter-loader.js";
 import { getBuildInfo } from "../core/build-info.js";
 import { registerProject } from "../core/global-config.js";
 import { writeFederationPeerConfig } from "../monitor/federation/peer-config.js";
-import { createMonitorServer } from "../monitor/server.js";
+import { createMonitorServer, type MonitorServerOptions } from "../monitor/server.js";
 import {
   deriveWorkerEnrollmentReadiness,
   repoFreshnessFromManifest,
@@ -75,6 +75,26 @@ async function loadWorkerAdapters(options: {
   return { adapters, port, skippedProjects, fromGlobalConfig };
 }
 
+/** Build the legacy single-project worker envelope without dropping operator trust. */
+export function buildSingleProjectWorkerServerOptions(
+  adapter: ProjectAdapter,
+  port: number,
+  host: string,
+): MonitorServerOptions {
+  return {
+    logDir: path.resolve(adapter.projectRoot, adapter.config.logging.dir),
+    port,
+    adapterPath: path.resolve(adapter.projectRoot, ".quack", "adapter.json"),
+    projectRoot: adapter.projectRoot,
+    taskDir: adapter.config.project.taskDir,
+    ...(adapter.trustedLocalReadRemotePaths
+      ? { trustedLocalReadRemotePaths: adapter.trustedLocalReadRemotePaths }
+      : {}),
+    runtimeRole: "worker",
+    host,
+  };
+}
+
 export async function workerRuntimeCommand(options: {
   port?: string;
   host?: string;
@@ -110,16 +130,9 @@ export async function workerRuntimeCommand(options: {
     let server;
     if (adapters.length === 1 && !fromGlobalConfig) {
       const adapter = adapters[0];
-      const logDir = path.resolve(adapter.projectRoot, adapter.config.logging.dir);
-      server = createMonitorServer({
-        logDir,
-        port,
-        adapterPath: path.resolve(adapter.projectRoot, ".quack", "adapter.json"),
-        projectRoot: adapter.projectRoot,
-        taskDir: adapter.config.project.taskDir,
-        runtimeRole: "worker",
-        host: options.host ?? "127.0.0.1",
-      });
+      server = createMonitorServer(
+        buildSingleProjectWorkerServerOptions(adapter, port, options.host ?? "127.0.0.1"),
+      );
     } else {
       server = createMonitorServer({
         port,

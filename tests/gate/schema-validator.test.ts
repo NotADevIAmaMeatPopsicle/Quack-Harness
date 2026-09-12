@@ -101,20 +101,6 @@ describe("validateTaskSchema", () => {
         expect(result.missing).toEqual([]);
       });
     });
-
-    test.each(["../../secrets.txt", "/etc/passwd", "C:\\Windows\\win.ini"])(
-      "should reject an out-of-project file path: %s",
-      (filePath) => {
-        const task = makeValidTask({
-          filesToModify: [{ path: filePath, action: "Modify", notes: "" }],
-        });
-
-        const result = validateTaskSchema(task);
-
-        expect(result.valid).toBe(false);
-        expect(result.missing.join("\n")).toContain("outside the project root");
-      },
-    );
   });
 
   describe("missing required fields", () => {

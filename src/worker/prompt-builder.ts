@@ -172,7 +172,7 @@ Your actual working directory for this run is:
 
 The Agent SDK \`cwd\` is set to that path. Use relative paths from the current working directory, or this exact absolute path, for all Read/Glob/Grep/Edit/Write/Bash work.
 
-Project documentation may mention other host paths, migration paths, admin verification paths, or historical canonical paths such as \`/srv/...\`, \`C:\\Users\\...\\example-service\`, Headnode, Worker-B, or Tailscale URLs. Treat those as operational notes for humans/admin agents unless they exactly match the working directory above. Do not read, write, search, or cd into those paths for implementation work.`;
+Project documentation may mention other host paths, migration paths, admin verification paths, or historical canonical paths such as \`/root/...\`, \`C:\\Users\\...\\example-service\`, Headnode, Worker-B, or Tailscale URLs. Treat those as operational notes for humans/admin agents unless they exactly match the working directory above. Do not read, write, search, or cd into those paths for implementation work.`;
 }
 
 // ─── System Prompt Assembly ──────────────────────────────────────────

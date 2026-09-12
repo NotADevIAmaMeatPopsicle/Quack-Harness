@@ -61,7 +61,7 @@ function verificationEntryFromRow(row: VerifiedRow): NormalizedVerificationEntry
     criteriaPassed: row.criteria_passed,
     notes: row.notes ?? undefined,
     verifiedAt: row.verified_at,
-    updatedAt: row.updated_at ?? row.verified_at,
+    updatedAt: row.updated_at ?? `${row.verified_at}T00:00:00.000Z`,
     reviewId: extractStructuredNoteValue(row.notes, "reviewId"),
     workflowId: extractStructuredNoteValue(row.notes, "workflowId"),
   };

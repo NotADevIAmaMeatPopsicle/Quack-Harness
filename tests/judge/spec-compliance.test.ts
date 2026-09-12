@@ -718,7 +718,7 @@ describe("blueprintToChecks", () => {
     expect(checks[1].pattern).toBe("migrations/001_init.sql");
   });
 
-  test("should convert grep_count to grep", () => {
+  test("should preserve grep_count thresholds", () => {
     const patterns: VerificationPattern[] = [
       {
         criterion: "Has at least 3 test cases",
@@ -732,8 +732,9 @@ describe("blueprintToChecks", () => {
     const checks = blueprintToChecks(patterns);
 
     expect(checks).toHaveLength(1);
-    expect(checks[0].type).toBe("grep");
+    expect(checks[0].type).toBe("grep_count");
     expect(checks[0].pattern).toBe("test\\(");
+    expect(checks[0].expectedMatches).toBe(3);
   });
 
   test("should convert file_not_exists check type", () => {
@@ -764,6 +765,69 @@ describe("blueprintToChecks", () => {
 // ─── Integration Tests ─────────────────────────────────────────────
 
 describe("spec-compliance: integration", () => {
+  test("should enforce exact-zero grep_count checks against full changed files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "quack-grep-count-"));
+    try {
+      await fs.mkdir(join(root, "src"), { recursive: true });
+      await fs.writeFile(join(root, "src", "safe.ts"), "export const safe = true;\n");
+      await fs.writeFile(join(root, "src", "unsafe.ts"), "export const value = Math.random();\n");
+      const task = makeTask(["Gameplay modules no longer call Math.random() directly."]);
+      const checks: DeterministicCheck[] = [
+        {
+          name: "no-random",
+          criterionMatch: "no longer call Math.random",
+          type: "grep_count",
+          pattern: "Math\\.random",
+          glob: "src/*.ts",
+          expectedMatches: 0,
+          severity: "flag",
+        },
+      ];
+
+      const passing = await runSpecComplianceChecks(task, "", ["src/safe.ts"], checks, root);
+      expect(passing.find((result) => result.patternMatched === "no-random")?.found).toBe(true);
+
+      const failing = await runSpecComplianceChecks(task, "", ["src/unsafe.ts"], checks, root);
+      expect(failing.find((result) => result.patternMatched === "no-random")?.found).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("should enforce positive grep_count minimums against full changed files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "quack-grep-count-min-"));
+    try {
+      await fs.mkdir(join(root, "tests"), { recursive: true });
+      await fs.writeFile(
+        join(root, "tests", "example.test.ts"),
+        "test('one', () => {});\ntest('two', () => {});\n",
+      );
+      const task = makeTask(["Has at least 2 tests"]);
+      const checks: DeterministicCheck[] = [
+        {
+          name: "two-tests",
+          criterionMatch: "at least 2 tests",
+          type: "grep_count",
+          pattern: "test\\(",
+          glob: "tests/**/*.test.ts",
+          expectedMatches: 2,
+          severity: "flag",
+        },
+      ];
+
+      const results = await runSpecComplianceChecks(
+        task,
+        "",
+        ["tests/example.test.ts"],
+        checks,
+        root,
+      );
+      expect(results.find((result) => result.patternMatched === "two-tests")?.found).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("should combine built-in and adapter checks", async () => {
     const task = makeTask(["Enforces max 5 items", "Uses AppError for all errors"]);
     const diff = `
@@ -849,7 +913,7 @@ describe("blueprintToChecks", () => {
     expect(checks[0]?.severity).toBe("flag");
   });
 
-  test("should convert grep_count to grep type", () => {
+  test("should preserve grep_count type and expected count", () => {
     const patterns: VerificationPattern[] = [
       {
         criterion: "At least 3 test cases",
@@ -863,8 +927,9 @@ describe("blueprintToChecks", () => {
     const checks = blueprintToChecks(patterns);
 
     expect(checks).toHaveLength(1);
-    expect(checks[0]?.type).toBe("grep"); // grep_count maps to grep
+    expect(checks[0]?.type).toBe("grep_count");
     expect(checks[0]?.pattern).toBe('test\\("');
+    expect(checks[0]?.expectedMatches).toBe(3);
   });
 
   test("should convert file_exists pattern correctly", () => {

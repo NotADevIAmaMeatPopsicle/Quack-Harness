@@ -76,6 +76,11 @@ jest.mock("node:child_process", () => {
   };
 });
 
+jest.mock("../../src/testing/docker-test-runner.js", () => ({
+  isDockerAvailable: jest.fn(() => false),
+  run: jest.fn(),
+}));
+
 // ─── Import AFTER mocking ────────────────────────────────────────────
 
 // Must import after jest.mock so the mock is in place when the module loads
@@ -293,6 +298,10 @@ describe("runVerification", () => {
 
       expect(result.allPassed).toBe(false);
       expect(result.commands[0].passed).toBe(false);
+      expect(result.commands[0]).toMatchObject({
+        required: true,
+        status: "failed",
+      });
       expect(result.commands[0].output).toContain("failed");
       expect(result.commands[1].passed).toBe(true);
       expect(result.commands[2].passed).toBe(true);
@@ -317,10 +326,62 @@ describe("runVerification", () => {
       expect(result.commands[1]).toMatchObject({
         name: "typecheck",
         passed: false,
+        required: false,
+        status: "optional-unavailable",
       });
     });
 
-    test("can skip optional commands during worker verification", async () => {
+    test("blocks an unavailable required Docker check but not an optional one", async () => {
+      const docker = {
+        composeFile: "docker-compose.test.yml",
+        service: "test-runner",
+        warmUp: false,
+        dependsOn: [],
+      };
+      const adapter = makeAdapter({
+        verification: {
+          commands: [
+            {
+              name: "required-browser-smoke",
+              command: "npm run test:browser",
+              required: true,
+              timeout: 300,
+              environment: "docker",
+              docker,
+            },
+            {
+              name: "optional-browser-smoke",
+              command: "npm run test:browser",
+              required: false,
+              timeout: 300,
+              environment: "docker",
+              docker,
+            },
+          ],
+          conventionChecks: [],
+        },
+      });
+
+      const result = await runVerification(adapter, "all");
+
+      expect(result.allPassed).toBe(false);
+      expect(result.commands).toEqual([
+        expect.objectContaining({
+          name: "required-browser-smoke",
+          passed: false,
+          required: true,
+          status: "failed",
+        }),
+        expect.objectContaining({
+          name: "optional-browser-smoke",
+          passed: false,
+          required: false,
+          status: "optional-unavailable",
+        }),
+      ]);
+    });
+
+    test("reports optional commands as explicitly skipped when their execution is disabled", async () => {
       setupMockCommands({
         "npm test": { stdout: "Tests:  42 passed, 42 total" },
         "layer-violations": { stdout: "" },
@@ -330,7 +391,25 @@ describe("runVerification", () => {
       const result = await runVerification(adapter, "all", { includeOptional: false });
 
       expect(result.allPassed).toBe(true);
-      expect(result.commands.map((command) => command.name)).toEqual(["tests"]);
+      expect(result.commands.map((command) => command.name)).toEqual([
+        "tests",
+        "typecheck",
+        "lint",
+      ]);
+      expect(result.commands.slice(1)).toEqual([
+        expect.objectContaining({
+          name: "typecheck",
+          passed: false,
+          required: false,
+          status: "skipped",
+        }),
+        expect.objectContaining({
+          name: "lint",
+          passed: false,
+          required: false,
+          status: "skipped",
+        }),
+      ]);
       expect(result.conventionChecks).toHaveLength(1);
     });
   });
@@ -635,6 +714,40 @@ describe("formatVerificationResult", () => {
     expect(formatted).toContain("VERIFICATION FAILED");
     expect(formatted).toContain("[FAIL] tests");
     expect(formatted).toContain("[PASS] lint");
+  });
+
+  test("distinguishes non-blocking optional results from required failures", () => {
+    const formatted = formatVerificationResult({
+      allPassed: false,
+      commands: [
+        {
+          name: "browser-smoke",
+          passed: false,
+          required: false,
+          status: "optional-unavailable",
+          output: "Browser dependency is not integrated",
+        },
+        {
+          name: "optional-sweep",
+          passed: false,
+          required: false,
+          status: "skipped",
+          output: "Optional verifier execution was disabled",
+        },
+        {
+          name: "tests",
+          passed: false,
+          required: true,
+          status: "failed",
+          output: "3 tests failed",
+        },
+      ],
+      conventionChecks: [],
+    });
+
+    expect(formatted).toContain("[OPTIONAL UNAVAILABLE] browser-smoke");
+    expect(formatted).toContain("[SKIPPED] optional-sweep");
+    expect(formatted).toContain("[FAIL] tests");
   });
 });
 

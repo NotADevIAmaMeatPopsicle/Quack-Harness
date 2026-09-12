@@ -1,3 +1,4 @@
+import { buildClaudeChildEnvironment } from "../sdk/claude-auth.js";
 import type { ScanResult } from "./project-scanner.js";
 import type { CommandValidation, TestingStrategy, AdapterReviewResult } from "./intake-types.js";
 import path from "node:path";
@@ -55,11 +56,14 @@ export async function analyzeIntake(
   scan: ScanResult,
   validationResults: CommandValidation[],
 ): Promise<IntakeAnalysisResult> {
-  // Run all three analyses in parallel for efficiency
+  // Bootstrap has no target adapter. Decide host auth before any parallel work,
+  // without borrowing the unrelated active project's ambient credential pool.
+  const environment = Object.freeze(buildClaudeChildEnvironment());
+  // Run all three analyses against the same immutable auth snapshot.
   const [testingStrategy, conventionsAnalysis, adapterReview] = await Promise.all([
-    analyzeTestingStrategy(scan, validationResults),
-    analyzeConventions(scan),
-    reviewAdapter(scan, validationResults),
+    analyzeTestingStrategy(scan, validationResults, environment),
+    analyzeConventions(scan, environment),
+    reviewAdapter(scan, validationResults, environment),
   ]);
 
   return {
@@ -74,6 +78,7 @@ export async function analyzeIntake(
 async function analyzeTestingStrategy(
   scan: ScanResult,
   validationResults: CommandValidation[],
+  environment: NodeJS.ProcessEnv,
 ): Promise<TestingStrategy> {
   const query = await getQueryFn();
 
@@ -83,6 +88,7 @@ async function analyzeTestingStrategy(
   for await (const msg of query({
     prompt,
     options: {
+      env: environment,
       model: "claude-sonnet-4-6",
       maxTokens: 2000,
     },
@@ -178,7 +184,10 @@ function parseTestingStrategyResponse(responseText: string): TestingStrategy {
 
 // ─── Conventions Analyzer ──────────────────────────────────────────
 
-async function analyzeConventions(scan: ScanResult): Promise<string> {
+async function analyzeConventions(
+  scan: ScanResult,
+  environment: NodeJS.ProcessEnv,
+): Promise<string> {
   const query = await getQueryFn();
 
   const prompt = await buildConventionsPrompt(scan);
@@ -187,6 +196,7 @@ async function analyzeConventions(scan: ScanResult): Promise<string> {
   for await (const msg of query({
     prompt,
     options: {
+      env: environment,
       model: "claude-sonnet-4-6",
       maxTokens: 4000,
     },
@@ -270,6 +280,7 @@ Keep it concise and actionable. Focus on what the agent MUST follow, not general
 async function reviewAdapter(
   scan: ScanResult,
   validationResults: CommandValidation[],
+  environment: NodeJS.ProcessEnv,
 ): Promise<AdapterReviewResult> {
   const query = await getQueryFn();
 
@@ -279,6 +290,7 @@ async function reviewAdapter(
   for await (const msg of query({
     prompt,
     options: {
+      env: environment,
       model: "claude-sonnet-4-6",
       maxTokens: 1500,
     },

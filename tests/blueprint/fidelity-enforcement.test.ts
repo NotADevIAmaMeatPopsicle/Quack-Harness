@@ -90,11 +90,13 @@ describe("TASK-1324 S5: fidelity seam tripwire", () => {
     const stamps = source.match(/stampBriefFidelity\(/g) ?? [];
     expect(stamps.length).toBeGreaterThanOrEqual(2);
     expect(source).toMatch(/stampBriefFidelity\(\s*await Promise\.race/);
+    expect(source).toMatch(/await Promise\.race[\s\S]*?task\.mandatedChecks/);
   });
 
   it("the dispatcher timeout stub stamps its own fidelity", () => {
     const source = read("src/dispatcher/dispatcher.ts");
-    expect(source).toMatch(/stampBriefFidelity\(createMinimalBlueprint\(taskId\)/);
+    expect(source).toMatch(/stampBriefFidelity\(\s*createMinimalBlueprint\(taskId\)/);
+    expect(source).toMatch(/createMinimalBlueprint\(taskId\)[\s\S]*?task\.mandatedChecks/);
   });
 
   it("the legacy-cache placeholder stays un-audited but reattaches a persisted verdict", () => {

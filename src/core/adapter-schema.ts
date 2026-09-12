@@ -1,8 +1,20 @@
+import { isIP } from "node:net";
 import { z } from "zod";
 import { ReviewerRunnerConfigSchema } from "../review/reviewer-config.js";
 import { JudgmentConfigSchema } from "../judgment/runner/intent-judgment-config.js";
 
 // ─── Sub-schemas ────────────────────────────────────────────────────
+
+function isCanonicalSha512Sri(value: string): boolean {
+  if (!/^sha512-[A-Za-z0-9+/]+={0,2}$/.test(value)) return false;
+  const encoded = value.slice("sha512-".length);
+  try {
+    const digest = Buffer.from(encoded, "base64");
+    return digest.length === 64 && digest.toString("base64") === encoded;
+  } catch {
+    return false;
+  }
+}
 
 export const TestPatternConfigSchema = z.object({
   testDir: z.string(),
@@ -20,16 +32,55 @@ export const AdapterProjectConfigSchema = z.object({
   testPatterns: TestPatternConfigSchema.optional(),
 });
 
+export const CodexImplementationWorkerConfigSchema = z
+  .object({
+    binaryPath: z.string().min(1).default("codex"),
+    /** Hard floor: implementation may write only inside the selected worktree. */
+    sandbox: z.literal("workspace-write").default("workspace-write"),
+    /** CODEX_HOME override for an unattended/headless authenticated profile. */
+    codexHome: z.string().min(1).optional(),
+    /** Optional named Codex CLI profile. */
+    profile: z.string().min(1).optional(),
+    /** Optional provider id, passed as a fixed model_provider override. */
+    provider: z
+      .string()
+      .regex(/^[A-Za-z0-9._-]+$/)
+      .optional(),
+    /** Provider API-key environment variable copied into the scrubbed Codex env. */
+    credentialEnvVar: z
+      .string()
+      .regex(/^[A-Z_][A-Z0-9_]*$/)
+      .refine((name) => !name.startsWith("QUACK_"), {
+        message: "credentialEnvVar cannot use the QUACK_* namespace",
+      })
+      .optional(),
+    /** Wall-clock ceiling; expiry kills the complete Codex process tree. */
+    timeoutMs: z.number().int().positive().default(1_800_000),
+  })
+  .strict();
+
 export const AdapterAgentConfigSchema = z.object({
+  /** Implementation backend. Existing adapters remain on the Claude SDK. */
+  runner: z.enum(["claude-sdk", "codex-cli"]).default("claude-sdk"),
   model: z.string().default("claude-opus-4-6"),
   judgeModel: z.string().default("claude-sonnet-4-6"),
   enrichModel: z.string().default("claude-sonnet-4-6"),
   maxTurns: z.number().int().positive().default(50),
   maxBudgetPerTask: z.number().positive().default(5.0),
   maxRetries: z.number().int().min(0).default(1),
+  codex: CodexImplementationWorkerConfigSchema.optional(),
   apiKeys: z
     .object({
-      pool: z.array(z.string()).min(1),
+      pool: z
+        .array(
+          z
+            .string()
+            .regex(
+              /^env:ANTHROPIC_API_KEY(?:_\d+)?$/,
+              "Use named Anthropic key references such as env:ANTHROPIC_API_KEY_2",
+            ),
+        )
+        .min(1),
       strategy: z.enum(["round-robin", "least-used", "least-cost"]).default("round-robin"),
       cooldownMs: z.number().int().positive().default(60000),
     })
@@ -50,15 +101,86 @@ export const VerificationCommandDockerConfigSchema = z.object({
   dependsOn: z.array(z.string()).default([]),
 });
 
-export const VerificationCommandSchema = z.object({
+const VERIFICATION_RESERVED_ENV_NAMES = new Set([
+  "APPDATA",
+  "BASHOPTS",
+  "BASH_ENV",
+  "CODEX_HOME",
+  "COMSPEC",
+  "ENV",
+  "HOME",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "LOCALAPPDATA",
+  "NODE_OPTIONS",
+  "NODE_PATH",
+  "PATH",
+  "PATHEXT",
+  "PYTHONHOME",
+  "PYTHONPATH",
+  "PYTHONSTARTUP",
+  "RUBYLIB",
+  "RUBYOPT",
+  "SHELLOPTS",
+  "SYSTEMROOT",
+  "TEMP",
+  "TMP",
+  "TMPDIR",
+  "USERPROFILE",
+  "WINDIR",
+  "ZDOTDIR",
+]);
+const VERIFICATION_RESERVED_ENV_PREFIXES = ["DYLD_", "GIT_", "LD_", "NPM_CONFIG_", "QUACK_"];
+
+const VerificationCommandEnvironmentSchema = z
+  .record(z.string(), z.string())
+  .superRefine((environment, context) => {
+    for (const name of Object.keys(environment)) {
+      const normalized = name.toUpperCase();
+      if (!/^[A-Z_][A-Z0-9_]*$/u.test(normalized)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [name],
+          message: "Environment variable names must use letters, digits, and underscores",
+        });
+      } else if (
+        VERIFICATION_RESERVED_ENV_NAMES.has(normalized) ||
+        VERIFICATION_RESERVED_ENV_PREFIXES.some((prefix) => normalized.startsWith(prefix))
+      ) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [name],
+          message: "Reserved process, runtime, package-manager, or isolation variable",
+        });
+      }
+    }
+  });
+
+const VerificationCommandBaseSchema = z.object({
   name: z.string().min(1),
-  command: z.string().min(1),
   required: z.boolean(),
   timeout: z.number().int().positive(),
   phase: z.enum(["fast", "thorough", "all"]).default("all"),
   environment: z.enum(["host", "docker"]).default("host"),
   docker: VerificationCommandDockerConfigSchema.optional(),
 });
+
+export const VerificationCommandSchema = z.union([
+  VerificationCommandBaseSchema.extend({
+    command: z.string().min(1),
+    cmd: z.never().optional(),
+    args: z.never().optional(),
+    cwd: z.string().optional(),
+    env: VerificationCommandEnvironmentSchema.optional(),
+  }),
+  VerificationCommandBaseSchema.extend({
+    command: z.never().optional(),
+    cmd: z.string().min(1),
+    args: z.array(z.string()),
+    cwd: z.string().optional(),
+    env: VerificationCommandEnvironmentSchema.optional(),
+  }),
+]);
 
 export const ConventionCheckSchema = z.object({
   name: z.string().min(1),
@@ -108,16 +230,149 @@ export const RetentionConfigSchema = z
   })
   .optional();
 
-export const AdapterVerificationConfigSchema = z.object({
-  commands: z
-    .array(VerificationCommandSchema)
-    .min(1, "At least one verification command is required"),
-  conventionChecks: z.array(ConventionCheckSchema).default([]),
-  postJudge: PostJudgeConfigSchema,
-  smartTesting: SmartTestingConfigSchema,
-  tieredTesting: TieredTestingConfigSchema,
-  retention: RetentionConfigSchema,
-});
+export const DockerVerificationSandboxConfigSchema = z
+  .object({
+    image: z
+      .string()
+      .regex(
+        /^(?:docker\.io\/library\/)?node(?::[A-Za-z0-9._-]+)?@sha256:[a-fA-F0-9]{64}$/,
+        "dockerSandbox.image must be an immutable official Node image digest",
+      ),
+    pidsLimit: z.number().int().min(16).max(4096).default(256),
+    memoryMb: z.number().int().min(128).max(32768).default(2048),
+    cpus: z.number().positive().max(16).default(2),
+    tmpfsSizeMb: z.number().int().min(16).max(4096).default(256),
+    dependencyRoots: z
+      .array(
+        z
+          .string()
+          .refine(
+            (value) =>
+              value === "." ||
+              (/^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/.test(value) &&
+                !value.split("/").some((segment) => segment === "." || segment === "..")),
+            "dependency roots must be normalized relative paths",
+          ),
+      )
+      .min(1)
+      .max(32)
+      .refine((values) => new Set(values).size === values.length, "dependency roots must be unique")
+      .default(["."]),
+    allowedRegistryOrigins: z
+      .array(
+        z
+          .string()
+          .url()
+          .refine((value) => {
+            try {
+              const url = new URL(value);
+              return (
+                url.protocol === "https:" &&
+                !url.username &&
+                !url.password &&
+                !url.port &&
+                url.pathname === "/" &&
+                !url.search &&
+                !url.hash &&
+                isIP(url.hostname) === 0
+              );
+            } catch {
+              return false;
+            }
+          }, "registries must be credential-free HTTPS hostname origins"),
+      )
+      .min(1)
+      .max(16)
+      .refine((values) => new Set(values).size === values.length, "registry origins must be unique")
+      .default(["https://registry.npmjs.org"]),
+    offlineNativeRebuilds: z
+      .array(
+        z
+          .object({
+            dependencyRoot: z
+              .string()
+              .refine(
+                (value) =>
+                  value === "." ||
+                  (/^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/.test(value) &&
+                    !value.split("/").some((segment) => segment === "." || segment === "..")),
+                "native rebuild dependency roots must be normalized relative paths",
+              ),
+            packageName: z
+              .string()
+              .regex(
+                /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/,
+                "native rebuild package names must be normalized npm names",
+              ),
+            version: z
+              .string()
+              .regex(
+                /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/,
+                "native rebuild versions must be exact semantic versions",
+              ),
+            integrity: z
+              .string()
+              .refine(
+                isCanonicalSha512Sri,
+                "native rebuild integrity must be a canonical 64-byte sha512 SRI",
+              ),
+            installScript: z
+              .string()
+              .min(1)
+              .max(512)
+              .refine(
+                (value) => !/[\0\r\n]/.test(value),
+                "native rebuild install scripts cannot contain control lines",
+              ),
+          })
+          .strict(),
+      )
+      .max(16)
+      .refine(
+        (values) =>
+          new Set(values.map((entry) => `${entry.dependencyRoot}\0${entry.packageName}`)).size ===
+          values.length,
+        "native rebuild packages must be unique within each dependency root",
+      )
+      .default([]),
+    setupTimeoutMs: z.number().int().positive().max(3_600_000).default(600_000),
+    maxContextBytes: z
+      .number()
+      .int()
+      .positive()
+      .max(2 * 1024 * 1024 * 1024)
+      .default(512 * 1024 * 1024),
+    maxOutputBytes: z
+      .number()
+      .int()
+      .min(1024)
+      .max(10 * 1024 * 1024)
+      .default(1024 * 1024),
+  })
+  .strict();
+
+export const AdapterVerificationConfigSchema = z
+  .object({
+    hostExecution: z.enum(["direct", "codex-sandbox", "docker-sandbox"]).default("direct"),
+    dockerSandbox: DockerVerificationSandboxConfigSchema.optional(),
+    commands: z
+      .array(VerificationCommandSchema)
+      .min(1, "At least one verification command is required"),
+    conventionChecks: z.array(ConventionCheckSchema).default([]),
+    postJudge: PostJudgeConfigSchema,
+    smartTesting: SmartTestingConfigSchema,
+    tieredTesting: TieredTestingConfigSchema,
+    retention: RetentionConfigSchema,
+  })
+  .superRefine((config, ctx) => {
+    if (config.hostExecution === "docker-sandbox" && !config.dockerSandbox) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["dockerSandbox"],
+        message: "dockerSandbox is required when hostExecution is docker-sandbox",
+      });
+    }
+  });
 
 export const AdapterSandboxConfigSchema = z.object({
   writablePaths: z.array(z.string()).default(["src/", "tests/"]),
@@ -138,6 +393,7 @@ export const AdapterSandboxConfigSchema = z.object({
       ".quack/convention-checks/",
       ".quack/templates/",
     ]),
+  disposablePaths: z.array(z.string()).optional(),
   allowedBashPatterns: z.array(z.string()).default([]),
   deniedBashPatterns: z.array(z.string()).default([]),
 });
@@ -454,6 +710,23 @@ export const LoopConfigSchema = z
   })
   .strict();
 
+/**
+ * Opt-in providers for structured, read-only pipeline evaluation stages.
+ * Each field is independent; absence preserves the existing Claude SDK path.
+ */
+export const EvaluationProvidersConfigSchema = z
+  .object({
+    readinessDepth: ReviewerRunnerConfigSchema.optional(),
+    specReview: ReviewerRunnerConfigSchema.optional(),
+    blueprint: ReviewerRunnerConfigSchema.optional(),
+    taskDecomposition: ReviewerRunnerConfigSchema.optional(),
+    childSpecMaterialization: ReviewerRunnerConfigSchema.optional(),
+    judge: ReviewerRunnerConfigSchema.optional(),
+    semanticPostJudge: ReviewerRunnerConfigSchema.optional(),
+    lifecycleVerify: ReviewerRunnerConfigSchema.optional(),
+  })
+  .strict();
+
 // ─── Enrichment auto-commit schema (TASK-922) ───────────────────────
 
 /**
@@ -546,13 +819,66 @@ const IntegrationsConfigSchema = z.object({
 
 // ─── Worktree Init schema ────────────────────────────────────────────
 
+const WORKTREE_INIT_RESERVED_ENV_NAMES = new Set([
+  "APPDATA",
+  "BASH_ENV",
+  "COMSPEC",
+  "ENV",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "HOME",
+  "LD_LIBRARY_PATH",
+  "LD_PRELOAD",
+  "LOCALAPPDATA",
+  "PATH",
+  "PATHEXT",
+  "PYTHONHOME",
+  "PYTHONPATH",
+  "PYTHONSTARTUP",
+  "RUBYLIB",
+  "RUBYOPT",
+  "SHELLOPTS",
+  "SYSTEMROOT",
+  "TEMP",
+  "TMP",
+  "TMPDIR",
+  "USERPROFILE",
+  "WINDIR",
+  "ZDOTDIR",
+]);
+const WORKTREE_INIT_RESERVED_ENV_PREFIXES = ["DYLD_", "GIT_CONFIG_", "NODE_", "NPM_"];
+
+const WorktreeInitEnvironmentSchema = z
+  .record(z.string(), z.string())
+  .superRefine((environment, context) => {
+    for (const name of Object.keys(environment)) {
+      const normalized = name.toUpperCase();
+      if (!/^[A-Z_][A-Z0-9_]*$/u.test(normalized)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [name],
+          message: "Environment variable names must use letters, digits, and underscores",
+        });
+      } else if (
+        WORKTREE_INIT_RESERVED_ENV_NAMES.has(normalized) ||
+        WORKTREE_INIT_RESERVED_ENV_PREFIXES.some((prefix) => normalized.startsWith(prefix))
+      ) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [name],
+          message: "Reserved process, runtime, package-manager, or isolation variable",
+        });
+      }
+    }
+  });
+
 export const WorktreeInitStepSchema = z.object({
   /** Shell command to run, e.g. "npm ci" or "pip install -r requirements.txt" */
   command: z.string().min(1),
   /** Working directory relative to the worktree root. Defaults to worktree root. */
   cwd: z.string().optional(),
-  /** Additional environment variables to set for this step */
-  env: z.record(z.string(), z.string()).optional(),
+  /** Non-reserved variables merged into Quack's stripped initialization environment. */
+  env: WorktreeInitEnvironmentSchema.optional(),
   /** Human-readable label for logging/event emission */
   label: z.string().optional(),
 });
@@ -561,10 +887,25 @@ export const DispatchConfigSchema = z.object({
   /**
    * Optional explicit list of init steps to run after worktree creation.
    * Each entry is either a plain shell command string or a structured step object.
-   * When omitted, auto-discovery is used (finds package.json files, runs npm ci).
+   * When omitted, safe npm auto-discovery is used. An explicit [] disables init.
    */
   worktreeInit: z.array(z.union([z.string(), WorktreeInitStepSchema])).optional(),
 });
+
+// ─── Runtime Check schema ──────────────────────────────────────────
+
+export const RuntimeCheckConfigSchema = z
+  .object({
+    /** Required acknowledgement: the configured server executes with host authority. */
+    execution: z.literal("direct-trusted"),
+    startCommand: z.string().min(1),
+    healthUrl: z.string().url(),
+    routes: z.array(z.string()),
+    baseUrl: z.string().url(),
+    startupTimeoutMs: z.number().int().positive().optional(),
+    routeTimeoutMs: z.number().int().positive().optional(),
+  })
+  .strict();
 
 // ─── Recording (TASK-1201) ──────────────────────────────────────────
 
@@ -627,9 +968,11 @@ export const AdapterConfigSchema = z.preprocess(
     dispatch: DispatchConfigSchema.optional(),
     enrichment: EnrichmentConfigSchema.optional(),
     validationIntake: ValidationIntakeConfigSchema.optional(),
+    runtimeCheck: RuntimeCheckConfigSchema.optional(),
     workerOverlay: AdapterWorkerOverlayConfigSchema,
     executionMode: z.enum(["dispatch", "loop"]).default("dispatch"),
     loop: LoopConfigSchema.optional(),
+    evaluationProviders: EvaluationProvidersConfigSchema.optional(),
     judgment: JudgmentConfigSchema.optional(),
   }),
 );

@@ -14,6 +14,8 @@ export interface ApiKeyState {
 }
 
 export interface KeyManagerConfig {
+  /** Explicit environment references; omitted retains the legacy numbered pool. */
+  pool?: string[];
   strategy: "round-robin" | "least-used" | "least-cost";
   cooldownMs: number;
 }
@@ -38,6 +40,31 @@ export class KeyManager {
    * Looks for ANTHROPIC_API_KEY, ANTHROPIC_API_KEY_2, ANTHROPIC_API_KEY_3, etc.
    */
   private loadKeysFromEnv(): void {
+    if (this.config.pool !== undefined) {
+      if (
+        !Array.isArray(this.config.pool) ||
+        this.config.pool.length === 0 ||
+        this.config.pool.some((entry) => !/^env:ANTHROPIC_API_KEY(?:_\d+)?$/.test(entry))
+      ) {
+        throw new Error(
+          "agent.apiKeys.pool must contain named environment references such as env:ANTHROPIC_API_KEY",
+        );
+      }
+      const names = [...new Set(this.config.pool.map((entry) => entry.slice(4)))];
+      names.forEach((envVar, index) => {
+        if (!process.env[envVar]?.trim()) return;
+        const id = `key-${index + 1}`;
+        this.keys.set(id, {
+          id,
+          envVar,
+          isAvailable: true,
+          totalSpendUsd: 0,
+          requestCount: 0,
+          lastUsed: 0,
+        });
+      });
+      return;
+    }
     // Load primary key
     const primaryKey = process.env.ANTHROPIC_API_KEY;
     if (primaryKey) {
@@ -108,6 +135,17 @@ export class KeyManager {
       return undefined;
     }
     return process.env[keyState.envVar];
+  }
+
+  /** Names only, for child credential filtering and private probe cache invalidation. */
+  getEnvironmentNames(): string[] {
+    return this.config.pool
+      ? [...new Set(this.config.pool.map((reference) => reference.slice(4)))]
+      : [...this.keys.values()].map((key) => key.envVar);
+  }
+
+  hasExplicitPool(): boolean {
+    return Array.isArray(this.config.pool) && this.config.pool.length > 0;
   }
 
   /**

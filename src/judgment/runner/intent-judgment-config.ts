@@ -1,6 +1,7 @@
 import { z } from "zod";
+import { CodexRunnerConfigSchema } from "../../review/reviewer-config.js";
 
-export const IntentJudgmentRunnerConfigSchema = z
+export const ClaudeIntentJudgmentRunnerConfigSchema = z
   .object({
     provider: z.literal("claude-sdk").default("claude-sdk"),
     model: z.string().min(1).default("claude-sonnet-4-6"),
@@ -9,7 +10,31 @@ export const IntentJudgmentRunnerConfigSchema = z
   })
   .strict();
 
+export const CodexIntentJudgmentRunnerConfigSchema = z
+  .object({
+    provider: z.literal("codex-cli"),
+    /** Explicit because a Claude model fallback is never valid Codex argv. */
+    model: z.string().min(1),
+    /** Retained for config-shape parity; Codex CLI has no hard turn-count flag. */
+    maxTurns: z.number().int().positive().default(5),
+    timeoutMs: z.number().int().positive().default(120_000),
+    codex: CodexRunnerConfigSchema.default({
+      binaryPath: "codex",
+      sandbox: "read-only",
+    }),
+  })
+  .strict();
+
+export const IntentJudgmentRunnerConfigSchema = z.union([
+  CodexIntentJudgmentRunnerConfigSchema,
+  ClaudeIntentJudgmentRunnerConfigSchema,
+]);
+
 export type IntentJudgmentRunnerConfig = z.infer<typeof IntentJudgmentRunnerConfigSchema>;
+export type ClaudeIntentJudgmentRunnerConfig = z.infer<
+  typeof ClaudeIntentJudgmentRunnerConfigSchema
+>;
+export type CodexIntentJudgmentRunnerConfig = z.infer<typeof CodexIntentJudgmentRunnerConfigSchema>;
 
 // TASK-1315: the per-stage mode shape is shared by every intent cutover
 // stage (docs-review since 1311, readiness since 1315).

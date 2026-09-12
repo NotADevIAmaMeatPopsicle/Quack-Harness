@@ -4,25 +4,26 @@ import * as os from "node:os";
 import * as http from "node:http";
 
 import { createMonitorServer } from "../../src/monitor/server";
+import { teardownProjectContext, type ProjectContext } from "../../src/monitor/project-registry";
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
+let previousQuackHome: string | undefined;
+
+beforeEach(() => {
+  previousQuackHome = process.env.QUACK_HOME;
+});
+
+afterEach(() => {
+  if (previousQuackHome === undefined) {
+    delete process.env.QUACK_HOME;
+  } else {
+    process.env.QUACK_HOME = previousQuackHome;
+  }
+});
+
 function makeTempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "quack-test-project-registration-"));
-}
-
-async function getFreePort(): Promise<number> {
-  const probe = http.createServer();
-  await new Promise<void>((resolve, reject) => {
-    probe.once("error", reject);
-    probe.listen(0, "127.0.0.1", resolve);
-  });
-  const address = probe.address();
-  const port = typeof address === "object" && address ? address.port : 0;
-  await new Promise<void>((resolve, reject) => {
-    probe.close((error) => (error ? reject(error) : resolve()));
-  });
-  return port;
 }
 
 async function httpGet(url: string): Promise<{ status: number; body: string }> {
@@ -174,6 +175,23 @@ function makeAdapters(
   });
 }
 
+function createIsolatedMonitorServer(
+  port: number,
+  projectAdapters: import("../../src/core/adapter-loader").ProjectAdapter[],
+  authRoot: string,
+): ReturnType<typeof createMonitorServer> {
+  // Monitor startup persists auth state, and project registration persists global
+  // config. Keep both inside the per-test project instead of falling back to the
+  // repository's read-only .quack directory or the developer's real home directory.
+  process.env.QUACK_HOME = authRoot;
+  return createMonitorServer({
+    port,
+    host: "127.0.0.1",
+    projectAdapters,
+    quackRoot: authRoot,
+  });
+}
+
 // ─── Tests ───────────────────────────────────────────────────────
 
 describe("POST /api/projects - Dynamic project registration", () => {
@@ -187,7 +205,6 @@ describe("POST /api/projects - Dynamic project registration", () => {
   });
 
   it("POST /api/projects registers a new project at runtime", async () => {
-    const port = await getFreePort();
     const projectRoot1 = makeTempDir();
     const projectRoot2 = makeTempDir();
 
@@ -197,19 +214,21 @@ describe("POST /api/projects - Dynamic project registration", () => {
 
       // Start server with only Project Alpha
       const adapters = makeAdapters([projectRoot1]);
-      const serverObj = createMonitorServer({ port, projectAdapters: adapters });
-      const { stop } = await serverObj.start();
+      const serverObj = createIsolatedMonitorServer(0, adapters, projectRoot1);
+      const { port, stop } = await serverObj.start();
       stopServer = stop;
 
+      expect(fs.existsSync(path.join(projectRoot1, ".quack", "auth.json"))).toBe(true);
+
       // Initially only 1 project
-      const beforeRes = await httpGet(`http://localhost:${port}/api/projects`);
+      const beforeRes = await httpGet(`http://127.0.0.1:${port}/api/projects`);
       expect(beforeRes.status).toBe(200);
       const beforeData = JSON.parse(beforeRes.body) as Array<{ id: string; name: string }>;
       expect(beforeData).toHaveLength(1);
       expect(beforeData[0].name).toBe("Project Alpha");
 
       // Add Project Beta
-      const addRes = await httpPost(`http://localhost:${port}/api/projects`, {
+      const addRes = await httpPost(`http://127.0.0.1:${port}/api/projects`, {
         path: projectRoot2,
       });
       expect(addRes.status).toBe(200);
@@ -217,13 +236,23 @@ describe("POST /api/projects - Dynamic project registration", () => {
       expect(addData.ok).toBe(true);
       expect(addData.projectId).toBe("project-beta");
       expect(addData.name).toBe("Project Beta");
+      expect(fs.existsSync(path.join(projectRoot1, ".quack", "config.json"))).toBe(true);
 
       // Now 2 projects
-      const afterRes = await httpGet(`http://localhost:${port}/api/projects`);
+      const afterRes = await httpGet(`http://127.0.0.1:${port}/api/projects`);
       expect(afterRes.status).toBe(200);
       const afterData = JSON.parse(afterRes.body) as Array<{ id: string; name: string }>;
       expect(afterData).toHaveLength(2);
       expect(afterData.map((d) => d.name).sort()).toEqual(["Project Alpha", "Project Beta"]);
+
+      const betaContext = serverObj.registry!.getProject("project-beta")!;
+      const stopBetaWatcher = betaContext.stopWatcher!;
+      const stopBetaWatcherSpy = jest.fn(() => stopBetaWatcher());
+      betaContext.stopWatcher = stopBetaWatcherSpy;
+
+      await stop();
+      stopServer = null;
+      expect(stopBetaWatcherSpy).toHaveBeenCalledTimes(1);
     } finally {
       // Stop before rmSync: Windows cannot unlink the project quack.db while open.
       if (stopServer) {
@@ -236,18 +265,17 @@ describe("POST /api/projects - Dynamic project registration", () => {
   });
 
   it("POST /api/projects returns 400 for non-existent path", async () => {
-    const port = await getFreePort();
     const projectRoot1 = makeTempDir();
 
     try {
       setupProjectDirectory(projectRoot1, "Project Alpha");
 
       const adapters = makeAdapters([projectRoot1]);
-      const serverObj = createMonitorServer({ port, projectAdapters: adapters });
-      const { stop } = await serverObj.start();
+      const serverObj = createIsolatedMonitorServer(0, adapters, projectRoot1);
+      const { port, stop } = await serverObj.start();
       stopServer = stop;
 
-      const addRes = await httpPost(`http://localhost:${port}/api/projects`, {
+      const addRes = await httpPost(`http://127.0.0.1:${port}/api/projects`, {
         path: "/non/existent/path",
       });
       expect(addRes.status).toBe(400);
@@ -264,7 +292,6 @@ describe("POST /api/projects - Dynamic project registration", () => {
   });
 
   it("POST /api/projects returns 400 for path missing adapter.json", async () => {
-    const port = await getFreePort();
     const projectRoot1 = makeTempDir();
     const projectRoot2 = makeTempDir();
 
@@ -274,11 +301,11 @@ describe("POST /api/projects - Dynamic project registration", () => {
       fs.mkdirSync(projectRoot2, { recursive: true });
 
       const adapters = makeAdapters([projectRoot1]);
-      const serverObj = createMonitorServer({ port, projectAdapters: adapters });
-      const { stop } = await serverObj.start();
+      const serverObj = createIsolatedMonitorServer(0, adapters, projectRoot1);
+      const { port, stop } = await serverObj.start();
       stopServer = stop;
 
-      const addRes = await httpPost(`http://localhost:${port}/api/projects`, {
+      const addRes = await httpPost(`http://127.0.0.1:${port}/api/projects`, {
         path: projectRoot2,
       });
       expect(addRes.status).toBe(400);
@@ -296,19 +323,18 @@ describe("POST /api/projects - Dynamic project registration", () => {
   });
 
   it("POST /api/projects returns 409 for already-registered project", async () => {
-    const port = await getFreePort();
     const projectRoot1 = makeTempDir();
 
     try {
       setupProjectDirectory(projectRoot1, "Project Alpha");
 
       const adapters = makeAdapters([projectRoot1]);
-      const serverObj = createMonitorServer({ port, projectAdapters: adapters });
-      const { stop } = await serverObj.start();
+      const serverObj = createIsolatedMonitorServer(0, adapters, projectRoot1);
+      const { port, stop } = await serverObj.start();
       stopServer = stop;
 
       // Try to add the same project again
-      const addRes = await httpPost(`http://localhost:${port}/api/projects`, {
+      const addRes = await httpPost(`http://127.0.0.1:${port}/api/projects`, {
         path: projectRoot1,
       });
       expect(addRes.status).toBe(409);
@@ -336,7 +362,6 @@ describe("DELETE /api/projects/:id - Dynamic project unregistration", () => {
   });
 
   it("DELETE /api/projects/:id unregisters a project", async () => {
-    const port = await getFreePort();
     const projectRoot1 = makeTempDir();
     const projectRoot2 = makeTempDir();
 
@@ -345,24 +370,24 @@ describe("DELETE /api/projects/:id - Dynamic project unregistration", () => {
       setupProjectDirectory(projectRoot2, "Project Beta");
 
       const adapters = makeAdapters([projectRoot1, projectRoot2]);
-      const serverObj = createMonitorServer({ port, projectAdapters: adapters });
-      const { stop } = await serverObj.start();
+      const serverObj = createIsolatedMonitorServer(0, adapters, projectRoot1);
+      const { port, stop } = await serverObj.start();
       stopServer = stop;
 
       // Initially 2 projects
-      const beforeRes = await httpGet(`http://localhost:${port}/api/projects`);
+      const beforeRes = await httpGet(`http://127.0.0.1:${port}/api/projects`);
       expect(beforeRes.status).toBe(200);
       const beforeData = JSON.parse(beforeRes.body) as Array<{ id: string; name: string }>;
       expect(beforeData).toHaveLength(2);
 
       // Unregister Project Beta
-      const deleteRes = await httpDelete(`http://localhost:${port}/api/projects/project-beta`);
+      const deleteRes = await httpDelete(`http://127.0.0.1:${port}/api/projects/project-beta`);
       expect(deleteRes.status).toBe(200);
       const deleteData = JSON.parse(deleteRes.body) as { ok: boolean; message: string };
       expect(deleteData.ok).toBe(true);
 
       // Now only 1 project
-      const afterRes = await httpGet(`http://localhost:${port}/api/projects`);
+      const afterRes = await httpGet(`http://127.0.0.1:${port}/api/projects`);
       expect(afterRes.status).toBe(200);
       const afterData = JSON.parse(afterRes.body) as Array<{ id: string; name: string }>;
       expect(afterData).toHaveLength(1);
@@ -379,18 +404,17 @@ describe("DELETE /api/projects/:id - Dynamic project unregistration", () => {
   });
 
   it("DELETE /api/projects/:id returns 404 for non-existent project", async () => {
-    const port = await getFreePort();
     const projectRoot1 = makeTempDir();
 
     try {
       setupProjectDirectory(projectRoot1, "Project Alpha");
 
       const adapters = makeAdapters([projectRoot1]);
-      const serverObj = createMonitorServer({ port, projectAdapters: adapters });
-      const { stop } = await serverObj.start();
+      const serverObj = createIsolatedMonitorServer(0, adapters, projectRoot1);
+      const { port, stop } = await serverObj.start();
       stopServer = stop;
 
-      const deleteRes = await httpDelete(`http://localhost:${port}/api/projects/non-existent`);
+      const deleteRes = await httpDelete(`http://127.0.0.1:${port}/api/projects/non-existent`);
       expect(deleteRes.status).toBe(404);
       const data = JSON.parse(deleteRes.body) as { error: string };
       expect(data.error).toContain("not found");
@@ -405,7 +429,6 @@ describe("DELETE /api/projects/:id - Dynamic project unregistration", () => {
   });
 
   it("DELETE /api/projects/:id returns 409 when project has active dispatches", async () => {
-    const port = await getFreePort();
     const projectRoot1 = makeTempDir();
     const projectRoot2 = makeTempDir();
 
@@ -414,25 +437,31 @@ describe("DELETE /api/projects/:id - Dynamic project unregistration", () => {
       setupProjectDirectory(projectRoot2, "Project Beta");
 
       const adapters = makeAdapters([projectRoot1, projectRoot2]);
-      const serverObj = createMonitorServer({ port, projectAdapters: adapters });
-      const { stop } = await serverObj.start();
+      const serverObj = createIsolatedMonitorServer(0, adapters, projectRoot1);
+      const { port, stop } = await serverObj.start();
       stopServer = stop;
 
-      // Simulate an active dispatch on Project Beta by overriding getActiveJobs
+      // Simulate an active dispatch on Project Beta by overriding getAllJobs
       const betaContext = serverObj.registry!.getProject("project-beta")!;
       expect(betaContext.dispatchManager).not.toBeNull();
-      betaContext.dispatchManager!.getActiveJobs = () => [
-        { taskId: "TASK-001", status: "running" } as never,
+      const getAllJobs = betaContext.dispatchManager!.getAllJobs.bind(betaContext.dispatchManager);
+      betaContext.dispatchManager!.getAllJobs = () => [
+        { taskId: "TASK-001", status: "running", output: [] } as never,
       ];
 
       // Try to delete — should get 409
-      const deleteRes = await httpDelete(`http://localhost:${port}/api/projects/project-beta`);
+      let deleteRes: Awaited<ReturnType<typeof httpDelete>>;
+      try {
+        deleteRes = await httpDelete(`http://127.0.0.1:${port}/api/projects/project-beta`);
+      } finally {
+        betaContext.dispatchManager!.getAllJobs = getAllJobs;
+      }
       expect(deleteRes.status).toBe(409);
       const data = JSON.parse(deleteRes.body) as { error: string };
       expect(data.error).toContain("active dispatches");
 
       // Project should still be in the registry
-      const afterRes = await httpGet(`http://localhost:${port}/api/projects`);
+      const afterRes = await httpGet(`http://127.0.0.1:${port}/api/projects`);
       const afterData = JSON.parse(afterRes.body) as Array<{ id: string }>;
       expect(afterData).toHaveLength(2);
       expect(afterData.find((p) => p.id === "project-beta")).toBeDefined();
@@ -447,8 +476,7 @@ describe("DELETE /api/projects/:id - Dynamic project unregistration", () => {
     }
   });
 
-  it("DELETE /api/projects/:id calls teardown on DELETE (stops watcher, detector, queue)", async () => {
-    const port = await getFreePort();
+  it("DELETE /api/projects/:id returns 409 when project has active prep work", async () => {
     const projectRoot1 = makeTempDir();
     const projectRoot2 = makeTempDir();
 
@@ -457,25 +485,67 @@ describe("DELETE /api/projects/:id - Dynamic project unregistration", () => {
       setupProjectDirectory(projectRoot2, "Project Beta");
 
       const adapters = makeAdapters([projectRoot1, projectRoot2]);
-      const serverObj = createMonitorServer({ port, projectAdapters: adapters });
-      const { stop } = await serverObj.start();
+      const serverObj = createIsolatedMonitorServer(0, adapters, projectRoot1);
+      const { port, stop } = await serverObj.start();
+      stopServer = stop;
+
+      const betaContext = serverObj.registry!.getProject("project-beta")!;
+      expect(betaContext.prepWorker).not.toBeNull();
+      const getActivePrepJobs = betaContext.prepWorker!.getActiveJobs.bind(betaContext.prepWorker);
+      betaContext.prepWorker!.getActiveJobs = () => [
+        { taskId: "TASK-002", status: "running" } as never,
+      ];
+
+      let deleteRes: Awaited<ReturnType<typeof httpDelete>>;
+      try {
+        deleteRes = await httpDelete(`http://127.0.0.1:${port}/api/projects/project-beta`);
+      } finally {
+        // Do not leave the synthetic active job in place for server shutdown.
+        betaContext.prepWorker!.getActiveJobs = getActivePrepJobs;
+      }
+
+      expect(deleteRes.status).toBe(409);
+      const data = JSON.parse(deleteRes.body) as { error: string };
+      expect(data.error).toContain("active prep jobs");
+      expect(serverObj.registry!.getProject("project-beta")).toBe(betaContext);
+    } finally {
+      if (stopServer) {
+        await stopServer();
+        stopServer = null;
+      }
+      fs.rmSync(projectRoot1, { recursive: true, force: true });
+      fs.rmSync(projectRoot2, { recursive: true, force: true });
+    }
+  });
+
+  it("DELETE /api/projects/:id calls teardown on DELETE (stops watcher, detector, queue)", async () => {
+    const projectRoot1 = makeTempDir();
+    const projectRoot2 = makeTempDir();
+
+    try {
+      setupProjectDirectory(projectRoot1, "Project Alpha");
+      setupProjectDirectory(projectRoot2, "Project Beta");
+
+      const adapters = makeAdapters([projectRoot1, projectRoot2]);
+      const serverObj = createIsolatedMonitorServer(0, adapters, projectRoot1);
+      const { port, stop } = await serverObj.start();
       stopServer = stop;
 
       // Spy on the services of Project Beta to verify teardown is called
       const betaContext = serverObj.registry!.getProject("project-beta")!;
 
-      const originalStopWatcher = betaContext.stopWatcher;
-      const stopWatcherSpy = jest.fn(() => originalStopWatcher?.());
+      const stopWatcher = betaContext.stopWatcher!;
+      const stopWatcherSpy = jest.fn(() => stopWatcher());
       betaContext.stopWatcher = stopWatcherSpy;
 
-      const originalStopChecking = betaContext.progressDetector.stopChecking.bind(
+      const stopChecking = betaContext.progressDetector.stopChecking.bind(
         betaContext.progressDetector,
       );
-      const stopCheckingSpy = jest.fn(() => originalStopChecking());
+      const stopCheckingSpy = jest.fn(() => stopChecking());
       betaContext.progressDetector.stopChecking = stopCheckingSpy;
 
       // Delete Project Beta
-      const deleteRes = await httpDelete(`http://localhost:${port}/api/projects/project-beta`);
+      const deleteRes = await httpDelete(`http://127.0.0.1:${port}/api/projects/project-beta`);
       expect(deleteRes.status).toBe(200);
 
       // Verify teardown was called
@@ -483,7 +553,7 @@ describe("DELETE /api/projects/:id - Dynamic project unregistration", () => {
       expect(stopCheckingSpy).toHaveBeenCalledTimes(1);
 
       // Project should be removed
-      const afterRes = await httpGet(`http://localhost:${port}/api/projects`);
+      const afterRes = await httpGet(`http://127.0.0.1:${port}/api/projects`);
       const afterData = JSON.parse(afterRes.body) as Array<{ id: string }>;
       expect(afterData).toHaveLength(1);
       expect(afterData[0].id).toBe("project-alpha");
@@ -499,7 +569,6 @@ describe("DELETE /api/projects/:id - Dynamic project unregistration", () => {
   });
 
   it("DELETE /api/projects/:id switches active project when removing the active one", async () => {
-    const port = await getFreePort();
     const projectRoot1 = makeTempDir();
     const projectRoot2 = makeTempDir();
 
@@ -508,21 +577,21 @@ describe("DELETE /api/projects/:id - Dynamic project unregistration", () => {
       setupProjectDirectory(projectRoot2, "Project Beta");
 
       const adapters = makeAdapters([projectRoot1, projectRoot2]);
-      const serverObj = createMonitorServer({ port, projectAdapters: adapters });
-      const { stop } = await serverObj.start();
+      const serverObj = createIsolatedMonitorServer(0, adapters, projectRoot1);
+      const { port, stop } = await serverObj.start();
       stopServer = stop;
 
       // Project Alpha is active by default
-      const beforeRes = await httpGet(`http://localhost:${port}/api/projects`);
+      const beforeRes = await httpGet(`http://127.0.0.1:${port}/api/projects`);
       const beforeData = JSON.parse(beforeRes.body) as Array<{ id: string; active: boolean }>;
       expect(beforeData.find((p) => p.id === "project-alpha")?.active).toBe(true);
 
       // Remove Project Alpha
-      const deleteRes = await httpDelete(`http://localhost:${port}/api/projects/project-alpha`);
+      const deleteRes = await httpDelete(`http://127.0.0.1:${port}/api/projects/project-alpha`);
       expect(deleteRes.status).toBe(200);
 
       // Project Beta should now be active
-      const afterRes = await httpGet(`http://localhost:${port}/api/projects`);
+      const afterRes = await httpGet(`http://127.0.0.1:${port}/api/projects`);
       const afterData = JSON.parse(afterRes.body) as Array<{ id: string; active: boolean }>;
       expect(afterData).toHaveLength(1);
       expect(afterData[0].id).toBe("project-beta");
@@ -532,6 +601,56 @@ describe("DELETE /api/projects/:id - Dynamic project unregistration", () => {
       if (stopServer) {
         await stopServer();
         stopServer = null;
+      }
+      fs.rmSync(projectRoot1, { recursive: true, force: true });
+      fs.rmSync(projectRoot2, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("monitor project watcher shutdown", () => {
+  it("closes the server and surfaces aggregated project teardown failures", async () => {
+    const projectRoot1 = makeTempDir();
+    const projectRoot2 = makeTempDir();
+    let failedContext: ProjectContext | undefined;
+
+    try {
+      setupProjectDirectory(projectRoot1, "Project Alpha");
+      setupProjectDirectory(projectRoot2, "Project Beta");
+
+      const serverObj = createIsolatedMonitorServer(
+        0,
+        makeAdapters([projectRoot1, projectRoot2]),
+        projectRoot1,
+      );
+      const { port, stop } = await serverObj.start();
+      const alphaContext = serverObj.registry!.getProject("project-alpha")!;
+      const betaContext = serverObj.registry!.getProject("project-beta")!;
+      failedContext = alphaContext;
+      const closeAlpha = alphaContext.stopWatcher!;
+      const closeBeta = betaContext.stopWatcher!;
+      const closeAlphaSpy = jest.fn(async () => {
+        await closeAlpha();
+        throw new Error("synthetic event watcher close failure");
+      });
+      const closeBetaSpy = jest.fn(() => closeBeta());
+      alphaContext.stopWatcher = closeAlphaSpy;
+      betaContext.stopWatcher = closeBetaSpy;
+
+      await expect(stop()).rejects.toThrow("Monitor shutdown completed with cleanup errors");
+      expect(closeAlphaSpy).toHaveBeenCalledTimes(1);
+      expect(closeBetaSpy).toHaveBeenCalledTimes(1);
+      await expect(httpGet(`http://127.0.0.1:${port}/api/projects`)).rejects.toBeDefined();
+
+      // A failed close remains retriable and its database was deliberately
+      // retained. Complete that retry so the fixture can be removed cleanly.
+      alphaContext.stopWatcher = () => Promise.resolve();
+      await teardownProjectContext(alphaContext);
+      failedContext = undefined;
+    } finally {
+      if (failedContext) {
+        failedContext.stopWatcher = () => Promise.resolve();
+        await teardownProjectContext(failedContext).catch(() => undefined);
       }
       fs.rmSync(projectRoot1, { recursive: true, force: true });
       fs.rmSync(projectRoot2, { recursive: true, force: true });

@@ -9,7 +9,7 @@ import type {
 } from "../monitor/dispatch-manager.js";
 import type { PrepScheduler } from "../monitor/prep-scheduler.js";
 import type { PrepShutdownSurvivor, PrepWorker } from "../monitor/prep-worker.js";
-import { execSync } from "node:child_process";
+import { runTrustedGitSync } from "./trusted-git.js";
 
 export type FleetState = "running" | "paused" | "emergency_stopped";
 
@@ -203,9 +203,8 @@ export class FleetController {
   }
 
   /**
-   * Emergency stop — kill all active agents and stop auto-prep.
-   * This is the nuclear option: SIGTERM all processes, then SIGKILL
-   * after timeout if they don't exit gracefully.
+   * Emergency stop — stop all active agents and auto-prep through the managers'
+   * durable ownership and recovery barriers.
    */
   async emergencyStop(reason = "Emergency stop"): Promise<EmergencyStopResult> {
     const revision = ++this.transitionRevision;
@@ -238,22 +237,18 @@ export class FleetController {
     }
 
     return this.serializeTransition(async () => {
-      // Start prep termination before awaiting dispatch shutdown so neither
-      // agent class is allowed to keep running during the other's grace period.
+      // Start both shutdowns before awaiting either so one agent class cannot
+      // continue through the other's grace period.
       const prepShutdown = this.prepWorker?.shutdownAll({
         gracefulTimeoutMs: 5_000,
         forceTimeoutMs: 5_000,
       });
-
-      // Snapshot active jobs for operator-facing PID evidence, then delegate the
-      // actual termination/confirmation to DispatchManager. This also covers
-      // pending Docker creates (pid 0), approval pauses, descendants, and
-      // orphaned tracked containers that the legacy PID loop could not see.
       const activeJobs = this.dispatchManager.getActiveJobs();
       const dispatchShutdown = this.dispatchManager.shutdownAll({
         gracefulTimeoutMs: 5_000,
         forceTimeoutMs: 5_000,
       });
+
       try {
         const shutdown = await dispatchShutdown;
         result.killedTasks = shutdown.requested;
@@ -285,11 +280,11 @@ export class FleetController {
         }
       }
 
-      // Prune orphaned worktrees
       try {
-        execSync("git worktree prune", {
-          cwd: this.projectRoot,
-          stdio: "ignore",
+        runTrustedGitSync(["worktree", "prune"], this.projectRoot, {
+          timeoutMs: 30_000,
+          maxBuffer: 1024 * 1024,
+          errorContext: "Failed to prune worktrees",
         });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

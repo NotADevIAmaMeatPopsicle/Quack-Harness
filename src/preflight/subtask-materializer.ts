@@ -1,3 +1,4 @@
+import { getClaudeSdkEnvironment } from "../sdk/claude-auth.js";
 // ─── Subtask Materializer ───────────────────────────────────────────
 // Generates rich child-task markdown drafts from a topology plan.
 // Each draft has child-specific Problem Statement, Current State,
@@ -9,9 +10,16 @@ import type { ParsedTask } from "../core/types.js";
 import type { Blueprint } from "../blueprint/blueprint-types.js";
 import type { ProjectAdapter } from "../core/adapter-loader.js";
 import type { DecompositionTopology, SubtaskDefinition, ChildDraft } from "./decompose-types.js";
-import { runChildQualityGate } from "./subtask-quality-gate.js";
+import { runChildQualityGate, validateChildDraftScope } from "./subtask-quality-gate.js";
 import { resolveModel } from "../dispatcher/model-router.js";
 import { getSdkPermissionOptions } from "../sdk/permission-mode.js";
+import { runCodexStructuredEvaluation } from "../llm/codex-structured-evaluator.js";
+import {
+  CHILD_SPEC_MATERIALIZATION_OUTPUT_SCHEMA,
+  parseChildSpecMaterializationOutput,
+} from "./decomposition-provider-contract.js";
+import { hasValidDecompositionTopologyIdentity } from "./decomposition-plan-integrity.js";
+import { resolveEffectiveDecompositionMaxSubtasks } from "./decomposition-limits.js";
 
 /** Cross-layer file indicators — children touching these get the addendum */
 const CROSS_LAYER_PATH_PATTERNS = [
@@ -81,6 +89,19 @@ export async function materializeChildDrafts(
   adapter: ProjectAdapter,
   blueprint: Blueprint,
 ): Promise<ChildDraft[]> {
+  const maxSubtasks = resolveEffectiveDecompositionMaxSubtasks(
+    topology.maxSubtasks ?? adapter.config.preflight?.autoDecompose?.maxSubtasks,
+    adapter.config.preflight?.autoDecompose?.maxSubtasks,
+  );
+  if (
+    topology.parentTaskId !== parentTask.id ||
+    !hasValidDecompositionTopologyIdentity(parentTask.id, topology.subtasks, maxSubtasks)
+  ) {
+    throw new Error(
+      `Materialization topology for ${parentTask.id} must contain 2..configuredMax exact sequential children with one trailing final child`,
+    );
+  }
+
   const drafts: ChildDraft[] = [];
 
   for (const subtask of topology.subtasks) {
@@ -104,14 +125,15 @@ export async function materializeChildDrafts(
     }
 
     const gate = runChildQualityGate(subtask.id, markdown);
+    const scopeDeficiencies = validateChildDraftScope(subtask, markdown);
     drafts.push({
       subtaskId: subtask.id,
       title: subtask.title,
       markdown,
       sectionsPresent: gate.sectionsPresent,
       prepScore: gate.prepScore,
-      prepReady: gate.prepReady,
-      deficiencies: gate.deficiencies,
+      prepReady: gate.prepReady && scopeDeficiencies.length === 0,
+      deficiencies: [...gate.deficiencies, ...scopeDeficiencies],
       parseError: gate.parseError,
     });
   }
@@ -128,10 +150,43 @@ async function generateChildDraft(
   adapter: ProjectAdapter,
   blueprint: Blueprint,
 ): Promise<string> {
-  const prompt = buildMaterializePrompt(subtask, parentTask, blueprint);
-  const model = resolveModel(adapter.config.modelRouting, adapter.config.agent, {
-    stage: "plan",
-  });
+  const evaluator = adapter.config.evaluationProviders?.childSpecMaterialization;
+  const prompt = buildMaterializePrompt(
+    subtask,
+    parentTask,
+    blueprint,
+    evaluator?.runner === "codex-cli" ? "structured" : "markdown",
+  );
+  const model =
+    evaluator?.model ??
+    resolveModel(adapter.config.modelRouting, adapter.config.agent, {
+      stage: "plan",
+    });
+
+  if (evaluator?.runner === "codex-cli") {
+    const result = await runCodexStructuredEvaluation(
+      {
+        projectRoot: adapter.projectRoot,
+        model,
+        systemPrompt:
+          "Author only the requested child task specification. Inspect the repository read-only and return the required JSON object; do not modify files.",
+        prompt,
+        outputSchema: CHILD_SPEC_MATERIALIZATION_OUTPUT_SCHEMA,
+        parse: (rawText) => parseChildSpecMaterializationOutput(rawText, subtask.id),
+      },
+      evaluator,
+    );
+    if (result.status === "runner_error") {
+      throw new Error(`Codex child spec materialization ${result.errorKind}: ${result.message}`);
+    }
+    const validated = parseChildSpecMaterializationOutput(JSON.stringify(result.value), subtask.id);
+    if (!validated) {
+      throw new Error(
+        "Codex child spec materialization parse_failed: evaluator returned an invalid or conflicting child identity",
+      );
+    }
+    return validated.markdown;
+  }
 
   const queryFn = await getQueryFn();
   const queryResult = queryFn({
@@ -140,6 +195,7 @@ async function generateChildDraft(
       allowedTools: ["Read", "Glob", "Grep"],
       disallowedTools: ["Edit", "Write", "Bash", "WebSearch", "WebFetch"],
       ...getSdkPermissionOptions(),
+      env: getClaudeSdkEnvironment(adapter.config.agent.apiKeys),
       model,
       maxTurns: 10,
       cwd: adapter.projectRoot,
@@ -179,6 +235,7 @@ function buildMaterializePrompt(
   subtask: SubtaskDefinition,
   parentTask: ParsedTask,
   blueprint: Blueprint,
+  outputMode: "markdown" | "structured" = "markdown",
 ): string {
   const needsAddendum = requiresFullStackAddendum(subtask);
 
@@ -294,7 +351,11 @@ ${
 }
 \`\`\`
 
-Output ONLY the markdown spec above. No prose before or after. No code fences wrapping the spec.
+${
+  outputMode === "structured"
+    ? `Return ONLY a JSON object with exactly two fields: "subtaskId" set to "${subtask.id}", and "markdown" containing the complete markdown spec above. No prose before or after.`
+    : "Output ONLY the markdown spec above. No prose before or after. No code fences wrapping the spec."
+}
 `;
 }
 

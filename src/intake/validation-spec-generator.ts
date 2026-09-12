@@ -1,8 +1,20 @@
+import { parseTaskFile } from "../core/task-parser.js";
+import { listTaskClaimantDeclarations } from "../core/task-file-resolver.js";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
 
 import type { ProjectAdapter } from "../core/adapter-loader.js";
+import {
+  assertTaskCreationIdsAvailable,
+  readTaskCreationClaimants,
+  withTaskCreationReservation,
+} from "../core/task-creation-reservation.js";
+import { recoverPendingTaskSpecMutationsWithinReservation } from "../preflight/decomposition-transaction-journal.js";
+import {
+  removeDecompositionFileIfExact,
+  writeDecompositionFileAtomicExclusive,
+} from "../preflight/decomposition-file-io.js";
 import type { ValidationIntakePayload } from "./task-intake.js";
 
 /**
@@ -56,9 +68,9 @@ export interface ValidationSpecGeneratorResult {
  *    same output, byte-for-byte (subject to existing-id allocation when
  *    re-running against a directory that already contains the previously
  *    written file).
- *  - Atomic write: mirrors `planner/task-writer.ts:140-194` (tmp file then
- *    rename; cleanup on failure; `.plan.lock` to prevent concurrent
- *    allocator races).
+ *  - Atomic write: stages content in a temporary file, publishes it with an
+ *    exclusive hard link, and uses the cross-family task-creation reservation
+ *    to prevent allocator and declared-id races.
  *  - Idempotent: when a TASK file for this submission already exists
  *    (matched by intakeId-derived slug + payload content fingerprint
  *    embedded in the spec metadata), the existing taskId + path is
@@ -73,7 +85,8 @@ export interface ValidationSpecGeneratorResult {
  * @returns the allocated taskId, the absolute spec path, and the absolute
  *   per-intake evidence directory path.
  * @throws if the adapter taskDir is missing/invalid, the task allocator
- *   cannot acquire the `.plan.lock`, or filesystem I/O fails. NEVER throws
+ *   cannot acquire its reservation, the strict claimant scan is unavailable,
+ *   the allocated declared id already has an owner, or filesystem I/O fails. NEVER throws
  *   on an already-extant matching spec — that case returns the existing id.
  */
 export async function generateValidationSpec(
@@ -114,76 +127,91 @@ export async function generateValidationSpec(
     };
   }
 
-  // ── 4. Allocate next free TASK-NNNN id. ────────────────────────────
-  // Lock around id allocation + write to prevent concurrent submissions
-  // racing for the same numeric id. Mirrors task-writer.ts:140-194.
-  const lockPath = path.join(taskDir, ".plan.lock");
+  // Preserve the legacy planner lock as an explicit compatibility refusal.
+  // Current creators coordinate through the shared task-creation reservation.
+  const legacyLockPath = path.join(taskDir, ".plan.lock");
   try {
-    await fs.writeFile(lockPath, `${process.pid}\n${new Date().toISOString()}\n`, { flag: "wx" });
-  } catch {
-    throw new Error(`Another plan operation is in progress. If stale, delete ${lockPath}`);
+    await fs.stat(legacyLockPath);
+    throw new Error(`Another plan operation is in progress. If stale, delete ${legacyLockPath}`);
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
   }
 
-  const fileName = `__pending__-${process.pid}-${Date.now()}`;
-  const tempPath = path.join(taskDir, `${fileName}.tmp`);
   let finalSpecPath: string | undefined;
+  let finalSpecCreated = false;
 
-  try {
-    // After acquiring the lock, re-check for an existing match — another
-    // worker may have written between our pre-lock scan and now.
-    const lateMatch = await findExistingSpecByFingerprint(taskDir, fingerprint);
-    if (lateMatch) {
-      return {
-        taskId: lateMatch.taskId,
-        specPath: lateMatch.specPath,
-        evidencePath: evidenceDir,
-      };
-    }
+  return withTaskCreationReservation(
+    taskDir,
+    {
+      creator: "validation-intake",
+    },
+    async () => {
+      await recoverPendingTaskSpecMutationsWithinReservation(adapter);
+      // After acquiring the lock, re-check for an existing match — another
+      // worker may have written between our pre-lock scan and now.
+      const lateMatch = await findExistingSpecByFingerprint(taskDir, fingerprint);
+      if (lateMatch) {
+        return {
+          taskId: lateMatch.taskId,
+          specPath: lateMatch.specPath,
+          evidencePath: evidenceDir,
+        };
+      }
 
-    const existingIds = await getExistingTaskIds(taskDir);
-    const taskId = allocateNextTaskId(existingIds);
+      const existingIds = await getExistingTaskIds(taskDir);
+      const taskId = allocateNextTaskId(existingIds);
 
-    // ── 5. Copy referenced evidence files. ─────────────────────────
-    // Done BEFORE writing the spec so the spec's Evidence Bundle section
-    // can list the actually-copied destination paths (relative).
-    const copyReport = await copyEvidenceFiles({
-      projectRoot,
-      evidenceDir,
-      tests: payload.tests,
-      screenshots: payload.screenshots,
-    });
+      const finalName = `${taskId}-${slug}.md`;
+      finalSpecPath = path.join(taskDir, finalName);
+      const claimants = await readTaskCreationClaimants(taskDir);
+      assertTaskCreationIdsAvailable(claimants, [{ taskId, fileName: finalName }]);
 
-    // ── 6. Render the spec body. ───────────────────────────────────
-    const content = renderValidationSpec({
-      taskId,
-      intakeId,
-      payload,
-      fingerprint,
-      copyReport,
-    });
+      // ── 5. Copy referenced evidence files. ─────────────────────────
+      // Done BEFORE writing the spec so the spec's Evidence Bundle section
+      // can list the actually-copied destination paths (relative).
+      const copyReport = await copyEvidenceFiles({
+        projectRoot,
+        evidenceDir,
+        tests: payload.tests,
+        screenshots: payload.screenshots,
+      });
 
-    // ── 7. Atomic write: tmp file then rename. ─────────────────────
-    const finalName = `${taskId}-${slug}.md`;
-    finalSpecPath = path.join(taskDir, finalName);
+      // ── 6. Render the spec body. ───────────────────────────────────
+      const content = renderValidationSpec({
+        taskId,
+        intakeId,
+        payload,
+        fingerprint,
+        copyReport,
+      });
 
-    await fs.writeFile(tempPath, content, "utf-8");
-    await fs.rename(tempPath, finalSpecPath);
+      // ── 7. Atomic, create-only publication. ────────────────────────
+      try {
+        await writeDecompositionFileAtomicExclusive(finalSpecPath, content);
+        finalSpecCreated = true;
 
-    return {
-      taskId,
-      specPath: finalSpecPath,
-      evidencePath: evidenceDir,
-    };
-  } catch (err) {
-    // Cleanup on failure — leave no half-written tmp files behind.
-    await fs.unlink(tempPath).catch(() => {});
-    if (finalSpecPath) {
-      await fs.unlink(finalSpecPath).catch(() => {});
-    }
-    throw err;
-  } finally {
-    await fs.unlink(lockPath).catch(() => {});
-  }
+        return {
+          taskId,
+          specPath: finalSpecPath,
+          evidencePath: evidenceDir,
+        };
+      } catch (err) {
+        // Cleanup on failure — never remove a pre-existing destination.
+        if (finalSpecCreated && finalSpecPath) {
+          try {
+            await removeDecompositionFileIfExact(finalSpecPath, content);
+          } catch (rollbackError) {
+            throw new AggregateError(
+              [err, rollbackError],
+              `Validation spec creation failed and its published path could not be safely rolled back: ${err instanceof Error ? err.message : String(err)}`,
+              { cause: err },
+            );
+          }
+        }
+        throw err;
+      }
+    },
+  );
 }
 
 // ─── Internal helpers ───────────────────────────────────────────────
@@ -226,7 +254,7 @@ interface ExistingSpecMatch {
 /**
  * Scan the task directory for a previously-generated validation spec
  * whose embedded fingerprint matches the provided value. Returns the
- * first hit (deterministic ordering: ascending TASK-NNNN id).
+ * first parseable hit (deterministic filename ordering).
  *
  * The fingerprint lives in a `<!-- validation-fingerprint: XXXX -->`
  * HTML comment immediately after the `# TASK-NNNN: ...` header. Spec
@@ -244,30 +272,17 @@ async function findExistingSpecByFingerprint(
     return undefined;
   }
 
-  const specFiles = entries.filter((entry) => /^TASK-\d{3,}.*\.md$/.test(entry)).sort();
+  const specFiles = entries.filter((entry) => /\.md$/i.test(entry)).sort();
 
   for (const entry of specFiles) {
     const filePath = path.join(taskDir, entry);
-    let head: string;
     try {
-      // Read only the first 4 KB — fingerprint is in the metadata header.
-      const handle = await fs.open(filePath, "r");
-      try {
-        const buf = Buffer.alloc(4096);
-        const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
-        head = buf.subarray(0, bytesRead).toString("utf-8");
-      } finally {
-        await handle.close();
-      }
+      const content = await fs.readFile(filePath, "utf-8");
+      if (!content.includes(`validation-fingerprint: ${fingerprint}`)) continue;
+      const task = parseTaskFile(content, filePath);
+      return { taskId: task.id, specPath: filePath };
     } catch {
-      continue;
-    }
-
-    if (head.includes(`validation-fingerprint: ${fingerprint}`)) {
-      const idMatch = entry.match(/^(TASK-\d{3,})/);
-      if (idMatch) {
-        return { taskId: idMatch[1], specPath: filePath };
-      }
+      // An unreadable or malformed document cannot establish intake identity.
     }
   }
   return undefined;
@@ -275,20 +290,15 @@ async function findExistingSpecByFingerprint(
 
 /**
  * Mirror of `planner/task-writer.ts::getExistingTaskIds` — scans the task
- * directory and returns the set of allocated TASK-NNN ids (3+ digits).
+ * directory and returns its parsed declared task IDs.
  *
  * Kept private here rather than importing from task-writer so the spec
  * generator has zero coupling to the planner module.
  */
 async function getExistingTaskIds(taskDir: string): Promise<Set<string>> {
   try {
-    const entries = await fs.readdir(taskDir);
-    const ids = new Set<string>();
-    for (const entry of entries) {
-      const match = entry.match(/^(TASK-(\d{3,}))/);
-      if (match) ids.add(match[1]);
-    }
-    return ids;
+    const declarations = await listTaskClaimantDeclarations(taskDir);
+    return new Set(declarations.map(({ declaredId }) => declaredId));
   } catch {
     return new Set();
   }
@@ -306,7 +316,7 @@ async function getExistingTaskIds(taskDir: string): Promise<Set<string>> {
 function allocateNextTaskId(existingIds: Set<string>): string {
   let maxNum = 0;
   for (const id of existingIds) {
-    const match = id.match(/^TASK-(\d+)$/);
+    const match = id.match(/^TASK-(\d+)(?:-[A-Z])?$/);
     if (match) {
       const num = Number.parseInt(match[1], 10);
       if (Number.isFinite(num) && num > maxNum) {
@@ -507,6 +517,14 @@ function renderValidationSpec(args: RenderArgs): string {
   lines.push("- **Blocked By:** []");
   lines.push("- **Blocks:** []");
   lines.push("- **Tags:** [validation-intake]");
+  lines.push("");
+
+  // Validation specs participate in canonical parsed inventories too.
+  lines.push("## Problem Statement");
+  lines.push("");
+  lines.push(
+    `Validate the already-built branch ${payload.branch} against its claimed scope and supplied evidence before admin verification.`,
+  );
   lines.push("");
 
   // ── Already Built ─────────────────────────────────────────────────

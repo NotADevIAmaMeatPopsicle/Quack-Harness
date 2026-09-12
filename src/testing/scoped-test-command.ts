@@ -1,6 +1,5 @@
-import { execSync } from "node:child_process";
 import type { ParsedTask } from "../core/types.js";
-import { worktreeEnv } from "../utils/worktree-env.js";
+import { runTrustedGitSync } from "../dispatcher/trusted-git.js";
 
 function isTestFile(filePath: string): boolean {
   return /\.test\.|\.spec\.|(^|\/)tests\//i.test(filePath);
@@ -10,15 +9,27 @@ function quoteArg(value: string): string {
   return `"${value.replace(/(["\\$`])/g, "\\$1")}"`;
 }
 
-function resolveDiffBase(workDir: string, baseBranch: string): string {
-  const env = worktreeEnv(workDir);
+function validateBaseBranch(baseBranch: string): string {
+  if (
+    !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(baseBranch) ||
+    baseBranch.includes("..") ||
+    baseBranch.includes("@{") ||
+    baseBranch.endsWith("/") ||
+    baseBranch.endsWith(".")
+  ) {
+    throw new Error(`Unsafe base branch name: ${baseBranch}`);
+  }
+  return baseBranch;
+}
 
-  for (const ref of [`origin/${baseBranch}`, baseBranch]) {
+function resolveDiffBase(workDir: string, baseBranch: string): string {
+  const validatedBaseBranch = validateBaseBranch(baseBranch);
+
+  for (const ref of [`origin/${validatedBaseBranch}`, validatedBaseBranch]) {
     try {
-      const mergeBase = execSync(`git merge-base ${ref} HEAD`, {
-        cwd: workDir,
-        env,
-        encoding: "utf-8",
+      const mergeBase = runTrustedGitSync(["merge-base", ref, "HEAD"], workDir, {
+        timeoutMs: 10_000,
+        maxBuffer: 1024 * 1024,
       }).trim();
       if (mergeBase) return mergeBase;
     } catch {
@@ -26,7 +37,7 @@ function resolveDiffBase(workDir: string, baseBranch: string): string {
     }
   }
 
-  return baseBranch;
+  return validatedBaseBranch;
 }
 
 export function collectScopedTestFiles(
@@ -43,16 +54,16 @@ export function collectScopedTestFiles(
   }
 
   try {
-    const env = worktreeEnv(workDir);
     const diffBase = resolveDiffBase(workDir, baseBranch);
-    const diffFiles = execSync(`git diff --name-only ${diffBase}..HEAD`, {
-      cwd: workDir,
-      env,
-      encoding: "utf-8",
-      timeout: 10_000,
-    })
-      .trim()
-      .split("\n")
+    const diffFiles = runTrustedGitSync(
+      ["diff", "--name-only", "-z", `${diffBase}..HEAD`],
+      workDir,
+      {
+        timeoutMs: 10_000,
+        maxBuffer: 5 * 1024 * 1024,
+      },
+    )
+      .split("\0")
       .map((file) => file.trim())
       .filter(Boolean);
 

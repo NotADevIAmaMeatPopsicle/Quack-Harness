@@ -77,7 +77,8 @@ it("maps a refused preflight result to the pinned HTTP 409", async () => {
   let stop: (() => Promise<void>) | undefined;
   try {
     const server = createMonitorServer({
-      port: 30_000 + Math.floor(Math.random() * 10_000),
+      port: 0,
+      host: "127.0.0.1",
       projectRoot: fixture.root,
       taskDir: "docs/tasks",
       adapterPath,

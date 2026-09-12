@@ -27,8 +27,8 @@ function post(
   pathname: string,
   body?: unknown,
 ): Promise<{ status: number; body: string }> {
+  const payload = body === undefined ? "" : JSON.stringify(body);
   return new Promise((resolve, reject) => {
-    const payload = body === undefined ? "" : JSON.stringify(body);
     const request = http.request(
       {
         hostname: "127.0.0.1",
@@ -41,11 +41,11 @@ function post(
         },
       },
       (response) => {
-        let body = "";
+        let responseBody = "";
         response.on("data", (chunk: Buffer) => {
-          body += chunk.toString("utf-8");
+          responseBody += chunk.toString("utf-8");
         });
-        response.on("end", () => resolve({ status: response.statusCode ?? 0, body }));
+        response.on("end", () => resolve({ status: response.statusCode ?? 0, body: responseBody }));
         response.on("error", reject);
       },
     );
@@ -221,7 +221,7 @@ it("POST /api/fleet/resume restarts an emergency-aborted queue", async () => {
 
 it("POST /api/fleet/emergency-stop aborts queue admission before awaiting agent drain", async () => {
   const gate = deferred();
-  const abort = jest.fn();
+  const abort = jest.fn(() => true);
   const queue = { abort } as unknown as DispatchQueue;
   const emergencyStop = jest.fn(async () => {
     await gate.promise;
@@ -434,6 +434,67 @@ it("GET /api/queue exposes pending recovery rows and the unavailable reason", as
         recoveryScanUnavailableReason: reason,
       },
       items: [{ taskId: "TASK-100", status: "recovered_pending_scan" }],
+    });
+  } finally {
+    await server.close();
+  }
+});
+
+it("GET /api/queue reports an approval-held lane as waiting and active", async () => {
+  const queue = {
+    getStats: jest.fn(() => ({
+      total: 1,
+      queued: 0,
+      ready: 0,
+      running: 0,
+      awaitingApproval: 1,
+      completed: 0,
+      failed: 0,
+      blocked: 0,
+      skipped: 0,
+      stopped: 0,
+      recoveredPendingScan: 0,
+      totalCostUsd: 0,
+      totalDurationMs: 0,
+    })),
+    getConfig: jest.fn(() => ({ maxConcurrent: 1 })),
+    getItems: jest.fn(() => [
+      {
+        taskId: "TASK-100",
+        status: "awaiting_approval",
+        priority: 2,
+        blockedBy: [],
+        enqueuedAt: "2026-09-08T10:00:00.000Z",
+        awaitingApprovalAt: "2026-09-08T10:02:00.000Z",
+        retryCount: 0,
+      },
+    ]),
+    isPaused: jest.fn(() => false),
+    // A recovered gate remains operator-actionable even before the queue's
+    // scheduling loop is restarted.
+    isRunning: jest.fn(() => false),
+    getPauseReason: jest.fn(() => undefined),
+  } as unknown as DispatchQueue;
+  const app = express();
+  registerQueueRoutes(app, { resolveProject: () => ({ dispatchQueue: queue }) });
+  const server = await listen(app);
+  try {
+    const response = await get(server.port, "/api/queue");
+    const body = JSON.parse(response.body) as Record<string, unknown>;
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({
+      state: "waiting",
+      running: false,
+      activeTaskIds: ["TASK-100"],
+      stats: { running: 0, awaitingApproval: 1, failed: 0 },
+      items: [
+        {
+          taskId: "TASK-100",
+          status: "awaiting_approval",
+          awaitingApprovalAt: "2026-09-08T10:02:00.000Z",
+        },
+      ],
     });
   } finally {
     await server.close();

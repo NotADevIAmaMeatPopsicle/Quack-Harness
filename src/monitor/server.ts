@@ -1,12 +1,23 @@
-// â”€â”€â”€ Monitor Server â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+import { recheckRecoverableFederatedBlocks } from "./federation/scheduling.js";
+import {
+  buildClaudeChildEnvironment,
+  getClaudeSdkEnvironment,
+  selectClaudeApiKey,
+  sanitizeClaudeDiagnostic,
+  withClaudeAuthScope,
+} from "../sdk/claude-auth.js";
+import { ProjectClaudeAuthProbeCache } from "../sdk/claude-auth-health.js"; // â”€â”€â”€ Monitor Server â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Express app factory for the Quack Monitor dashboard.
 // Serves the static dashboard, REST API for session/task/dispatch data,
 // and SSE endpoint for real-time event streaming.
 
 import * as fs from "node:fs";
+import { parseVerifiedApiEntry } from "./verification-schema.js";
+import { VerificationDatabaseUnavailableError } from "./verification-store.js";
 import * as fsPromises from "node:fs/promises";
+import { createServer as createHttpServer } from "node:http";
 import * as path from "node:path";
-import { spawn, execFileSync, execSync, type ChildProcess } from "node:child_process";
+import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import express from "express";
 import type { Express, Request, Response } from "express";
 
@@ -49,7 +60,7 @@ import type {
 } from "../core/duplicate-claimants.js";
 import { TaskService } from "./task-service.js";
 import type { TaskSummary } from "./task-service.js";
-import { DispatchManager } from "./dispatch-manager.js";
+import { ApprovalDecisionConflictError, DispatchManager } from "./dispatch-manager.js";
 import { PrepCache, computeContentHash } from "./prep-cache.js";
 import {
   recordVerification,
@@ -95,6 +106,23 @@ import { CostVelocityTracker } from "../dispatcher/cost-velocity.js";
 import { ProgressDetector } from "./progress-detector.js";
 import { FileHeartbeat } from "../dispatcher/file-heartbeat.js";
 import { resolveRunScopedPauseState } from "../dispatcher/paused-run-state.js";
+import {
+  assertLocalFederatedResumeInstalledGrantIdentity,
+  assertLocalFederatedResumeStartGrant,
+  armLocalFederatedResume,
+  FederatedResumeStartRefusalError,
+  finalizeLocalFederatedResumeStart,
+  installLocalFederatedResumeStartGrant,
+  localFederatedResumeReservationMatches,
+  localFederatedResumeReplayMatches,
+  localFederatedResumeTerminalReplayMatches,
+  readLocalFederatedResumeState,
+  reconcileLocalFederatedResumeDecision,
+  recordLocalFederatedResumeDecision,
+  recoverFederatedRunIdentity,
+  reserveLocalFederatedResumeStart,
+} from "../dispatcher/federated-resume-state.js";
+import type { FederatedResumeStartGrant } from "./federation/types.js";
 import { KeyManager } from "../dispatcher/key-manager.js";
 import type {
   CostVelocityConfig,
@@ -114,6 +142,18 @@ import type { ProjectContext } from "./project-registry.js";
 import { QuackDB, NoopDB } from "../db/index.js";
 import type { ProjectAdapter } from "../core/adapter-loader.js";
 import { computeAdapterBundleMetadata, loadAdapter } from "../core/adapter-loader.js";
+import {
+  DecompositionRecoveryError,
+  recoverAndProjectPendingDecompositionTransactions,
+  recoverPendingDecompositionTransactions,
+  withDecompositionAdmissionFence,
+} from "../preflight/decomposition-transaction-journal.js";
+import type { DecompositionDispatchAdmission } from "../preflight/decomposition-transaction-journal.js";
+import {
+  CanonicalTaskSpecMutationError,
+  withCanonicalTaskSpecMutationFence,
+} from "../preflight/canonical-task-spec-mutation.js";
+import { hasPendingCanonicalTaskMutationJournals } from "../preflight/canonical-task-mutation-journal.js";
 import { ReadinessService } from "./readiness-service.js";
 import { evaluateEnrichmentCandidate } from "./enrichment-candidate-gate.js";
 import { inspectGeneratedProjectionHygiene } from "./projection-hygiene.js";
@@ -160,6 +200,7 @@ import type {
 import { type FederationProjectContext, type JobProvenance } from "./federation/types.js";
 import { resolveCcusageCommand } from "./ccusage-command.js";
 import { restoreTaskStatusFromInProgress } from "./federation/events.js";
+import { formatVerificationResult, runVerification } from "../worker/tools/verify.js";
 import {
   cleanupInactiveDbDispatchSessions,
   DEFAULT_STALE_DB_SESSION_MAX_AGE_MS,
@@ -180,6 +221,7 @@ import {
 import {
   loadFederationPeerConfig,
   loadFederatedJob,
+  leaseExpired,
   pullVerifiedFromPeer,
   pushVerificationToPeer,
   startPeriodicVerifiedSync,
@@ -195,8 +237,14 @@ import { AuthService, initAuthConfig } from "./auth.js";
 import { checkDockerHealth, requiresDocker } from "../utils/docker-health.js";
 import { resolveTargetBranch } from "../dispatcher/branch-resolver.js";
 import { PausedRunRefusalError } from "../dispatcher/paused-run-state.js";
+import {
+  formatLoopReviewFeedback,
+  prepareRevisionState,
+  resolveRevisionRuntimeContext,
+  resolveRevisionTask,
+  RevisionPreparationError,
+} from "../dispatcher/revision-preparation.js";
 import { toRuntimeDiagnostics } from "../core/runtime-errors.js";
-import type { ReviewRunResult } from "../review/reviewer-types.js";
 import { recordLoopFinalization } from "./loop-finalize.js";
 import { createTaskFilesFromInput } from "../planner/task-writer.js";
 import { getChangedFiles, parseJestOutput } from "../testing/smart-test-runner.js";
@@ -220,6 +268,43 @@ import {
   type WikiAction,
   type WikiArtifact,
 } from "../review/docs-gate.js";
+import {
+  runTrustedGitSync as executeTrustedGitSync,
+  type TrustedGitSyncOptions,
+} from "../dispatcher/trusted-git.js";
+import {
+  persistentOriginRepositoryBinding,
+  resolveBoundOriginRepository,
+  resolveOriginRepository,
+  type GitOriginIdentity,
+} from "../dispatcher/github-repository.js";
+
+const federatedResumeStartGrantSchema = z
+  .object({
+    token: z.string().trim().min(1),
+    projectId: z.string().trim().min(1),
+    jobId: z.string().trim().min(1),
+    taskId: z.string().trim().min(1),
+    jobType: z.literal("dispatch"),
+    hostId: z.string().trim().min(1),
+    originalSessionId: z.string().trim().min(1),
+    generation: z.number().int().positive(),
+    releaseNonce: z.string().trim().min(1),
+    claimToken: z.string().trim().min(1),
+    leaseId: z.string().trim().min(1),
+    issuedAt: z.string().datetime(),
+    expiresAt: z.string().datetime(),
+  })
+  .strict();
+
+const federatedResumeStartBodySchema = z
+  .object({
+    projectId: z.string().trim().min(1),
+    originalSessionId: z.string().trim().min(1),
+    resumedSessionId: z.string().trim().min(1).optional(),
+    startGrant: federatedResumeStartGrantSchema,
+  })
+  .strict();
 
 export interface MonitorServerOptions {
   /** @deprecated Use projectAdapters instead */
@@ -231,6 +316,12 @@ export interface MonitorServerOptions {
   projectRoot?: string;
   /** @deprecated Use projectAdapters instead */
   taskDir?: string;
+  /**
+   * Exact operator-authorized local bare repositories available for read-only
+   * Git transport in legacy single-project mode. Repository configuration must
+   * never populate this value.
+   */
+  trustedLocalReadRemotePaths?: readonly string[];
   /** Array of project adapters to register (new multi-project API) */
   projectAdapters?: ProjectAdapter[];
   /** Root of the Quack installation (for auth config). Defaults to auto-detect. */
@@ -247,10 +338,18 @@ export interface MonitorServerOptions {
   canonicalBaseUrl?: string;
   /** Optional bind host override. */
   host?: string;
-  /** Origins allowed to make credentialed cross-origin requests. Defaults to loopback only. */
-  corsOrigins?: string[];
   /** Optional external-completion git runner override for deterministic route tests. */
   federationGitExec?: FederationRouteDeps["execGit"];
+  /** Optional federation publication boundary override for deterministic route tests. */
+  federationMergeBoundary?: FederationOrchestrationDeps["mergeBoundary"];
+  /** Optional federation refresh boundary override for deterministic concurrency tests. */
+  federationBroadcastRefresh?: FederationOrchestrationDeps["broadcastRefresh"];
+  /**
+   * TASK-1302 rollout guard. `compat` lets an old unscoped worker finish a
+   * uniquely identifiable persisted job; `strict` requires explicit project
+   * scope for every federation lifecycle write.
+   */
+  federationProjectScopeMode?: "compat" | "strict";
 }
 
 export interface MonitorServer {
@@ -261,6 +360,8 @@ export interface MonitorServer {
   /** Project registry for multi-project support */
   registry?: ProjectRegistry;
   start: () => Promise<{ port: number; stop: () => Promise<void> }>;
+  /** Idempotent teardown, also available when start() rejects part-way through initialization. */
+  stop: () => Promise<void>;
 }
 
 type MonitorUiMode = "modern" | "legacy" | "headless";
@@ -473,8 +574,16 @@ interface CanonicalTaskSpecGitPrecheck {
   ok: boolean;
   gitRepository: boolean;
   branch?: string;
+  branchRef?: string;
+  headOid?: string;
   reason?: string;
   error?: string;
+}
+
+interface CanonicalTaskSpecGitIdentity {
+  branch: string;
+  branchRef: string;
+  headOid: string;
 }
 
 function commandOutputToString(value: unknown): string {
@@ -482,12 +591,16 @@ function commandOutputToString(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-function runGitSync(cwd: string, args: string[]): GitCommandResult {
+function runGitSync(
+  cwd: string,
+  args: string[],
+  options: TrustedGitSyncOptions = {},
+): GitCommandResult {
   try {
-    const stdout = execFileSync("git", args, {
-      cwd,
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "pipe"],
+    const stdout = executeTrustedGitSync(args, cwd, {
+      timeoutMs: 30_000,
+      maxBuffer: 10 * 1024 * 1024,
+      ...options,
     });
     return { exitCode: 0, stdout, stderr: "" };
   } catch (err: unknown) {
@@ -505,6 +618,68 @@ function runGitSync(cwd: string, args: string[]): GitCommandResult {
   }
 }
 
+function captureCanonicalTaskSpecGitIdentity(
+  projectRoot: string,
+):
+  | { ok: true; identity: CanonicalTaskSpecGitIdentity }
+  | { ok: false; reason: string; error?: string; branch?: string } {
+  const branchRefBefore = runGitSync(projectRoot, ["symbolic-ref", "--quiet", "HEAD"]);
+  if (branchRefBefore.exitCode !== 0) {
+    return {
+      ok: false,
+      reason: "detached_head",
+      error: branchRefBefore.stderr || branchRefBefore.stdout || "HEAD is detached",
+    };
+  }
+  const branchRef = branchRefBefore.stdout.trim();
+  if (!branchRef.startsWith("refs/heads/")) {
+    return { ok: false, reason: "branch_unresolved", error: "HEAD is not a local branch" };
+  }
+  const branch = branchRef.slice("refs/heads/".length);
+  const branchError = conservativeCanonicalBranchError(branch);
+  if (branchError || branchRef !== `refs/heads/${branch}`) {
+    return { ok: false, branch, reason: "unsafe_target_branch", error: branchError };
+  }
+
+  const headBefore = runGitSync(projectRoot, ["rev-parse", "--verify", "HEAD^{commit}"]);
+  const branchHead = runGitSync(projectRoot, ["rev-parse", "--verify", `${branchRef}^{commit}`]);
+  const branchRefAfter = runGitSync(projectRoot, ["symbolic-ref", "--quiet", "HEAD"]);
+  const headAfter = runGitSync(projectRoot, ["rev-parse", "--verify", "HEAD^{commit}"]);
+  const headOid = headBefore.stdout.trim().toLowerCase();
+  const branchOid = branchHead.stdout.trim().toLowerCase();
+  const finalHeadOid = headAfter.stdout.trim().toLowerCase();
+  if (
+    headBefore.exitCode !== 0 ||
+    branchHead.exitCode !== 0 ||
+    branchRefAfter.exitCode !== 0 ||
+    headAfter.exitCode !== 0 ||
+    !/^[0-9a-f]{40,64}$/u.test(headOid) ||
+    branchRefAfter.stdout.trim() !== branchRef ||
+    branchOid !== headOid ||
+    finalHeadOid !== headOid
+  ) {
+    return {
+      ok: false,
+      branch,
+      reason: "git_identity_changed",
+      error:
+        "Canonical task-spec branch or HEAD changed while its publication identity was captured",
+    };
+  }
+  return { ok: true, identity: { branch, branchRef, headOid } };
+}
+
+function sameCanonicalTaskSpecGitIdentity(
+  left: CanonicalTaskSpecGitIdentity,
+  right: CanonicalTaskSpecGitIdentity,
+): boolean {
+  return (
+    left.branch === right.branch &&
+    left.branchRef === right.branchRef &&
+    left.headOid === right.headOid
+  );
+}
+
 function inspectCanonicalTaskSpecGitTarget(
   projectRoot: string,
   allowedTargetBranches: string[],
@@ -514,20 +689,11 @@ function inspectCanonicalTaskSpecGitTarget(
     return { ok: true, gitRepository: false, reason: "not_git_repository" };
   }
 
-  const branchResult = runGitSync(projectRoot, ["rev-parse", "--abbrev-ref", "HEAD"]);
-  if (branchResult.exitCode !== 0) {
-    return {
-      ok: false,
-      gitRepository: true,
-      reason: "branch_unresolved",
-      error: branchResult.stderr || branchResult.stdout || "failed to resolve current branch",
-    };
+  const captured = captureCanonicalTaskSpecGitIdentity(projectRoot);
+  if (!captured.ok) {
+    return { ...captured, gitRepository: true };
   }
-
-  const branch = branchResult.stdout.trim();
-  if (!branch || branch === "HEAD") {
-    return { ok: false, gitRepository: true, branch, reason: "detached_head" };
-  }
+  const { branch, branchRef, headOid } = captured.identity;
 
   if (allowedTargetBranches.length > 0 && !allowedTargetBranches.includes(branch)) {
     return {
@@ -564,7 +730,7 @@ function inspectCanonicalTaskSpecGitTarget(
     };
   }
 
-  return { ok: true, gitRepository: true, branch };
+  return { ok: true, gitRepository: true, branch, branchRef, headOid };
 }
 
 /**
@@ -578,6 +744,8 @@ function inspectCanonicalTaskSpecGitTarget(
  * always attempted, no branch skip list.
  */
 interface CommitCanonicalTaskSpecOptions {
+  /** Exact task-spec bytes authorized by the caller's mutation fence. */
+  expectedTaskContent: string;
   /**
    * Commit message override. Supports `{taskId}` substitution.
    * Defaults to the v1 enrichment-candidate message when undefined.
@@ -591,14 +759,68 @@ interface CommitCanonicalTaskSpecOptions {
    * before touching the working tree.
    */
   skipBranches?: string[];
+  /** When provided, publication is limited to these exact configured branches. */
+  allowedTargetBranches?: string[];
 }
 
-function commitCanonicalTaskSpecChange(
+function conservativeCanonicalBranchError(branch: string): string | undefined {
+  if (
+    branch.length === 0 ||
+    branch.length > 200 ||
+    !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/u.test(branch) ||
+    branch === "@" ||
+    branch.endsWith("/") ||
+    branch.endsWith(".") ||
+    branch.includes("..") ||
+    branch.includes("//") ||
+    branch.includes("@{") ||
+    branch.split("/").some((segment) => segment.startsWith(".") || segment.endsWith(".lock"))
+  ) {
+    return `Refusing unsafe canonical task-spec target branch: ${JSON.stringify(branch)}`;
+  }
+  return undefined;
+}
+
+function trustedRepositoryExpectation(
+  origin: GitOriginIdentity,
+): { host: string; owner: string; repo: string } | undefined {
+  if (!origin.github) return undefined;
+  const [owner, repo] = origin.github.nameWithOwner.split("/");
+  return owner && repo ? { host: origin.github.host, owner, repo } : undefined;
+}
+
+function canonicalPublicationFailure(
+  branch: string | undefined,
+  commitSha: string | undefined,
+  error: unknown,
+): CanonicalTaskSpecCommitResult {
+  return {
+    attempted: true,
+    committed: true,
+    pushed: false,
+    branch,
+    commitSha,
+    error: error instanceof Error ? error.message : String(error),
+  };
+}
+
+function parseExactRemoteBranchOid(stdout: string, branch: string): string | undefined {
+  const expectedRef = `refs/heads/${branch}`;
+  const matches = stdout
+    .split(/\r?\n/u)
+    .map((line) => line.trim().split(/\s+/u))
+    .filter(([oid, ref]) => Boolean(oid) && ref === expectedRef);
+  if (matches.length !== 1) return undefined;
+  const oid = matches[0]?.[0];
+  return oid && /^[0-9a-f]{40,64}$/iu.test(oid) ? oid : undefined;
+}
+
+export async function commitCanonicalTaskSpecChange(
   projectRoot: string,
   taskId: string,
   taskFilePath: string,
-  options: CommitCanonicalTaskSpecOptions = {},
-): CanonicalTaskSpecCommitResult {
+  options: CommitCanonicalTaskSpecOptions,
+): Promise<CanonicalTaskSpecCommitResult> {
   const insideWorkTree = runGitSync(projectRoot, ["rev-parse", "--is-inside-work-tree"]);
   if (insideWorkTree.exitCode !== 0 || insideWorkTree.stdout.trim() !== "true") {
     return {
@@ -619,17 +841,47 @@ function commitCanonicalTaskSpecChange(
     };
   }
 
-  // Resolve the current branch up-front so we can apply skipBranches before
-  // staging anything. The v1 caller path does not pass skipBranches so this
-  // is a no-op for that flow.
-  const earlyBranchResult = runGitSync(projectRoot, ["rev-parse", "--abbrev-ref", "HEAD"]);
-  const earlyBranch =
-    earlyBranchResult.exitCode === 0 ? earlyBranchResult.stdout.trim() : undefined;
+  const capturedSource = captureCanonicalTaskSpecGitIdentity(projectRoot);
+  if (!capturedSource.ok) {
+    return {
+      attempted: false,
+      committed: false,
+      pushed: false,
+      branch: capturedSource.branch,
+      skippedReason: capturedSource.reason,
+      ...(capturedSource.error ? { error: capturedSource.error } : {}),
+    };
+  }
+  const sourceIdentity = capturedSource.identity;
+  const earlyBranch = sourceIdentity.branch;
+  const branchError = conservativeCanonicalBranchError(earlyBranch);
+  if (branchError) {
+    return {
+      attempted: false,
+      committed: false,
+      pushed: false,
+      branch: earlyBranch,
+      skippedReason: "unsafe_target_branch",
+      error: branchError,
+    };
+  }
+  if (
+    options.allowedTargetBranches &&
+    options.allowedTargetBranches.length > 0 &&
+    !options.allowedTargetBranches.includes(earlyBranch)
+  ) {
+    return {
+      attempted: false,
+      committed: false,
+      pushed: false,
+      branch: earlyBranch,
+      skippedReason: "not_on_canonical_target_branch",
+      error: `Current branch ${earlyBranch} is not one of: ${options.allowedTargetBranches.join(", ")}`,
+    };
+  }
   if (
     options.skipBranches &&
     options.skipBranches.length > 0 &&
-    earlyBranch &&
-    earlyBranch !== "HEAD" &&
     options.skipBranches.includes(earlyBranch)
   ) {
     return {
@@ -639,6 +891,24 @@ function commitCanonicalTaskSpecChange(
       branch: earlyBranch,
       skippedReason: "protected_branch",
     };
+  }
+
+  // Bind the exact, audited push URL before creating the local commit. A
+  // later config change must not be able to redirect publication to a
+  // different remote. Push-disabled callers do not need a remote at all.
+  let boundOrigin: GitOriginIdentity | undefined;
+  if (options.push !== false) {
+    try {
+      boundOrigin = await resolveOriginRepository(projectRoot);
+    } catch (error: unknown) {
+      return {
+        attempted: false,
+        committed: false,
+        pushed: false,
+        branch: earlyBranch,
+        error: `Failed to bind canonical Git origin: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
   }
 
   const stagedBefore = runGitSync(projectRoot, ["diff", "--cached", "--name-only"]);
@@ -697,35 +967,199 @@ function commitCanonicalTaskSpecChange(
     };
   }
 
-  const commitMessage = (
-    options.commitMessage ?? `docs(tasks): accept enrichment candidate for {taskId}`
-  ).replace(/\{taskId\}/gu, taskId);
-
-  const commitResult = runGitSync(projectRoot, ["commit", "-m", commitMessage]);
-  if (commitResult.exitCode !== 0) {
+  const beforeCommit = captureCanonicalTaskSpecGitIdentity(projectRoot);
+  if (
+    !beforeCommit.ok ||
+    !sameCanonicalTaskSpecGitIdentity(sourceIdentity, beforeCommit.identity)
+  ) {
     runGitSync(projectRoot, ["reset", "HEAD", "--", relativeTaskPath]);
     return {
       attempted: true,
       committed: false,
       pushed: false,
-      error: commitResult.stderr || commitResult.stdout || "git commit failed",
+      branch: earlyBranch,
+      skippedReason: "git_identity_changed",
+      error:
+        beforeCommit.ok === false && beforeCommit.error
+          ? beforeCommit.error
+          : "Canonical task-spec branch or HEAD changed before commit",
     };
   }
 
-  const branchResult = runGitSync(projectRoot, ["rev-parse", "--abbrev-ref", "HEAD"]);
-  const branch = branchResult.exitCode === 0 ? branchResult.stdout.trim() : undefined;
-  const commitShaResult = runGitSync(projectRoot, ["rev-parse", "HEAD"]);
-  const commitSha = commitShaResult.exitCode === 0 ? commitShaResult.stdout.trim() : undefined;
+  const commitMessage = (
+    options.commitMessage ?? `docs(tasks): accept enrichment candidate for {taskId}`
+  ).replace(/\{taskId\}/gu, taskId);
 
-  if (!branch || branch === "HEAD") {
+  // Freeze the exact staged tree, create its commit object, then advance only
+  // the inspected branch from the inspected source OID. This avoids the
+  // validation-to-use race in `git commit`, whose index and HEAD inputs can be
+  // replaced by another Git process after the checks above.
+  const stagedTreeResult = runGitSync(projectRoot, ["write-tree"]);
+  const stagedTreeOid = stagedTreeResult.stdout.trim().toLowerCase();
+  if (stagedTreeResult.exitCode !== 0 || !/^[0-9a-f]{40,64}$/u.test(stagedTreeOid)) {
+    runGitSync(projectRoot, ["reset", "HEAD", "--", relativeTaskPath]);
     return {
       attempted: true,
-      committed: true,
+      committed: false,
+      pushed: false,
+      error:
+        stagedTreeResult.stderr ||
+        stagedTreeResult.stdout ||
+        "failed to capture the exact staged task-spec tree",
+    };
+  }
+  const stagedTreePaths = runGitSync(projectRoot, [
+    "diff-tree",
+    "--no-commit-id",
+    "--name-only",
+    "-r",
+    sourceIdentity.headOid,
+    stagedTreeOid,
+  ]);
+  const immutablePaths = stagedTreePaths.stdout
+    .split(/\r?\n/u)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  const stagedTaskContent = runGitSync(projectRoot, [
+    "show",
+    `${stagedTreeOid}:${relativeTaskPath}`,
+  ]);
+  const normalizeTaskContent = (content: string): string => content.replace(/\r\n?/gu, "\n");
+  if (
+    stagedTreePaths.exitCode !== 0 ||
+    immutablePaths.length !== 1 ||
+    immutablePaths[0] !== relativeTaskPath ||
+    stagedTaskContent.exitCode !== 0 ||
+    normalizeTaskContent(stagedTaskContent.stdout) !==
+      normalizeTaskContent(options.expectedTaskContent)
+  ) {
+    runGitSync(projectRoot, ["reset", "HEAD", "--", relativeTaskPath]);
+    return {
+      attempted: true,
+      committed: false,
+      pushed: false,
+      branch: earlyBranch,
+      skippedReason: "staged_task_changed",
+      error: "The exact staged task-spec tree no longer matches the authorized replacement",
+    };
+  }
+
+  const branch = sourceIdentity.branch;
+  const commitResult = runGitSync(projectRoot, [
+    "commit-tree",
+    stagedTreeOid,
+    "-p",
+    sourceIdentity.headOid,
+    "-m",
+    commitMessage,
+  ]);
+  const commitSha = commitResult.stdout.trim().toLowerCase();
+  if (commitResult.exitCode !== 0 || !/^[0-9a-f]{40,64}$/u.test(commitSha)) {
+    runGitSync(projectRoot, ["reset", "HEAD", "--", relativeTaskPath]);
+    return {
+      attempted: true,
+      committed: false,
       pushed: false,
       branch,
-      commitSha,
-      skippedReason: "detached_head_not_pushed",
+      error: commitResult.stderr || commitResult.stdout || "git commit-tree failed",
     };
+  }
+
+  const beforeRefUpdate = captureCanonicalTaskSpecGitIdentity(projectRoot);
+  if (
+    !beforeRefUpdate.ok ||
+    !sameCanonicalTaskSpecGitIdentity(sourceIdentity, beforeRefUpdate.identity)
+  ) {
+    runGitSync(projectRoot, ["reset", "HEAD", "--", relativeTaskPath]);
+    return {
+      attempted: true,
+      committed: false,
+      pushed: false,
+      branch,
+      skippedReason: "git_identity_changed",
+      error:
+        beforeRefUpdate.ok === false && beforeRefUpdate.error
+          ? beforeRefUpdate.error
+          : "Canonical task-spec branch or HEAD changed before commit publication",
+    };
+  }
+
+  const updateRefResult = runGitSync(projectRoot, [
+    "update-ref",
+    "-m",
+    `quack canonical task ${taskId}`,
+    sourceIdentity.branchRef,
+    commitSha,
+    sourceIdentity.headOid,
+  ]);
+  if (updateRefResult.exitCode !== 0) {
+    runGitSync(projectRoot, ["reset", "HEAD", "--", relativeTaskPath]);
+    return {
+      attempted: true,
+      committed: false,
+      pushed: false,
+      branch,
+      skippedReason: "git_identity_changed",
+      error:
+        updateRefResult.stderr ||
+        updateRefResult.stdout ||
+        "Canonical task-spec source branch changed before its commit could be published",
+    };
+  }
+
+  const committedIdentity = captureCanonicalTaskSpecGitIdentity(projectRoot);
+  const expectedCommittedIdentity: CanonicalTaskSpecGitIdentity = {
+    branch,
+    branchRef: sourceIdentity.branchRef,
+    headOid: commitSha,
+  };
+  if (
+    !committedIdentity.ok ||
+    !sameCanonicalTaskSpecGitIdentity(expectedCommittedIdentity, committedIdentity.identity)
+  ) {
+    return canonicalPublicationFailure(
+      branch,
+      commitSha,
+      committedIdentity.ok === false && committedIdentity.error
+        ? committedIdentity.error
+        : "Canonical task-spec branch or HEAD changed after its exact commit was published",
+    );
+  }
+  const parents = runGitSync(projectRoot, ["rev-list", "--parents", "-n", "1", commitSha]);
+  const parentOids = parents.stdout.trim().toLowerCase().split(/\s+/u).filter(Boolean);
+  if (
+    parents.exitCode !== 0 ||
+    parentOids.length !== 2 ||
+    parentOids[0] !== commitSha ||
+    parentOids[1] !== sourceIdentity.headOid
+  ) {
+    return canonicalPublicationFailure(
+      branch,
+      commitSha,
+      "Canonical task-spec commit was not created directly from the inspected source HEAD",
+    );
+  }
+  const committedPaths = runGitSync(projectRoot, [
+    "diff-tree",
+    "--no-commit-id",
+    "--name-only",
+    "-r",
+    commitSha,
+  ]);
+  const publishedPaths = committedPaths.stdout
+    .split(/\r?\n/u)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (
+    committedPaths.exitCode !== 0 ||
+    publishedPaths.length !== 1 ||
+    publishedPaths[0] !== relativeTaskPath
+  ) {
+    return canonicalPublicationFailure(
+      branch,
+      commitSha,
+      "Canonical task-spec commit contains files outside the authorized task spec",
+    );
   }
 
   // Allow callers to skip the push step (e.g., when an operator wants to
@@ -741,7 +1175,40 @@ function commitCanonicalTaskSpecChange(
     };
   }
 
-  const pushResult = runGitSync(projectRoot, ["push", "origin", `HEAD:${branch}`]);
+  let publicationOrigin: GitOriginIdentity;
+  try {
+    publicationOrigin = await resolveBoundOriginRepository(
+      projectRoot,
+      persistentOriginRepositoryBinding(boundOrigin!),
+    );
+  } catch (error: unknown) {
+    return canonicalPublicationFailure(
+      branch,
+      commitSha,
+      `Canonical Git origin verification failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  const beforePush = captureCanonicalTaskSpecGitIdentity(projectRoot);
+  if (
+    !beforePush.ok ||
+    !sameCanonicalTaskSpecGitIdentity(committedIdentity.identity, beforePush.identity)
+  ) {
+    return canonicalPublicationFailure(
+      branch,
+      commitSha,
+      beforePush.ok === false && beforePush.error
+        ? beforePush.error
+        : "Canonical task-spec branch or HEAD changed before push",
+    );
+  }
+
+  const expectedRepository = trustedRepositoryExpectation(publicationOrigin);
+  const pushResult = runGitSync(
+    projectRoot,
+    ["push", publicationOrigin.pushUrl, `${commitSha}:refs/heads/${branch}`],
+    expectedRepository ? { expectedRepository } : undefined,
+  );
   if (pushResult.exitCode !== 0) {
     return {
       attempted: true,
@@ -751,6 +1218,27 @@ function commitCanonicalTaskSpecChange(
       commitSha,
       error: pushResult.stderr || pushResult.stdout || "git push failed",
     };
+  }
+
+  const readback = runGitSync(
+    projectRoot,
+    ["ls-remote", "--heads", publicationOrigin.pushUrl, `refs/heads/${branch}`],
+    expectedRepository ? { expectedRepository } : undefined,
+  );
+  if (readback.exitCode !== 0) {
+    return canonicalPublicationFailure(
+      branch,
+      commitSha,
+      readback.stderr || readback.stdout || "failed to read back canonical task-spec publication",
+    );
+  }
+  const remoteOid = parseExactRemoteBranchOid(readback.stdout, branch);
+  if (!remoteOid || remoteOid.toLowerCase() !== commitSha.toLowerCase()) {
+    return canonicalPublicationFailure(
+      branch,
+      commitSha,
+      `Canonical task-spec publication readback mismatch: expected ${commitSha}, received ${remoteOid ?? "no exact remote ref"}`,
+    );
   }
 
   return {
@@ -902,6 +1390,29 @@ function sessionSortValue(session: MonitorSessionSummary, sort: string): string 
 // Runs verification commands (test, lint, build) as child processes
 // and streams output to SSE clients.
 
+function terminateWindowsProcessTree(processId: number): boolean {
+  const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT ?? process.env.WINDIR;
+  if (!systemRoot || !path.win32.isAbsolute(systemRoot)) return false;
+  try {
+    const executable = fs.realpathSync.native(
+      path.win32.join(systemRoot, "System32", "taskkill.exe"),
+    );
+    execFileSync(executable, ["/F", "/T", "/PID", String(processId)], {
+      cwd: path.dirname(executable),
+      env: {
+        SystemRoot: systemRoot,
+        WINDIR: systemRoot,
+        PATH: path.dirname(executable),
+      },
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export { TestRunResult } from "../core/types.js";
 
 interface TestRunnerStartOptions {
@@ -936,6 +1447,7 @@ export class TestRunner {
   private currentName = "";
   private currentCommand = "";
   private currentAdapterFreshness: AdapterFreshnessMetadata | undefined;
+  private terminalDrain = false;
   private history: TestRunResult[] = [];
   private projectRoot: string;
   private historyFile: string;
@@ -980,6 +1492,10 @@ export class TestRunner {
     return this.running;
   }
 
+  beginTerminalDrain(): void {
+    this.terminalDrain = true;
+  }
+
   getStatus(): {
     running: boolean;
     name: string;
@@ -1000,10 +1516,9 @@ export class TestRunner {
 
   private getCurrentGitSha(): string | undefined {
     try {
-      return execSync("git rev-parse HEAD", {
-        cwd: this.projectRoot,
-        stdio: ["ignore", "pipe", "ignore"],
-        encoding: "utf-8",
+      return executeTrustedGitSync(["rev-parse", "HEAD"], this.projectRoot, {
+        timeoutMs: 10_000,
+        maxBuffer: 1024 * 1024,
       }).trim();
     } catch {
       return undefined;
@@ -1012,10 +1527,9 @@ export class TestRunner {
 
   private hasSourceChangesSince(lastRunGitSha: string | undefined): boolean {
     try {
-      const status = execSync("git status --porcelain", {
-        cwd: this.projectRoot,
-        stdio: ["ignore", "pipe", "ignore"],
-        encoding: "utf-8",
+      const status = executeTrustedGitSync(["status", "--porcelain"], this.projectRoot, {
+        timeoutMs: 10_000,
+        maxBuffer: 5 * 1024 * 1024,
       }).trim();
       if (status.length > 0) return true;
     } catch {
@@ -1083,6 +1597,9 @@ export class TestRunner {
   }
 
   start(name: string, command: string, options?: TestRunnerStartOptions): TestRunnerStartResult {
+    if (this.terminalDrain) {
+      throw new Error("Test runner is terminally drained and cannot accept new commands");
+    }
     if (this.running) {
       throw new Error("A command is already running");
     }
@@ -1283,6 +1800,92 @@ export class TestRunner {
     return { started: true };
   }
 
+  /**
+   * Run a named adapter verifier through the same authoritative verification
+   * boundary used by dispatch and post-judge checks.  The dashboard must not
+   * bypass `verification.hostExecution` by spawning an adapter command on the
+   * monitor host.
+   */
+  startAdapterVerification(
+    adapter: ProjectAdapter,
+    name: string,
+    options?: TestRunnerStartOptions,
+  ): TestRunnerStartResult {
+    if (this.terminalDrain) {
+      throw new Error("Test runner is terminally drained and cannot accept new commands");
+    }
+    if (this.running) {
+      throw new Error("A command is already running");
+    }
+    if (path.resolve(adapter.projectRoot) !== path.resolve(this.projectRoot)) {
+      throw new Error("Test runner project does not match the selected adapter project");
+    }
+
+    this.running = true;
+    this.currentName = name;
+    this.currentCommand = `verification:${name}`;
+    this.currentAdapterFreshness = options?.adapterFreshness;
+    const startedAt = new Date().toISOString();
+    const startMs = Date.now();
+    const gitSha = this.getCurrentGitSha();
+    const taskId = `manual-${Date.now()}`;
+
+    this.onOutput(
+      `[verification] Running '${name}' through the configured execution boundary...\n`,
+    );
+
+    void runVerification(adapter, name, {
+      includeOptional: true,
+      baseBranch: options?.baseBranch,
+    })
+      .then((verification) => {
+        const finishedAt = new Date().toISOString();
+        const result: TestRunResult = {
+          name,
+          command: this.currentCommand,
+          exitCode: verification.allPassed ? 0 : 1,
+          durationMs: Date.now() - startMs,
+          startedAt,
+          finishedAt,
+          projectId: this.projectRoot,
+          gitSha,
+          taskId,
+          adapterFreshness: verification.adapterFreshness ?? options?.adapterFreshness,
+        };
+        this.onOutput(`${formatVerificationResult(verification)}\n`);
+        this.finishRun(name, result);
+        this.onEvent?.("test_run_complete", {
+          taskId,
+          passed: verification.allPassed,
+          commandCount: verification.commands.length,
+          conventionCheckCount: verification.conventionChecks.length,
+        });
+        this.onEvent?.("test_dashboard_update", { taskId });
+      })
+      .catch((error: unknown) => {
+        const finishedAt = new Date().toISOString();
+        const message = error instanceof Error ? error.message : String(error);
+        const result: TestRunResult = {
+          name,
+          command: this.currentCommand,
+          exitCode: -1,
+          durationMs: Date.now() - startMs,
+          startedAt,
+          finishedAt,
+          projectId: this.projectRoot,
+          gitSha,
+          taskId,
+          adapterFreshness: options?.adapterFreshness,
+        };
+        this.onOutput(`\n--- ${name} verification error: ${message} ---\n`);
+        this.finishRun(name, result);
+        this.onEvent?.("test_run_complete", { taskId, passed: false, error: message });
+        this.onEvent?.("test_dashboard_update", { taskId });
+      });
+
+    return { started: true, taskId };
+  }
+
   stop(): boolean {
     if (!this.process || !this.running) {
       return false;
@@ -1300,9 +1903,7 @@ export class TestRunner {
   private killProcess(proc: ChildProcess): void {
     if (process.platform === "win32" && proc.pid) {
       // On Windows, shell-spawned processes need taskkill /T to kill the entire tree
-      try {
-        execSync(`taskkill /F /T /PID ${proc.pid}`, { stdio: "ignore" });
-      } catch {
+      if (!terminateWindowsProcessTree(proc.pid)) {
         proc.kill("SIGTERM");
       }
     } else {
@@ -1331,93 +1932,47 @@ function resolveTaskRuntimeLogDir(
   taskId: string,
   configuredLogDir?: string,
 ): string {
+  const managedWorktree = dispatchManager?.getJob(taskId)?.worktreePath;
   const fallback = path.resolve(projectRoot, ".quack", "logs");
   const configured = configuredLogDir ?? fallback;
-  const safeDockerRuntime = (candidate: string): boolean => {
-    const root = path.resolve(configured, "docker-import");
-    const resolved = path.resolve(candidate);
-    const relative = path.relative(root, resolved);
-    if (!relative || path.isAbsolute(relative) || relative.startsWith(`..${path.sep}`))
-      return false;
-    const pending = [resolved];
-    try {
-      while (pending.length > 0) {
-        const current = pending.pop()!;
-        const stat = fs.lstatSync(current);
-        if (stat.isSymbolicLink()) return false;
-        if (stat.isFile()) {
-          if (stat.nlink !== 1) return false;
-          continue;
-        }
-        if (!stat.isDirectory()) return false;
-        for (const entry of fs.readdirSync(current)) pending.push(path.join(current, entry));
-      }
-      return true;
-    } catch {
-      return false;
-    }
-  };
-  const exactDockerPause = dispatchManager?.getDockerPausedRuntimeDir(taskId);
-  if (exactDockerPause) {
-    if (!safeDockerRuntime(exactDockerPause)) {
-      throw new Error(`Docker pause archive for ${taskId} failed the trusted-path check`);
-    }
-    return exactDockerPause;
-  }
-  const job = dispatchManager?.getJob(taskId);
-  if (job?.runtimeLogDir && safeDockerRuntime(job.runtimeLogDir)) return job.runtimeLogDir;
-  // While the Docker child is live (or its output import failed), keep host
-  // control writes in the authoritative monitor tree. Never return the
-  // container-writable worktree subtree to approval/checkpoint writers.
-  if (job?.containerId) return configured;
-  const managedWorktree = job?.worktreePath;
-  const conventionalWorktree = path.join(projectRoot, ".quack", "worktrees", taskId);
-  const runtimeRoot =
-    managedWorktree ?? (fs.existsSync(conventionalWorktree) ? conventionalWorktree : projectRoot);
-  if (runtimeRoot === projectRoot) return configured;
-  const rel = path.relative(projectRoot, configured);
-  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
-    // The configured dir lives outside the project: the child writes
-    // there directly, worktree or not.
-    return configured;
-  }
-  return path.resolve(runtimeRoot, rel);
+  return resolveRevisionRuntimeContext(projectRoot, taskId, configured, managedWorktree).logDir;
 }
 
-function formatLoopReviewFeedback(review: ReviewRunResult | undefined): string {
-  if (!review) return "";
-  if (review.status === "runner_error") {
-    return `### Loop reviewer environment failure\n- ${review.errorKind}: ${review.message}`;
+interface ShutdownDispatchManager {
+  killAll(): boolean;
+}
+
+/**
+ * Stop every dispatch manager and propagate any fail-closed refusal. A monitor
+ * must remain alive when even one manager cannot durably fence its children.
+ */
+export function stopDispatchManagersForShutdown(
+  managers: Iterable<ShutdownDispatchManager>,
+): boolean {
+  let allStopped = true;
+  for (const manager of new Set(managers)) {
+    try {
+      if (!manager.killAll()) allStopped = false;
+    } catch {
+      allStopped = false;
+    }
   }
-  if (review.findings.length === 0) {
-    return `### Loop reviewer verdict: ${review.verdict}\n${review.summary}`;
-  }
-  return [
-    `### Loop reviewer verdict: ${review.verdict}`,
-    review.summary,
-    ...review.findings.map(
-      (finding) =>
-        `- [${finding.severity}] ${finding.summary}${finding.detail ? ` — ${finding.detail}` : ""}`,
-    ),
-  ].join("\n");
+  return allStopped;
 }
 
 export function createMonitorServer(options: MonitorServerOptions): MonitorServer {
-  const { logDir, port = 3333, adapterPath, projectRoot, taskDir, projectAdapters } = options;
+  const {
+    logDir,
+    port = 3333,
+    adapterPath,
+    projectRoot: configuredProjectRoot,
+    taskDir,
+    projectAdapters,
+  } = options;
+  const projectRoot = configuredProjectRoot ? path.resolve(configuredProjectRoot) : undefined;
 
-  // Strip Claude Code nesting detection env vars â€” the monitor is a standalone
-  // server process, not a Claude Code session. Without this, inline LLM calls
-  // (preflight depth evaluation, enrichment, blueprint generation) fail when
-  // the monitor was spawned from within a Claude Code session.
-  delete process.env.CLAUDECODE;
-  delete process.env.CLAUDE_CODE;
-
-  // Strip ANTHROPIC_API_KEY so the SDK CLI subprocess uses the Max subscription's
-  // OAuth auth instead of a potentially empty/depleted API key inherited from the
-  // parent environment. The dispatch manager already does this for child processes
-  // (dispatch-manager.ts:323), but in-process SDK calls (depth evaluator, spec
-  // reviewer, blueprint agent) inherit the monitor's env directly.
-  delete process.env.ANTHROPIC_API_KEY;
+  // Keep operator credentials intact for KeyManager initialization. Claude SDK
+  // and process boundaries select and scrub their own credential environment.
 
   const app = express();
   let shutdownAdmissionClosed = false;
@@ -1433,6 +1988,120 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       return;
     }
     next();
+  });
+
+  type StartupPhase = "idle" | "starting" | "ready" | "stopped" | "failed";
+  let startupPhase: StartupPhase = "idle";
+
+  // `start()` binds the socket before it performs reconciliation or starts
+  // watchers. While that post-bind initialization is in progress, keep the
+  // newly-owned port deliberately unavailable to callers.
+  app.use((req: Request, res: Response, next) => {
+    if (startupPhase !== "starting") {
+      next();
+      return;
+    }
+    res.setHeader("Connection", "close");
+    res.status(503).json({
+      error: "Monitor is still starting",
+      code: "MONITOR_STARTING",
+    });
+  });
+
+  interface MonitorDrainState {
+    reason: string;
+    requestedAt: string;
+    attempts: number;
+    dispatchStopConfirmed: boolean;
+    quiesceComplete: boolean;
+    lastAttemptAt?: string;
+    lastError?: string;
+  }
+
+  // A drain is a terminal admission state for this server instance. It is set
+  // synchronously before any process-stop work begins, which closes the race
+  // where a new dispatch could enter between a final job poll and termination.
+  let monitorDrain: MonitorDrainState | undefined;
+  let runtimeDrainPromise: Promise<void> | undefined;
+  let fatalShutdownRetry: ReturnType<typeof setTimeout> | undefined;
+  let terminalExitRequested = false;
+  let httpServer: ReturnType<typeof createHttpServer> | undefined;
+  let stopPromise: Promise<void> | undefined;
+  let startPromise: Promise<{ port: number; stop: () => Promise<void> }> | undefined;
+
+  interface RuntimeLifecycleResources {
+    onUncaughtException?: (error: Error) => void;
+    onUnhandledRejection?: (reason: unknown) => void;
+    onSigint?: () => void;
+    onSigterm?: () => void;
+    stopWatcher?: () => Promise<void>;
+    baselineInterval?: ReturnType<typeof setInterval>;
+    cleanupInterval?: ReturnType<typeof setInterval>;
+    startupValidationTasks: Array<Promise<void>>;
+    stopFreshnessMonitors: Array<() => Promise<void>>;
+    stopOnMergeRecorders: Array<() => void>;
+    stopVerifiedSyncs: Array<() => void>;
+    adapterWatcher?: { close: () => Promise<void> };
+    taskWatcherInstance?: { close: () => Promise<void> };
+    githubPollInterval?: ReturnType<typeof setInterval>;
+    githubSyncInterval?: ReturnType<typeof setInterval>;
+    githubBackgroundTasks: Set<Promise<void>>;
+  }
+
+  const runtimeLifecycle: RuntimeLifecycleResources = {
+    startupValidationTasks: [],
+    stopFreshnessMonitors: [],
+    stopOnMergeRecorders: [],
+    stopVerifiedSyncs: [],
+    githubBackgroundTasks: new Set(),
+  };
+
+  const runGitHubBackgroundTask = (run: () => Promise<void>): void => {
+    if (shutdownAdmissionClosed) return;
+    const work = run();
+    runtimeLifecycle.githubBackgroundTasks.add(work);
+    const release = (): void => {
+      runtimeLifecycle.githubBackgroundTasks.delete(work);
+    };
+    void work.then(release, release);
+  };
+
+  const describeDrainError = (error: unknown): string => {
+    if (error instanceof AggregateError) {
+      const causes = error.errors.map((cause: unknown) => describeDrainError(cause));
+      return [error.message, ...causes].filter(Boolean).join(": ");
+    }
+    return error instanceof Error ? error.message : String(error);
+  };
+
+  const beginMonitorDrain = (reason: string): MonitorDrainState => {
+    if (!monitorDrain) {
+      monitorDrain = {
+        reason,
+        requestedAt: new Date().toISOString(),
+        attempts: 0,
+        dispatchStopConfirmed: false,
+        quiesceComplete: false,
+      };
+    }
+    return monitorDrain;
+  };
+
+  app.use((req: Request, res: Response, next) => {
+    if (!monitorDrain) {
+      next();
+      return;
+    }
+    if (req.path === "/api/health" || req.path === "/api/admin/drain") {
+      next();
+      return;
+    }
+    res.setHeader("Connection", "close");
+    res.status(503).json({
+      error: "Monitor is draining and no longer accepts work",
+      code: "MONITOR_DRAINING",
+      drain: monitorDrain,
+    });
   });
 
   // Multi-project mode or legacy single-project mode
@@ -1469,10 +2138,19 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
   // Note: DispatchManager creation delayed until after apiKeysConfig is loaded
   let dispatchManager: DispatchManager | null = null;
+  const dispatchManagersForShutdown = (): DispatchManager[] => {
+    const managers = new Set<DispatchManager>();
+    if (dispatchManager) managers.add(dispatchManager);
+    if (registry) {
+      for (const context of registry.listProjects()) {
+        if (context.dispatchManager) managers.add(context.dispatchManager);
+      }
+    }
+    return [...managers];
+  };
 
   // â”€â”€â”€ Prep cache, worker & scheduler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   const prepCache = projectRoot ? new PrepCache(projectRoot) : null;
-  const prepWorker = projectRoot ? new PrepWorker(projectRoot, quackBin) : null;
 
   // Load automation config and fleet budget from adapter.json (if available)
   let autoPrepConfig: AutoPrepConfig | undefined;
@@ -1660,10 +2338,33 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
   // Initialize KeyManager for legacy single-project mode (if apiKeys config present)
   const legacyKeyManager = apiKeysConfig
     ? new KeyManager({
+        pool: apiKeysConfig.pool,
         strategy: apiKeysConfig.strategy,
         cooldownMs: apiKeysConfig.cooldownMs,
       })
     : undefined;
+
+  const prepWorker = projectRoot
+    ? new PrepWorker(
+        projectRoot,
+        quackBin,
+        {},
+        {
+          keyManager: legacyKeyManager,
+          logDir: logDir || undefined,
+          projectId: legacyProjectId,
+          onTerminal: (job) =>
+            sse.broadcast({
+              sessionId: job.jobId ?? "prep",
+              taskId: job.taskId,
+              project: legacyProjectId,
+              timestamp: job.completedAt ?? new Date().toISOString(),
+              stage: job.status === "completed" ? "prep_job_completed" : "prep_failed",
+              payload: { ...job },
+            }),
+        },
+      )
+    : null;
 
   // Now create DispatchManager with KeyManager (if available)
   dispatchManager = projectRoot
@@ -1682,11 +2383,15 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
               claimants: await listDuplicateClaimants(taskService.getTaskDirectory(), taskId),
             })
           : undefined,
+        options.trustedLocalReadRemotePaths,
+        async (taskId, dispatch) => {
+          const adapter = await loadAdapter(projectRoot);
+          return withDecompositionAdmissionFence(adapter, taskId, dispatch, legacyDb);
+        },
       )
     : null;
 
-  // Start watchdog to kill stuck dispatch processes (2-hour default)
-  dispatchManager?.startWatchdog();
+  dispatchManager?.setObservationProjectId(legacyProjectId);
 
   const fleetBudget = new FleetBudgetChecker(
     reader,
@@ -1770,6 +2475,10 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
             });
           },
           legacyDb,
+          async (taskId, dispatch) => {
+            const dispatchAdapter = await loadAdapter(projectRoot);
+            return withDecompositionAdmissionFence(dispatchAdapter, taskId, dispatch, legacyDb);
+          },
         )
       : null;
 
@@ -1795,24 +2504,28 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
   // Track revision dispatches so we can emit revision_complete on session_complete
   const activeRevisions = new Set<string>();
 
-  // Wire stuck detection callback â†’ emit SSE events + kill agent
+  // Wire stuck detection callback â†’ emit SSE events + stop agent
   progressDetector.setStuckCallback((stuckEvent) => {
     if (stuckEvent.level === "kill") {
-      // Auto-kill the stuck agent
-      if (dispatchManager) {
-        dispatchManager.stop(stuckEvent.taskId);
-      }
+      const stopConfirmed = dispatchManager?.stop(stuckEvent.taskId) ?? false;
       sse.broadcast({
         sessionId: "progress-detector",
         taskId: stuckEvent.taskId,
         project: currentProjectId(),
         timestamp: new Date().toISOString(),
-        stage: "agent_stuck_killed",
+        // Do not emit the terminal "killed" fact unless containment actually
+        // confirmed the process tree. Critical keeps operators and workflow
+        // projection aware that manual cleanup is still required.
+        stage: stopConfirmed ? "agent_stuck_killed" : "agent_stuck_critical",
         payload: {
           taskId: stuckEvent.taskId,
           silentMs: stuckEvent.silentMs,
           totalCostUsd: stuckEvent.totalCostUsd,
           turnsCompleted: stuckEvent.turnNumber,
+          terminationConfirmed: stopConfirmed,
+          ...(stopConfirmed
+            ? {}
+            : { stopError: "Durable process-tree termination could not be confirmed" }),
         } as never,
       });
     } else if (stuckEvent.level === "critical") {
@@ -1865,28 +2578,9 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
   // Same-origin requests don't send Origin, and setting "Access-Control-Allow-Origin: *"
   // with "Access-Control-Allow-Credentials: true" is forbidden by the spec â€”
   // the browser silently drops Set-Cookie headers, breaking auth.
-  const defaultCorsOrigins = new Set([
-    "http://localhost",
-    "https://localhost",
-    "http://127.0.0.1",
-    "https://127.0.0.1",
-    "http://[::1]",
-    "https://[::1]",
-  ]);
-  const configuredCorsOrigins = new Set(options.corsOrigins ?? []);
-  const isAllowedCorsOrigin = (origin: string): boolean => {
-    if (configuredCorsOrigins.has(origin)) return true;
-    try {
-      const parsed = new URL(origin);
-      return defaultCorsOrigins.has(`${parsed.protocol}//${parsed.hostname}`);
-    } catch {
-      return false;
-    }
-  };
-
   app.use((_req, res, next) => {
     const origin = _req.headers.origin;
-    if (origin && isAllowedCorsOrigin(origin)) {
+    if (origin) {
       res.setHeader("Access-Control-Allow-Origin", origin);
       res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
       res.setHeader(
@@ -1894,10 +2588,6 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         "Authorization, Content-Type, X-API-Key, X-Project-Id, X-Quack-Service-Token",
       );
       res.setHeader("Access-Control-Allow-Credentials", "true");
-    }
-    if (_req.method === "OPTIONS" && origin && !isAllowedCorsOrigin(origin)) {
-      res.status(403).json({ error: "Origin not allowed" });
-      return;
     }
     if (_req.method === "OPTIONS") {
       res.sendStatus(204);
@@ -1994,6 +2684,26 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     judgmentConfig?: JudgmentConfig;
   }
 
+  async function dispatchWithDecompositionFence<T>(
+    project: ResolvedProject,
+    taskId: string,
+    dispatch: (admission?: DecompositionDispatchAdmission) => T | Promise<T>,
+  ): Promise<T> {
+    if (!project.projectRoot) return dispatch();
+    const dispatchAdapter = await loadCanonicalMutationAdapter(project);
+    return withDecompositionAdmissionFence(dispatchAdapter, taskId, dispatch, project.db);
+  }
+
+  function withDispatchAdmission(
+    options: Parameters<DispatchManager["start"]>[1],
+    admission?: DecompositionDispatchAdmission,
+  ): Parameters<DispatchManager["start"]>[1] {
+    return {
+      ...options,
+      ...(admission ? { admittedTaskContentHash: admission.contentHash } : {}),
+    };
+  }
+
   async function rejectDuplicateClaimantWrite(
     project: ResolvedProject,
     taskId: string,
@@ -2017,6 +2727,56 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
     res.status(409).json({ ok: false, ...duplicateClaimantRefusal(check) });
     return true;
+  }
+
+  function rejectCanonicalTaskSpecMutation(error: unknown, res: Response): boolean {
+    if (!(error instanceof CanonicalTaskSpecMutationError)) return false;
+    if (error.claimants.length > 1 && error.taskId) {
+      res.status(409).json({
+        ok: false,
+        error: "duplicate_claimants",
+        taskId: error.taskId,
+        claimants: [...error.claimants],
+        message: error.message,
+      });
+      return true;
+    }
+    res.status(409).json({ ok: false, error: error.code, message: error.message });
+    return true;
+  }
+
+  async function loadCanonicalMutationAdapter(project: ResolvedProject): Promise<ProjectAdapter> {
+    if (!project.projectRoot || !project.taskService) {
+      throw new Error("Canonical task mutation requires a configured project and task service.");
+    }
+    const conventionalAdapterPath = path.join(project.projectRoot, ".quack", "adapter.json");
+    if (project.adapterPath || fs.existsSync(conventionalAdapterPath)) {
+      return loadAdapter(project.projectRoot);
+    }
+
+    // Legacy embedded-monitor tests and callers may provide the project/task
+    // roots directly without an adapter file. Preserve that supported mode,
+    // but still route the write through the same reservation/recovery/CAS
+    // boundary as registry-backed projects.
+    return {
+      projectRoot: project.projectRoot,
+      conventionsDoc: "",
+      config: {
+        project: {
+          name: "legacy-monitor",
+          root: ".",
+          taskDir: project.taskService.getTaskDirectory(),
+          conventionsDir: ".quack",
+        },
+        git: {
+          baseBranch: "main",
+          branchPrefix: "quack/",
+          commitFormat: "[{taskId}] {message}",
+          commitTrailer: "",
+          autoPush: false,
+        },
+      },
+    } as ProjectAdapter;
   }
 
   function rejectDuplicateClaimantIndex(
@@ -2211,6 +2971,78 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     return true;
   }
 
+  /** Deliberate, pre-mutation lifecycle refusals are request conflicts, not
+   * monitor failures. Approval file corruption and unexpected I/O retain the
+   * normal 500 path because this helper accepts only the manager's typed
+   * conflict. */
+  function respondIfApprovalDecisionConflict(res: Response, err: unknown): boolean {
+    if (!(err instanceof ApprovalDecisionConflictError)) return false;
+    res.status(409).json({
+      error: err.message,
+      code: err.code,
+      reason: err.reason,
+    });
+    return true;
+  }
+
+  async function assertJudgeApprovalRecordPresent(taskId: string, logDir: string): Promise<void> {
+    const approvalPath = path.join(logDir, "approvals", `${taskId}-judge.json`);
+    try {
+      await fs.promises.lstat(approvalPath);
+    } catch (error: unknown) {
+      const code =
+        typeof error === "object" && error !== null && "code" in error
+          ? String((error as { code?: unknown }).code)
+          : "";
+      if (code === "ENOENT") {
+        throw new ApprovalDecisionConflictError(
+          "approval_missing",
+          `Cannot resolve ${taskId}'s approval pause: the judge approval record does not exist.`,
+        );
+      }
+      throw error;
+    }
+  }
+
+  function respondIfDecompositionRecoveryRequired(res: Response, err: unknown): boolean {
+    if (!(err instanceof DecompositionRecoveryError)) return false;
+    res.status(409).json({
+      ok: false,
+      code: "decomposition_recovery_required",
+      error: err.message,
+      journalPath: err.journalPath,
+      details: err.details,
+    });
+    return true;
+  }
+
+  class JudgeRecycleConflictError extends Error {
+    constructor(
+      public readonly status: 404 | 409,
+      public readonly code: string,
+      message: string,
+      public readonly verdict?: string,
+    ) {
+      super(message);
+      this.name = "JudgeRecycleConflictError";
+    }
+  }
+
+  class FederatedStartClaimError extends Error {
+    readonly code = "federated_claim_unverified";
+
+    constructor() {
+      super("The federated job lease no longer authorizes this task start.");
+      this.name = "FederatedStartClaimError";
+    }
+  }
+
+  function respondIfFederatedStartClaimInvalid(res: Response, err: unknown): boolean {
+    if (!(err instanceof FederatedStartClaimError)) return false;
+    res.status(409).json({ ok: false, code: err.code, error: err.message });
+    return true;
+  }
+
   function resolveProject(req?: Request): ResolvedProject {
     const requestProjectId = req
       ? (resolveProjectIdFromRequest(req).projectId ??
@@ -2263,6 +3095,201 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     return [resolveProject(req)];
   }
 
+  const runtimeDrainHook = async (): Promise<void> => {
+    const closes: Array<{ label: string; promise: Promise<void> }> = [];
+    const legacyTaskWatcher = runtimeLifecycle.taskWatcherInstance;
+    if (legacyTaskWatcher) {
+      closes.push({
+        label: "legacy task watcher",
+        promise: (async () => {
+          await legacyTaskWatcher.close();
+          if (runtimeLifecycle.taskWatcherInstance === legacyTaskWatcher) {
+            runtimeLifecycle.taskWatcherInstance = undefined;
+          }
+        })(),
+      });
+    }
+    if (registry) {
+      for (const context of registry.listProjects()) {
+        if (context.taskWatcher) {
+          const watcher = context.taskWatcher;
+          closes.push({
+            label: `task watcher for ${context.id}`,
+            promise: (async () => {
+              await watcher.close();
+              if (context.taskWatcher === watcher) context.taskWatcher = undefined;
+            })(),
+          });
+        }
+      }
+    }
+    const results = await Promise.allSettled(closes.map(({ promise }) => promise));
+    const failures = results.flatMap((result, index) => {
+      if (result.status !== "rejected") return [];
+      const cause =
+        result.reason instanceof Error ? result.reason : new Error(String(result.reason));
+      return [new Error(`${closes[index].label}: ${cause.message}`, { cause })];
+    });
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "One or more task watchers failed to close");
+    }
+  };
+
+  function stopAutonomousWorkForDrain(reason: string): boolean {
+    const drain = beginMonitorDrain(reason);
+    drain.attempts += 1;
+    drain.lastAttemptAt = new Date().toISOString();
+    try {
+      for (const project of resolveProjects()) {
+        project.dispatchManager?.beginTerminalDrain();
+        project.prepWorker?.beginTerminalDrain();
+        project.dispatchQueue?.stop();
+        project.prepScheduler?.stop();
+        project.prepWorker?.killAll();
+      }
+      adminRuns.beginTerminalDrain();
+      for (const runner of testRunners.values()) {
+        runner.beginTerminalDrain();
+      }
+      adminRuns.stopAll();
+      for (const runner of testRunners.values()) {
+        runner.killAll();
+      }
+    } catch (error: unknown) {
+      drain.lastError = describeDrainError(error);
+    }
+    drain.dispatchStopConfirmed = stopDispatchManagersForShutdown(dispatchManagersForShutdown());
+    return drain.dispatchStopConfirmed;
+  }
+
+  async function quiesceMonitorForDrain(reason: string): Promise<void> {
+    const drain = beginMonitorDrain(reason);
+    // Each call is a real retry. Clear only at the beginning of the attempt so
+    // the second stop pass cannot erase a failure from the watcher close.
+    drain.lastError = undefined;
+    stopAutonomousWorkForDrain(reason);
+    if (!runtimeDrainPromise) {
+      drain.quiesceComplete = false;
+      const attempt = (async () => {
+        if (runtimeDrainHook) await runtimeDrainHook();
+        drain.quiesceComplete = true;
+      })();
+      runtimeDrainPromise = attempt;
+      void attempt.catch(() => undefined);
+    }
+    try {
+      await runtimeDrainPromise;
+    } catch (error: unknown) {
+      drain.quiesceComplete = false;
+      drain.lastError = describeDrainError(error);
+      // A rejected watcher close is retryable. The task watcher reference is
+      // retained by runtimeDrainHook until a later close succeeds.
+      runtimeDrainPromise = undefined;
+      throw error;
+    } finally {
+      // A watcher callback already queued when the drain began may have raced
+      // with the first stop. Repeating after watcher closure makes the fence
+      // effective even when one cleanup reports an error.
+      stopAutonomousWorkForDrain(reason);
+    }
+  }
+
+  async function monitorDrainSnapshot(): Promise<Record<string, unknown>> {
+    const unsafeDispatchJobs = resolveProjects().flatMap((project) =>
+      (project.dispatchManager?.getAllJobs() ?? [])
+        .filter(
+          (job) =>
+            job.status === "running" ||
+            job.status === "awaiting_approval" ||
+            job.operatorStopCleanupPending === true,
+        )
+        .map((job) => ({
+          projectId: project.projectId,
+          taskId: job.taskId,
+          status: job.status,
+          cleanupPending: job.operatorStopCleanupPending === true,
+          cleanupWarning: [...job.output]
+            .reverse()
+            .find((line) => line.startsWith("[quarantine] Recovery warning:")),
+        })),
+    );
+    const activePrepJobs = resolveProjects().flatMap((project) =>
+      (project.prepWorker?.getActiveJobs() ?? []).map((job) => ({
+        projectId: project.projectId,
+        taskId: job.taskId,
+      })),
+    );
+    const liveDispatchProcesses = resolveProjects()
+      .filter((project) => project.dispatchManager?.hasLiveProcesses())
+      .map((project) => ({ projectId: project.projectId }));
+    const livePrepProcesses = resolveProjects()
+      .filter((project) => project.prepWorker?.hasLiveProcesses())
+      .map((project) => ({ projectId: project.projectId }));
+    let activeAdminRuns = 0;
+    try {
+      activeAdminRuns = (await adminRuns.listRuns()).filter(
+        (run) => run.status === "running",
+      ).length;
+    } catch (error: unknown) {
+      if (monitorDrain) {
+        monitorDrain.lastError = error instanceof Error ? error.message : String(error);
+      }
+      activeAdminRuns = 1;
+    }
+    const adminProcessActive = adminRuns.hasLiveProcesses();
+    const activeTestProjects = [...testRunners.entries()]
+      .filter(([, runner]) => runner.isRunning())
+      .map(([root]) => root);
+    const testRunActive = activeTestProjects.length > 0;
+    const safeToTerminate = Boolean(
+      monitorDrain?.dispatchStopConfirmed &&
+      monitorDrain.quiesceComplete &&
+      !monitorDrain.lastError &&
+      unsafeDispatchJobs.length === 0 &&
+      liveDispatchProcesses.length === 0 &&
+      activePrepJobs.length === 0 &&
+      livePrepProcesses.length === 0 &&
+      activeAdminRuns === 0 &&
+      !adminProcessActive &&
+      !testRunActive,
+    );
+    return {
+      active: Boolean(monitorDrain),
+      acceptingWork: !monitorDrain,
+      safeToTerminate,
+      state: monitorDrain,
+      unsafeDispatchJobs,
+      liveDispatchProcesses,
+      activePrepJobs,
+      livePrepProcesses,
+      activeAdminRuns,
+      adminProcessActive,
+      testRunActive,
+      activeTestProjects,
+    };
+  }
+
+  async function waitForMonitorDrainSafety(timeoutMs = 15_000): Promise<Record<string, unknown>> {
+    const deadline = Date.now() + timeoutMs;
+    let snapshot = await monitorDrainSnapshot();
+    while (snapshot.safeToTerminate !== true && Date.now() < deadline) {
+      await new Promise<void>((resolveWait) => setTimeout(resolveWait, 50));
+      if (monitorDrain) {
+        try {
+          // A process-tree stop or watcher close can fail transiently. Polling
+          // the old snapshot alone can never advance dispatchStopConfirmed or
+          // retry a rejected runtime drain, so make each wait iteration a real
+          // cleanup attempt.
+          await quiesceMonitorForDrain(monitorDrain.reason);
+        } catch {
+          // The next snapshot retains the concrete error and the loop may retry.
+        }
+      }
+      snapshot = await monitorDrainSnapshot();
+    }
+    return snapshot;
+  }
+
   type WriteScopeResult =
     | { ok: true; project: ResolvedProject }
     | { ok: false; status: number; body: Record<string, unknown> };
@@ -2310,6 +3337,58 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       }
     }
     return { ok: true, project: resolveProject(req) };
+  }
+
+  const federationProjectScopeMode =
+    options.federationProjectScopeMode ??
+    (process.env.QUACK_FEDERATION_PROJECT_SCOPE_MODE === "strict" ? "strict" : "compat");
+
+  async function resolveProjectForFederatedJobWrite(
+    req: Request,
+    jobId: string,
+  ): Promise<WriteScopeResult & { compatibilityFallback?: boolean }> {
+    const explicitOrSingle = resolveProjectForWrite(req);
+    if (
+      explicitOrSingle.ok ||
+      explicitOrSingle.body.code !== "PROJECT_SCOPE_REQUIRED" ||
+      federationProjectScopeMode === "strict" ||
+      !registry
+    ) {
+      return explicitOrSingle;
+    }
+
+    const matches: ResolvedProject[] = [];
+    for (const context of registry.listProjects()) {
+      const candidate = resolvedProjectFromContext(context);
+      if (candidate.projectRoot && (await loadFederatedJob(candidate.projectRoot, jobId))) {
+        matches.push(candidate);
+      }
+    }
+
+    if (matches.length === 1) {
+      const project = matches[0];
+      console.warn(
+        `[federation] Accepted legacy unscoped write for ${jobId}; ` +
+          `resolved uniquely to project ${project.projectId}. Upgrade the caller to send projectId.`,
+      );
+      return { ok: true, project, compatibilityFallback: true };
+    }
+
+    if (matches.length > 1) {
+      return {
+        ok: false,
+        status: 409,
+        body: {
+          error: `Federated job id "${jobId}" exists in more than one project; explicit project scope is required.`,
+          code: "FEDERATED_JOB_SCOPE_AMBIGUOUS",
+          jobId,
+          projects: matches.map((project) => project.projectId),
+          hint: "Pass ?project=<id> (or ?projectId=), a projectId body field, or an X-Project-Id header.",
+        },
+      };
+    }
+
+    return explicitOrSingle;
   }
 
   app.use((req: Request, res: Response, next) => {
@@ -2427,6 +3506,12 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     next();
   });
 
+  // Authentication/project validation above chooses the canonical project before
+  // any SDK call may inherit its pool. Selection is lazy, so GET costs nothing.
+  app.use((req: Request, _res: Response, next) => {
+    withClaudeAuthScope(resolveProject(req).keyManager ?? undefined, next);
+  });
+
   // Helper to get the current project ID for SSE events.
   // Resolves ID directly (not via resolveProject) so it's safe to call
   // during construction before all services are initialized.
@@ -2523,10 +3608,28 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
   const federationOrchestrationDeps: FederationOrchestrationDeps = {
     createWriter: createFederationWriter,
+    ...(options.federationMergeBoundary ? { mergeBoundary: options.federationMergeBoundary } : {}),
+    ...(options.federationBroadcastRefresh
+      ? { broadcastRefresh: options.federationBroadcastRefresh }
+      : {}),
   };
 
   const federationSchedulingDeps: FederationSchedulingDeps = {
     createWriter: createFederationWriter,
+    canDispatch: (project) => {
+      if (monitorDrain) return false;
+      const context = registry?.getProject(project.projectId);
+      if (context)
+        return (
+          context.rootPath === project.projectRoot &&
+          (context.fleetController?.canDispatch().allowed ?? true)
+        );
+      return (
+        project.projectId === legacyProjectId &&
+        project.projectRoot === projectRoot &&
+        (fleetController?.canDispatch().allowed ?? true)
+      );
+    },
     reconcileJobs: (project, claimantIndex) =>
       reconcileFederatedJobsModule(project, federationOrchestrationDeps, claimantIndex),
   };
@@ -2764,6 +3867,64 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
   // â”€â”€â”€ API routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+  app.post("/api/admin/drain", async (req: Request, res: Response) => {
+    if (!requireServiceScopeWhenConfigured(req, res, "admin:write")) return;
+    const body = req.body as Record<string, unknown> | undefined;
+    const requestedReason =
+      typeof body?.reason === "string" && body.reason.trim().length > 0
+        ? body.reason.trim().slice(0, 200)
+        : "operator-requested drain";
+    beginMonitorDrain(requestedReason);
+    try {
+      await quiesceMonitorForDrain(requestedReason);
+    } catch {
+      // The snapshot carries the concrete failure and remains terminal. A
+      // failed drain must never reopen admission.
+    }
+    const snapshot = await monitorDrainSnapshot();
+    res.status(snapshot.safeToTerminate === true ? 200 : 202).json(snapshot);
+  });
+
+  app.get("/api/admin/drain", async (req: Request, res: Response) => {
+    if (!requireServiceScopeAnyWhenConfigured(req, res, ["admin:read", "admin:write"])) return;
+    if (monitorDrain) {
+      try {
+        await quiesceMonitorForDrain(monitorDrain.reason);
+      } catch {
+        // The returned snapshot carries the retryable failure details.
+      }
+    }
+    res.json(await monitorDrainSnapshot());
+  });
+
+  const claudeAuthProbes = new ProjectClaudeAuthProbeCache();
+  const claudeAuthProbeFor = (project: ResolvedProject) =>
+    claudeAuthProbes.forProject(project.projectId, project.projectRoot, project.keyManager);
+
+  app.post("/api/diag/claude-auth", async (req: Request, res: Response) => {
+    if (!requireServiceScopeWhenConfigured(req, res, "admin:write")) return;
+    const scope = resolveProjectForWrite(req);
+    if (!scope.ok) {
+      res.status(scope.status).json(scope.body);
+      return;
+    }
+    const p = scope.project;
+    const environment = { ...process.env };
+    const { probe, policy } = claudeAuthProbeFor(p);
+    const result = await probe.probe(
+      environment,
+      () =>
+        buildClaudeChildEnvironment(
+          environment,
+          p.keyManager ? selectClaudeApiKey(p.keyManager) : undefined,
+        ),
+      policy,
+    );
+    res.status(result.status === "passed" ? 200 : 503).json({
+      claudeAuth: probe.snapshot(environment, p.keyManager?.hasExplicitPool() ?? false, policy),
+    });
+  });
+
   app.get("/api/health", (req: Request, res: Response) => {
     const p = resolveProject(req);
     const projects = resolveProjects(req);
@@ -2801,8 +3962,30 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
           ]
         : [];
     const dbDegraded = dbIssues.length > 0;
+    const claudeAuth = {
+      projectId: p.projectId,
+      ...claudeAuthProbeFor(p).probe.snapshot(
+        process.env,
+        p.keyManager?.hasExplicitPool() ?? false,
+        claudeAuthProbeFor(p).policy,
+      ),
+    };
+    const claudeAuthByProject = projects.map((project) => ({
+      projectId: project.projectId,
+      ...claudeAuthProbeFor(project).probe.snapshot(
+        process.env,
+        project.keyManager?.hasExplicitPool() ?? false,
+        claudeAuthProbeFor(project).policy,
+      ),
+    }));
+    const claudeAuthDegraded =
+      claudeAuth.ready === false || claudeAuthByProject.some((health) => health.ready === false);
     res.json({
-      status: worktreeDegraded || dbDegraded ? "degraded" : "ok",
+      status: monitorDrain
+        ? "draining"
+        : worktreeDegraded || dbDegraded || claudeAuthDegraded
+          ? "degraded"
+          : "ok",
       version: build.version,
       commit: build.commit,
       branch: build.branch,
@@ -2812,8 +3995,12 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       projectCount: projects.length,
       clients: sse.getClientCount(),
       activeJobs,
+      acceptingWork: !monitorDrain,
+      drain: monitorDrain,
       worktreeDegraded,
       dbDegraded,
+      claudeAuth,
+      claudeAuthByProject,
       dbIssues,
       projectionHygiene: p.projectRoot
         ? inspectGeneratedProjectionHygiene(p.projectRoot)
@@ -2896,6 +4083,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     const run = adminRuns.startOvernight({
       projectId: p.projectId,
       projectRoot: p.projectRoot,
+      keyManager: p.keyManager ?? undefined,
       monitorUrl:
         typeof body?.monitorUrl === "string" ? body.monitorUrl : `http://localhost:${port}`,
       taskIds,
@@ -2955,6 +4143,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         maxTurns: 3,
         tools: [],
         ...getSdkPermissionOptions(),
+        env: getClaudeSdkEnvironment(),
       };
       if (useOutputFormat) {
         queryOptions.outputFormat = {
@@ -3493,7 +4682,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     }
 
     try {
-      const adapter = await loadAdapter(p.projectRoot);
+      const adapter = await loadCanonicalMutationAdapter(p);
       const result = await createTaskFilesFromInput(parsed.tasks ?? [], adapter);
 
       const beforeCount = p.taskService.getLastParsedCount();
@@ -3753,7 +4942,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
   app.post("/api/tasks/refresh", async (req: Request, res: Response) => {
     const p = resolveProject(req);
-    if (!p.taskService) {
+    if (!p.taskService || !p.projectRoot) {
       res.status(404).json({ error: "Task service not configured" });
       return;
     }
@@ -3859,23 +5048,13 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
   registerFederationRoutes(app, {
     resolveProject,
     resolveProjectForWrite: resolveProjectForWrite as FederationRouteDeps["resolveProjectForWrite"],
+    resolveProjectForFederatedJobWrite:
+      resolveProjectForFederatedJobWrite as FederationRouteDeps["resolveProjectForFederatedJobWrite"],
     createWorkflowWriter: createWorkflowWriter as FederationRouteDeps["createWorkflowWriter"],
     resolveAndBroadcastProjection:
       resolveAndBroadcastProjection as FederationRouteDeps["resolveAndBroadcastProjection"],
     requireServiceScope,
     requireServiceScopeAny,
-    allowDashboardRead: (req: Request) => {
-      const authReq = req as AuthenticatedRequest;
-      const hasConfiguredServiceToken = (authConfig.serviceTokens ?? []).some(
-        (token) => token.enabled !== false,
-      );
-      const hasConfiguredApiKey = authService.apiKeyCount > 0;
-      return (
-        !!authReq.session ||
-        !!authReq.apiPrincipal ||
-        (!authService.enabled && !hasConfiguredServiceToken && !hasConfiguredApiKey)
-      );
-    },
     federationSchedulingDeps,
     federationOrchestrationDeps,
     execGit: options.federationGitExec,
@@ -3888,7 +5067,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       return;
     }
     const p = scope.project;
-    if (!p.taskService) {
+    if (!p.taskService || !p.projectRoot) {
       res.status(404).json({ error: "Task service not configured" });
       return;
     }
@@ -3905,6 +5084,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     const reason = (req.body as { reason?: string })?.reason ?? "";
 
     try {
+      const adapter = await loadCanonicalMutationAdapter(p);
       const filePath = await p.taskService.getTaskFilePath(taskId);
       if (!filePath) {
         res.status(404).json({ error: `Task ${taskId} not found` });
@@ -3921,8 +5101,13 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       }
 
       const updated = content.replace(/(\*\*Status:\*\*\s*)\w+/, `$1REJECTED`);
-      if (await rejectDuplicateClaimantWrite(p, taskId, res)) return;
-      await fsPromises.writeFile(filePath, updated, "utf-8");
+      await withCanonicalTaskSpecMutationFence({
+        adapter,
+        taskId,
+        taskFilePath: filePath,
+        expectedContent: content,
+        replacementContent: updated,
+      });
 
       // TASK-867: canonical verification store handles DB + JSON in lockstep.
       await recordVerification(p, {
@@ -3946,6 +5131,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
       res.json({ success: true, taskId, previousStatus, newStatus: "REJECTED" });
     } catch (err: unknown) {
+      if (rejectCanonicalTaskSpecMutation(err, res)) return;
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ error: `Failed to reject task: ${msg}` });
     }
@@ -4019,19 +5205,34 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       return;
     }
 
+    let verificationEntry: ReturnType<typeof parseVerifiedApiEntry>;
     try {
-      const reviewId = typeof body.reviewId === "string" ? body.reviewId : undefined;
-      const method = typeof body.method === "string" ? body.method : "";
+      verificationEntry = parseVerifiedApiEntry(taskId, body);
+    } catch (error: unknown) {
+      const issues = error instanceof z.ZodError ? error.issues : [];
+      const cursorIssue = issues.find((issue) => issue.path.includes("updatedAt"));
+      res.status(400).json({
+        ok: false,
+        error: cursorIssue?.message ?? "invalid_verification_payload",
+        details: issues,
+        taskId,
+      });
+      return;
+    }
+
+    try {
+      const reviewId = verificationEntry.reviewId;
+      const method = verificationEntry.method;
       const requireReviewExplicit = body.requireReview === true || body.requireReview === "true";
       // TASK-1106: validation-intake VERIFIED writes also require a review
       // bundle. Non-bypass rule — without this guard, a teammate could POST
       // { verdict: "VERIFIED", method: "validation-intake" } with no evidence.
       const requireReviewForGuardedMethod =
-        body.verdict === "VERIFIED" &&
+        verificationEntry.verdict === "VERIFIED" &&
         (method === "/verify-task" || method === "verify-task" || method === "validation-intake");
       const requireReview = requireReviewExplicit || requireReviewForGuardedMethod;
 
-      if (body.verdict === "VERIFIED") {
+      if (verificationEntry.verdict === "VERIFIED") {
         if (requireReview && !reviewId) {
           res.status(409).json({
             error: "review_required",
@@ -4100,79 +5301,17 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         }
       }
 
-      // TASK-1203 round-2 guard: updated_at is the write-recency cursor, so
-      // an unvalidated value could plant a future stamp that beats every
-      // subsequent canonical write forever (QPI-022 class). Require the UTC
-      // ISO-8601 shape (lexical order == chronological order in the store's
-      // comparator) and reject cursors from the future beyond clock skew.
-      if (body.updated_at !== undefined) {
-        const rawCursor = body.updated_at;
-        const UTC_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
-        const parsedCursor = typeof rawCursor === "string" ? Date.parse(rawCursor) : NaN;
-        // Round-trip check: Date.parse rolls invalid calendar days over
-        // (2026-02-30 parses as Mar 2), which would store a cursor string
-        // whose lexical order disagrees with its parsed instant.
-        const roundTrips =
-          Number.isFinite(parsedCursor) &&
-          typeof rawCursor === "string" &&
-          new Date(parsedCursor).toISOString().slice(0, 19) === rawCursor.slice(0, 19);
-        if (typeof rawCursor !== "string" || !UTC_ISO_RE.test(rawCursor) || !roundTrips) {
-          res.status(400).json({
-            ok: false,
-            error: "invalid_updated_at",
-            message: "updated_at must be a UTC ISO-8601 datetime (e.g. 2026-07-14T21:00:00.000Z).",
-            taskId,
-          });
-          return;
-        }
-        const MAX_CURSOR_SKEW_MS = 5 * 60 * 1000;
-        if (parsedCursor > Date.now() + MAX_CURSOR_SKEW_MS) {
-          res.status(400).json({
-            ok: false,
-            error: "updated_at_in_future",
-            message: "updated_at may not be in the future (5 minutes of clock skew allowed).",
-            taskId,
-          });
-          return;
-        }
-      }
-
       // TASK-867: route through canonical verification store so DB + JSON
       // stay in lockstep. Closes the regression that left verified.json
       // empty on this code path (the bug the other agent surfaced 2026-04-29
       // when 18 tasks had VERIFIED in verified.json but IN_PROGRESS in DB,
       // blocking dependency resolution).
-      const verdictNarrowed = body.verdict as
-        | "VERIFIED"
-        | "FAILED"
-        | "REJECTED"
-        | "SOFT-VERIFIED"
-        | "CANNOT_VERIFY";
+      const verdictNarrowed = verificationEntry.verdict;
       const claimantIndex =
         verdictNarrowed === "VERIFIED" || verdictNarrowed === "SOFT-VERIFIED"
           ? await buildFederationClaimantIndexModule(p)
           : undefined;
-      const recordResult = await recordVerification(
-        p,
-        {
-          taskId,
-          verdict: verdictNarrowed,
-          commitSha: (body.commit as string) ?? "unknown",
-          method: (body.method as string) ?? "api",
-          criteriaChecked: (body.criteria_checked as number) ?? 0,
-          criteriaPassed: (body.criteria_passed as number) ?? 0,
-          notes: (body.notes as string) ?? null,
-          verifiedAt: (body.verified as string) ?? undefined,
-          // TASK-1203 (surfaced pre-existing gap): forward the optional write
-          // cursor so callers replaying historical evidence can hit the
-          // recency-precedence stale path (federation-sync already sets it on
-          // peer rows; without this, every /api repeat write is "newer").
-          updatedAt: (body.updated_at as string) ?? undefined,
-          reviewId: typeof body.reviewId === "string" ? body.reviewId : undefined,
-        },
-        {},
-        claimantIndex,
-      );
+      const recordResult = await recordVerification(p, verificationEntry, {}, claimantIndex);
 
       if (recordResult.refusal) {
         res.status(409).json({ ok: false, ...recordResult.refusal });
@@ -4233,7 +5372,9 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      res.status(500).json({ error: `Failed to record verification: ${msg}` });
+      res
+        .status(err instanceof VerificationDatabaseUnavailableError ? 503 : 500)
+        .json({ error: `Failed to record verification: ${msg}` });
     }
   });
 
@@ -4853,16 +5994,11 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         return;
       }
 
-      let allowedTargetBranches: string[] = [];
-      try {
-        const adapter = await loadAdapter(p.projectRoot);
-        allowedTargetBranches = [
-          adapter.config.git.autoMergeTarget ?? adapter.config.git.baseBranch,
-          adapter.config.git.baseBranch,
-        ].filter((branch, index, branches) => branch && branches.indexOf(branch) === index);
-      } catch {
-        allowedTargetBranches = [];
-      }
+      const adapter = await loadCanonicalMutationAdapter(p);
+      const allowedTargetBranches = [
+        adapter.config.git.autoMergeTarget ?? adapter.config.git.baseBranch,
+        adapter.config.git.baseBranch,
+      ].filter((branch, index, branches) => branch && branches.indexOf(branch) === index);
       const gitPrecheck = inspectCanonicalTaskSpecGitTarget(p.projectRoot, allowedTargetBranches);
       if (!gitPrecheck.ok) {
         res.status(409).json({
@@ -4879,10 +6015,18 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         return;
       }
 
-      if (await rejectDuplicateClaimantWrite(p, taskId, res)) return;
-      const tmpPath = `${taskFilePath}.tmp`;
-      await fsPromises.writeFile(tmpPath, body.candidateContent, "utf-8");
-      await fsPromises.rename(tmpPath, taskFilePath);
+      const git = await withCanonicalTaskSpecMutationFence({
+        adapter,
+        taskId,
+        taskFilePath,
+        expectedContent: currentContent,
+        replacementContent: body.candidateContent,
+        afterWrite: () =>
+          commitCanonicalTaskSpecChange(p.projectRoot!, taskId, taskFilePath, {
+            expectedTaskContent: body.candidateContent,
+            allowedTargetBranches,
+          }),
+      });
 
       const record = readiness.persistEffectiveSpec({
         taskId,
@@ -4898,8 +6042,6 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         ? await p.prepCache.invalidatePreflight(taskId)
         : false;
       p.db.invalidatePrep(taskId);
-      const git = commitCanonicalTaskSpecChange(p.projectRoot, taskId, taskFilePath);
-
       sse.broadcast({
         sessionId: "enrichment-candidates",
         taskId,
@@ -4944,6 +6086,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         authority,
       });
     } catch (err: unknown) {
+      if (rejectCanonicalTaskSpecMutation(err, res)) return;
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ error: `Failed to process enrichment candidate: ${msg}` });
     }
@@ -5048,35 +6191,35 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
                   `Enriched content has no parseable "# ${taskId}" heading; refusing to persist. ` +
                   "Re-run /enrich or pass dryRun: true to preview.";
               } else if (filePath) {
-                if (await rejectDuplicateClaimantWrite(p, taskId, res)) return;
-                // Atomic write: tmp + rename.
-                const tmpPath = `${filePath}.tmp`;
-                await fs.promises.writeFile(tmpPath, cleanedBody, "utf-8");
-                await fs.promises.rename(tmpPath, filePath);
-                writtenPath = filePath;
-                approvalStatus = "accepted";
-
                 // TASK-922: commit + push the enriched spec to the canonical
                 // clone when adapter.config.enrichment.autoCommit.enabled is
                 // true. Default is OFF — operator/laptop clones preserve
                 // the prior write-only behavior unless they opt in.
                 const autoCommit = adapter.config.enrichment?.autoCommit;
-                if (autoCommit?.enabled === true) {
-                  gitOutcome = commitCanonicalTaskSpecChange(
-                    adapter.projectRoot,
-                    taskId,
-                    filePath,
-                    {
-                      commitMessage: autoCommit.commitMessageTemplate,
-                      push: autoCommit.push,
-                      skipBranches: autoCommit.skipBranches,
-                    },
-                  );
-                }
+                gitOutcome = await withCanonicalTaskSpecMutationFence({
+                  adapter,
+                  taskId,
+                  taskFilePath: filePath,
+                  expectedContent: bundle.content,
+                  replacementContent: cleanedBody,
+                  afterWrite: () =>
+                    autoCommit?.enabled === true
+                      ? commitCanonicalTaskSpecChange(adapter.projectRoot, taskId, filePath, {
+                          expectedTaskContent: cleanedBody,
+                          commitMessage: autoCommit.commitMessageTemplate,
+                          push: autoCommit.push,
+                          skipBranches: autoCommit.skipBranches,
+                          allowedTargetBranches: [adapter.config.git.baseBranch],
+                        })
+                      : undefined,
+                });
+                writtenPath = filePath;
+                approvalStatus = "accepted";
               } else {
                 writeError = `Could not locate spec file for ${taskId}`;
               }
             } catch (writeErr) {
+              if (writeErr instanceof CanonicalTaskSpecMutationError) throw writeErr;
               writeError = writeErr instanceof Error ? writeErr.message : String(writeErr);
             }
           }
@@ -5116,6 +6259,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         });
       }
     } catch (err: unknown) {
+      if (rejectCanonicalTaskSpecMutation(err, res)) return;
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ error: `Enrichment failed: ${msg}` });
     }
@@ -5155,8 +6299,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     }
 
     try {
-      const { loadAdapter } = await import("../core/adapter-loader.js");
-      const adapter = await loadAdapter(p.projectRoot);
+      const adapter = await loadCanonicalMutationAdapter(p);
 
       // TASK-1334: resolve ONCE, canonically, and reuse the bundle for both
       // the read and the write. The prefix match this replaces selected a
@@ -5197,28 +6340,28 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         return;
       }
 
-      // Write the enriched content to the task file.
-      // TASK-1334: tmp + rename, matching the sibling enrich route. A direct
-      // write leaves a truncated spec if the process dies mid-write, and this
-      // route is the one an operator reaches by clicking approve.
-      if (await rejectDuplicateClaimantWrite(p, taskId, res)) return;
-      const approveTmpPath = `${filePath}.tmp`;
-      await fs.promises.writeFile(approveTmpPath, content, "utf-8");
-      await fs.promises.rename(approveTmpPath, filePath);
-
       // TASK-922: commit + push when adapter.config.enrichment.autoCommit
       // is enabled. Default OFF preserves the prior write-only behavior.
       // Done BEFORE persistEffectiveSpec so the resulting commit SHA can be
       // written onto the effective-spec DB row as audit metadata.
-      let gitOutcome: CanonicalTaskSpecCommitResult | undefined;
       const autoCommit = adapter.config.enrichment?.autoCommit;
-      if (autoCommit?.enabled === true) {
-        gitOutcome = commitCanonicalTaskSpecChange(adapter.projectRoot, taskId, filePath, {
-          commitMessage: autoCommit.commitMessageTemplate,
-          push: autoCommit.push,
-          skipBranches: autoCommit.skipBranches,
-        });
-      }
+      const gitOutcome = await withCanonicalTaskSpecMutationFence({
+        adapter,
+        taskId,
+        taskFilePath: filePath,
+        expectedContent: originalContent,
+        replacementContent: content,
+        afterWrite: () =>
+          autoCommit?.enabled === true
+            ? commitCanonicalTaskSpecChange(adapter.projectRoot, taskId, filePath, {
+                expectedTaskContent: content,
+                commitMessage: autoCommit.commitMessageTemplate,
+                push: autoCommit.push,
+                skipBranches: autoCommit.skipBranches,
+                allowedTargetBranches: [adapter.config.git.baseBranch],
+              })
+            : undefined,
+      });
 
       const approvalRecord = createReadinessService(p)?.persistEffectiveSpec({
         taskId,
@@ -5241,6 +6384,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         git: gitOutcome,
       });
     } catch (err: unknown) {
+      if (rejectCanonicalTaskSpecMutation(err, res)) return;
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ error: `Failed to write enriched content: ${msg}` });
     }
@@ -5248,7 +6392,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
   app.post("/api/tasks/:id/repair", async (req: Request, res: Response) => {
     const p = resolveProject(req);
-    if (!p.taskService || !p.projectRoot) {
+    if (!p.taskService || !p.projectRoot || !p.taskDir) {
       res.status(404).json({ error: "Task service not configured" });
       return;
     }
@@ -5273,22 +6417,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         const parseError = parseErr instanceof TPE ? parseErr.message : String(parseErr);
 
         // Load adapter for conventions
-        let adapter: ProjectAdapter;
-        try {
-          adapter = await loadAdapter(
-            p.adapterPath ?? path.join(p.projectRoot, ".quack", "adapter.json"),
-          );
-        } catch {
-          adapter = {
-            config: {
-              project: { name: "", taskDir: "" },
-              agent: {},
-              verification: { commands: [] },
-            },
-            conventionsDoc: "",
-            projectRoot: p.projectRoot,
-          } as unknown as ProjectAdapter;
-        }
+        const adapter = await loadCanonicalMutationAdapter(p);
 
         const { repairTaskSpec } = await import("../gate/spec-repair-agent.js");
         const repaired = await repairTaskSpec(rawContent, filePath, parseError, adapter);
@@ -5296,8 +6425,14 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         // Validate the repaired content
         const repairedTask = parse(repaired, filePath);
 
-        // Write back
-        await fs.promises.writeFile(filePath, repaired, "utf-8");
+        await withCanonicalTaskSpecMutationFence({
+          adapter,
+          taskId,
+          taskFilePath: filePath,
+          expectedContent: rawContent,
+          replacementContent: repaired,
+          allowUnparseableCurrent: true,
+        });
 
         sse.broadcast({
           sessionId: "task-watcher",
@@ -5311,6 +6446,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         res.json({ ok: true, taskId: repairedTask.id, repaired: true, title: repairedTask.title });
       }
     } catch (err: unknown) {
+      if (rejectCanonicalTaskSpecMutation(err, res)) return;
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ error: `Failed to repair task: ${msg}` });
     }
@@ -5384,11 +6520,31 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         ok: true,
         taskId,
         pid: job.pid,
+        jobId: job.jobId,
+        startedAt: job.startedAt,
         message: `Prep started for ${taskId}`,
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ error: `Failed to start prep: ${msg}` });
+    }
+  });
+
+  app.get("/api/tasks/:id/prep/job", (req: Request, res: Response) => {
+    const p = resolveProject(req);
+    if (!p.prepWorker) {
+      res.status(404).json({ error: "Prep not available" });
+      return;
+    }
+    try {
+      const job = p.prepWorker.getJob(req.params.id as string);
+      if (!job) {
+        res.status(404).json({ error: "No prep attempt recorded" });
+        return;
+      }
+      res.json({ job });
+    } catch {
+      res.status(503).json({ error: "Stored prep diagnostics are unavailable or malformed" });
     }
   });
 
@@ -5417,6 +6573,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
             : `No prep result for ${taskId}`,
           currentSpecHash: state?.currentSpecHash,
           stale: state?.hasStalePrep ?? false,
+          job: p.prepWorker?.getJob(taskId),
         });
         return;
       }
@@ -5498,15 +6655,64 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
     try {
       const logDir = resolveTaskRuntimeLogDir(p.projectRoot, p.dispatchManager, taskId, p.logDir);
-      const approval = await loadApproval(taskId, logDir);
-      if (!approval) throw new Error(`No pending approval found for task ${taskId}`);
-      const claimantCheck = await buildDuplicateClaimantCheck(p, taskId);
-      if (rejectDuplicateClaimantCheck(claimantCheck, res)) return;
-      const decided = await updateApprovalState(taskId, "approved", logDir, undefined, undefined, {
-        ...(actor ? { actor } : {}),
-        ...(reason ? { reason } : {}),
-        mode: advisoryOverrideMode(p),
+      // Preserve the route's established no-op response without taking the
+      // mutation reservation. The approval is loaded again under the fence
+      // before any state can change.
+      if (!(await loadApproval(taskId, logDir))) {
+        throw new Error(`No pending approval found for task ${taskId}`);
+      }
+      const admitted = await dispatchWithDecompositionFence(p, taskId, async (admission) => {
+        const approval = await loadApproval(taskId, logDir);
+        if (!approval) throw new Error(`No pending approval found for task ${taskId}`);
+        const claimantCheck = await buildDuplicateClaimantCheck(p, taskId);
+        if (claimantCheck.claimants.length > 1) {
+          throw new DuplicateClaimantAdmissionError(claimantCheck);
+        }
+        const resolution = await p.dispatchManager!.resolveApprovalPauseDecision(
+          taskId,
+          "blueprint",
+          "approved",
+          () =>
+            updateApprovalState(taskId, "approved", logDir, undefined, undefined, {
+              ...(actor ? { actor } : {}),
+              ...(reason ? { reason } : {}),
+              mode: advisoryOverrideMode(p),
+            }),
+          logDir,
+        );
+        const deferredResume = recordLocalFederatedResumeDecision(logDir, taskId, "blueprint", {
+          action: "approved",
+          ...(reason ? { reason } : {}),
+        });
+        if (deferredResume) {
+          return { kind: "deferred" as const, resolution, deferredResume };
+        }
+
+        const queueResumeRecorded =
+          p.dispatchQueue?.recordApprovalResume(taskId, resolution.released) ?? false;
+        try {
+          const job = p.dispatchManager!.start(
+            taskId,
+            withDispatchAdmission(
+              {
+                resume: true,
+                provenance: startProvenance(req),
+                duplicateClaimantCheck: claimantCheck,
+              },
+              admission,
+            ),
+            claimantCheck,
+          );
+          return { kind: "started" as const, resolution, job };
+        } catch (err) {
+          if (queueResumeRecorded) {
+            const msg = err instanceof Error ? err.message : String(err);
+            p.dispatchQueue?.requeueApprovalResume(taskId, msg);
+          }
+          throw err;
+        }
       });
+      const decided = admitted.resolution.decision;
       broadcastAdvisoryOverride(taskId, decided);
 
       // Emit SSE event
@@ -5522,21 +6728,26 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         } as never,
       });
 
-      // Resume dispatch with resume flag so dispatcher skips completed stages
-      p.dispatchManager.start(
-        taskId,
-        {
-          resume: true,
-          dockerResumeStateDir: logDir,
-          provenance: startProvenance(req),
-          duplicateClaimantCheck: claimantCheck,
-        },
-        claimantCheck,
-      );
+      if (admitted.kind === "deferred") {
+        res.status(202).json({
+          ok: true,
+          deferred: true,
+          message:
+            "Blueprint decision recorded; the federation listener will reclaim the original job.",
+          resume: admitted.deferredResume,
+        });
+        return;
+      }
 
       res.json({ ok: true, message: "Blueprint approved, dispatch resuming" });
     } catch (err: unknown) {
+      if (respondIfDecompositionRecoveryRequired(res, err)) return;
       if (respondIfAdvisoryOverrideRequired(res, err)) return;
+      if (respondIfApprovalDecisionConflict(res, err)) return;
+      if (err instanceof DuplicateClaimantAdmissionError) {
+        rejectDuplicateClaimantCheck({ taskId: err.taskId, claimants: err.claimants }, res);
+        return;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ error: `Failed to approve blueprint: ${msg}` });
     }
@@ -5555,7 +6766,21 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
     try {
       const logDir = resolveTaskRuntimeLogDir(p.projectRoot, p.dispatchManager, taskId, p.logDir);
-      await updateApprovalState(taskId, "rejected", logDir, undefined, rejectionReason);
+      const persistRejection = () =>
+        updateApprovalState(taskId, "rejected", logDir, undefined, rejectionReason);
+      let managerPauseReleased = false;
+      if (p.dispatchManager) {
+        const resolution = await p.dispatchManager.resolveApprovalPauseDecision(
+          taskId,
+          "blueprint",
+          "rejected",
+          persistRejection,
+          logDir,
+        );
+        managerPauseReleased = resolution.released;
+      } else {
+        await persistRejection();
+      }
 
       // Emit SSE event
       sse.broadcast({
@@ -5567,8 +6792,29 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         payload: { taskId, rejectionReason: rejectionReason ?? "No reason provided" } as never,
       });
 
+      const deferredResume = recordLocalFederatedResumeDecision(logDir, taskId, "blueprint", {
+        action: "rejected",
+        ...(rejectionReason ? { reason: rejectionReason } : {}),
+      });
+      p.dispatchQueue?.settleApprovalRejection(
+        taskId,
+        rejectionReason ?? "Blueprint rejected",
+        "rejected",
+        managerPauseReleased,
+      );
+      if (deferredResume) {
+        res.status(202).json({
+          ok: true,
+          deferred: true,
+          message: "Blueprint rejection recorded for the original federated job.",
+          resume: deferredResume,
+        });
+        return;
+      }
+
       res.json({ ok: true, message: "Blueprint rejected" });
     } catch (err: unknown) {
+      if (respondIfApprovalDecisionConflict(res, err)) return;
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ error: `Failed to reject blueprint: ${msg}` });
     }
@@ -5591,7 +6837,36 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         taskId,
         p.logDir,
       );
-      await updateApprovalState(taskId, "rejected", logDirPath, undefined, "Requested re-plan");
+      const persistReplan = () =>
+        updateApprovalState(taskId, "rejected", logDirPath, undefined, "Requested re-plan");
+      let managerPauseReleased = false;
+      if (p.dispatchManager) {
+        const resolution = await p.dispatchManager.resolveApprovalPauseDecision(
+          taskId,
+          "blueprint",
+          "rejected",
+          persistReplan,
+          logDirPath,
+          { allowAlreadyRejected: true },
+        );
+        managerPauseReleased = resolution.released;
+      } else {
+        await persistReplan();
+      }
+
+      // Federation must see the rejection before successful preflight removes
+      // the old approval record. Otherwise listener reconciliation can lose
+      // the only durable decision for the paused generation.
+      const deferredResume = recordLocalFederatedResumeDecision(logDirPath, taskId, "blueprint", {
+        action: "rejected",
+        reason: "Requested re-plan",
+      });
+      p.dispatchQueue?.settleApprovalRejection(
+        taskId,
+        "Blueprint re-plan requested; run dispatch after preflight completes",
+        "blueprint_replan_requested",
+        managerPauseReleased,
+      );
 
       // Invalidate preflight cache to force new blueprint generation
       await p.prepCache.invalidate(taskId);
@@ -5691,12 +6966,14 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         }
       }
 
-      res.json({
+      res.status(deferredResume ? 202 : 200).json({
         ok: true,
+        ...(deferredResume ? { deferred: true, resume: deferredResume } : {}),
         message:
           "Blueprint rejected, new preflight triggered. Listen for blueprint_replan_complete/blueprint_replan_failed SSE events for status.",
       });
     } catch (err: unknown) {
+      if (respondIfApprovalDecisionConflict(res, err)) return;
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ error: `Failed to replan blueprint: ${msg}` });
     }
@@ -5769,6 +7046,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     try {
       const logDir = resolveTaskRuntimeLogDir(p.projectRoot, p.dispatchManager, taskId, p.logDir);
       const paused = resolveRunScopedPauseState(logDir, taskId, runStartedAt);
+      const identity = paused ? recoverFederatedRunIdentity(logDir, taskId) : null;
       res.json(
         paused
           ? {
@@ -5776,6 +7054,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
               gate: paused.gate,
               createdAt: paused.createdAt,
               approvalFile: paused.approvalFile,
+              identity,
             }
           : { paused: false },
       );
@@ -5785,37 +7064,538 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     }
   });
 
+  app.post("/api/tasks/:id/federated-resume/arm", (req: Request, res: Response) => {
+    const p = resolveProject(req);
+    if (!p.projectRoot) {
+      res.status(500).json({ error: "Project not configured" });
+      return;
+    }
+    const taskId = req.params.id as string;
+    const body = req.body as Record<string, unknown>;
+    const projectId = stringField(body.projectId);
+    const jobType = body.jobType;
+    const gate = body.gate;
+    const jobId = stringField(body.jobId);
+    const hostId = stringField(body.hostId);
+    const sessionId = stringField(body.sessionId);
+    const releaseNonce = stringField(body.releaseNonce);
+    const pauseOpenedAt = stringField(body.pauseOpenedAt);
+    const generation = typeof body.generation === "number" ? body.generation : undefined;
+    if (
+      (gate !== "blueprint" && gate !== "judge") ||
+      !projectId ||
+      projectId !== p.projectId ||
+      jobType !== "dispatch" ||
+      !jobId ||
+      !hostId ||
+      !sessionId ||
+      !releaseNonce ||
+      !pauseOpenedAt ||
+      !Number.isFinite(Date.parse(pauseOpenedAt)) ||
+      generation === undefined ||
+      !Number.isInteger(generation) ||
+      generation <= 0
+    ) {
+      res.status(400).json({ error: "invalid_federated_resume_arm" });
+      return;
+    }
+    const logDir = resolveTaskRuntimeLogDir(p.projectRoot, p.dispatchManager, taskId, p.logDir);
+    const identity = recoverFederatedRunIdentity(logDir, taskId);
+    if (
+      !identity ||
+      identity.jobId !== jobId ||
+      identity.jobType !== jobType ||
+      identity.hostId !== hostId ||
+      identity.sessionId !== sessionId
+    ) {
+      res.status(409).json({ error: "federated_pause_identity_mismatch" });
+      return;
+    }
+    const state = armLocalFederatedResume(logDir, {
+      projectId,
+      taskId,
+      jobType,
+      gate,
+      jobId,
+      hostId,
+      sessionId,
+      generation,
+      releaseNonce,
+      pauseOpenedAt,
+    });
+    res.status(201).json({ ok: true, state });
+  });
+
+  app.get("/api/tasks/:id/federated-resume-state", (req: Request, res: Response) => {
+    const p = resolveProject(req);
+    if (!p.projectRoot) {
+      res.status(500).json({ error: "Project not configured" });
+      return;
+    }
+    const taskId = req.params.id as string;
+    const requestedProjectId =
+      typeof req.query.projectId === "string" ? req.query.projectId.trim() : "";
+    const requestedJobId = typeof req.query.jobId === "string" ? req.query.jobId.trim() : "";
+    const requestedOriginalSessionId =
+      typeof req.query.originalSessionId === "string" ? req.query.originalSessionId.trim() : "";
+    const requestedResumedSessionId =
+      typeof req.query.resumedSessionId === "string"
+        ? req.query.resumedSessionId.trim()
+        : undefined;
+    if (!requestedProjectId || !requestedJobId || !requestedOriginalSessionId) {
+      res.status(400).json({ error: "invalid_federated_resume_state_scope" });
+      return;
+    }
+    if (requestedProjectId !== p.projectId) {
+      res.status(409).json({ error: "federated_resume_project_mismatch" });
+      return;
+    }
+    const logDir = resolveTaskRuntimeLogDir(p.projectRoot, p.dispatchManager, taskId, p.logDir);
+    const installedState = readLocalFederatedResumeState(logDir, taskId);
+    if (!installedState) {
+      res.status(404).json({ error: "federated_resume_state_not_found" });
+      return;
+    }
+    if (
+      installedState.projectId !== requestedProjectId ||
+      requestedJobId !== installedState.jobId ||
+      requestedOriginalSessionId !== installedState.sessionId ||
+      (requestedResumedSessionId && requestedResumedSessionId !== installedState.resumedSessionId)
+    ) {
+      res.status(409).json({ error: "federated_resume_state_identity_mismatch" });
+      return;
+    }
+    const state = reconcileLocalFederatedResumeDecision(logDir, taskId);
+    if (!state) {
+      res.status(404).json({ error: "federated_resume_state_not_found" });
+      return;
+    }
+    res.json({ ok: true, state });
+  });
+
+  app.post("/api/tasks/:id/federated-resume/grant", (req: Request, res: Response) => {
+    const p = resolveProject(req);
+    if (!p.projectRoot) {
+      res.status(500).json({ error: "Project not configured" });
+      return;
+    }
+    const taskId = req.params.id as string;
+    const parsed = federatedResumeStartBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: "invalid_federated_resume_grant",
+        details: parsed.error.issues,
+      });
+      return;
+    }
+    try {
+      if (
+        parsed.data.projectId !== p.projectId ||
+        parsed.data.projectId !== parsed.data.startGrant.projectId ||
+        parsed.data.originalSessionId !== parsed.data.startGrant.originalSessionId
+      ) {
+        res.status(409).json({ error: "federated_resume_grant_scope_mismatch" });
+        return;
+      }
+      const logDir = resolveTaskRuntimeLogDir(p.projectRoot, p.dispatchManager, taskId, p.logDir);
+      const existingState = readLocalFederatedResumeState(logDir, taskId);
+      if (
+        (existingState?.resumedSessionId &&
+          parsed.data.resumedSessionId !== existingState.resumedSessionId) ||
+        (!existingState?.resumedSessionId &&
+          Boolean(parsed.data.resumedSessionId) &&
+          (!existingState?.startGrantConsumedAt ||
+            existingState.status !== "approved_but_not_started"))
+      ) {
+        res.status(409).json({ error: "federated_resume_session_mismatch" });
+        return;
+      }
+      const state = installLocalFederatedResumeStartGrant(
+        logDir,
+        taskId,
+        parsed.data.startGrant as FederatedResumeStartGrant,
+      );
+      res.status(201).json({ ok: true, state });
+    } catch (error) {
+      if (error instanceof FederatedResumeStartRefusalError) {
+        res.status(409).json({ ok: false, error: error.code, message: error.message });
+        return;
+      }
+      res.status(500).json({
+        ok: false,
+        error: "federated_resume_grant_install_failed",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  app.post("/api/tasks/:id/federated-resume/start", async (req: Request, res: Response) => {
+    try {
+      const p = resolveProject(req);
+      if (!p.projectRoot || !p.dispatchManager) {
+        res.status(500).json({ error: "Project not configured" });
+        return;
+      }
+      const taskId = req.params.id as string;
+      const body = (req.body as Record<string, unknown> | undefined) ?? {};
+      const parsed = federatedResumeStartBodySchema.safeParse(body);
+      if (!parsed.success) {
+        res.status(400).json({
+          error: "invalid_federated_resume_start",
+          details: parsed.error.issues,
+        });
+        return;
+      }
+      const startGrant = parsed.data.startGrant as FederatedResumeStartGrant;
+      if (
+        parsed.data.projectId !== p.projectId ||
+        parsed.data.projectId !== startGrant.projectId ||
+        parsed.data.originalSessionId !== startGrant.originalSessionId
+      ) {
+        res.status(409).json({ error: "federated_resume_start_scope_mismatch" });
+        return;
+      }
+      const logDir = resolveTaskRuntimeLogDir(p.projectRoot, p.dispatchManager, taskId, p.logDir);
+      try {
+        const admitted = await dispatchWithDecompositionFence(p, taskId, async (admission) => {
+          const currentState = reconcileLocalFederatedResumeDecision(logDir, taskId);
+          // Immutable installed-grant identity precedes every
+          // replay/terminal/active-child shortcut. Freshness is checked below
+          // only when a new reservation/start is attempted; an exact observed
+          // child may be reconciled after the wall-clock grant expiry.
+          assertLocalFederatedResumeInstalledGrantIdentity(currentState, taskId, startGrant);
+          const currentDecision = currentState.decision;
+          if (!currentDecision) {
+            throw new FederatedResumeStartRefusalError(
+              "federated_resume_decision_missing",
+              `Federated resume decision disappeared for ${taskId}.`,
+            );
+          }
+          const active = p.dispatchManager!.getActiveJob(taskId);
+          if (currentState.status === "terminal") {
+            if (parsed.data.resumedSessionId !== currentState.resumedSessionId) {
+              throw new FederatedResumeStartRefusalError(
+                "federated_resume_session_mismatch",
+                `Federated resume terminal replay for ${taskId} requires its exact resumed session.`,
+              );
+            }
+            if (localFederatedResumeTerminalReplayMatches(currentState, startGrant, active)) {
+              return { terminal: currentState } as const;
+            }
+            throw new FederatedResumeStartRefusalError(
+              "federated_resume_grant_replayed",
+              `Federated resume start grant was already consumed for ${taskId}.`,
+            );
+          }
+          if (currentState.status === "started") {
+            if (parsed.data.resumedSessionId !== currentState.resumedSessionId) {
+              throw new FederatedResumeStartRefusalError(
+                "federated_resume_session_mismatch",
+                `Federated resume replay for ${taskId} requires its exact resumed session.`,
+              );
+            }
+            if (localFederatedResumeReplayMatches(currentState, startGrant, active)) {
+              return {
+                replay: true,
+                job: active!,
+                started: currentState,
+              } as const;
+            }
+            throw new FederatedResumeStartRefusalError(
+              "federated_resume_child_observation_mismatch",
+              "The consumed resume grant no longer has its exact child session; manual recovery is required.",
+            );
+          }
+          if (
+            currentState.status === "approved_but_not_started" &&
+            currentState.startGrantConsumedAt
+          ) {
+            if (!parsed.data.resumedSessionId) {
+              throw new FederatedResumeStartRefusalError(
+                "federated_resume_session_missing",
+                `Federated resume reconciliation for ${taskId} requires its exact resumed session.`,
+              );
+            }
+            if (active?.sessionId !== parsed.data.resumedSessionId) {
+              throw new FederatedResumeStartRefusalError(
+                "federated_resume_session_mismatch",
+                `Federated resume reconciliation for ${taskId} requires its exact resumed session.`,
+              );
+            }
+            if (localFederatedResumeReservationMatches(currentState, startGrant, active)) {
+              const reconciled = finalizeLocalFederatedResumeStart(
+                logDir,
+                taskId,
+                startGrant,
+                "started",
+                active.sessionId,
+              );
+              return {
+                replay: true,
+                job: active,
+                started: reconciled,
+              } as const;
+            }
+            throw new FederatedResumeStartRefusalError(
+              "federated_resume_child_observation_mismatch",
+              "The reserved resume grant does not have its exact active child; manual recovery is required.",
+            );
+          }
+          if (currentState.startGrantConsumedAt) {
+            throw new FederatedResumeStartRefusalError(
+              "federated_resume_grant_replayed",
+              `Federated resume start grant was already consumed for ${taskId}.`,
+            );
+          }
+          if (parsed.data.resumedSessionId) {
+            throw new FederatedResumeStartRefusalError(
+              "federated_resume_session_mismatch",
+              `Federated resume start for ${taskId} cannot preselect a child session.`,
+            );
+          }
+          // Freshness authorizes a new consumption. Exact observed replay and
+          // post-spawn reconciliation above rely on the prior reservation and
+          // therefore remain safe after the capability's wall-clock expiry.
+          assertLocalFederatedResumeStartGrant(currentState, taskId, startGrant);
+          if (active) {
+            throw new FederatedResumeStartRefusalError(
+              "federated_resume_child_already_active",
+              `Task ${taskId} already has an unrelated active child ${active.sessionId}.`,
+            );
+          }
+
+          if (currentState.gate === "blueprint" && currentDecision.action === "rejected") {
+            const consumedAt = new Date().toISOString();
+            reserveLocalFederatedResumeStart(logDir, taskId, startGrant, consumedAt);
+            const terminal = finalizeLocalFederatedResumeStart(
+              logDir,
+              taskId,
+              startGrant,
+              "terminal",
+              undefined,
+              consumedAt,
+            );
+            return { terminal } as const;
+          }
+
+          const claimantCheck = await buildDuplicateClaimantCheck(p, taskId);
+          if (claimantCheck.claimants.length > 1) {
+            throw new DuplicateClaimantAdmissionError(claimantCheck);
+          }
+          // Consume under the same decomposition admission fence that protects
+          // the task spec and DispatchManager.start.  A failed launch requires
+          // a new headnode recovery decision; this capability is never reused.
+          const consumedAt = new Date().toISOString();
+          const reservedState = reserveLocalFederatedResumeStart(
+            logDir,
+            taskId,
+            startGrant,
+            consumedAt,
+          );
+          const decision = reservedState.decision;
+          if (!decision) {
+            throw new FederatedResumeStartRefusalError(
+              "federated_resume_decision_missing",
+              `Federated resume decision disappeared for ${taskId}.`,
+            );
+          }
+
+          let startOptions: Parameters<DispatchManager["start"]>[1] = {
+            resume: true,
+            federatedJobId: startGrant.jobId,
+            federatedHostId: startGrant.hostId,
+            federatedLeaseId: startGrant.leaseId,
+            provenance: startProvenance(req, {
+              federatedJobId: startGrant.jobId,
+              federatedWorkerStart: true,
+            }),
+            duplicateClaimantCheck: claimantCheck,
+          };
+          if (reservedState.gate === "judge" && decision.action === "rejected") {
+            const { loadJudgeApproval, deleteJudgeApproval } =
+              await import("../dispatcher/judge-approval.js");
+            const approval = await loadJudgeApproval(taskId, logDir);
+            const reviewFeedback = formatLoopReviewFeedback(approval?.review);
+            const feedback = [
+              decision.reason ??
+                "Changes rejected during judge review. Please review the feedback and try again.",
+              reviewFeedback,
+            ]
+              .filter(Boolean)
+              .join("\n\n---\n\n");
+            let resuming = false;
+            if (approval?.executionMode === "loop") {
+              const { CheckpointManager } = await import("../dispatcher/checkpoint-manager.js");
+              const checkpointMgr = new CheckpointManager(logDir);
+              const rewound = await checkpointMgr.rewindFrom(taskId, "agent");
+              resuming = Boolean(rewound?.claudeSessionId && checkpointMgr.isUsable(rewound));
+            }
+            await deleteJudgeApproval(taskId, logDir);
+            startOptions = {
+              ...startOptions,
+              judgeFeedback: feedback,
+              reuseWorktree: approval?.executionMode === "loop",
+              resume: approval?.executionMode === "loop" ? resuming : false,
+            };
+          }
+          const job = p.dispatchManager!.start(
+            taskId,
+            {
+              ...withDispatchAdmission(startOptions, admission),
+              admittedTaskContentHash: admission!.contentHash,
+            },
+            claimantCheck,
+          );
+          try {
+            const started = finalizeLocalFederatedResumeStart(
+              logDir,
+              taskId,
+              startGrant,
+              "started",
+              job.sessionId,
+              consumedAt,
+            );
+            return { job, started } as const;
+          } catch (projectionError) {
+            return {
+              job,
+              // Return the already-durable reservation so the listener can
+              // prove that a delayed headnode observation was reserved inside
+              // the grant window even though the `started` projection failed.
+              started: reservedState,
+              projectionWarning: `The resume child started, but its durable started state could not be projected: ${projectionError instanceof Error ? projectionError.message : String(projectionError)}`,
+            } as const;
+          }
+        });
+        if ("terminal" in admitted) {
+          res.json({ ok: true, terminal: true, state: admitted.terminal });
+          return;
+        }
+        if ("replay" in admitted) {
+          res.json({
+            ok: true,
+            alreadyStarted: true,
+            sessionId: admitted.job.sessionId,
+            state: admitted.started,
+          });
+          return;
+        }
+        res.status(202).json({
+          ok: true,
+          sessionId: admitted.job.sessionId,
+          state: admitted.started,
+          warning: "projectionWarning" in admitted ? admitted.projectionWarning : undefined,
+        });
+      } catch (error) {
+        if (error instanceof DuplicateClaimantAdmissionError) {
+          rejectDuplicateClaimantCheck({ taskId: error.taskId, claimants: error.claimants }, res);
+          return;
+        }
+        if (error instanceof FederatedResumeStartRefusalError) {
+          res.status(409).json({ ok: false, error: error.code, message: error.message });
+          return;
+        }
+        const isRecoveryFailure = error instanceof DecompositionRecoveryError;
+        res.status(isRecoveryFailure ? 409 : 503).json({
+          ok: false,
+          error: isRecoveryFailure
+            ? "decomposition_recovery_required"
+            : "federated_resume_start_failed",
+          message: isRecoveryFailure
+            ? `Pending decomposition recovery must complete before federated resume: ${error.message}`
+            : `Federated resume could not start: ${error instanceof Error ? error.message : String(error)}`,
+        });
+        return;
+      }
+    } catch (error) {
+      if (res.headersSent) return;
+      res.status(500).json({
+        ok: false,
+        error: "federated_resume_start_failed",
+        message: `Federated resume start failed before admission: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  });
+
   app.post("/api/tasks/:id/judge/approve", async (req: Request, res: Response) => {
     const p = resolveProject(req);
-    if (!p.projectRoot || !p.dispatchManager) {
+    if (!p.projectRoot || !p.taskDir || !p.dispatchManager) {
       res.status(500).json({ error: "Project not configured" });
       return;
     }
 
     const taskId = req.params.id as string;
-    const { loadJudgeApproval, updateJudgeApprovalState } =
+    const { StaleJudgeApprovalError, updateJudgeApprovalState } =
       await import("../dispatcher/judge-approval.js");
     // TASK-1319: see the blueprint handler. Same contract, same reason.
     const { actor, reason } = req.body as { actor?: string; reason?: string };
 
     try {
       const logDir = resolveTaskRuntimeLogDir(p.projectRoot, p.dispatchManager, taskId, p.logDir);
-      const approval = await loadJudgeApproval(taskId, logDir);
-      if (!approval) throw new Error(`No pending judge approval found for task ${taskId}`);
-      const claimantCheck = await buildDuplicateClaimantCheck(p, taskId);
-      if (rejectDuplicateClaimantCheck(claimantCheck, res)) return;
-      const decided = await updateJudgeApprovalState(
-        taskId,
-        "approved",
-        logDir,
-        undefined,
-        undefined,
-        {
-          ...(actor ? { actor } : {}),
+      // Preserve missing-record no-op precedence without parsing content here.
+      // The manager remains the authoritative reader under the reservation,
+      // where malformed JSON and read failures retain the server-error path.
+      await assertJudgeApprovalRecordPresent(taskId, logDir);
+      const admitted = await dispatchWithDecompositionFence(p, taskId, async (admission) => {
+        const { resolveCurrentSpecIdentity } = await import("../core/spec-identity.js");
+        const currentSpecIdentity = resolveCurrentSpecIdentity(p.projectRoot!, p.taskDir!, taskId);
+        const claimantCheck = await buildDuplicateClaimantCheck(p, taskId);
+        if (claimantCheck.claimants.length > 1) {
+          throw new DuplicateClaimantAdmissionError(claimantCheck);
+        }
+        const resolution = await p.dispatchManager!.resolveApprovalPauseDecision(
+          taskId,
+          "judge",
+          "approved",
+          () =>
+            updateJudgeApprovalState(
+              taskId,
+              "approved",
+              logDir,
+              undefined,
+              undefined,
+              {
+                ...(actor ? { actor } : {}),
+                ...(reason ? { reason } : {}),
+                mode: advisoryOverrideMode(p),
+              },
+              currentSpecIdentity,
+            ),
+          logDir,
+        );
+        const deferredResume = recordLocalFederatedResumeDecision(logDir, taskId, "judge", {
+          action: "approved",
           ...(reason ? { reason } : {}),
-          mode: advisoryOverrideMode(p),
-        },
-      );
+        });
+        if (deferredResume) {
+          return { kind: "deferred" as const, resolution, deferredResume };
+        }
+
+        const queueResumeRecorded =
+          p.dispatchQueue?.recordApprovalResume(taskId, resolution.released) ?? false;
+        try {
+          const job = p.dispatchManager!.start(
+            taskId,
+            withDispatchAdmission(
+              {
+                resume: true,
+                provenance: startProvenance(req),
+                duplicateClaimantCheck: claimantCheck,
+              },
+              admission,
+            ),
+            claimantCheck,
+          );
+          return { kind: "started" as const, resolution, job };
+        } catch (err) {
+          if (queueResumeRecorded) {
+            const msg = err instanceof Error ? err.message : String(err);
+            p.dispatchQueue?.requeueApprovalResume(taskId, msg);
+          }
+          throw err;
+        }
+      });
+      const decided = admitted.resolution.decision;
       broadcastAdvisoryOverride(taskId, decided);
 
       // Emit SSE event
@@ -5831,23 +7611,188 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         } as never,
       });
 
-      // Resume dispatch with resume flag so dispatcher skips completed stages
-      p.dispatchManager.start(
-        taskId,
-        {
-          resume: true,
-          dockerResumeStateDir: logDir,
-          provenance: startProvenance(req),
-          duplicateClaimantCheck: claimantCheck,
-        },
-        claimantCheck,
-      );
+      if (admitted.kind === "deferred") {
+        res.status(202).json({
+          ok: true,
+          deferred: true,
+          message:
+            "Judge decision recorded; the federation listener will reclaim the original job.",
+          resume: admitted.deferredResume,
+        });
+        return;
+      }
 
       res.json({ ok: true, message: "Judge review approved, dispatch resuming" });
     } catch (err: unknown) {
+      if (respondIfDecompositionRecoveryRequired(res, err)) return;
       if (respondIfAdvisoryOverrideRequired(res, err)) return;
+      if (respondIfApprovalDecisionConflict(res, err)) return;
+      if (err instanceof DuplicateClaimantAdmissionError) {
+        rejectDuplicateClaimantCheck({ taskId: err.taskId, claimants: err.claimants }, res);
+        return;
+      }
+      if (err instanceof StaleJudgeApprovalError) {
+        res.status(409).json({
+          error: err.message,
+          code: err.code,
+          surface: err.surface,
+          verdict: err.comparison.verdict,
+          recoveryAction: `POST /api/tasks/${taskId}/judge/recycle`,
+        });
+        return;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ error: `Failed to approve judge review: ${msg}` });
+    }
+  });
+
+  /**
+   * TASK-1333 / QPI-045: supersede a stale judge clearance without routing
+   * through rejection (which deletes its hold) or the whole-run paused-state
+   * override (which clears both gates, rather than only superseding the stale
+   * judge clearance). The archive primitive moves the approval and checkpoint
+   * only after the committed branch is reachable via a create-only archive
+   * ref; then a normal fresh start reads the current authoritative spec.
+   */
+  app.post("/api/tasks/:id/judge/recycle", async (req: Request, res: Response) => {
+    const p = resolveProject(req);
+    if (!p.projectRoot || !p.taskDir || !p.dispatchManager) {
+      res.status(500).json({ error: "Project not configured" });
+      return;
+    }
+
+    const taskId = req.params.id as string;
+    try {
+      const activeJob = p.dispatchManager.getActiveJob(taskId);
+      if (activeJob && activeJob.status !== "awaiting_approval") {
+        res.status(409).json({
+          error: `Cannot recycle ${taskId} while its dispatch is still running`,
+          code: "judge_recycle_run_active",
+        });
+        return;
+      }
+      const claimantCheck = await buildDuplicateClaimantCheck(p, taskId);
+      if (rejectDuplicateClaimantCheck(claimantCheck, res)) return;
+
+      const { compareJudgeApprovalSpecIdentity, loadJudgeApproval } =
+        await import("../dispatcher/judge-approval.js");
+      const { foundSpecIdentity, mayConsume, resolveCurrentSpecIdentity } =
+        await import("../core/spec-identity.js");
+      const approval = await loadJudgeApproval(
+        taskId,
+        resolveTaskRuntimeLogDir(p.projectRoot, p.dispatchManager, taskId, p.logDir),
+      );
+      if (!approval) {
+        res.status(404).json({ error: `No judge approval found for task ${taskId}` });
+        return;
+      }
+
+      const currentSpecIdentity = resolveCurrentSpecIdentity(p.projectRoot, p.taskDir, taskId);
+      const current = foundSpecIdentity(currentSpecIdentity);
+      if (!current) {
+        res.status(409).json({
+          error:
+            `Cannot recycle ${taskId} until exactly one readable authoritative task spec exists. ` +
+            "No live state was moved.",
+          code: "authoritative_spec_unavailable",
+        });
+        return;
+      }
+      const comparison = compareJudgeApprovalSpecIdentity(approval, currentSpecIdentity);
+      if (mayConsume(comparison.verdict)) {
+        res.status(409).json({
+          error:
+            `Judge approval for ${taskId} is not stale (${comparison.verdict}); ` +
+            "use the normal approve or reject action.",
+          code: "judge_approval_not_stale",
+          verdict: comparison.verdict,
+        });
+        return;
+      }
+
+      const logDir = resolveTaskRuntimeLogDir(p.projectRoot, p.dispatchManager, taskId, p.logDir);
+      const { archiveAndMoveJudgeRunState } = await import("../dispatcher/paused-run-state.js");
+      const admitted = await dispatchWithDecompositionFence(p, taskId, async (admission) => {
+        const freshActiveJob = p.dispatchManager!.getActiveJob(taskId);
+        if (freshActiveJob && freshActiveJob.status !== "awaiting_approval") {
+          throw new JudgeRecycleConflictError(
+            409,
+            "judge_recycle_run_active",
+            `Cannot recycle ${taskId} while its dispatch is still running`,
+          );
+        }
+        const freshClaimantCheck = await buildDuplicateClaimantCheck(p, taskId);
+        if (freshClaimantCheck.claimants.length > 1) {
+          throw new DuplicateClaimantAdmissionError(freshClaimantCheck);
+        }
+        const freshApproval = await loadJudgeApproval(taskId, logDir);
+        if (!freshApproval) {
+          throw new JudgeRecycleConflictError(
+            404,
+            "judge_approval_not_found",
+            `No judge approval found for task ${taskId}`,
+          );
+        }
+        const freshSpecIdentity = resolveCurrentSpecIdentity(p.projectRoot!, p.taskDir!, taskId);
+        if (!foundSpecIdentity(freshSpecIdentity)) {
+          throw new JudgeRecycleConflictError(
+            409,
+            "authoritative_spec_unavailable",
+            `Cannot recycle ${taskId} until exactly one readable authoritative task spec exists. No live state was moved.`,
+          );
+        }
+        const freshComparison = compareJudgeApprovalSpecIdentity(freshApproval, freshSpecIdentity);
+        if (mayConsume(freshComparison.verdict)) {
+          throw new JudgeRecycleConflictError(
+            409,
+            "judge_approval_not_stale",
+            `Judge approval for ${taskId} is not stale (${freshComparison.verdict}); use the normal approve or reject action.`,
+            freshComparison.verdict,
+          );
+        }
+        const archive = archiveAndMoveJudgeRunState(p.projectRoot!, logDir, taskId);
+        const job = p.dispatchManager!.start(
+          taskId,
+          withDispatchAdmission(
+            {
+              replaceArchivedJudgeRun: true,
+              provenance: startProvenance(req),
+              duplicateClaimantCheck: freshClaimantCheck,
+            },
+            admission,
+          ),
+          freshClaimantCheck,
+        );
+        return { archive, comparison: freshComparison, job };
+      });
+      res.status(202).json({
+        ok: true,
+        message:
+          "Stale judge run archived; fresh dispatch started from the authoritative current spec",
+        verdict: admitted.comparison.verdict,
+        archive: admitted.archive,
+        job: {
+          taskId: admitted.job.taskId,
+          sessionId: admitted.job.sessionId,
+          status: admitted.job.status,
+        },
+      });
+    } catch (err: unknown) {
+      if (respondIfDecompositionRecoveryRequired(res, err)) return;
+      if (err instanceof DuplicateClaimantAdmissionError) {
+        rejectDuplicateClaimantCheck({ taskId: err.taskId, claimants: err.claimants }, res);
+        return;
+      }
+      if (err instanceof JudgeRecycleConflictError) {
+        res.status(err.status).json({
+          error: err.message,
+          code: err.code,
+          verdict: err.verdict,
+        });
+        return;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ error: `Failed to recycle stale judge review: ${msg}` });
     }
   });
 
@@ -5865,14 +7810,94 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
     try {
       const logDir = resolveTaskRuntimeLogDir(p.projectRoot, p.dispatchManager, taskId, p.logDir);
-      const approval = await loadJudgeApproval(taskId, logDir);
-      if (!approval) {
-        await updateJudgeApprovalState(taskId, "rejected", logDir, undefined, rejectionReason);
-        return;
-      }
-      const claimantCheck = await buildDuplicateClaimantCheck(p, taskId);
-      if (rejectDuplicateClaimantCheck(claimantCheck, res)) return;
-      await updateJudgeApprovalState(taskId, "rejected", logDir, undefined, rejectionReason);
+      // Preserve missing-record no-op precedence without parsing content here;
+      // the in-fence manager owns authoritative validation and classification.
+      await assertJudgeApprovalRecordPresent(taskId, logDir);
+      const admitted = await dispatchWithDecompositionFence(p, taskId, async (admission) => {
+        const claimantCheck = await buildDuplicateClaimantCheck(p, taskId);
+        if (claimantCheck.claimants.length > 1) {
+          throw new DuplicateClaimantAdmissionError(claimantCheck);
+        }
+        const resolution = await p.dispatchManager!.resolveApprovalPauseDecision(
+          taskId,
+          "judge",
+          "rejected",
+          async () => {
+            // Keep the review evidence and execution mode captured under the
+            // same reservation as the durable decision. A concurrent route may
+            // neither replace nor delete this record between validation and the
+            // rejection write.
+            const approval = await loadJudgeApproval(taskId, logDir);
+            if (!approval) {
+              throw new Error(
+                `Judge approval for ${taskId} disappeared while its decision was reserved`,
+              );
+            }
+            await updateJudgeApprovalState(taskId, "rejected", logDir, undefined, rejectionReason);
+            return approval;
+          },
+          logDir,
+        );
+        const approval = resolution.decision;
+        const deferredResume = recordLocalFederatedResumeDecision(logDir, taskId, "judge", {
+          action: "rejected",
+          ...(rejectionReason ? { reason: rejectionReason } : {}),
+        });
+        if (deferredResume) {
+          return { kind: "deferred" as const, resolution, deferredResume };
+        }
+
+        const reviewFeedback = formatLoopReviewFeedback(approval?.review);
+        const feedback = [
+          rejectionReason ??
+            "Changes rejected during judge review. Please review the feedback and try again.",
+          reviewFeedback,
+        ]
+          .filter(Boolean)
+          .join("\n\n---\n\n");
+
+        let resuming = false;
+        if (approval?.executionMode === "loop") {
+          const { CheckpointManager } = await import("../dispatcher/checkpoint-manager.js");
+          const checkpointMgr = new CheckpointManager(logDir);
+          const rewound = await checkpointMgr.rewindFrom(taskId, "agent");
+          resuming = Boolean(rewound?.claudeSessionId && checkpointMgr.isUsable(rewound));
+        }
+
+        // The evidence has been formatted above; the next attempt writes a fresh record.
+        await deleteJudgeApproval(taskId, logDir);
+
+        const loopRevision = approval?.executionMode === "loop";
+        const startOptions = loopRevision
+          ? {
+              judgeFeedback: feedback,
+              reuseWorktree: true,
+              ...(resuming ? { resume: true } : {}),
+              provenance: startProvenance(req),
+              duplicateClaimantCheck: claimantCheck,
+            }
+          : {
+              judgeFeedback: feedback,
+              provenance: startProvenance(req),
+              duplicateClaimantCheck: claimantCheck,
+            };
+        const queueResumeRecorded =
+          p.dispatchQueue?.recordApprovalResume(taskId, resolution.released) ?? false;
+        try {
+          const job = p.dispatchManager!.start(
+            taskId,
+            withDispatchAdmission(startOptions, admission),
+            claimantCheck,
+          );
+          return { kind: "started" as const, resolution, resuming, loopRevision, job };
+        } catch (err) {
+          if (queueResumeRecorded) {
+            const msg = err instanceof Error ? err.message : String(err);
+            p.dispatchQueue?.requeueApprovalResume(taskId, msg);
+          }
+          throw err;
+        }
+      });
 
       // Emit SSE event
       sse.broadcast({
@@ -5884,50 +7909,31 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         payload: { taskId, rejectionReason: rejectionReason ?? "No reason provided" } as never,
       });
 
-      const reviewFeedback = formatLoopReviewFeedback(approval?.review);
-      const feedback = [
-        rejectionReason ??
-          "Changes rejected during judge review. Please review the feedback and try again.",
-        reviewFeedback,
-      ]
-        .filter(Boolean)
-        .join("\n\n---\n\n");
-
-      let resuming = false;
-      if (approval?.executionMode === "loop") {
-        const { CheckpointManager } = await import("../dispatcher/checkpoint-manager.js");
-        const checkpointMgr = new CheckpointManager(logDir);
-        const rewound = await checkpointMgr.rewindFrom(taskId, "agent");
-        resuming = Boolean(rewound?.claudeSessionId && checkpointMgr.isUsable(rewound));
+      if (admitted.kind === "deferred") {
+        res.status(202).json({
+          ok: true,
+          deferred: true,
+          message:
+            "Judge rejection recorded; the federation listener will reclaim the original job.",
+          resume: admitted.deferredResume,
+        });
+        return;
       }
-
-      // The evidence has been formatted above; the next attempt writes a fresh record.
-      await deleteJudgeApproval(taskId, logDir);
-
-      const loopRevision = approval?.executionMode === "loop";
-      const startOptions = loopRevision
-        ? {
-            judgeFeedback: feedback,
-            reuseWorktree: true,
-            ...(resuming ? { resume: true } : {}),
-            ...(resuming ? { dockerResumeStateDir: logDir } : {}),
-            provenance: startProvenance(req),
-            duplicateClaimantCheck: claimantCheck,
-          }
-        : {
-            judgeFeedback: feedback,
-            provenance: startProvenance(req),
-            duplicateClaimantCheck: claimantCheck,
-          };
-      p.dispatchManager.start(taskId, startOptions, claimantCheck);
 
       res.json({
         ok: true,
-        resuming: loopRevision ? resuming : undefined,
-        fallback: loopRevision && !resuming ? "fresh-session-reused-worktree" : undefined,
+        resuming: admitted.loopRevision ? admitted.resuming : undefined,
+        fallback:
+          admitted.loopRevision && !admitted.resuming ? "fresh-session-reused-worktree" : undefined,
         message: "Judge review rejected, re-dispatching agent with feedback",
       });
     } catch (err: unknown) {
+      if (respondIfDecompositionRecoveryRequired(res, err)) return;
+      if (respondIfApprovalDecisionConflict(res, err)) return;
+      if (err instanceof DuplicateClaimantAdmissionError) {
+        rejectDuplicateClaimantCheck({ taskId: err.taskId, claimants: err.claimants }, res);
+        return;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ error: `Failed to reject judge review: ${msg}` });
     }
@@ -6113,31 +8119,53 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       return;
     }
 
+    // Preserve not-found response precedence without opening any mutation
+    // window: there is no canonical parent to recover or finalize when the
+    // exact resolver has no bundle for this identity.
+    let bundle: Awaited<ReturnType<TaskService["getTaskBundle"]>>;
     try {
+      bundle = await p.taskService.getTaskBundle(taskId);
+    } catch (error) {
+      res.status(500).json({
+        error: `Failed to resolve task ${taskId}: ${error instanceof Error ? error.message : String(error)}`,
+      });
+      return;
+    }
+    const task = bundle?.task ?? null;
+    if (!task || !bundle) {
+      res.status(404).json({ error: `Task ${taskId} not found` });
+      return;
+    }
+
+    try {
+      const adapter = await loadCanonicalMutationAdapter(p);
+      try {
+        await recoverPendingDecompositionTransactions(adapter);
+      } catch (recoveryError) {
+        res.status(409).json({
+          ok: false,
+          mode,
+          taskId,
+          refusalCode: "DECOMPOSE_WRITE_LOCKED",
+          refusalMessage: `Pending decomposition recovery must complete before continuing: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+        });
+        return;
+      }
       // TASK-1334 slice 1 round 1 (S1-R1): ONE resolution for the whole
       // route. This handler used to resolve the parent here, DISCARD it, and
       // then prefix-select a child below, so `plan` and `materialize` built
       // drafts from the child while `finalize` rewrote the canonical PARENT as
       // DECOMPOSED. I converted the CLI twin of this route in slice 1 and did
       // not check the HTTP one.
-      const bundle = await p.taskService.getTaskBundle(taskId);
-      const task = bundle?.task ?? null;
-      if (!task || !bundle) {
-        res.status(404).json({ error: `Task ${taskId} not found` });
-        return;
-      }
-
       // Load adapter and parse task
-      const { loadAdapter } = await import("../core/adapter-loader.js");
       const { decomposeTask } = await import("../preflight/task-decomposer.js");
       const { materializeChildDrafts } = await import("../preflight/subtask-materializer.js");
-      const { writeSubtaskSpecs } = await import("../preflight/subtask-writer.js");
+      const { DecompositionFinalizeError, finalizeDecompositionTransaction } =
+        await import("../preflight/decomposition-finalizer.js");
       const { generateBlueprint } = await import("../blueprint/blueprint-agent.js");
       const { parseTaskFile } = await import("../core/task-parser.js");
       const { DECOMPOSE_REFUSAL_CODES } = await import("../preflight/decompose-types.js");
-      const fsSync = await import("node:fs/promises");
 
-      const adapter = await loadAdapter(p.projectRoot);
       // TASK-1334 (S1-R1): the file this route already resolved, not a fresh
       // prefix match. `parseTaskFile` is kept only as the fallback for a spec
       // that does not parse, which is the one case the bundle carries no task
@@ -6156,12 +8184,17 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
         // Attach parentReadiness metrics from prep cache if available
         if (p.prepCache) {
-          const parentPrep = await p.prepCache.read(taskId, filePath);
+          const parentPrep = await p.prepCache.read(taskId, filePath, computeContentHash(content));
           if (parentPrep) {
             topology.parentReadiness = {
               score: parentPrep.depthScore,
-              ready: parentPrep.depthReady,
-              deficiencies: parentPrep.deficiencies,
+              ready: parentPrep.depthReady && !parentPrep.stale,
+              deficiencies: parentPrep.stale
+                ? [
+                    "Prep result is stale for the current parent spec; run prep again",
+                    ...parentPrep.deficiencies,
+                  ]
+                : parentPrep.deficiencies,
             };
           } else {
             topology.parentReadiness = {
@@ -6245,8 +8278,18 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         }
 
         // Gate 2: parent readiness — parent must have a passing prep score
+        if (!p.prepCache) {
+          res.status(503).json({
+            ok: false,
+            mode: "finalize",
+            taskId,
+            refusalCode: DECOMPOSE_REFUSAL_CODES.PARENT_NOT_READY,
+            refusalMessage: "Parent readiness storage is unavailable; finalization is disabled.",
+          });
+          return;
+        }
         if (p.prepCache) {
-          const parentPrep = await p.prepCache.read(taskId, filePath);
+          const parentPrep = await p.prepCache.read(taskId, filePath, computeContentHash(content));
           const parentThreshold =
             adapter.config.preflight?.autoDecompose?.parentPrepThreshold ?? 4.0;
           if (!parentPrep) {
@@ -6257,6 +8300,24 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
               refusalCode: DECOMPOSE_REFUSAL_CODES.PARENT_NOT_READY,
               refusalMessage: `Parent task ${taskId} has no prep result. Run prep on the parent before finalizing decomposition.`,
               parentReadiness: { score: 0, ready: false, deficiencies: ["No prep result found"] },
+            });
+            return;
+          }
+          if (parentPrep.stale) {
+            res.status(400).json({
+              ok: false,
+              mode: "finalize",
+              taskId,
+              refusalCode: DECOMPOSE_REFUSAL_CODES.PARENT_NOT_READY,
+              refusalMessage: `Parent task ${taskId} prep result is stale for the current spec. Run prep again before finalizing decomposition.`,
+              parentReadiness: {
+                score: parentPrep.depthScore,
+                ready: false,
+                deficiencies: [
+                  "Prep result is stale for the current parent spec",
+                  ...parentPrep.deficiencies,
+                ],
+              },
             });
             return;
           }
@@ -6279,8 +8340,8 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
         // Gate 3: drafts must be provided
         type ChildDraftType = import("../preflight/decompose-types.js").ChildDraft;
-        const rawDrafts = body.drafts as ChildDraftType[] | undefined;
-        if (!rawDrafts || rawDrafts.length === 0) {
+        const submittedDrafts: unknown = body.drafts;
+        if (!Array.isArray(submittedDrafts) || submittedDrafts.length === 0) {
           res.status(400).json({
             ok: false,
             mode: "finalize",
@@ -6291,133 +8352,190 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
           });
           return;
         }
-
-        const { PREP_THRESHOLD } = await import("../preflight/subtask-quality-gate.js");
-
-        // Gate 4: check parse errors and prep scores
-        const failedDrafts = rawDrafts.filter((d) => d.parseError || !d.prepReady);
-        if (failedDrafts.length > 0) {
-          const failInfo = failedDrafts.map((d) => ({
-            subtaskId: d.subtaskId,
-            parseError: d.parseError,
-            prepScore: d.prepScore,
-            prepThreshold: PREP_THRESHOLD,
-            deficiencies: d.deficiencies,
-          }));
-          const refusalCode = failedDrafts.some((d) => d.parseError)
-            ? DECOMPOSE_REFUSAL_CODES.DRAFT_INVALID
-            : DECOMPOSE_REFUSAL_CODES.DRAFT_BELOW_THRESHOLD;
+        const malformedDraftIndexes = submittedDrafts.flatMap((draft: unknown, index) => {
+          if (typeof draft !== "object" || draft === null || Array.isArray(draft)) return [index];
+          const draftRecord = draft as Record<string, unknown>;
+          return typeof draftRecord.subtaskId !== "string" ||
+            draftRecord.subtaskId.trim().length === 0 ||
+            typeof draftRecord.markdown !== "string"
+            ? [index]
+            : [];
+        });
+        if (malformedDraftIndexes.length > 0) {
           res.status(400).json({
             ok: false,
             mode: "finalize",
             taskId,
-            refusalCode,
-            refusalMessage: `${failedDrafts.length} child draft(s) failed quality gates.`,
-            failedDrafts: failInfo,
+            refusalCode: DECOMPOSE_REFUSAL_CODES.DRAFT_INVALID,
+            refusalMessage:
+              "Each child draft must contain a non-empty subtaskId and Markdown string.",
+            malformedDraftIndexes,
+          });
+          return;
+        }
+        const rawDrafts = submittedDrafts as ChildDraftType[];
+
+        // Give callers the established draft-quality response early, then run
+        // the same gate again inside the reserved transaction before writing.
+        const { PREP_THRESHOLD, runChildQualityGate } =
+          await import("../preflight/subtask-quality-gate.js");
+        const preliminaryDrafts = rawDrafts.map((draft) => ({
+          ...draft,
+          ...runChildQualityGate(draft.subtaskId, draft.markdown),
+        }));
+        const preliminaryFailures = preliminaryDrafts.filter(
+          (draft) => draft.parseError || !draft.prepReady,
+        );
+        if (preliminaryFailures.length > 0) {
+          const failedDrafts = preliminaryFailures.map((draft) => ({
+            subtaskId: draft.subtaskId,
+            parseError: draft.parseError,
+            prepScore: draft.prepScore,
+            prepThreshold: PREP_THRESHOLD,
+            deficiencies: draft.deficiencies,
+          }));
+          res.status(400).json({
+            ok: false,
+            mode: "finalize",
+            taskId,
+            refusalCode: preliminaryFailures.some((draft) => draft.parseError)
+              ? DECOMPOSE_REFUSAL_CODES.DRAFT_INVALID
+              : DECOMPOSE_REFUSAL_CODES.DRAFT_BELOW_THRESHOLD,
+            refusalMessage: `${preliminaryFailures.length} child draft(s) failed quality gates.`,
+            failedDrafts,
           });
           return;
         }
 
-        // Gate 5: coverage report must be clean (if topology provided)
-        type CoverageType = import("../preflight/decompose-types.js").CoverageReport;
+        // Gate 4: a staged finalize is authorized by the topology itself, not
+        // by client-supplied scores or a client-supplied coverage verdict.
         type TopologyType = import("../preflight/decompose-types.js").DecompositionTopology;
         const rawTopology = body.plan as TopologyType | undefined;
-        if (rawTopology) {
-          const coverageReport = rawTopology.coverageReport as CoverageType | undefined;
-          if (coverageReport?.hasCoverageGap) {
-            res.status(400).json({
-              ok: false,
-              mode: "finalize",
-              taskId,
-              refusalCode: DECOMPOSE_REFUSAL_CODES.COVERAGE_GAP,
-              refusalMessage:
-                "Coverage gap detected — not all parent files or criteria are mapped.",
-              unmappedFiles: coverageReport.unmappedFiles,
-              unmappedCriteria: coverageReport.unmappedCriteria,
-            });
-            return;
-          }
+        if (!rawTopology) {
+          res.status(400).json({
+            ok: false,
+            mode: "finalize",
+            taskId,
+            refusalCode: DECOMPOSE_REFUSAL_CODES.PLAN_INVALID,
+            refusalMessage:
+              "Finalize requires the reviewed topology plan produced for the current parent.",
+          });
+          return;
         }
 
-        // Write child files
+        // Keep the early duplicate diagnostic for the established HTTP
+        // contract; the shared transaction repeats the strict check under its
+        // reservation before any write.
         if (await rejectDuplicateClaimantWrite(p, taskId, res)) return;
-        let writtenPaths: string[] = [];
+
+        let finalized: Awaited<ReturnType<typeof finalizeDecompositionTransaction>>;
         try {
-          writtenPaths = await writeSubtaskSpecs(rawDrafts, adapter);
-        } catch (writeErr: unknown) {
-          const writeMsg = writeErr instanceof Error ? writeErr.message : String(writeErr);
-          if (writeMsg.includes("in progress")) {
-            res.status(409).json({
-              ok: false,
-              mode: "finalize",
-              taskId,
-              refusalCode: DECOMPOSE_REFUSAL_CODES.WRITE_LOCKED,
-              refusalMessage: writeMsg,
-            });
-            return;
-          }
-          throw writeErr;
+          finalized = await finalizeDecompositionTransaction({
+            adapter,
+            parentTask: parsedTask,
+            parentFilePath: filePath,
+            parentContent: content,
+            topology: rawTopology,
+            drafts: rawDrafts,
+          });
+        } catch (error) {
+          if (!(error instanceof DecompositionFinalizeError)) throw error;
+          const coverage = error.details.coverageReport as
+            | import("../preflight/decompose-types.js").CoverageReport
+            | undefined;
+          const refusalCode =
+            error.kind === "coverage_gap"
+              ? DECOMPOSE_REFUSAL_CODES.COVERAGE_GAP
+              : error.kind === "child_quality"
+                ? DECOMPOSE_REFUSAL_CODES.DRAFT_INVALID
+                : error.kind === "invalid_plan"
+                  ? DECOMPOSE_REFUSAL_CODES.PLAN_INVALID
+                  : error.kind === "parent_changed"
+                    ? DECOMPOSE_REFUSAL_CODES.PARENT_CHANGED
+                    : error.kind === "commit_indeterminate"
+                      ? DECOMPOSE_REFUSAL_CODES.COMMIT_INDETERMINATE
+                      : error.kind === "write_locked" || error.kind === "index_dirty"
+                        ? DECOMPOSE_REFUSAL_CODES.WRITE_LOCKED
+                        : DECOMPOSE_REFUSAL_CODES.WRITE_FAILED;
+          const conflict =
+            error.kind === "parent_changed" ||
+            error.kind === "write_locked" ||
+            error.kind === "write_failed" ||
+            error.kind === "commit_indeterminate" ||
+            error.kind === "index_dirty";
+          res.status(conflict ? 409 : 400).json({
+            ok: false,
+            mode: "finalize",
+            taskId,
+            refusalCode,
+            refusalMessage: error.message,
+            ...(error.kind === "commit_indeterminate"
+              ? { recoveryPending: true, retryable: false }
+              : {}),
+            ...(coverage
+              ? {
+                  coverageReport: coverage,
+                  unmappedFiles: coverage.unmappedFiles,
+                  unmappedCriteria: coverage.unmappedCriteria,
+                }
+              : {}),
+            ...(error.details.rejectedDrafts ? { failedDrafts: error.details.rejectedDrafts } : {}),
+            ...(error.rollbackErrors.length > 0 ? { rollbackErrors: error.rollbackErrors } : {}),
+          });
+          return;
         }
 
-        // Rewrite parent as decomposition tracker.
-        // TASK-1334 (S1-R1): the file THIS ROUTE resolved, not a second
-        // independent `getTaskFilePath` call. The drafts above were built from
-        // `parsedTask`; rewriting a file resolved separately is how "built
-        // from one spec, applied to another" happened, and resolving correctly
-        // twice is still resolving twice.
-        let parentStatusUpdated = false;
-        const parentTaskPath = bundle.filePath;
-        if (parentTaskPath) {
-          // Round 2 (R2-1): the resolution's own content, not a re-read at
-          // write time.
-          const parentContent = bundle.content;
-          const childIds = rawDrafts.map((d) => d.subtaskId);
-
-          // Build Decomposition Summary table
-          const tableRows = rawDrafts
-            .map((d) => {
-              const deps = rawTopology?.subtasks
-                ? (rawTopology.subtasks.find((s) => s.id === d.subtaskId)?.dependsOn ?? [])
-                : [];
-              return `| \`${d.subtaskId}\` | ${d.title} | ${deps.length > 0 ? deps.join(", ") : "\u2014"} | prep ${d.prepScore} |`;
-            })
-            .join("\n");
-
-          const decompositionSummary =
-            `\n\n## Decomposition Summary\n\n` +
-            `This task has been decomposed into ${childIds.length} child task(s). ` +
-            `It is now a tracker task and should not be dispatched directly while the child chain is active.\n\n` +
-            `| Child | Scope | Depends On | Ready Gate |\n` +
-            `|-------|-------|------------|------------|\n` +
-            tableRows;
-
-          let updatedParent = parentContent
-            .replace(/(\*\*Status:\*\*\s*)\S+/, "$1DECOMPOSED")
-            .replace(/(\*\*Blocks:\*\*\s*)\[.*?\]/, `$1[${childIds.join(", ")}]`);
-
-          if (!updatedParent.includes("## Decomposition Summary")) {
-            updatedParent += decompositionSummary;
+        const validatedDrafts = finalized.drafts;
+        const writtenPaths = finalized.writtenPaths;
+        const parentStatusUpdated = finalized.parentStatusUpdated;
+        let recoveryPending = finalized.commit.recoveryPending === true;
+        let statusProjectionId = finalized.commit.statusProjectionId;
+        let recoveryWarning: string | undefined;
+        try {
+          const convergence = await recoverAndProjectPendingDecompositionTransactions(
+            adapter,
+            p.db,
+          );
+          statusProjectionId ??= convergence.recoveries.find(
+            (item) => item.parentTaskId === taskId,
+          )?.statusProjectionId;
+          statusProjectionId ??= convergence.projections.find(
+            (item) => item.parentTaskId === taskId,
+          )?.projectionId;
+          const projected = p.db.getStatus(taskId);
+          const expectedSource = statusProjectionId
+            ? `decomposition:${statusProjectionId}`
+            : undefined;
+          if (
+            !expectedSource ||
+            projected?.status !== "DECOMPOSED" ||
+            projected.updated_by !== expectedSource
+          ) {
+            throw new DecompositionRecoveryError(
+              `Committed decomposition ${taskId} did not reach its exact authoritative status projection.`,
+              undefined,
+              { statusProjectionId, projected },
+            );
           }
-
-          if (updatedParent !== parentContent) {
-            await fsSync.default.writeFile(parentTaskPath, updatedParent, "utf-8");
-            p.db.setStatus(taskId, "DECOMPOSED", "decompose");
-            parentStatusUpdated = true;
-          }
+          recoveryPending = false;
+        } catch (statusError) {
+          recoveryPending = true;
+          recoveryWarning = `Failed to project committed decomposition status for ${taskId}; durable recovery remains pending: ${statusError instanceof Error ? statusError.message : String(statusError)}`;
+          console.warn(recoveryWarning);
         }
 
         // Optionally enqueue children
         let enqueuedItems: Array<{ taskId: string; status: string }> = [];
         let enqueueRefusals: DuplicateClaimantRefusal[] = [];
         const enqueue = body.enqueue === true;
-        if (enqueue && p.dispatchQueue) {
+        if (enqueue && p.dispatchQueue && !recoveryPending) {
           try {
-            const subtaskIds = rawDrafts.map((draft) => draft.subtaskId);
+            const subtaskIds = validatedDrafts.map((draft) => draft.subtaskId);
             const claimantChecks = await p.dispatchQueue.scanEnqueueClaimants(subtaskIds);
             const items = p.dispatchQueue.enqueueSubtasks(
               {
                 parentTaskId: taskId,
-                subtasks: rawDrafts.map((d) => ({
+                subtasks: validatedDrafts.map((d) => ({
                   id: d.subtaskId,
                   dependsOn: rawTopology?.subtasks
                     ? (rawTopology.subtasks.find((s) => s.id === d.subtaskId)?.dependsOn ?? [])
@@ -6435,15 +8553,28 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
           }
         }
 
-        const subtaskIds = rawDrafts.map((d) => d.subtaskId);
-        sse.broadcast({
-          sessionId: "decompose",
-          taskId,
-          project: p.projectId,
-          timestamp: new Date().toISOString(),
-          stage: "task_decomposed",
-          payload: { taskId, subtaskCount: rawDrafts.length, subtaskIds, mode: "finalize" },
-        });
+        const subtaskIds = validatedDrafts.map((d) => d.subtaskId);
+        try {
+          sse.broadcast({
+            sessionId: "decompose",
+            taskId,
+            project: p.projectId,
+            timestamp: new Date().toISOString(),
+            stage: "task_decomposed",
+            payload: {
+              taskId,
+              subtaskCount: validatedDrafts.length,
+              subtaskIds,
+              mode: "finalize",
+              recoveryPending,
+              statusProjectionId,
+            },
+          });
+        } catch (eventError) {
+          console.warn(
+            `Failed to publish committed decomposition event for ${taskId}: ${eventError instanceof Error ? eventError.message : String(eventError)}`,
+          );
+        }
 
         res.json({
           ok: true,
@@ -6454,6 +8585,9 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
           enqueuedItems,
           enqueueRefusals,
           parentStatusUpdated,
+          recoveryPending,
+          statusProjectionId,
+          ...(recoveryWarning ? { warnings: [recoveryWarning] } : {}),
         });
         return;
       }
@@ -6588,15 +8722,24 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
   // is in an active state — the claim alone previously bypassed the
   // swarm-mode dispatch block and would have mislabeled provenance.
   async function verifyFederatedStartClaim(
-    projectRoot: string | undefined,
+    project: ResolvedProject,
+    taskId: string,
     federatedJobId: string | undefined,
     federatedHostId: string | undefined,
+    federatedLeaseId: string | undefined,
   ): Promise<boolean> {
-    if (!projectRoot || !federatedJobId || !federatedHostId) return false;
-    const record = await loadFederatedJob(projectRoot, federatedJobId);
+    if (!project.projectRoot || !federatedJobId || !federatedHostId || !federatedLeaseId) {
+      return false;
+    }
+    const record = await loadFederatedJob(project.projectRoot, federatedJobId);
     return Boolean(
       record &&
+      record.projectId === project.projectId &&
+      record.taskId === taskId &&
       record.hostId === federatedHostId &&
+      record.lease?.leaseId === federatedLeaseId &&
+      record.lease.hostId === federatedHostId &&
+      !leaseExpired(record) &&
       ["assigned", "running", "verifying", "fixing"].includes(record.status),
     );
   }
@@ -6606,10 +8749,13 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
   ): Promise<boolean> {
     if (!projectRoot) return false;
     try {
-      const listeners = await new ListenerRegistry(projectRoot).list();
-      return listeners.some((listener) => listener.enabled !== false);
+      const snapshot = await new ListenerRegistry(projectRoot).listWithDiagnostics();
+      return (
+        snapshot.issues.length > 0 ||
+        snapshot.records.some((listener) => listener.enabled !== false)
+      );
     } catch {
-      return false;
+      return true;
     }
   }
 
@@ -6661,10 +8807,33 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       headerString(req, "x-quack-federated-lease-id");
     const localSmokeOnly =
       body?.localSmokeOnly === true || headerString(req, "x-quack-local-smoke") === "true";
+
+    // A crash between journal fsync and commit can leave a READY parent beside
+    // partial transaction bytes. Recover before any admission lookup, and
+    // fail closed while evidence is divergent or a live writer owns the lock.
+    if (p.projectRoot) {
+      try {
+        const adapter = await loadCanonicalMutationAdapter(p);
+        await recoverPendingDecompositionTransactions(adapter);
+      } catch (recoveryError) {
+        res.status(409).json({
+          ok: false,
+          code: "decomposition_recovery_required",
+          error: `Pending decomposition recovery must complete before dispatch: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+        });
+        return;
+      }
+    }
     const claimsFederatedStart = Boolean(federatedJobId && federatedHostId);
     const federatedWorkerStart =
       claimsFederatedStart &&
-      (await verifyFederatedStartClaim(p.projectRoot, federatedJobId, federatedHostId));
+      (await verifyFederatedStartClaim(
+        p,
+        taskId,
+        federatedJobId,
+        federatedHostId,
+        federatedLeaseId,
+      ));
 
     if (
       !localSmokeOnly &&
@@ -6940,25 +9109,44 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     }
 
     try {
-      const job = p.dispatchManager.start(
-        taskId,
-        {
-          skipGate,
-          skipDepthOnly,
-          forceClean,
-          overridePausedRun,
-          model,
-          maxTurns,
-          maxBudget,
-          federatedJobId,
-          federatedHostId,
-          federatedHostAlias,
-          federatedHostEndpoint,
-          federatedLeaseId,
-          provenance: startProvenance(req, { federatedJobId, federatedWorkerStart }),
-          duplicateClaimantCheck: claimantCheck,
-        },
-        claimantCheck,
+      const job = await dispatchWithDecompositionFence(p, taskId, (admission) =>
+        (async () => {
+          if (
+            claimsFederatedStart &&
+            !(await verifyFederatedStartClaim(
+              p,
+              taskId,
+              federatedJobId,
+              federatedHostId,
+              federatedLeaseId,
+            ))
+          ) {
+            throw new FederatedStartClaimError();
+          }
+          return p.dispatchManager!.start(
+            taskId,
+            withDispatchAdmission(
+              {
+                skipGate,
+                skipDepthOnly,
+                forceClean,
+                overridePausedRun,
+                model,
+                maxTurns,
+                maxBudget,
+                federatedJobId,
+                federatedHostId,
+                federatedHostAlias,
+                federatedHostEndpoint,
+                federatedLeaseId,
+                provenance: startProvenance(req, { federatedJobId, federatedWorkerStart }),
+                duplicateClaimantCheck: claimantCheck,
+              },
+              admission,
+            ),
+            claimantCheck,
+          );
+        })(),
       );
       // Set task status to IN_PROGRESS in DB immediately so dashboard reflects reality
       p.db.setStatus(
@@ -6981,6 +9169,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         message: `Dispatch started for ${taskId}`,
       });
     } catch (err: unknown) {
+      if (respondIfFederatedStartClaimInvalid(res, err)) return;
       // TASK-1326 (QPI-042): a start that would discard a human-gate
       // pause gets a NAMED code, not a bare message — an operator (or a
       // listener) has to be able to tell "you would destroy paid-for
@@ -7015,18 +9204,45 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       return;
     }
 
-    const taskId = req.params.id as string;
-    let taskExecutionMode: ExecutionMode | undefined;
+    if (!p.projectRoot) {
+      res.status(500).json({ error: "Project root not configured" });
+      return;
+    }
 
-    // Check if task exists
     try {
-      const task = await p.taskService.getTask(taskId);
-      if (!task) {
-        res.status(404).json({ error: `Task ${taskId} not found` });
-        return;
+      const adapter = await loadCanonicalMutationAdapter(p);
+      await recoverPendingDecompositionTransactions(adapter);
+    } catch (recoveryError) {
+      res.status(409).json({
+        ok: false,
+        code: "decomposition_recovery_required",
+        error: `Pending decomposition recovery must complete before revision dispatch: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+      });
+      return;
+    }
+
+    const taskId = req.params.id as string;
+    const existingJob = p.dispatchManager.getJob(taskId);
+    const inMemoryRunning =
+      existingJob?.status === "running" || existingJob?.status === "awaiting_approval";
+    const configuredLogDir = p.logDir ?? path.resolve(p.projectRoot, ".quack", "logs");
+    const runtime = resolveRevisionRuntimeContext(
+      p.projectRoot,
+      taskId,
+      configuredLogDir,
+      existingJob?.worktreePath,
+    );
+    const runtimeTaskDir = p.taskDir
+      ? path.resolve(runtime.projectRoot, p.taskDir)
+      : p.taskService.getTaskDirectory();
+    // Canonical parsed-spec admission is shared with the CLI and happens
+    // before either surface may create persistent session state.
+    try {
+      await resolveRevisionTask(runtimeTaskDir, taskId);
+    } catch (err: unknown) {
+      if (!(err instanceof RevisionPreparationError) || err.code !== "task_not_found") {
+        throw err;
       }
-      taskExecutionMode = task.executionMode;
-    } catch {
       res.status(404).json({ error: `Task ${taskId} not found` });
       return;
     }
@@ -7084,7 +9300,13 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     const claimsFederatedStart = Boolean(federatedJobId && federatedHostId);
     const federatedWorkerStart =
       claimsFederatedStart &&
-      (await verifyFederatedStartClaim(p.projectRoot, federatedJobId, federatedHostId));
+      (await verifyFederatedStartClaim(
+        p,
+        taskId,
+        federatedJobId,
+        federatedHostId,
+        federatedLeaseId,
+      ));
 
     if (
       !localSmokeOnly &&
@@ -7104,15 +9326,19 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       return;
     }
 
-    // Get last judge feedback from most recent run
-    const sessions = p.reader.getExecutionSessions().filter((s) => s.taskId === taskId);
-    if (sessions.length === 0) {
+    const runtimeReader = new EventReader(runtime.logDir);
+    const revisionSessions = runtimeReader.getExecutionSessions();
+
+    // These read-only checks preserve the route's established response
+    // precedence. prepareRevisionState repeats them at the mutation boundary.
+    if (revisionSessions.every((session) => session.taskId !== taskId)) {
       res.status(400).json({ error: "Cannot revise: no prior runs" });
       return;
     }
-
-    // Check if task is currently running
-    if (p.dispatchManager.getJob(taskId)) {
+    if (
+      inMemoryRunning ||
+      revisionSessions.some((session) => session.taskId === taskId && session.status === "active")
+    ) {
       res.status(409).json({ error: `Task ${taskId} is already running` });
       return;
     }
@@ -7120,90 +9346,89 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     const claimantCheck = await buildDuplicateClaimantCheck(p, taskId);
     if (rejectDuplicateClaimantCheck(claimantCheck, res)) return;
 
-    let judgeFeedback = "";
-    const lastSession = sessions[0];
-    const events = p.reader.getSessionEvents(lastSession.sessionId);
-    const judgeEvent = events.find((e) => e.stage === "judge_result");
-    if (judgeEvent) {
-      const payload = judgeEvent.payload as Record<string, unknown>;
-      judgeFeedback = typeof payload.feedback === "string" ? payload.feedback : "";
-    }
-
-    // Merge feedbacks
-    let mergedFeedback = judgeFeedback
-      ? `${judgeFeedback}\n\n---\n\n## Human Revision Feedback\n\n${feedback}`
-      : feedback;
-    const effectiveExecutionMode = taskExecutionMode ?? adapterExecutionMode;
-    let resuming = false;
-    let resumeRuntimeLogDir: string | undefined;
-
-    if (effectiveExecutionMode === "loop" && p.projectRoot) {
-      const runtimeLogDir = resolveTaskRuntimeLogDir(
-        p.projectRoot,
-        p.dispatchManager,
-        taskId,
-        p.logDir,
-      );
-      resumeRuntimeLogDir = runtimeLogDir;
-      const { loadJudgeApproval, deleteJudgeApproval } =
-        await import("../dispatcher/judge-approval.js");
-      const approval = await loadJudgeApproval(taskId, runtimeLogDir);
-      const reviewFeedback = formatLoopReviewFeedback(approval?.review);
-      if (reviewFeedback) {
-        mergedFeedback = [mergedFeedback, reviewFeedback].filter(Boolean).join("\n\n---\n\n");
-      }
-
-      const { CheckpointManager } = await import("../dispatcher/checkpoint-manager.js");
-      const checkpointMgr = new CheckpointManager(runtimeLogDir);
-      const rewound = await checkpointMgr.rewindFrom(taskId, "agent");
-      resuming = Boolean(rewound?.claudeSessionId && checkpointMgr.isUsable(rewound));
-      if (approval) {
-        await deleteJudgeApproval(taskId, runtimeLogDir);
-      }
-    }
-
-    // Emit revision_start event
-    sse.broadcast({
-      sessionId: "revision",
-      taskId,
-      project: p.projectId,
-      timestamp: new Date().toISOString(),
-      stage: "revision_start",
-      payload: {
-        taskId,
-        feedback: mergedFeedback,
-        prNumber: undefined,
-        budget: maxBudget,
-        turns: maxTurns,
-      },
-    });
-
     try {
-      const job = p.dispatchManager.start(
+      const admitted = await dispatchWithDecompositionFence(p, taskId, async (admission) => {
+        if (
+          claimsFederatedStart &&
+          !(await verifyFederatedStartClaim(
+            p,
+            taskId,
+            federatedJobId,
+            federatedHostId,
+            federatedLeaseId,
+          ))
+        ) {
+          throw new FederatedStartClaimError();
+        }
+        const freshExistingJob = p.dispatchManager!.getJob(taskId);
+        const freshInMemoryRunning =
+          freshExistingJob?.status === "running" ||
+          freshExistingJob?.status === "awaiting_approval";
+        const freshRuntimeReader = new EventReader(runtime.logDir);
+        const freshRevisionSessions = freshRuntimeReader.getExecutionSessions();
+        const freshResolvedTask = await resolveRevisionTask(runtimeTaskDir, taskId);
+        const freshClaimantCheck = await buildDuplicateClaimantCheck(p, taskId);
+        if (freshClaimantCheck.claimants.length > 1) {
+          throw new DuplicateClaimantAdmissionError(freshClaimantCheck);
+        }
+        const revision = await prepareRevisionState({
+          taskId,
+          resolvedTask: freshResolvedTask,
+          adapterExecutionMode,
+          runtimeLogDir: runtime.logDir,
+          sessions: freshRevisionSessions,
+          getSessionEvents: (sessionId) => freshRuntimeReader.getSessionEvents(sessionId),
+          humanFeedback: feedback,
+          inMemoryRunning: freshInMemoryRunning,
+        });
+        const { mergedFeedback, resuming } = revision;
+        const job = p.dispatchManager!.start(
+          taskId,
+          withDispatchAdmission(
+            {
+              judgeFeedback: mergedFeedback,
+              skipGate: true,
+              reuseWorktree: true,
+              ...(resuming ? { resume: true } : {}),
+              maxBudget,
+              maxTurns,
+              federatedJobId,
+              federatedHostId,
+              federatedHostAlias,
+              federatedHostEndpoint,
+              federatedLeaseId,
+              provenance: startProvenance(req, { federatedJobId, federatedWorkerStart }),
+              duplicateClaimantCheck: freshClaimantCheck,
+            },
+            admission,
+          ),
+          freshClaimantCheck,
+        );
+        return { revision, job };
+      });
+      const { executionMode: effectiveExecutionMode, mergedFeedback, resuming } = admitted.revision;
+
+      // Observers run only after the fenced state transition and dispatch
+      // admission have both succeeded.
+      sse.broadcast({
+        sessionId: "revision",
         taskId,
-        {
-          judgeFeedback: mergedFeedback,
-          skipGate: true,
-          reuseWorktree: true,
-          ...(resuming ? { resume: true } : {}),
-          ...(resuming && resumeRuntimeLogDir ? { dockerResumeStateDir: resumeRuntimeLogDir } : {}),
-          maxBudget,
-          maxTurns,
-          federatedJobId,
-          federatedHostId,
-          federatedHostAlias,
-          federatedHostEndpoint,
-          federatedLeaseId,
-          provenance: startProvenance(req, { federatedJobId, federatedWorkerStart }),
-          duplicateClaimantCheck: claimantCheck,
+        project: p.projectId,
+        timestamp: new Date().toISOString(),
+        stage: "revision_start",
+        payload: {
+          taskId,
+          feedback: mergedFeedback,
+          prNumber: undefined,
+          budget: maxBudget,
+          turns: maxTurns,
         },
-        claimantCheck,
-      );
+      });
       // Track this as a revision dispatch for revision_complete emission
       activeRevisions.add(taskId);
       res.json({
         ok: true,
-        sessionId: job.sessionId,
+        sessionId: admitted.job.sessionId,
         resuming,
         fallback:
           effectiveExecutionMode === "loop" && !resuming
@@ -7211,12 +9436,24 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
             : undefined,
       });
     } catch (err: unknown) {
+      if (respondIfFederatedStartClaimInvalid(res, err)) return;
+      if (respondIfDecompositionRecoveryRequired(res, err)) return;
+      if (err instanceof RevisionPreparationError) {
+        const status =
+          err.code === "task_not_found" ? 404 : err.code === "no_prior_runs" ? 400 : 409;
+        res.status(status).json({ error: err.message });
+        return;
+      }
+      if (err instanceof DuplicateClaimantAdmissionError) {
+        rejectDuplicateClaimantCheck({ taskId: err.taskId, claimants: err.claimants }, res);
+        return;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       res.status(409).json({ error: msg });
     }
   });
 
-  app.post("/api/tasks/:id/stop", (req: Request, res: Response) => {
+  app.post("/api/tasks/:id/stop", async (req: Request, res: Response) => {
     const p = resolveProject(req);
     if (!p.dispatchManager) {
       res.status(500).json({ error: "Dispatch not available" });
@@ -7224,11 +9461,54 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     }
 
     const taskId = req.params.id as string;
+    const jobBeforeStop = p.dispatchManager.getJob(taskId);
+    const requestedResumedSessionId = stringField(
+      (req.body as Record<string, unknown> | undefined)?.resumedSessionId,
+    );
+    if (
+      requestedResumedSessionId &&
+      (!jobBeforeStop || jobBeforeStop.sessionId !== requestedResumedSessionId)
+    ) {
+      res.status(409).json({
+        error: "federated_resume_session_mismatch",
+        message: `Active dispatch for ${taskId} is not resumed session ${requestedResumedSessionId}.`,
+      });
+      return;
+    }
+    const wasActiveBeforeStop =
+      jobBeforeStop?.status === "running" ||
+      jobBeforeStop?.status === "awaiting_approval" ||
+      jobBeforeStop?.operatorStopCleanupPending === true;
     const stopped = p.dispatchManager.stop(taskId);
+    let idleAfterStop = !stopped;
     if (stopped) {
+      try {
+        idleAfterStop = await p.dispatchManager.waitForIdle();
+      } catch {
+        idleAfterStop = false;
+      }
+    }
+    const cleanupPending = p.dispatchManager.hasPendingOperatorStopCleanup(taskId);
+
+    if (stopped && (!idleAfterStop || cleanupPending)) {
+      res.status(409).json({
+        error: `Process-tree termination was confirmed for ${taskId}, but recovery cleanup is still pending`,
+        code: "DISPATCH_STOP_CLEANUP_PENDING",
+        terminationConfirmed: true,
+        cleanupPending,
+        processExitPending: !idleAfterStop,
+      });
+    } else if (stopped) {
       // Revert task status â€” stopped dispatch means task is back to READY
       p.db.setStatus(taskId, "READY", "dispatch_stopped");
       res.json({ ok: true, message: `Dispatch stopped for ${taskId}` });
+    } else if (wasActiveBeforeStop || cleanupPending) {
+      res.status(409).json({
+        error: `Durable process-tree termination could not be confirmed for ${taskId}`,
+        code: "DISPATCH_STOP_UNCONFIRMED",
+        terminationConfirmed: false,
+        cleanupPending,
+      });
     } else {
       res.status(404).json({ error: `No active dispatch for ${taskId}` });
     }
@@ -7308,10 +9588,9 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       const branchName = buildBranchName(taskId, adapter);
 
       // Check local branches via git
-      const stdout = execSync(`git branch --list ${branchName}`, {
-        cwd: adapter.projectRoot,
-        encoding: "utf-8",
-        timeout: 10_000,
+      const stdout = executeTrustedGitSync(["branch", "--list", branchName], adapter.projectRoot, {
+        timeoutMs: 10_000,
+        maxBuffer: 1024 * 1024,
       });
       const exists = stdout.trim().length > 0;
 
@@ -7397,17 +9676,22 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     if (rejectDuplicateClaimantCheck(claimantCheck, res)) return;
 
     try {
-      const job = p.dispatchManager.start(
-        taskId,
-        {
-          skipGate: true,
-          model,
-          maxBudget,
-          judgeFeedback,
-          provenance: startProvenance(req),
-          duplicateClaimantCheck: claimantCheck,
-        },
-        claimantCheck,
+      const job = await dispatchWithDecompositionFence(p, taskId, (admission) =>
+        p.dispatchManager!.start(
+          taskId,
+          withDispatchAdmission(
+            {
+              skipGate: true,
+              model,
+              maxBudget,
+              judgeFeedback,
+              provenance: startProvenance(req),
+              duplicateClaimantCheck: claimantCheck,
+            },
+            admission,
+          ),
+          claimantCheck,
+        ),
       );
       res.json({
         ok: true,
@@ -7485,16 +9769,20 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       const resumeId = sessionId ?? checkpoint?.claudeSessionId;
       // resume: true adds --resume flag to child process, which triggers
       // checkpoint loading + progress file injection in the dispatcher
-      const job = p.dispatchManager.start(
-        taskId,
-        {
-          skipGate: true,
-          resume: true,
-          dockerResumeStateDir: taskRuntimeLogDir,
-          provenance: startProvenance(req),
-          duplicateClaimantCheck: claimantCheck,
-        },
-        claimantCheck,
+      const job = await dispatchWithDecompositionFence(p, taskId, (admission) =>
+        p.dispatchManager!.start(
+          taskId,
+          withDispatchAdmission(
+            {
+              skipGate: true,
+              resume: true,
+              provenance: startProvenance(req),
+              duplicateClaimantCheck: claimantCheck,
+            },
+            admission,
+          ),
+          claimantCheck,
+        ),
       );
       res.json({
         ok: true,
@@ -7578,6 +9866,43 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     }
   });
 
+  app.get("/api/tasks/:id/dispatch/observation", (req: Request, res: Response) => {
+    const p = resolveProject(req);
+    const scope = z
+      .object({
+        projectId: z.string().min(1).max(512),
+        taskId: z.string().min(1).max(512),
+        jobId: z.string().min(1).max(512),
+        hostId: z.string().min(1).max(512),
+        leaseId: z.string().min(1).max(512),
+        sessionId: z.string().min(1).max(512),
+      })
+      .safeParse({ ...req.query, taskId: req.params.id });
+    if (!scope.success) {
+      res.status(400).json({ error: "invalid_dispatch_observation_scope" });
+      return;
+    }
+    if (scope.data.projectId !== p.projectId || !p.dispatchManager) {
+      res.status(404).json({ error: "dispatch_observation_not_found" });
+      return;
+    }
+    try {
+      const observation = p.dispatchManager.getDispatchObservation(scope.data);
+      if (!observation) {
+        res.status(404).json({ error: "dispatch_observation_not_found" });
+        return;
+      }
+      res.json(observation);
+    } catch (error) {
+      res.status(503).json({
+        error: "dispatch_observation_unavailable",
+        message: sanitizeClaudeDiagnostic(
+          error instanceof Error ? error.message : String(error),
+        ).slice(0, 2048),
+      });
+    }
+  });
+
   app.get("/api/dispatch/jobs", (req: Request, res: Response) => {
     const jobs = resolveProjects(req).flatMap(
       (project) =>
@@ -7608,7 +9933,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
   // ─── Coordination endpoints (TASK-926) ─────────────────────────
   // Agent-to-agent coordination broker. Uses the active project's QuackDB.
-  registerCoordinationRoutes(app, {
+  const coordinationRoutes = registerCoordinationRoutes(app, {
     authService,
     getDb: () => {
       const project = resolveProject();
@@ -8039,37 +10364,65 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     }
   }
 
-  const testRunner = projectRoot
-    ? new TestRunner(
-        projectRoot,
-        (data: string) => {
-          sse.broadcast({
-            sessionId: "testing",
-            taskId: "",
-            project: currentProjectId(),
-            timestamp: new Date().toISOString(),
-            stage: "testing_output" as QuackEvent["stage"],
-            payload: { output: data } as unknown as QuackEvent["payload"],
-          });
-        },
-        (stage, payload) => {
-          sse.broadcast({
-            sessionId: "testing",
-            taskId: typeof payload.taskId === "string" ? payload.taskId : "",
-            project: currentProjectId(),
-            timestamp: new Date().toISOString(),
-            stage,
-            payload: payload as unknown as QuackEvent["payload"],
-          });
-        },
-      )
-    : null;
+  const testRunners = new Map<string, TestRunner>();
+  const canonicalTestProjectRoot = (root: string): string => {
+    const resolved = path.resolve(root);
+    try {
+      return fs.realpathSync.native(resolved);
+    } catch {
+      return resolved;
+    }
+  };
+  const testProjectId = (root: string): string => {
+    const canonical = canonicalTestProjectRoot(root);
+    const matched = registry
+      ?.listProjects()
+      .find(
+        (context) =>
+          canonicalTestProjectRoot(context.rootPath).toLowerCase() === canonical.toLowerCase(),
+      );
+    return matched?.id ?? generateProjectId(canonical);
+  };
+  const getTestRunner = (root: string): TestRunner => {
+    const canonical = canonicalTestProjectRoot(root);
+    const key = process.platform === "win32" ? canonical.toLowerCase() : canonical;
+    const existing = testRunners.get(key);
+    if (existing) return existing;
+    const runner = new TestRunner(
+      canonical,
+      (data: string) => {
+        sse.broadcast({
+          sessionId: "testing",
+          taskId: "",
+          project: testProjectId(canonical),
+          timestamp: new Date().toISOString(),
+          stage: "testing_output" as QuackEvent["stage"],
+          payload: { output: data } as unknown as QuackEvent["payload"],
+        });
+      },
+      (stage, payload) => {
+        sse.broadcast({
+          sessionId: "testing",
+          taskId: typeof payload.taskId === "string" ? payload.taskId : "",
+          project: testProjectId(canonical),
+          timestamp: new Date().toISOString(),
+          stage,
+          payload: payload as unknown as QuackEvent["payload"],
+        });
+      },
+    );
+    if (monitorDrain) runner.beginTerminalDrain();
+    testRunners.set(key, runner);
+    return runner;
+  };
+  const testRunner = projectRoot ? getTestRunner(projectRoot) : null;
 
   // â”€â”€â”€ Testing endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // Extracted into ./routes/testing.ts (TASK-873).
   registerTestingRoutes(app, {
     resolveProject,
     testRunner,
+    getTestRunner,
     sse,
     getVerificationCommands,
     getSmartTestingConfig,
@@ -8267,6 +10620,18 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         return;
       }
 
+      // A dynamically registered project gets the same recovery/projection
+      // barrier as startup projects before any queue or watcher can observe it.
+      const registrationDb = initializeProjectDb(
+        path.resolve(adapter.projectRoot, ".quack", "quack.db"),
+        adapter.config.project.name,
+      ).db;
+      try {
+        await recoverAndProjectPendingDecompositionTransactions(adapter, registrationDb);
+      } finally {
+        registrationDb.close();
+      }
+
       // Build project context
       const quackBin = path.resolve(__dirname, "..", "index.js");
       const context = buildProjectContext(adapter, quackBin, (stage, taskId, payload) => {
@@ -8349,20 +10714,44 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
     // Check no active dispatches
     if (context.dispatchManager) {
-      const activeJobs = context.dispatchManager.getActiveJobs();
-      if (activeJobs.length > 0) {
+      const unsafeDispatches = context.dispatchManager
+        .getAllJobs()
+        .filter(
+          (job) =>
+            job.status === "running" ||
+            job.status === "awaiting_approval" ||
+            job.operatorStopCleanupPending === true,
+        );
+      if (unsafeDispatches.length > 0) {
         res.status(409).json({
           error: "Cannot unregister project with active dispatches. Stop all dispatches first.",
         });
         return;
       }
     }
+    if (context.prepWorker) {
+      const activePrepJobs = context.prepWorker.getActiveJobs();
+      if (activePrepJobs.length > 0 || context.prepWorker.hasLiveProcesses()) {
+        res.status(409).json({
+          error: "Cannot unregister project with active prep jobs. Stop all prep jobs first.",
+        });
+        return;
+      }
+    }
 
     // Teardown services
-    teardownProjectContext(context);
+    try {
+      await teardownProjectContext(context);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[monitor] Failed to unregister project ${projectId}: ${message}`);
+      res.status(500).json({ error: message });
+      return;
+    }
 
     // Unregister
     registry.unregister(projectId);
+    claudeAuthProbes.delete(projectId);
 
     // Persist removal to global config (non-fatal)
     try {
@@ -8452,7 +10841,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
           githubConfig,
         );
         // Update sync map for published tasks
-        const syncMap = await getSyncMap(adapter.config);
+        const syncMap = await getSyncMap(adapter.projectRoot);
         for (const result of outcome.published) {
           if (!syncMap.hasTask(result.taskId)) {
             syncMap.addEntry({
@@ -8479,7 +10868,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
           githubConfig,
           adapter.config.project.taskDir,
         );
-        const syncMap = await getSyncMap(adapter.config);
+        const syncMap = await getSyncMap(adapter.projectRoot);
         syncMap.addEntry({
           taskId,
           issueNumber: result.issueNumber,
@@ -8518,10 +10907,10 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         await import("../integrations/github/status-syncer.js");
 
       if (showStatus) {
-        const syncStatus = await getSyncStatus(adapter.config);
+        const syncStatus = await getSyncStatus(adapter.config, adapter.projectRoot);
         res.json({ success: true, status: syncStatus });
       } else {
-        const outcome = await syncAllTasks(adapter.config);
+        const outcome = await syncAllTasks(adapter.config, adapter.projectRoot);
         const success = outcome.outcomes.every((row) => row.outcome !== "skipped");
         res.json({ success, ...outcome });
       }
@@ -8540,7 +10929,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       }
 
       const { getSyncStatus } = await import("../integrations/github/status-syncer.js");
-      const syncStatus = await getSyncStatus(adapter.config);
+      const syncStatus = await getSyncStatus(adapter.config, adapter.projectRoot);
       const ghConfig = adapter.config.integrations?.github;
       res.json({
         success: true,
@@ -8558,7 +10947,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
   registerTemplateRoutes(app, resolveProject);
   registerAnalyticsRoutes(app, resolveProject);
   registerGitHubSyncRoutes(app, resolveProject);
-  registerTestResultsRoutes(app, resolveProject);
+  registerTestResultsRoutes(app, resolveProject, { getTestRunner });
   registerResearchRoutes(app, resolveProject);
   registerTriageRoutes(app, resolveProject, authority);
   registerAgentResourcesRoutes(app);
@@ -8643,8 +11032,9 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     logDir: string;
     db: QuackDB | NoopDB;
     taskService: TaskService | null;
-  }): (event: QuackEvent) => void {
-    return (event: QuackEvent) => {
+  }): (event: QuackEvent) => Promise<void> {
+    return async (event: QuackEvent) => {
+      const pendingWork: Promise<unknown>[] = [];
       let claimantIndexPromise: Promise<DuplicateClaimantIndex> | undefined;
       const claimantIndex = (): Promise<DuplicateClaimantIndex> => {
         claimantIndexPromise ??= buildFederationClaimantIndexModule({
@@ -8675,22 +11065,56 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
           services.db.setStatus(taskId, status, source);
           return;
         }
-        void claimantIndex()
-          .then((index) => {
-            const refusal = duplicateClaimantRefusalForIndex(index, taskId);
-            if (refusal) {
-              emitPositiveTokenRefusal(refusal.message, failedStage);
-              return;
-            }
-            services.db.setStatus(taskId, status, source);
-          })
-          .catch((err: unknown) => {
-            emitPositiveTokenRefusal(err instanceof Error ? err.message : String(err), failedStage);
-          });
+        pendingWork.push(
+          claimantIndex()
+            .then((index) => {
+              const refusal = duplicateClaimantRefusalForIndex(index, taskId);
+              if (refusal) {
+                emitPositiveTokenRefusal(refusal.message, failedStage);
+                return;
+              }
+              services.db.setStatus(taskId, status, source);
+            })
+            .catch((err: unknown) => {
+              emitPositiveTokenRefusal(
+                err instanceof Error ? err.message : String(err),
+                failedStage,
+              );
+            }),
+        );
       };
       // Ensure event carries the correct project ID
       const tagged = { ...event, project: services.projectId };
       sse.broadcast(tagged);
+
+      if (event.stage === "prep_job_completed" && services.projRoot && !monitorDrain) {
+        // The watcher already owns and drains pending callbacks. The event is
+        // a wake-up only: current source/cache and all admission gates decide.
+        const context = registry?.getProject(services.projectId);
+        const sameContext = context?.rootPath === services.projRoot && context.db === services.db;
+        const legacyContext =
+          services.projectId === legacyProjectId &&
+          services.projRoot === projectRoot &&
+          services.db === legacyDb;
+        if (sameContext || legacyContext) {
+          const project: FederationProjectContext = {
+            projectId: services.projectId,
+            projectRoot: services.projRoot,
+            reader: services.eventReader,
+            taskService: services.taskService,
+            db: services.db,
+            prepCache: sameContext ? (context?.prepCache ?? null) : prepCache,
+          };
+          pendingWork.push(
+            (async () => {
+              await recheckRecoverableFederatedBlocks(project, { taskId: event.taskId });
+              if (federationSchedulingDeps.canDispatch?.(project) !== false) {
+                await runSwarmSchedulerTickModule(project, {}, federationSchedulingDeps);
+              }
+            })(),
+          );
+        }
+      }
 
       // Feed events to progress detector for stuck agent detection
       services.progressDet.processEvent(tagged);
@@ -8727,53 +11151,55 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
           services.db.setStatus(event.taskId, "REJECTED", "session_" + outcome);
         }
 
-        void claimantIndex()
-          .then((index) =>
-            recordLoopFinalization(authority.stateAuthority, event.taskId, pl, {
-              project: { projectRoot: services.projRoot, db: services.db },
-              getCriteriaCount: async (taskId) => {
-                const task = await services.taskService?.getTask(taskId);
-                return task?.successCriteria.length ?? 0;
-              },
-              claimantIndex: index,
-            }),
-          )
-          .then((finalizeResult) => {
-            if (finalizeResult.attempted) {
-              if (finalizeResult.record.refusal) {
-                emitPositiveTokenRefusal(finalizeResult.record.refusal.message, "loop_finalize");
-                return;
+        pendingWork.push(
+          claimantIndex()
+            .then((index) =>
+              recordLoopFinalization(authority.stateAuthority, event.taskId, pl, {
+                project: { projectRoot: services.projRoot, db: services.db },
+                getCriteriaCount: async (taskId) => {
+                  const task = await services.taskService?.getTask(taskId);
+                  return task?.successCriteria.length ?? 0;
+                },
+                claimantIndex: index,
+              }),
+            )
+            .then((finalizeResult) => {
+              if (finalizeResult.attempted) {
+                if (finalizeResult.record.refusal) {
+                  emitPositiveTokenRefusal(finalizeResult.record.refusal.message, "loop_finalize");
+                  return;
+                }
+                sse.broadcast({
+                  sessionId: event.sessionId,
+                  taskId: event.taskId,
+                  project: services.projectId,
+                  timestamp: new Date().toISOString(),
+                  stage: "loop_finalize_recorded",
+                  payload: {
+                    taskId: event.taskId,
+                    commit: finalizeResult.commit,
+                    applied: finalizeResult.record.applied,
+                    reason: finalizeResult.record.skippedReason,
+                  },
+                });
               }
+            })
+            .catch((err: unknown) => {
+              const message = err instanceof Error ? err.message : String(err);
               sse.broadcast({
                 sessionId: event.sessionId,
                 taskId: event.taskId,
                 project: services.projectId,
                 timestamp: new Date().toISOString(),
-                stage: "loop_finalize_recorded",
+                stage: "loop_finalize_record_failed",
                 payload: {
                   taskId: event.taskId,
-                  commit: finalizeResult.commit,
-                  applied: finalizeResult.record.applied,
-                  reason: finalizeResult.record.skippedReason,
+                  commit: pl.mergeCommitSha ?? "",
+                  error: message,
                 },
               });
-            }
-          })
-          .catch((err: unknown) => {
-            const message = err instanceof Error ? err.message : String(err);
-            sse.broadcast({
-              sessionId: event.sessionId,
-              taskId: event.taskId,
-              project: services.projectId,
-              timestamp: new Date().toISOString(),
-              stage: "loop_finalize_record_failed",
-              payload: {
-                taskId: event.taskId,
-                commit: pl.mergeCommitSha ?? "",
-                error: message,
-              },
-            });
-          });
+            }),
+        );
       }
 
       // Record dispatch cost when session completes
@@ -8801,11 +11227,15 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         }
         const pw = activeProgressWatchers.get(event.taskId);
         if (pw) {
-          pw.stop().catch((err: unknown) =>
-            console.error(
-              "[monitor] progress watcher close error (non-fatal):",
-              err instanceof Error ? err.message : err,
-            ),
+          pendingWork.push(
+            pw
+              .stop()
+              .catch((err: unknown) =>
+                console.error(
+                  "[monitor] progress watcher close error (non-fatal):",
+                  err instanceof Error ? err.message : err,
+                ),
+              ),
           );
           activeProgressWatchers.delete(event.taskId);
         }
@@ -8910,11 +11340,15 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         }
         const pw = activeProgressWatchers.get(event.taskId);
         if (pw) {
-          pw.stop().catch((err: unknown) =>
-            console.error(
-              "[monitor] progress watcher close error (non-fatal):",
-              err instanceof Error ? err.message : err,
-            ),
+          pendingWork.push(
+            pw
+              .stop()
+              .catch((err: unknown) =>
+                console.error(
+                  "[monitor] progress watcher close error (non-fatal):",
+                  err instanceof Error ? err.message : err,
+                ),
+              ),
           );
           activeProgressWatchers.delete(event.taskId);
         }
@@ -8956,28 +11390,49 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         const taskId = (pl.taskId as string) ?? event.taskId;
         const verdict = pl.verdict as string;
         if (taskId && verdict) {
-          const persistLifecycleVerdict = (): void =>
-            services.db.setVerified({
-              task_id: taskId,
-              verified_at: new Date().toISOString().split("T")[0],
-              commit_sha: (pl.commitSha as string) ?? "unknown",
-              method: "pipeline",
+          const persistLifecycleVerdict = async (index?: DuplicateClaimantIndex): Promise<void> => {
+            const entry = parseVerifiedApiEntry(taskId, {
               verdict,
-              criteria_checked: (pl.criteriaChecked as number) ?? 0,
-              criteria_passed: (pl.criteriaPassed as number) ?? 0,
-              notes: (pl.notes as string) ?? null,
+              commit: pl.commitSha ?? "unknown",
+              method: "pipeline",
+              criteria_checked: pl.criteriaChecked ?? 0,
+              criteria_passed: pl.criteriaPassed ?? 0,
+              notes: pl.notes ?? null,
             });
+            await recordVerification(
+              { projectRoot: services.projRoot, db: services.db },
+              entry,
+              { updateTaskStatus: false, syncToPeers: false },
+              index,
+            );
+          };
           if (verdict === "VERIFIED" || verdict === "SOFT-VERIFIED") {
-            void claimantIndex().then((index) => {
-              const refusal = duplicateClaimantRefusalForIndex(index, taskId);
-              if (refusal) {
-                emitPositiveTokenRefusal(refusal.message, "lifecycle_complete");
-                return;
-              }
-              persistLifecycleVerdict();
-            });
+            pendingWork.push(
+              claimantIndex()
+                .then((index) => {
+                  const refusal = duplicateClaimantRefusalForIndex(index, taskId);
+                  if (refusal) {
+                    emitPositiveTokenRefusal(refusal.message, "lifecycle_complete");
+                    return;
+                  }
+                  return persistLifecycleVerdict(index);
+                })
+                .catch((err: unknown) => {
+                  emitPositiveTokenRefusal(
+                    err instanceof Error ? err.message : String(err),
+                    "lifecycle_complete",
+                  );
+                }),
+            );
           } else {
-            persistLifecycleVerdict();
+            pendingWork.push(
+              persistLifecycleVerdict().catch((error: unknown) => {
+                emitPositiveTokenRefusal(
+                  error instanceof Error ? error.message : String(error),
+                  "lifecycle_complete",
+                );
+              }),
+            );
           }
         }
       }
@@ -9010,26 +11465,29 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         }
         // Start watching PROGRESS.md for live dashboard updates
         if (workDir) {
-          import("../dispatcher/progress-watcher.js")
-            .then(({ ProgressWatcher }) => {
-              const watcher = ProgressWatcher.watch(workDir, (progress) => {
-                sse.broadcast({
-                  sessionId: event.sessionId,
-                  taskId: event.taskId,
-                  project: services.projectId,
-                  timestamp: new Date().toISOString(),
-                  stage: "agent_progress_update",
-                  payload: {
+          pendingWork.push(
+            import("../dispatcher/progress-watcher.js")
+              .then(({ ProgressWatcher }) => {
+                if (monitorDrain) return;
+                const watcher = ProgressWatcher.watch(workDir, (progress) => {
+                  sse.broadcast({
+                    sessionId: event.sessionId,
                     taskId: event.taskId,
-                    ...progress,
-                  } as never,
+                    project: services.projectId,
+                    timestamp: new Date().toISOString(),
+                    stage: "agent_progress_update",
+                    payload: {
+                      taskId: event.taskId,
+                      ...progress,
+                    } as never,
+                  });
                 });
-              });
-              activeProgressWatchers.set(event.taskId, watcher);
-            })
-            .catch(() => {
-              // Non-fatal: progress watching is best-effort
-            });
+                activeProgressWatchers.set(event.taskId, watcher);
+              })
+              .catch(() => {
+                // Non-fatal: progress watching is best-effort
+              }),
+          );
         }
       }
 
@@ -9094,10 +11552,371 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
           services.progressDet.recordFileActivity(taskId);
         }
       }
+
+      await Promise.allSettled(pendingWork);
     };
   }
 
-  async function start(): Promise<{ port: number; stop: () => Promise<void> }> {
+  async function bindHttpServer(): Promise<number> {
+    const candidate = createHttpServer(app);
+    httpServer = candidate;
+
+    return new Promise<number>((resolve, reject) => {
+      let settled = false;
+      const onError = (error: Error): void => {
+        if (settled) return;
+        settled = true;
+        candidate.off("listening", onListening);
+        reject(error);
+      };
+      const onListening = (): void => {
+        if (settled) return;
+        settled = true;
+        candidate.off("error", onError);
+        const address = candidate.address();
+        resolve(typeof address === "object" && address !== null ? address.port : port);
+      };
+
+      candidate.once("error", onError);
+      candidate.once("listening", onListening);
+      try {
+        if (options.host) candidate.listen(port, options.host);
+        else candidate.listen(port);
+      } catch (error: unknown) {
+        candidate.off("error", onError);
+        candidate.off("listening", onListening);
+        settled = true;
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
+  async function performStop(): Promise<void> {
+    shutdownAdmissionClosed = true;
+    // Closing timers alone does not own async callbacks that have already entered.
+    if (runtimeLifecycle.githubPollInterval) {
+      clearInterval(runtimeLifecycle.githubPollInterval);
+      runtimeLifecycle.githubPollInterval = undefined;
+    }
+    if (runtimeLifecycle.githubSyncInterval) {
+      clearInterval(runtimeLifecycle.githubSyncInterval);
+      runtimeLifecycle.githubSyncInterval = undefined;
+    }
+    const shutdownErrors: Error[] = [];
+    const waitForShutdownBackgroundWork = async (work: Promise<unknown>): Promise<void> => {
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          work,
+          new Promise<void>((resolveDeadline) => {
+            deadline = setTimeout(resolveDeadline, 1000);
+          }),
+        ]);
+      } finally {
+        if (deadline !== undefined) clearTimeout(deadline);
+      }
+    };
+    const recordShutdownError = (label: string, reason: unknown): void => {
+      const cause = reason instanceof Error ? reason : new Error(String(reason));
+      shutdownErrors.push(new Error(`${label}: ${cause.message}`, { cause }));
+    };
+    const runShutdownCleanup = (label: string, cleanup: () => void): void => {
+      try {
+        cleanup();
+      } catch (error: unknown) {
+        recordShutdownError(label, error);
+      }
+    };
+    const awaitShutdownCleanup = async (
+      label: string,
+      cleanup: () => Promise<void>,
+    ): Promise<boolean> => {
+      try {
+        await cleanup();
+        return true;
+      } catch (error: unknown) {
+        recordShutdownError(label, error);
+        return false;
+      }
+    };
+
+    // These resources must stop even if a child later refuses termination.
+    // Neither is part of the dispatch-safety proof, and leaving them alive
+    // makes failed starts and repeated test servers retain background timers.
+    runShutdownCleanup("coordination routes close", () => coordinationRoutes.closeAll());
+    for (const manager of dispatchManagersForShutdown()) {
+      runShutdownCleanup("dispatch watchdog stop", () => manager.stopWatchdog());
+    }
+
+    try {
+      await quiesceMonitorForDrain("monitor stop requested");
+    } catch {
+      // waitForMonitorDrainSafety performs bounded, real retries and exposes
+      // the final concrete failure in its returned snapshot.
+    }
+    const drainSnapshot = await waitForMonitorDrainSafety();
+    if (drainSnapshot.safeToTerminate !== true) {
+      throw new Error(
+        "Monitor shutdown refused: one or more dispatches could not be durably stopped. " +
+          JSON.stringify(drainSnapshot),
+      );
+    }
+    if (fatalShutdownRetry) {
+      clearTimeout(fatalShutdownRetry);
+      fatalShutdownRetry = undefined;
+    }
+
+    // Poll/import and status sync can still use project state after their timer
+    // is cleared. Retain those resources if the existing grace period expires;
+    // a later stop attempt can finish after the owned callbacks settle.
+    if (runtimeLifecycle.githubBackgroundTasks.size > 0) {
+      await waitForShutdownBackgroundWork(
+        Promise.allSettled([...runtimeLifecycle.githubBackgroundTasks]),
+      );
+      if (runtimeLifecycle.githubBackgroundTasks.size > 0) {
+        throw new Error(
+          `Monitor shutdown refused: ${runtimeLifecycle.githubBackgroundTasks.size} GitHub polling callback(s) remain active after the 1000ms background grace period. Retry stop after they settle.`,
+        );
+      }
+    }
+
+    // Stop event ingestion and drain every callback before tearing down any
+    // resource that a callback can still reach (progress watchers, ccusage,
+    // SSE, or a project database).
+    const legacyEventWatcherStop = runtimeLifecycle.stopWatcher;
+    let legacyEventWatcherClosed = !legacyEventWatcherStop;
+    if (legacyEventWatcherStop) {
+      legacyEventWatcherClosed = await awaitShutdownCleanup(
+        "legacy event watcher close",
+        legacyEventWatcherStop,
+      );
+      if (legacyEventWatcherClosed && runtimeLifecycle.stopWatcher === legacyEventWatcherStop) {
+        runtimeLifecycle.stopWatcher = undefined;
+      }
+    }
+    const projectEventWatcherStates = new Map<ProjectContext, "closed" | "failed">();
+    if (registry) {
+      for (const context of registry.listProjects()) {
+        const projectEventWatcherStop = context.stopWatcher;
+        if (!projectEventWatcherStop) {
+          projectEventWatcherStates.set(context, "closed");
+          continue;
+        }
+        const closed = await awaitShutdownCleanup(
+          `event watcher for ${context.id}`,
+          projectEventWatcherStop,
+        );
+        projectEventWatcherStates.set(context, closed ? "closed" : "failed");
+        if (closed && context.stopWatcher === projectEventWatcherStop) {
+          context.stopWatcher = undefined;
+        }
+      }
+    }
+
+    ccusageAborted = true;
+    if (ccusageChild) {
+      const childToStop = ccusageChild;
+      runShutdownCleanup("ccusage process stop", () => {
+        if (process.platform === "win32" && childToStop.pid) {
+          if (!terminateWindowsProcessTree(childToStop.pid)) childToStop.kill();
+        } else {
+          childToStop.kill();
+        }
+      });
+      ccusageChild = null;
+    }
+    if (ccusageRefreshPromise) {
+      await waitForShutdownBackgroundWork(ccusageRefreshPromise.catch(() => undefined));
+    }
+
+    runShutdownCleanup("legacy prep scheduler stop", () => prepScheduler?.stop());
+    runShutdownCleanup("legacy progress detector stop", () => progressDetector.stopChecking());
+    await waitForShutdownBackgroundWork(
+      Promise.allSettled(runtimeLifecycle.startupValidationTasks),
+    );
+    if (runtimeLifecycle.baselineInterval) clearInterval(runtimeLifecycle.baselineInterval);
+    if (runtimeLifecycle.cleanupInterval) clearInterval(runtimeLifecycle.cleanupInterval);
+    if (runtimeLifecycle.onUncaughtException) {
+      process.off("uncaughtException", runtimeLifecycle.onUncaughtException);
+    }
+    if (runtimeLifecycle.onUnhandledRejection) {
+      process.off("unhandledRejection", runtimeLifecycle.onUnhandledRejection);
+    }
+    if (runtimeLifecycle.onSigint) process.off("SIGINT", runtimeLifecycle.onSigint);
+    if (runtimeLifecycle.onSigterm) process.off("SIGTERM", runtimeLifecycle.onSigterm);
+
+    const freshnessResults = await Promise.allSettled(
+      runtimeLifecycle.stopFreshnessMonitors.map((stopFm) => stopFm()),
+    );
+    freshnessResults.forEach((result, index) => {
+      if (result.status === "rejected") {
+        recordShutdownError(`freshness monitor ${index + 1}`, result.reason);
+      }
+    });
+    runtimeLifecycle.stopOnMergeRecorders.forEach((stopRecorder, index) =>
+      runShutdownCleanup(`merge recorder ${index + 1}`, stopRecorder),
+    );
+    runtimeLifecycle.stopVerifiedSyncs.forEach((stopSync, index) =>
+      runShutdownCleanup(`verification sync ${index + 1}`, stopSync),
+    );
+    for (const proj of resolveProjects()) {
+      runShutdownCleanup(`verification peer sync for ${proj.projectId}`, () =>
+        setVerificationPeerSyncHandler(proj.projectRoot, undefined),
+      );
+    }
+    const adapterWatcherToClose = runtimeLifecycle.adapterWatcher;
+    if (adapterWatcherToClose) {
+      const closed = await awaitShutdownCleanup("adapter watcher close", () =>
+        adapterWatcherToClose.close(),
+      );
+      if (closed && runtimeLifecycle.adapterWatcher === adapterWatcherToClose) {
+        runtimeLifecycle.adapterWatcher = undefined;
+      }
+    }
+    const legacyTaskWatcherToClose = runtimeLifecycle.taskWatcherInstance;
+    if (legacyTaskWatcherToClose) {
+      const closed = await awaitShutdownCleanup("legacy task watcher close", () =>
+        legacyTaskWatcherToClose.close(),
+      );
+      if (closed && runtimeLifecycle.taskWatcherInstance === legacyTaskWatcherToClose) {
+        runtimeLifecycle.taskWatcherInstance = undefined;
+      }
+    }
+
+    [...activeHeartbeats.values()].forEach((heartbeat, index) =>
+      runShutdownCleanup(`heartbeat ${index + 1}`, () => heartbeat.stop()),
+    );
+    activeHeartbeats.clear();
+    const progressWatcherStops: Promise<void>[] = [];
+    [...activeProgressWatchers.values()].forEach((progressWatcher, index) => {
+      try {
+        progressWatcherStops.push(progressWatcher.stop());
+      } catch (error: unknown) {
+        recordShutdownError(`progress watcher ${index + 1}`, error);
+      }
+    });
+    activeProgressWatchers.clear();
+    const progressWatcherResults = await Promise.allSettled(progressWatcherStops);
+    progressWatcherResults.forEach((result, index) => {
+      if (result.status === "rejected") {
+        recordShutdownError(`progress watcher ${index + 1}`, result.reason);
+      }
+    });
+    runShutdownCleanup("admin runs stop", () => adminRuns.stopAll());
+    runShutdownCleanup("legacy prep worker stop", () => {
+      if (prepWorker && !prepWorker.killAll()) {
+        throw new Error("one or more prep process trees could not be confirmed stopped");
+      }
+    });
+    [...testRunners.values()].forEach((runner, index) =>
+      runShutdownCleanup(`test runner ${index + 1}`, () => runner.killAll()),
+    );
+
+    if (registry) {
+      const projectContexts = registry.listProjects();
+      const projectTeardownResults = await Promise.allSettled(
+        projectContexts.map((context) =>
+          teardownProjectContext(context, {
+            eventWatcherState: projectEventWatcherStates.get(context) ?? "not-attempted",
+          }),
+        ),
+      );
+      projectTeardownResults.forEach((result, index) => {
+        if (result.status === "rejected") {
+          recordShutdownError(
+            `project teardown for ${projectContexts[index]?.id ?? index + 1}`,
+            result.reason,
+          );
+        }
+      });
+    }
+
+    runShutdownCleanup("SSE close", () => sse.closeAll());
+    runShutdownCleanup("auth service destroy", () => authService.destroy());
+
+    if (legacyEventWatcherClosed) {
+      runShutdownCleanup("legacy database close", () => legacyDb.close());
+    }
+
+    const activeServer = httpServer;
+    if (activeServer?.listening) {
+      const closed = await awaitShutdownCleanup(
+        "HTTP server close",
+        () =>
+          new Promise<void>((resolveClose, rejectClose) => {
+            activeServer.close((error) => {
+              if (error) rejectClose(error);
+              else resolveClose();
+            });
+          }),
+      );
+      if (closed && httpServer === activeServer) httpServer = undefined;
+    } else if (httpServer === activeServer) {
+      httpServer = undefined;
+    }
+
+    await new Promise<void>((resolveSettle) => setTimeout(resolveSettle, 25));
+    startupPhase = "stopped";
+    if (shutdownErrors.length > 0) {
+      throw new AggregateError(shutdownErrors, "Monitor shutdown completed with cleanup errors");
+    }
+  }
+
+  function teardown(): Promise<void> {
+    if (stopPromise) return stopPromise;
+    const attempt = performStop();
+    stopPromise = attempt;
+    void attempt.catch(() => {
+      if (stopPromise === attempt) stopPromise = undefined;
+    });
+    return attempt;
+  }
+
+  function stop(): Promise<void> {
+    const pendingStart = startPromise;
+    if (startupPhase === "starting" && pendingStart) {
+      return pendingStart.then(
+        () => teardown(),
+        () => teardown(),
+      );
+    }
+    return teardown();
+  }
+
+  async function startInternal(): Promise<{ port: number; stop: () => Promise<void> }> {
+    startupPhase = "starting";
+    // Recover or fail before binding the HTTP listener. This closes the
+    // restart window where a journaled-but-uncommitted READY parent could be
+    // dispatched before its transaction was reconciled.
+    if (useMultiProject && projectAdapters) {
+      for (const projectAdapter of projectAdapters) {
+        const startupDb = initializeProjectDb(
+          path.resolve(projectAdapter.projectRoot, ".quack", "quack.db"),
+          projectAdapter.config.project.name,
+        ).db;
+        try {
+          await recoverAndProjectPendingDecompositionTransactions(projectAdapter, startupDb);
+        } finally {
+          startupDb.close();
+        }
+      }
+    } else if (projectRoot && adapterPath && fs.existsSync(adapterPath)) {
+      const gitWorktree = runGitSync(projectRoot, ["rev-parse", "--is-inside-work-tree"]);
+      const requiresRecovery =
+        (gitWorktree.exitCode === 0 && gitWorktree.stdout.trim() === "true") ||
+        (await hasPendingCanonicalTaskMutationJournals(projectRoot));
+      // Non-Git read-only fixtures and partially bootstrapped projects cannot
+      // have a decomposition commit journal. Avoid making monitor startup
+      // depend on loading their adapter unless a durable canonical-mutation
+      // journal proves that recovery is required.
+      if (requiresRecovery) {
+        const startupAdapter = await loadAdapter(projectRoot);
+        await recoverAndProjectPendingDecompositionTransactions(startupAdapter, legacyDb);
+      }
+    }
+    const boundPort = await bindHttpServer();
+    dispatchManager?.startWatchdog();
+
     // â”€â”€â”€ Process crash handlers (Phase A) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Install BEFORE anything else so crashes during initialization are captured.
 
@@ -9110,153 +11929,40 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     }
     const crashLogPath = path.join(crashLogDir, "monitor-crash.log");
 
-    const dispatchManagersForShutdown = (): DispatchManager[] => {
-      const managers = new Set<DispatchManager>();
-      if (dispatchManager) managers.add(dispatchManager);
-      if (registry) {
-        for (const context of registry.listProjects()) {
-          if (context.dispatchManager) managers.add(context.dispatchManager);
-        }
-      }
-      return [...managers];
-    };
-    const abortDispatchQueuesForShutdown = (): void => {
-      const queues = new Set<DispatchQueue>();
-      if (dispatchQueue) queues.add(dispatchQueue);
-      if (registry) {
-        for (const context of registry.listProjects()) {
-          if (context.dispatchQueue) queues.add(context.dispatchQueue);
-        }
-      }
-      for (const queue of queues) {
+    const scheduleTerminalExit = (reason: string, exitCode: number) => {
+      beginMonitorDrain(reason);
+      if (terminalExitRequested) return;
+      terminalExitRequested = true;
+
+      const retryUntilStopped = async (): Promise<void> => {
         try {
-          queue.abort();
+          // Use the same teardown as the public stop handle. Dispatch safety
+          // remains the gate inside performStop(), but process exit now also
+          // waits for watchers, timers, databases, SSE clients, and the HTTP
+          // listener to close.
+          await stop();
+          if (fatalShutdownRetry) {
+            clearTimeout(fatalShutdownRetry);
+            fatalShutdownRetry = undefined;
+          }
+          process.exit(exitCode);
+          return;
         } catch (error: unknown) {
-          console.error("[monitor] Dispatch queue abort failed:", error);
-        }
-      }
-    };
-    const shutdownDispatchManagers = async (): Promise<void> => {
-      // Queue pollers can schedule work or propagate a transient failure while
-      // manager shutdown spends several seconds draining children. Admission
-      // must close before every normal, signal, or fatal shutdown path.
-      abortDispatchQueuesForShutdown();
-      const managers = dispatchManagersForShutdown();
-      for (const manager of managers) {
-        try {
-          manager.stopWatchdog();
-        } catch {
-          /* best effort */
-        }
-      }
-      const results = await Promise.allSettled(
-        managers.map((manager) =>
-          manager.shutdownAll({ gracefulTimeoutMs: 1_000, forceTimeoutMs: 2_000 }),
-        ),
-      );
-      for (const result of results) {
-        if (result.status === "rejected") {
-          console.error("[monitor] Dispatch shutdown failed:", result.reason);
-        } else if (result.value.timedOut.length > 0) {
-          console.error(
-            `[monitor] Dispatch shutdown timed out for: ${result.value.timedOut.join(", ")}`,
-          );
-        }
-      }
-    };
-    const stopPrepSchedulers = (): void => {
-      try {
-        prepScheduler?.stop();
-      } catch {
-        /* best effort */
-      }
-      if (registry) {
-        for (const context of registry.listProjects()) {
-          try {
-            context.prepScheduler?.stop();
-          } catch {
-            /* best effort */
+          if (monitorDrain) {
+            monitorDrain.lastError = error instanceof Error ? error.message : String(error);
           }
         }
-      }
-    };
-    const prepWorkersForShutdown = (): PrepWorker[] => {
-      const workers = new Set<PrepWorker>();
-      if (prepWorker) workers.add(prepWorker);
-      if (registry) {
-        for (const context of registry.listProjects()) {
-          if (context.prepWorker) workers.add(context.prepWorker);
-        }
-      }
-      return [...workers];
-    };
-    const shutdownPrepWorkers = async (): Promise<void> => {
-      const results = await Promise.allSettled(
-        prepWorkersForShutdown().map((worker) =>
-          worker.shutdownAll({ gracefulTimeoutMs: 1_000, forceTimeoutMs: 2_000 }),
-        ),
-      );
-      for (const result of results) {
-        if (result.status === "rejected") {
-          console.error("[monitor] Prep worker shutdown failed:", result.reason);
-        } else if (result.value.timedOut.length > 0) {
-          console.error(
-            `[monitor] Prep worker shutdown timed out for: ${result.value.timedOut.join(", ")}`,
-          );
-        }
-      }
-    };
-    const stopAuxiliaryWorkers = (): void => {
-      try {
-        testRunner?.killAll();
-      } catch {
-        /* best effort */
-      }
-      try {
-        adminRuns.stopAll();
-      } catch {
-        /* best effort */
-      }
-    };
-    const stopProgressWatchersBounded = async (timeoutMs = 2_000): Promise<void> => {
-      const stops = Array.from(activeProgressWatchers.values(), (watcher) =>
-        Promise.resolve()
-          .then(() => watcher.stop())
-          .catch(() => undefined),
-      );
-      activeProgressWatchers.clear();
-      if (stops.length === 0) return;
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      try {
-        await Promise.race([
-          Promise.allSettled(stops),
-          new Promise<void>((resolve) => {
-            timer = setTimeout(resolve, timeoutMs);
-          }),
-        ]);
-      } finally {
-        if (timer) clearTimeout(timer);
-      }
-    };
-    const settleBounded = async (
-      operations: Array<Promise<unknown>>,
-      timeoutMs = 2_000,
-    ): Promise<void> => {
-      if (operations.length === 0) return;
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      try {
-        await Promise.race([
-          Promise.allSettled(operations),
-          new Promise<void>((resolve) => {
-            timer = setTimeout(resolve, timeoutMs);
-          }),
-        ]);
-      } finally {
-        if (timer) clearTimeout(timer);
-      }
+        console.error(
+          `[monitor] ${reason} shutdown is draining; process exit remains fenced until children stop.`,
+        );
+        fatalShutdownRetry = setTimeout(() => {
+          void retryUntilStopped();
+        }, 250);
+      };
+
+      void retryUntilStopped();
     };
 
-    let fatalShutdownStarted = false;
     const onUncaughtException = (err: Error) => {
       const timestamp = new Date().toISOString();
       const entry = `[${timestamp}] UNCAUGHT EXCEPTION: ${err.message}\n${err.stack ?? "no stack"}\n\n`;
@@ -9267,22 +11973,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         process.stderr.write(entry);
       }
       console.error("[monitor] FATAL uncaughtException:", err.message);
-      if (fatalShutdownStarted) return;
-      fatalShutdownStarted = true;
-      shutdownAdmissionClosed = true;
-      stopPrepSchedulers();
-      stopAuxiliaryWorkers();
-      // The monitor must not exit until agent process trees have either exited
-      // or exhausted the bounded forced-shutdown window.
-      void Promise.allSettled([shutdownDispatchManagers(), shutdownPrepWorkers()]).finally(() => {
-        stopAuxiliaryWorkers();
-        try {
-          sse.closeAll();
-        } catch {
-          /* best effort */
-        }
-        process.exit(1);
-      });
+      scheduleTerminalExit("fatal uncaught exception", 1);
     };
 
     const onUnhandledRejection = (reason: unknown) => {
@@ -9298,14 +11989,25 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       console.error("[monitor] unhandledRejection (non-fatal):", msg);
       // Do NOT crash â€” log and continue (Node 15+ behavior)
     };
+    runtimeLifecycle.onUncaughtException = onUncaughtException;
+    runtimeLifecycle.onUnhandledRejection = onUnhandledRejection;
     process.on("uncaughtException", onUncaughtException);
     process.on("unhandledRejection", onUnhandledRejection);
 
-    const startupValidationTasks: Array<Promise<void>> = [];
+    const startupValidationTasks = runtimeLifecycle.startupValidationTasks;
 
     // â”€â”€â”€ Multi-project initialization â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if (useMultiProject && registry && projectAdapters) {
       const quackBin = path.resolve(__dirname, "..", "index.js");
+      const projectIds = projectAdapters.map((adapter) =>
+        generateProjectId(adapter.config.project.name),
+      );
+      const duplicateProjectId = projectIds.find(
+        (projectId, index) => projectIds.indexOf(projectId) !== index,
+      );
+      if (duplicateProjectId) {
+        throw new Error(`Project ${duplicateProjectId} is already registered`);
+      }
 
       const initializedProjectContexts = projectAdapters.map((adapter) => {
         const context = buildProjectContext(adapter, quackBin, (stage, taskId, payload) => {
@@ -9481,7 +12183,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
             },
             {
               autoRepair: false,
-              autoPreflight: !!context.prepWorker,
+              autoPreflight: adapter.config.preflight?.autoRun === true,
               isPreflightCurrent: context.prepWorker
                 ? (twTaskId, contentHash) =>
                     readiness.isPreflightCurrentForHash(twTaskId, contentHash)
@@ -9494,18 +12196,23 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
             },
           );
 
-          projTw
-            .start()
-            .catch((err: unknown) =>
-              console.error(
-                `[task-watcher][${context.name}] start error (non-fatal):`,
-                err instanceof Error ? err.message : err,
-              ),
-            );
           context.taskWatcher = projTw;
+          await projTw.start();
           console.log(`[task-watcher][${context.name}] Watching for task file changes`);
-        } catch {
-          // TaskWatcher init failed â€” non-fatal, skip
+        } catch (error: unknown) {
+          const watcher = context.taskWatcher;
+          if (watcher) {
+            try {
+              await watcher.close();
+              if (context.taskWatcher === watcher) context.taskWatcher = null;
+            } catch {
+              // Retain the reference so terminal cleanup can retry it.
+            }
+          }
+          console.error(
+            `[task-watcher][${context.name}] start error (non-fatal):`,
+            error instanceof Error ? error.message : error,
+          );
         }
       }
 
@@ -9583,49 +12290,12 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       if (signalShutdownStarted) return;
       signalShutdownStarted = true;
       console.log(`[monitor] Received ${signal}, shutting down gracefully...`);
-      shutdownAdmissionClosed = true;
-      stopPrepSchedulers();
-      stopAuxiliaryWorkers();
-      void (async () => {
-        for (const [, hb] of activeHeartbeats) {
-          try {
-            hb.stop();
-          } catch {
-            /* best effort */
-          }
-        }
-        activeHeartbeats.clear();
-        // Start child termination before waiting on watcher close. A stuck
-        // chokidar close must never prevent dispatch TERM/KILL escalation.
-        const dispatchShutdown = shutdownDispatchManagers();
-        const prepShutdown = shutdownPrepWorkers();
-        const progressShutdown = stopProgressWatchersBounded();
-        await Promise.allSettled([dispatchShutdown, prepShutdown, progressShutdown]);
-        stopAuxiliaryWorkers();
-        try {
-          legacyDb.close();
-        } catch {
-          /* best effort */
-        }
-        if (registry) {
-          for (const ctx of registry.listProjects()) {
-            try {
-              ctx.db.close();
-            } catch {
-              /* best effort */
-            }
-          }
-        }
-        try {
-          sse.closeAll();
-        } catch {
-          /* best effort */
-        }
-        process.exit(0);
-      })();
+      scheduleTerminalExit(`signal ${signal}`, 0);
     };
     const onSigint = () => gracefulShutdown("SIGINT");
     const onSigterm = () => gracefulShutdown("SIGTERM");
+    runtimeLifecycle.onSigint = onSigint;
+    runtimeLifecycle.onSigterm = onSigterm;
     process.on("SIGINT", onSigint);
     process.on("SIGTERM", onSigterm);
 
@@ -9641,7 +12311,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     }
 
     // Start file watcher to bridge JSONL changes â†’ SSE (legacy single-project mode)
-    const stopWatcher = await reader.watch(
+    runtimeLifecycle.stopWatcher = await reader.watch(
       buildEventWatcherCallback({
         projectId: legacyProjectId,
         progressDet: progressDetector,
@@ -9660,7 +12330,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     progressDetector.startChecking();
 
     // Recompute velocity baseline periodically (every 5 minutes)
-    const baselineInterval = setInterval(
+    runtimeLifecycle.baselineInterval = setInterval(
       () => {
         try {
           // Legacy single-project baseline
@@ -9740,7 +12410,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     // Runs every 60 seconds to prune:
     //  - Completed/failed dispatch jobs older than 5 minutes from memory
     //  - "active" sessions with no events for >2 hours (mark as error)
-    const cleanupInterval = setInterval(() => {
+    runtimeLifecycle.cleanupInterval = setInterval(() => {
       try {
         runSessionRecoverySweep();
         dispatchManager?.cleanup(5 * 60 * 1000);
@@ -9768,7 +12438,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     }, 60 * 1000).unref();
 
     // â”€â”€â”€ Task freshness monitor (Fix 1 + Fix 3) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    const stopFreshnessMonitors: Array<() => Promise<void>> = [];
+    const stopFreshnessMonitors = runtimeLifecycle.stopFreshnessMonitors;
     if (taskService && taskDir) {
       const absTaskDir = path.resolve(projectRoot ?? "", taskDir);
       // Fix 3: startup validation
@@ -9834,7 +12504,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     // Records completion-shaped merges on the adapter base branch as
     // SOFT-VERIFIED via the canonical writer, so manual-loop work stops
     // being invisible to the ledger. One recorder per projectRoot.
-    const stopOnMergeRecorders: (() => void)[] = [];
+    const stopOnMergeRecorders = runtimeLifecycle.stopOnMergeRecorders;
     const onMergeStartedRoots = new Set<string>();
 
     // TASK-1204: one deps builder for both recording scans. The profile is
@@ -10056,6 +12726,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
           usePolling: process.platform === "win32",
           interval: 1000,
         });
+        runtimeLifecycle.adapterWatcher = adapterWatcher;
         adapterWatcher.on("error", (err: unknown) => {
           console.error(
             "[hot-reload] chokidar error (non-fatal):",
@@ -10095,14 +12766,14 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     }
 
     // â”€â”€â”€ Task file watcher (auto-discovery + auto-repair + auto-preflight)
-    let taskWatcherInstance: { close: () => Promise<void> } | undefined;
     if (taskDir && projectRoot) {
       try {
         const { TaskWatcher } = await import("./task-watcher.js");
+        const absoluteTaskDir = path.resolve(projectRoot, taskDir);
         let watcherAdapter: ProjectAdapter | undefined;
         if (adapterPath && fs.existsSync(adapterPath)) {
           try {
-            watcherAdapter = await loadAdapter(adapterPath);
+            watcherAdapter = await loadAdapter(projectRoot);
           } catch {
             /* use fallback */
           }
@@ -10110,7 +12781,10 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         if (!watcherAdapter) {
           watcherAdapter = {
             config: {
-              project: { name: "", taskDir: "" },
+              project: {
+                name: "",
+                taskDir: path.relative(projectRoot, absoluteTaskDir) || ".",
+              },
               agent: {},
               verification: { commands: [] },
             },
@@ -10119,7 +12793,6 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
           } as unknown as ProjectAdapter;
         }
 
-        const absoluteTaskDir = path.resolve(projectRoot, taskDir);
         const readiness = taskService
           ? new ReadinessService({
               projectRoot,
@@ -10194,7 +12867,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
           },
           {
             autoRepair: false, // Disabled by default â€” users can trigger repair via API
-            autoPreflight: !!prepWorker,
+            autoPreflight: watcherAdapter.config.preflight?.autoRun === true,
             isPreflightCurrent: readiness
               ? (taskId, contentHash) => readiness.isPreflightCurrentForHash(taskId, contentHash)
               : undefined,
@@ -10206,25 +12879,31 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
           },
         );
 
-        tw.start().catch((err: unknown) =>
-          console.error(
-            "[task-watcher] start error (non-fatal):",
-            err instanceof Error ? err.message : err,
-          ),
-        );
-        taskWatcherInstance = tw;
+        runtimeLifecycle.taskWatcherInstance = tw;
+        await tw.start();
         console.log("[task-watcher] Watching for task file changes");
-      } catch {
-        // TaskWatcher init failed â€” non-fatal, skip
+      } catch (error: unknown) {
+        const watcher = runtimeLifecycle.taskWatcherInstance;
+        if (watcher) {
+          try {
+            await watcher.close();
+            if (runtimeLifecycle.taskWatcherInstance === watcher) {
+              runtimeLifecycle.taskWatcherInstance = undefined;
+            }
+          } catch {
+            // Retain the reference so terminal cleanup can retry it.
+          }
+        }
+        console.error(
+          "[task-watcher] start error (non-fatal):",
+          error instanceof Error ? error.message : error,
+        );
       }
     }
 
     // â”€â”€â”€ GitHub polling daemon â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // Poll for new issues to import and sync status for mapped tasks.
     // Only runs when pollEnabled is true in adapter config.
-    let githubPollInterval: ReturnType<typeof setInterval> | undefined;
-    let githubSyncInterval: ReturnType<typeof setInterval> | undefined;
-
     const activeProject = registry?.getActiveProject();
     const ghConfig = activeProject?.adapter?.config?.integrations?.github;
     if (ghConfig?.pollEnabled) {
@@ -10233,9 +12912,9 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       const importLabel = ghConfig.importLabel || "quack-ready";
 
       // Poll for new issues to import
-      githubPollInterval = setInterval(
+      runtimeLifecycle.githubPollInterval = setInterval(
         () =>
-          void (async () => {
+          runGitHubBackgroundTask(async () => {
             try {
               const adapter = activeProject?.adapter;
               if (!adapter) return;
@@ -10245,8 +12924,13 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
               const { getSyncMap } = await import("../integrations/github/sync-map.js");
               const { importIssue } = await import("../integrations/github/import-pipeline.js");
 
-              const issues = await fetchIssuesByLabel(ghConfig.owner, ghConfig.repo, importLabel);
-              const syncMap = await getSyncMap(adapter.config);
+              const issues = await fetchIssuesByLabel(
+                ghConfig.owner,
+                ghConfig.repo,
+                importLabel,
+                adapter.projectRoot,
+              );
+              const syncMap = await getSyncMap(adapter.projectRoot);
 
               for (const issue of issues) {
                 if (!syncMap.hasIssue(issue.number)) {
@@ -10265,20 +12949,20 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
               const msg = err instanceof Error ? err.message : String(err);
               console.error(`[github-poll] Poll failed: ${msg}`);
             }
-          })(),
+          }),
         pollMs,
       ).unref();
 
       // Sync status for existing mapped tasks
-      githubSyncInterval = setInterval(
+      runtimeLifecycle.githubSyncInterval = setInterval(
         () =>
-          void (async () => {
+          runGitHubBackgroundTask(async () => {
             try {
               const adapter = activeProject?.adapter;
               if (!adapter) return;
 
               const { syncAllTasks } = await import("../integrations/github/status-syncer.js");
-              const outcome = await syncAllTasks(adapter.config);
+              const outcome = await syncAllTasks(adapter.config, adapter.projectRoot);
               const skippedRows = outcome.outcomes
                 .filter((row) => row.outcome === "skipped")
                 .map((row) => {
@@ -10297,7 +12981,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
               const msg = err instanceof Error ? err.message : String(err);
               console.error(`[github-sync] Sync failed: ${msg}`);
             }
-          })(),
+          }),
         syncMs,
       ).unref();
 
@@ -10308,7 +12992,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
     sse.startHeartbeat();
 
-    const stopVerifiedSyncs: Array<() => void> = [];
+    const stopVerifiedSyncs = runtimeLifecycle.stopVerifiedSyncs;
     const projects = resolveProjects();
     for (const proj of projects) {
       if (proj.projectRoot) {
@@ -10320,12 +13004,14 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         }
       }
 
+      let verificationReconciled = false;
       try {
         const claimantIndex = await buildFederationClaimantIndexModule(proj);
         const r = await reconcileVerifiedDrift(proj, {
           claimantIndex,
           log: (message) => console.error(message),
         });
+        verificationReconciled = true;
         if (r.jsonToDb.length > 0 || r.dbToJson.length > 0 || r.taskStatusFixed.length > 0) {
           console.log(
             `[verification-store] reconcile project=${proj.projectId}: ` +
@@ -10338,7 +13024,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       }
 
       try {
-        await regenerateProjection(proj);
+        if (verificationReconciled) await regenerateProjection(proj);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(
@@ -10377,127 +13063,42 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       }
     }
 
-    return new Promise((resolve) => {
-      const onListening = () => {
-        const address = server.address();
-        const boundPort = typeof address === "object" && address ? address.port : port;
-        resolve({
-          port: boundPort,
-          stop: async () => {
-            shutdownAdmissionClosed = true;
-            stopPrepSchedulers();
-            // Start dispatch termination before any watcher or telemetry
-            // teardown. Those integrations are third-party async boundaries
-            // and must never delay TERM/KILL escalation for worker children.
-            const dispatchShutdown = shutdownDispatchManagers();
-            const prepShutdown = shutdownPrepWorkers();
-            const progressShutdown = stopProgressWatchersBounded();
-            stopAuxiliaryWorkers();
-            // Kill in-flight ccusage refresh to prevent "Cannot log after tests are done"
-            ccusageAborted = true;
-            if (ccusageChild) {
-              if (process.platform === "win32" && ccusageChild.pid) {
-                try {
-                  execSync(`taskkill /F /T /PID ${ccusageChild.pid}`, { stdio: "ignore" });
-                } catch {
-                  ccusageChild.kill();
-                }
-              } else {
-                ccusageChild.kill();
-              }
-              ccusageChild = null;
-            }
-            if (ccusageRefreshPromise) {
-              await settleBounded([ccusageRefreshPromise.catch(() => undefined)], 1_000);
-            }
-            prepScheduler?.stop();
-            progressDetector.stopChecking();
-            await settleBounded([Promise.allSettled(startupValidationTasks)], 1_000);
-            clearInterval(baselineInterval);
-            clearInterval(cleanupInterval);
-            process.off("uncaughtException", onUncaughtException);
-            process.off("unhandledRejection", onUnhandledRejection);
-            process.off("SIGINT", onSigint);
-            process.off("SIGTERM", onSigterm);
-            await settleBounded(
-              stopFreshnessMonitors.map((stopFm) => Promise.resolve().then(() => stopFm())),
-            );
-            for (const stopRecorder of stopOnMergeRecorders) stopRecorder();
-            for (const stopSync of stopVerifiedSyncs) stopSync();
-            for (const proj of resolveProjects()) {
-              setVerificationPeerSyncHandler(proj.projectRoot, undefined);
-            }
-            if (githubPollInterval) clearInterval(githubPollInterval);
-            if (githubSyncInterval) clearInterval(githubSyncInterval);
-            await settleBounded([
-              ...(adapterWatcher ? [Promise.resolve().then(() => adapterWatcher.close())] : []),
-              ...(taskWatcherInstance
-                ? [Promise.resolve().then(() => taskWatcherInstance.close())]
-                : []),
-            ]);
-            for (const hb of activeHeartbeats.values()) {
-              try {
-                hb.stop();
-              } catch {
-                /* best effort */
-              }
-            }
-            activeHeartbeats.clear();
-            await Promise.allSettled([dispatchShutdown, prepShutdown, progressShutdown]);
-            stopAuxiliaryWorkers();
-            // Stop multi-project watchers and services. Resolve event
-            // watchers from the live registry so projects registered after
-            // startup are covered too.
-            const registryWatcherCloses: Array<Promise<unknown>> = [];
-            if (registry) {
-              for (const ctx of registry.listProjects()) {
-                if (ctx.stopWatcher) {
-                  registryWatcherCloses.push(Promise.resolve().then(() => ctx.stopWatcher?.()));
-                }
-                ctx.progressDetector.stopChecking();
-                ctx.prepScheduler?.stop();
-                if (ctx.taskWatcher) {
-                  registryWatcherCloses.push(
-                    Promise.resolve().then(() => ctx.taskWatcher?.close()),
-                  );
-                }
-                try {
-                  ctx.db.close();
-                } catch {
-                  /* best effort */
-                }
-              }
-            }
-            await settleBounded(registryWatcherCloses);
-            sse.closeAll();
-            authService.destroy();
-            try {
-              legacyDb.close();
-            } catch {
-              /* best effort */
-            }
-            stopWatcher();
-            await new Promise<void>((resolveClose) => {
-              let settled = false;
-              const finish = (): void => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(closeTimer);
-                resolveClose();
-              };
-              const closeTimer = setTimeout(() => {
-                server.closeAllConnections();
-                finish();
-              }, 2_000);
-              server.close(finish);
-            });
-            await new Promise<void>((resolveSettle) => setTimeout(resolveSettle, 25));
-          },
-        });
-      };
-      const server = app.listen(port, options.host ?? "127.0.0.1", onListening);
-    });
+    startupPhase = "ready";
+    return { port: boundPort, stop };
   }
 
-  return { app, sse, reader, registry, start };
+  function start(): Promise<{ port: number; stop: () => Promise<void> }> {
+    if (startPromise) return startPromise;
+    const attempt = startInternal().catch(async (error: unknown) => {
+      startupPhase = "failed";
+      const cleanupErrors: Error[] = [];
+      let cleanupSucceeded = false;
+      for (let cleanupAttempt = 0; cleanupAttempt < 2; cleanupAttempt += 1) {
+        try {
+          await teardown();
+          cleanupSucceeded = true;
+          break;
+        } catch (cleanupError: unknown) {
+          cleanupErrors.push(
+            cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError)),
+          );
+          // A failed attempt clears its own cached promise. Assigning here as
+          // well makes the retry deterministic even if promise reaction order
+          // changes in a future refactor.
+          stopPromise = undefined;
+        }
+      }
+      if (!cleanupSucceeded) {
+        throw new AggregateError(
+          [error, ...cleanupErrors],
+          "Monitor failed to start and cleanup did not complete",
+        );
+      }
+      throw error;
+    });
+    startPromise = attempt;
+    return attempt;
+  }
+
+  return { app, sse, reader, registry, start, stop };
 }

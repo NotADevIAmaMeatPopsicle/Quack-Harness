@@ -67,9 +67,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       body = await response.text();
     }
-    const message = typeof body === "object" && body && "error" in body
-      ? String((body as { error: unknown }).error)
-      : `HTTP ${response.status}`;
+    const message =
+      typeof body === "object" && body && "error" in body
+        ? String((body as { error: unknown }).error)
+        : `HTTP ${response.status}`;
     throw new QuackApiError(response.status, message, body);
   }
   if (response.status === 204) {
@@ -85,9 +86,10 @@ export const getHealth = (): Promise<HealthResponse> => request("/api/health");
 export const getAuthStatus = (): Promise<DashboardAuthStatusResponse> =>
   request("/api/auth/status");
 
-export const loginDashboard = (
-  payload: { username: string; password: string },
-): Promise<DashboardLoginResponse> =>
+export const loginDashboard = (payload: {
+  username: string;
+  password: string;
+}): Promise<DashboardLoginResponse> =>
   request("/api/auth/login", {
     method: "POST",
     body: JSON.stringify(payload),
@@ -99,7 +101,9 @@ export const logoutDashboard = (): Promise<{ ok: true }> =>
     body: JSON.stringify({}),
   });
 
-export const getManagedWorktrees = (maxAgeHours?: number): Promise<ManagedWorktreeInventoryResponse> =>
+export const getManagedWorktrees = (
+  maxAgeHours?: number,
+): Promise<ManagedWorktreeInventoryResponse> =>
   request(`/api/worktrees${buildQuery({ maxAgeHours })}`);
 
 export const pruneManagedWorktrees = (
@@ -133,7 +137,10 @@ function buildQuery(options: Record<string, string | number | undefined> | objec
 export const listTasks = (options: ListTasksOptions = {}): Promise<TaskListResponse> =>
   request(`/api/tasks${buildQuery(options)}`);
 
-export const updateTaskStatus = (taskId: string, status: TaskStatus): Promise<{ ok: true; taskId: string; status: TaskStatus }> =>
+export const updateTaskStatus = (
+  taskId: string,
+  status: TaskStatus,
+): Promise<{ ok: true; taskId: string; status: TaskStatus }> =>
   request(`/api/tasks/${encodeURIComponent(taskId)}/status`, {
     method: "POST",
     body: JSON.stringify({ status }),
@@ -180,16 +187,17 @@ export const getQueue = (): Promise<QueueSummaryResponse> => request("/api/queue
 // ─── Federation ────────────────────────────────────────────────────
 
 export const getFederationQueue = (): Promise<FederationQueueResponse> =>
-  request<FederationQueueResponse>("/v1/federation/queue")
-    .then((raw) => {
-      const hosts = raw.summary?.hosts ?? [];
-      return {
-        ...raw,
-        jobs: raw.jobs.map((job) => ({
-          ...job,
-          assignedHostId: job.assignedHostId ?? job.hostId,
-        })),
-        listeners: raw.listeners ?? hosts.map((host) => ({
+  request<FederationQueueResponse>("/v1/federation/queue").then((raw) => {
+    const hosts = raw.summary?.hosts ?? [];
+    return {
+      ...raw,
+      jobs: raw.jobs.map((job) => ({
+        ...job,
+        assignedHostId: job.assignedHostId ?? job.hostId,
+      })),
+      listeners:
+        raw.listeners ??
+        hosts.map((host) => ({
           hostId: host.id,
           status: host.healthy ? "online" : "offline",
           lastHeartbeatAt: host.lastHealthCheckAt,
@@ -197,13 +205,12 @@ export const getFederationQueue = (): Promise<FederationQueueResponse> =>
           activeJobs: host.currentLoad,
           capabilities: host.capabilities,
         })),
-      };
-    });
+    };
+  });
 
 // ─── Reviews ───────────────────────────────────────────────────────
 
-export const listReviews = (): Promise<ReviewListResponse> =>
-  request("/v1/reviews");
+export const listReviews = (): Promise<ReviewListResponse> => request("/v1/reviews");
 
 export const getReview = (reviewId: string): Promise<ReviewDetailResponse> =>
   request(`/v1/reviews/${encodeURIComponent(reviewId)}`);
@@ -211,8 +218,9 @@ export const getReview = (reviewId: string): Promise<ReviewDetailResponse> =>
 // ─── Testing ───────────────────────────────────────────────────────
 
 export const getTestingCommands = (): Promise<TestingCommandsResponse> =>
-  request<TestingCommandsResponse | TestingCommandsResponse["commands"]>("/api/testing/commands")
-    .then((raw) => Array.isArray(raw) ? { commands: raw } : raw);
+  request<TestingCommandsResponse | TestingCommandsResponse["commands"]>(
+    "/api/testing/commands",
+  ).then((raw) => (Array.isArray(raw) ? { commands: raw } : raw));
 
 export const getTestingStatus = (): Promise<TestingStatusResponse> =>
   request("/api/testing/status");
@@ -220,28 +228,30 @@ export const getTestingStatus = (): Promise<TestingStatusResponse> =>
 export const getTestingHistory = (): Promise<TestingHistoryResponse> => {
   // Current backend returns a bare array. Wrap so TanStack Query has a
   // stable response shape for v1 of the UI.
-  return request<TestingHistoryResponse | { runs?: TestingHistoryResponse["runs"] } | TestingHistoryResponse["runs"]>("/api/testing/history")
-    .then((raw) => {
-      if (Array.isArray(raw)) return { runs: raw };
-      if (raw && "runs" in raw && Array.isArray(raw.runs)) return { runs: raw.runs };
-      return { runs: [] };
-    });
+  return request<
+    | TestingHistoryResponse
+    | { runs?: TestingHistoryResponse["runs"] }
+    | TestingHistoryResponse["runs"]
+  >("/api/testing/history").then((raw) => {
+    if (Array.isArray(raw)) return { runs: raw };
+    if (raw && "runs" in raw && Array.isArray(raw.runs)) return { runs: raw.runs };
+    return { runs: [] };
+  });
 };
 
 // ─── Projects ──────────────────────────────────────────────────────
 
 export const listProjects = (): Promise<ProjectsResponse> =>
-  request<ProjectsResponse | ProjectSummary[]>("/api/projects")
-    .then((raw) => {
-      if (!Array.isArray(raw)) {
-        return raw;
-      }
+  request<ProjectsResponse | ProjectSummary[]>("/api/projects").then((raw) => {
+    if (!Array.isArray(raw)) {
+      return raw;
+    }
 
-      return {
-        projects: raw,
-        activeProjectId: raw.find((project) => project.active)?.id ?? null,
-      };
-    });
+    return {
+      projects: raw,
+      activeProjectId: raw.find((project) => project.active)?.id ?? null,
+    };
+  });
 
 export const getDeploymentMonitoring = (): Promise<DeploymentMonitoringResponse> =>
   request("/api/monitoring/environments");
@@ -252,7 +262,9 @@ export const getWorkerEnrollmentProfiles = (): Promise<WorkerEnrollmentProfilesR
 export const listWorkerEnrollments = (): Promise<WorkerEnrollmentListResponse> =>
   request("/api/workers/enrollments");
 
-export const getWorkerEnrollment = (enrollmentId: string): Promise<WorkerEnrollmentDetailResponse> =>
+export const getWorkerEnrollment = (
+  enrollmentId: string,
+): Promise<WorkerEnrollmentDetailResponse> =>
   request(`/api/workers/enrollments/${encodeURIComponent(enrollmentId)}`);
 
 export const createWorkerEnrollment = (
@@ -263,13 +275,17 @@ export const createWorkerEnrollment = (
     body: JSON.stringify(payload),
   });
 
-export const setActiveProject = (projectId: string): Promise<{ ok: true; activeProjectId: string }> =>
+export const setActiveProject = (
+  projectId: string,
+): Promise<{ ok: true; activeProjectId: string }> =>
   request("/api/projects/active", {
     method: "POST",
     body: JSON.stringify({ projectId }),
   });
 
-export const addProject = (projectPath: string): Promise<{ ok: true; projectId: string; name: string; path: string }> =>
+export const addProject = (
+  projectPath: string,
+): Promise<{ ok: true; projectId: string; name: string; path: string }> =>
   request("/api/projects", {
     method: "POST",
     body: JSON.stringify({ path: projectPath }),
@@ -282,8 +298,7 @@ export const removeProject = (
     method: "DELETE",
   });
 
-export const getWikiStatus = (): Promise<WikiStatusResponse> =>
-  request("/api/wiki/status");
+export const getWikiStatus = (): Promise<WikiStatusResponse> => request("/api/wiki/status");
 
 export const getWikiIndex = (pathPrefix?: string): Promise<WikiIndexResponse> =>
   request(`/api/wiki/index${buildQuery({ pathPrefix })}`);
@@ -291,10 +306,7 @@ export const getWikiIndex = (pathPrefix?: string): Promise<WikiIndexResponse> =>
 export const getWikiPage = (path: string): Promise<WikiPageResponse> =>
   request(`/api/wiki/page${buildQuery({ path })}`);
 
-export const searchWiki = (
-  q: string,
-  limit = 25,
-): Promise<WikiSearchResponse> =>
+export const searchWiki = (q: string, limit = 25): Promise<WikiSearchResponse> =>
   request(`/api/wiki/search${buildQuery({ q, limit })}`);
 
 // ─── Task mutations (TASK-879) ─────────────────────────────────────
@@ -373,10 +385,10 @@ export const queueRemove = (taskId: string): Promise<{ ok: true; message: string
 
 // ─── Federation mutations ──────────────────────────────────────────
 
-export const cancelFederationJob = (jobId: string): Promise<unknown> =>
+export const cancelFederationJob = (jobId: string, projectId: string): Promise<unknown> =>
   request(`/v1/federation/jobs/${encodeURIComponent(jobId)}/cancel`, {
     method: "POST",
-    body: JSON.stringify({}),
+    body: JSON.stringify({ projectId }),
   });
 
 // ─── Testing mutations ─────────────────────────────────────────────
@@ -398,8 +410,7 @@ export const fleetEmergencyStop = (reason: string): Promise<unknown> =>
     body: JSON.stringify({ reason }),
   });
 
-export const getFleetStatus = (): Promise<FleetStatusResponse> =>
-  request("/api/fleet/status");
+export const getFleetStatus = (): Promise<FleetStatusResponse> => request("/api/fleet/status");
 
 export const fleetPause = (reason?: string): Promise<unknown> =>
   request("/api/fleet/pause", {
@@ -413,5 +424,4 @@ export const fleetResume = (): Promise<unknown> =>
 export const getFleetVelocity = (): Promise<FleetVelocityResponse> =>
   request("/api/fleet/velocity");
 
-export const getFleetHealth = (): Promise<FleetHealthResponse> =>
-  request("/api/fleet/health");
+export const getFleetHealth = (): Promise<FleetHealthResponse> => request("/api/fleet/health");

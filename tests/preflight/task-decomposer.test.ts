@@ -11,7 +11,7 @@ describe("task-decomposer", () => {
   });
 
   describe("decomposeTask", () => {
-    it("should produce 2-4 subtasks from a complex task", async () => {
+    it("should produce between 2 and the configured maximum subtasks", async () => {
       const task: ParsedTask = {
         id: "TASK-042",
         title: "Multi-Project Switcher",
@@ -182,6 +182,11 @@ describe("task-decomposer", () => {
       expect(result.parentTaskId).toBe("TASK-042");
       expect(result.subtasks.length).toBeGreaterThanOrEqual(2);
       expect(result.subtasks.length).toBeLessThanOrEqual(4);
+      expect(result.subtasks[0].filesToModify.map((file) => file.path)).toEqual(
+        expect.arrayContaining(["src/types.ts", "src/registry.ts"]),
+      );
+      expect(result.coverageReport.unmappedCriteria).toEqual([]);
+      expect(result.coverageReport.hasCoverageGap).toBe(false);
     });
 
     it("should group related files into the same subtask", async () => {
@@ -204,8 +209,9 @@ describe("task-decomposer", () => {
         filesToModify: [
           { path: "src/types.ts", action: "Create", notes: "" },
           { path: "src/impl.ts", action: "Create", notes: "" },
+          { path: "src/independent.ts", action: "Create", notes: "" },
         ],
-        successCriteria: ["Criteria 1", "Criteria 2"],
+        successCriteria: ["Criteria 1", "Criteria 2", "Criteria 3"],
         testingRequirements: [],
         contextReferences: [],
         rawContent: "",
@@ -226,6 +232,13 @@ describe("task-decomposer", () => {
             action: "Create",
             currentStructure: "[new file]",
             integrationPoints: "Imports from src/types.ts",
+            patternToFollow: "",
+          },
+          {
+            filePath: "src/independent.ts",
+            action: "Create",
+            currentStructure: "[new file]",
+            integrationPoints: "None",
             patternToFollow: "",
           },
         ],
@@ -689,8 +702,9 @@ describe("task-decomposer", () => {
         filesToModify: [
           { path: "src/alpha.ts", action: "Create", notes: "" },
           { path: "src/beta.ts", action: "Create", notes: "" },
+          { path: "src/gamma.ts", action: "Create", notes: "" },
         ],
-        successCriteria: ["Alpha works", "Beta works"],
+        successCriteria: ["Alpha works", "Beta works", "Gamma works"],
         testingRequirements: [],
         contextReferences: [],
         rawContent: "",
@@ -711,6 +725,13 @@ describe("task-decomposer", () => {
             action: "Create",
             currentStructure: "[new file]",
             integrationPoints: "Imports from src/alpha.ts",
+            patternToFollow: "",
+          },
+          {
+            filePath: "src/gamma.ts",
+            action: "Create",
+            currentStructure: "[new file]",
+            integrationPoints: "None",
             patternToFollow: "",
           },
         ],
@@ -825,8 +846,11 @@ describe("task-decomposer", () => {
         problemStatement: "Test",
         currentState: "Test",
         recommendedApproach: "Test",
-        filesToModify: [{ path: "src/x.ts", action: "Create", notes: "" }],
-        successCriteria: ["X works"],
+        filesToModify: [
+          { path: "src/x.ts", action: "Create", notes: "" },
+          { path: "src/y.ts", action: "Create", notes: "" },
+        ],
+        successCriteria: ["X works", "Y works"],
         testingRequirements: [],
         contextReferences: [],
         rawContent: "",
@@ -837,6 +861,13 @@ describe("task-decomposer", () => {
         fileAnalyses: [
           {
             filePath: "src/x.ts",
+            action: "Create",
+            currentStructure: "[new file]",
+            integrationPoints: "None",
+            patternToFollow: "",
+          },
+          {
+            filePath: "src/y.ts",
             action: "Create",
             currentStructure: "[new file]",
             integrationPoints: "None",
@@ -950,8 +981,9 @@ describe("task-decomposer", () => {
         filesToModify: [
           { path: "src/a.ts", action: "Create", notes: "" },
           { path: "src/b.ts", action: "Create", notes: "" },
+          { path: "src/c.ts", action: "Create", notes: "" },
         ],
-        successCriteria: ["C1", "C2"],
+        successCriteria: ["C1", "C2", "C3"],
         testingRequirements: [],
         contextReferences: [],
         rawContent: "",
@@ -1094,8 +1126,9 @@ describe("task-decomposer", () => {
         filesToModify: [
           { path: "src/a.ts", action: "Create", notes: "" },
           { path: "src/b.ts", action: "Create", notes: "" },
+          { path: "src/c.ts", action: "Create", notes: "" },
         ],
-        successCriteria: ["C1", "C2"],
+        successCriteria: ["C1", "C2", "C3"],
         testingRequirements: [],
         contextReferences: [],
         rawContent: "",
@@ -1116,6 +1149,13 @@ describe("task-decomposer", () => {
             action: "Create",
             currentStructure: "[new file]",
             integrationPoints: "Depends on src/a.ts",
+            patternToFollow: "",
+          },
+          {
+            filePath: "src/c.ts",
+            action: "Create",
+            currentStructure: "[new file]",
+            integrationPoints: "None",
             patternToFollow: "",
           },
         ],
@@ -1557,8 +1597,9 @@ describe("task-decomposer", () => {
                 filesToModify: [
                   { path: "src/a.ts", action: "Create", notes: "" },
                   { path: "src/b.ts", action: "Create", notes: "" },
+                  { path: "src/c.ts", action: "Create", notes: "" },
                 ],
-                successCriteria: ["C1", "C2"],
+                successCriteria: ["C1", "C2", "C3"],
                 dependsOn: [],
                 isFinal: false,
               },
@@ -1566,22 +1607,12 @@ describe("task-decomposer", () => {
                 id: "TASK-300-B",
                 title: "Integration",
                 filesToModify: [
-                  { path: "src/c.ts", action: "Create", notes: "" },
                   { path: "src/d.ts", action: "Create", notes: "" },
-                ],
-                successCriteria: ["C3", "C4"],
-                dependsOn: ["TASK-300-A"],
-                isFinal: false,
-              },
-              {
-                id: "TASK-300-C",
-                title: "Final",
-                filesToModify: [
                   { path: "src/e.ts", action: "Create", notes: "" },
                   { path: "src/f.ts", action: "Create", notes: "" },
                 ],
-                successCriteria: ["C5", "C6"],
-                dependsOn: ["TASK-300-B"],
+                successCriteria: ["C4", "C5", "C6"],
+                dependsOn: ["TASK-300-A"],
                 isFinal: true,
               },
             ],

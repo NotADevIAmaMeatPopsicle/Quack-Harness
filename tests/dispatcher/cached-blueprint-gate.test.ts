@@ -256,8 +256,12 @@ describe("cache-hit dispatch reaches the approval gate with real content (TASK-1
     // The empty stub trivially auto-approves (documented legacy parity) and the
     // dispatch proceeds until the BRANCH stage's git fetch fails in this
     // non-repo temp dir — proving it went PAST the gate rather than pausing.
+    // The trusted launcher can reject the unresolved `origin` before Git
+    // reaches its historical not-a-repository diagnostic.
     expect(result.outcome).toBe("error");
-    expect(result.error ?? "").toContain("not a git repository");
+    expect(result.error ?? "").toMatch(
+      /not a git repository|Refusing local or helper-backed Git transport target: origin/,
+    );
 
     const generated = events.find((e) => e.stage === "blueprint_generated");
     expect(generated!.payload.structured).toBe(false);

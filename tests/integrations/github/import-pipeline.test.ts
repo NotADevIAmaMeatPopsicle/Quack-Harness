@@ -156,6 +156,12 @@ describe("Import Pipeline", () => {
 
     const result = await importIssue(ISSUE_NUMBER, adapter, true);
 
+    expect(mockFetchIssue).toHaveBeenCalledWith(
+      "fixture-owner",
+      "fixture-repo",
+      ISSUE_NUMBER,
+      projectRoot,
+    );
     const persistedMap = new GitHubSyncMap(syncPath);
     await persistedMap.load();
     expect(result).toEqual({ taskId: TASK_ID, issueNumber: ISSUE_NUMBER });

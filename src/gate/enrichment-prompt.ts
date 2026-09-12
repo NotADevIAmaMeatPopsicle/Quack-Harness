@@ -205,7 +205,7 @@ ${focusedFilesSection ? "\n" + focusedFilesSection : ""}
 4. Make success criteria specific and testable.
 5. Add relevant convention/ADR references.
 6. Identify integration points: if the task creates new files, specify which existing files must import or register them, what line/section needs modification, and what the integration code looks like.
-6.5. **Ground concrete technical claims in real reads (TASK-923).** Any specific column name, file path, function or class signature, migration ID, table name, environment variable, or import path you introduce into the enriched spec MUST be verified by a Read or Grep call against the actual codebase. If a fact cannot be verified by reading the source — for example, because it depends on an external system or a runtime probe — say "needs operator confirmation: <what to check>" rather than producing a confident-sounding guess. Examples of facts that require a Read/Grep before stating them: database column names (verify against the migration file or schema), function/class signatures (verify in the actual source), file paths and module structure (verify with Glob), test command names and arguments (verify in package.json or runner script), environment variable names (verify in config/env loaders), SQL table schemas (verify in init-scripts/migrations). Examples that are OK to assert from context without re-reading: general architectural patterns already described in the focused-files list, convention guidance already in the conventions doc, cross-references between two specs both visible in the prompt.
+6.5. **Ground concrete technical claims in real reads (TASK-923).** Any specific column name, file path, function or class signature, migration ID, table name, environment variable, or import path you introduce into the enriched spec MUST be verified by an actual Read, Grep, or Glob tool call against the current codebase during this session. Do not treat the original prompt, a guessed path, or a Grounded By row you merely write as verification. Use Read for source contents and signatures, Grep for identifiers/usages, and Glob for path existence or module layout. If a fact cannot be verified from source — for example, because it depends on an external system or a runtime probe — say "needs operator confirmation: <what to check>" rather than producing a confident-sounding guess. Examples of facts that require tool grounding before stating them: database column names (Read the migration or schema), function/class signatures (Read the actual source), file paths and module structure (Glob, then Read when contents matter), test command names and arguments (Read package.json or the runner script), environment variable names (Grep or Read config/env loaders), SQL table schemas (Read init scripts/migrations). Examples that are OK to assert from context without re-reading: general architectural patterns already described in the focused-files list, convention guidance already in the conventions doc, cross-references between two specs both visible in the prompt.
 7. Output only the COMPLETE enriched task spec in the standardized format.${enhancedDirectives}
 
 ## Required Section Format (the parser is strict)
@@ -228,21 +228,22 @@ Example of a valid Testing Requirements section:
 
 ## Grounded By footer (TASK-923, required when concrete claims are introduced)
 
-If the enriched spec introduces any specific column name, file path, function signature, migration ID, table name, environment variable, or import path that did NOT already appear verbatim in the original task, append a \`## Grounded By\` section at the end of the spec listing the Read/Grep calls that verified each fact. Use this shape:
+If the enriched spec introduces any specific column name, file path, function signature, migration ID, table name, environment variable, or import path that did NOT already appear verbatim in the original task, append a \`## Grounded By\` section at the end of the spec listing the actual Read/Grep/Glob calls that verified each fact. Each row must match the tool name and input recorded in the SDK trace; a footer row without a corresponding tool call is unsupported evidence. Use this shape:
 
 \`\`\`
 ## Grounded By
 
 This enrichment's concrete file paths, column names, and signatures were verified by:
-- Read: src/migrations/20260506150000-add-per-tier-external-provider-markers.js (columns: last_appointments_delta_at, ...)
-- Read: src/src/services/external-provider/external-provider-config.js (env vars: PROVIDER_API_BASE)
-- Grep: 'CREATE TABLE.*external-provider_credentials' in src/init-scripts/
+- Read: src/migrations/20260506150000-add-per-tier-phorest-markers.js (columns: last_appointments_delta_at, ...)
+- Read: src/src/services/phorest/phorest-config.js (env vars: PHOREST_API_BASE)
+- Grep: 'CREATE TABLE.*phorest_credentials' in src/init-scripts/
+- Glob: src/config/*.ts (verified config module layout before naming a file)
 
 Claims marked "needs operator confirmation":
 - The deploy SHA currently running on staging (requires staging probe).
 \`\`\`
 
-This section is informational and is part of the spec body — \`extractSpecBody\` preserves it. Its purpose is to make hallucinated content obvious in review: if the enriched spec claims a specific column name and the Grounded By footer has no Read entry for the migration that defines it, the verifier should treat that claim as suspect.
+This section is informational and is part of the spec body — \`extractSpecBody\` preserves it. Quack compares its rows with the session's actual Read/Grep/Glob tool trace and emits non-blocking observations for unsupported evidence or concrete claims. Its purpose is to make hallucinated content obvious in review, not to reject the whole spec: if the enriched spec claims a specific column name and the Grounded By footer has no observed Read entry for the migration that defines it, the verifier should treat that claim as suspect.
 
 ## Integration Context
 If this task creates new files, identify the "wiring files" — existing files that must import or register the new modules. For each new file, specify:

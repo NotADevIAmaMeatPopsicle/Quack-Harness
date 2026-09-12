@@ -3,6 +3,8 @@
 // The Blueprint Agent pre-digests the codebase and produces code-level
 // implementation details before dispatch, reducing agent exploration time.
 
+import type { ModelProvenance } from "../review/reviewer-types.js";
+
 /**
  * Analysis of a single file that will be created, modified, or deleted.
  */
@@ -49,8 +51,14 @@ export interface VerificationPattern {
   pattern: string;
   /** Target file(s) as a glob pattern (for grep checks) */
   fileGlob: string;
-  /** Expected minimum match count (for grep_count type only) */
+  /** grep_count threshold: 0 means exactly zero; positive means minimum count. */
   expectedMatches?: number;
+  /**
+   * TASK-1325: exact task-authored mandated form represented by this
+   * pattern. This is preservation evidence, not proof the check or a
+   * mutation/bite was executed.
+   */
+  mandatedCheck?: string;
 }
 
 /**
@@ -119,7 +127,12 @@ export interface BriefEntryPointDirective {
 
 /** TASK-1324: one mechanically-found fidelity violation. */
 export interface BriefFidelityViolation {
-  kind: "missing_file" | "unexported_symbol" | "type_only_export" | "empty_brief";
+  kind:
+    | "missing_file"
+    | "unexported_symbol"
+    | "type_only_export"
+    | "empty_brief"
+    | "mandated_check_softened";
   /** Human-readable description with the offending directive/anchor. */
   detail: string;
   /** file or file:line the violation anchors to, when applicable. */
@@ -131,7 +144,9 @@ export interface BriefFidelityViolation {
  * PIPELINE (never the LLM) after synthesis at both generation sites.
  * `failed` briefs are never auto-approvable. An empty or effectively
  * empty brief (the createMinimalBlueprint stub shape) is `failed`, not
- * vacuously ok. Data, never control flow beyond the approval predicate.
+ * vacuously ok. Substantive failures remain approval-gate data; the
+ * `empty_brief` failure is terminal for a fresh dispatch because there is no
+ * artifact for a reviewer or human approver to salvage.
  */
 export interface BriefFidelityResult {
   status: "ok" | "failed";
@@ -142,7 +157,7 @@ export interface BriefFidelityResult {
    * Honest boundary marker: free-text prose received existence-only
    * checks; only the typed directive surface got export resolution.
    */
-  scope: "typed-surface+file-existence";
+  scope: "typed-surface+file-existence" | "typed-surface+file-existence+mandated-checks";
 }
 
 /**
@@ -175,6 +190,14 @@ export interface Blueprint {
   generatedAt?: string;
   /** Provenance + re-validation against the generation tree. */
   baseValidation?: BriefBaseValidation;
+  /**
+   * Pipeline-stamped model identity of the agent that synthesized this Brief.
+   * Absent on deterministic fallbacks and legacy cached briefs, which makes a
+   * required cross-model review pause for human confirmation. A freshly
+   * synthesized empty/provider-fallback Brief is the narrower exception: its
+   * `empty_brief` fidelity violation stops dispatch before checkpoint/review.
+   */
+  producerProvenance?: ModelProvenance;
   /** Adjacent issues surfaced for the operator. NOT work orders. */
   handBack?: BriefHandBackItem[];
   /** ADR/convention constraints the implementation must honor. */
@@ -191,6 +214,11 @@ export interface Blueprint {
    *  ParsedTask.decidedFacts — a diffable fidelity surface for the gate
    *  and reviewer; `undefined` when the spec has no Decided Facts). */
   specFacts?: string[];
+  /**
+   * TASK-1325: verbatim echo of ParsedTask.mandatedChecks. Every entry
+   * must also be attached to a verificationPattern via mandatedCheck.
+   */
+  mandatedChecks?: string[];
   /** Pipeline-stamped deterministic audit result. NEVER LLM-authored:
    *  the normalizer carries it tolerantly (the cached path needs it),
    *  and the generation path OVERWRITES it unconditionally after

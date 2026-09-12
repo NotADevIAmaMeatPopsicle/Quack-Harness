@@ -143,7 +143,7 @@ describe("research API validation taxonomy", () => {
       expect.arrayContaining([
         expect.objectContaining({ worker: "headnode", stale_adapter: 1 }),
         expect.objectContaining({
-          worker: "worker-laptop",
+          worker: "example-laptop",
           refreshed_adapter: 1,
           validation_class_mismatch: 1,
         }),

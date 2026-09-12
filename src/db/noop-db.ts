@@ -14,9 +14,19 @@ import type {
   ReadinessSnapshotRow,
   EffectiveSpecRow,
   QueueItemRow,
+  QuackDbHealth,
 } from "./types.js";
 
 export class NoopDB {
+  getHealth(): QuackDbHealth {
+    return {
+      mode: "noop",
+      available: false,
+      reason:
+        "SQLite is unavailable; verification writes and projection regeneration require a healthy database",
+    };
+  }
+
   getStatus(): TaskStatusRow | undefined {
     return undefined;
   }

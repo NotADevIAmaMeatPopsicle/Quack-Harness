@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-require-imports */
 /**
  * Tests for TASK-072: Branch-Aware Dispatch & Resume
  *
@@ -38,7 +37,12 @@ type MockExecResult = {
 };
 
 let mockGitResults: Record<string, MockExecResult> = {};
-const SEALED_HEAD = "a".repeat(40);
+let mockGitHubRepository: { host: string; owner: string; repo: string } | undefined;
+const MOCK_ORIGIN_PUSH_URL = "git@github.com:org/repo.git";
+
+const MOCK_HEAD_COMMIT_SHA = "a".repeat(40);
+const MOCK_BASE_COMMIT_SHA = "b".repeat(40);
+const MOCK_EVIDENCE_RANGE = `${MOCK_BASE_COMMIT_SHA}...${MOCK_HEAD_COMMIT_SHA}`;
 
 function findGitResult(command: string): MockExecResult | undefined {
   for (const [pattern, result] of Object.entries(mockGitResults)) {
@@ -84,16 +88,6 @@ jest.mock("node:child_process", () => {
   const mockExec = jest.fn();
   (mockExec as unknown as Record<symbol, unknown>)[promisify.custom] = customPromisified;
 
-  const customPromisifiedExecFile = (
-    file: string,
-    args: readonly string[],
-    _options: Record<string, unknown>,
-  ): Promise<{ stdout: string; stderr: string }> =>
-    customPromisified([file, ...args].join(" "), _options);
-  const mockExecFile = jest.fn();
-  (mockExecFile as unknown as Record<symbol, unknown>)[promisify.custom] =
-    customPromisifiedExecFile;
-
   const mockExecSync = jest
     .fn()
     .mockImplementation((command: string, _options?: Record<string, unknown>) => {
@@ -112,13 +106,66 @@ jest.mock("node:child_process", () => {
       return matchedResult.stdout ?? "";
     });
 
+  const mockExecFileSync = jest
+    .fn()
+    .mockImplementation((command: string, args: string[] = [], options?: { encoding?: string }) => {
+      const executable = ["git", "git.exe"].includes(path.basename(command).toLowerCase())
+        ? "git"
+        : command;
+      const rendered = [executable, ...args].join(" ");
+      execSyncCalls.push(rendered);
+      const matchedResult = findGitResult(rendered);
+      if (matchedResult?.error) {
+        throw Object.assign(new Error("Command failed"), {
+          status: matchedResult.code ?? 1,
+          stdout: Buffer.from(matchedResult.stdout ?? ""),
+          stderr: Buffer.from(matchedResult.stderr ?? ""),
+        });
+      }
+      const stdout = matchedResult?.stdout ?? "";
+      return options?.encoding ? stdout : Buffer.from(stdout);
+    });
+
   return {
     ...actual,
     exec: mockExec,
-    execFile: mockExecFile,
     execSync: mockExecSync,
+    execFileSync: mockExecFileSync,
   };
 });
+
+// Branch-manager routes Git through the trusted-executable boundary. Keep this
+// dispatcher unit suite deterministic while preserving its command table.
+jest.mock("../../src/worker/trusted-executable", () => ({
+  ...jest.requireActual<typeof import("../../src/worker/trusted-executable")>(
+    "../../src/worker/trusted-executable",
+  ),
+  resolveTrustedGitHubRepository: (projectRoot: string) => {
+    if (projectRoot !== tmpDir || !mockGitHubRepository) {
+      return Promise.reject(new Error("No audited repository fixture for this project"));
+    }
+    return Promise.resolve(mockGitHubRepository);
+  },
+  runTrustedGitResult: (_projectRoot: string, args: readonly string[]) => {
+    const commitRef = args[0] === "rev-parse" && args[1] === "--verify" ? args[2] : undefined;
+    if (commitRef?.endsWith("^{commit}")) {
+      return Promise.resolve({
+        exitCode: 0,
+        stdout: `${commitRef === "HEAD^{commit}" ? MOCK_HEAD_COMMIT_SHA : MOCK_BASE_COMMIT_SHA}\n`,
+        stderr: "",
+      });
+    }
+    const matchedResult = findGitResult(["git", ...args].join(" "));
+    if (args[0] === "push" && !matchedResult) {
+      return Promise.resolve({ exitCode: 1, stdout: "", stderr: "Unexpected push arguments" });
+    }
+    return Promise.resolve({
+      exitCode: matchedResult?.error ? (matchedResult.code ?? 1) : 0,
+      stdout: matchedResult?.stdout ?? "",
+      stderr: matchedResult?.stderr ?? "",
+    });
+  },
+}));
 
 // ─── Mock gate, worker, and judge ──────────────────────────────────────
 
@@ -223,8 +270,8 @@ jest.mock("../../src/dispatcher/checkpoint-manager", () => {
 
 // ─── Import dispatcher after mocking ────────────────────────────────
 
-// eslint-disable-next-line @typescript-eslint/no-require-imports
 const { dispatchTask } =
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
   require("../../src/dispatcher/dispatcher") as typeof import("../../src/dispatcher/dispatcher");
 
 // ─── Test helpers ──────────────────────────────────────────────────────
@@ -261,10 +308,8 @@ function makeAdapter(overrides: Partial<ProjectAdapter> = {}): ProjectAdapter {
       branchPrefix: "quack/",
       commitFormat: "[{taskId}] {message}",
       commitTrailer: "Implemented-by: Quack Agent",
-      // Publication is unrelated to these branch-resume fixtures. Keep it
-      // disabled so the tests exercise only the lifecycle they claim to cover.
-      autoCreatePr: false,
-      autoPush: false,
+      autoCreatePr: true,
+      autoPush: true,
     },
     logging: {
       dir: ".quack/logs",
@@ -374,6 +419,7 @@ beforeEach(async () => {
   jest.clearAllMocks();
   _mockCheckpoints.clear();
   mockGitResults = {};
+  mockGitHubRepository = undefined;
   execSyncCalls = [];
   mockIsUsable = jest.fn<boolean, [DispatchCheckpoint, number?]>().mockReturnValue(true);
 
@@ -413,11 +459,21 @@ describe("Branch-Aware Dispatch", () => {
     mockRunAgent.mockResolvedValue(makeAgentResult("TASK-042"));
     mockRunJudge.mockResolvedValue(makeJudgeResult());
 
-    // Git commands for diff + PR
+    // The success path seals this exact repository, branch, and commit before push.
+    mockGitHubRepository = { host: "github.com", owner: "org", repo: "repo" };
     mockGitResults = {
-      "diff main": { stdout: "diff content" },
+      "remote get-url --push --all origin": { stdout: `${MOCK_ORIGIN_PUSH_URL}\n` },
+      "rev-parse --verify refs/heads/quack/TASK-042": { stdout: MOCK_HEAD_COMMIT_SHA },
+      [`push -u ${MOCK_ORIGIN_PUSH_URL} ${MOCK_HEAD_COMMIT_SHA}:refs/heads/quack/TASK-042`]: {
+        stdout: "Branch pushed",
+      },
+      [`ls-remote --heads ${MOCK_ORIGIN_PUSH_URL} refs/heads/quack/TASK-042`]: {
+        stdout: `${MOCK_HEAD_COMMIT_SHA}\trefs/heads/quack/TASK-042\n`,
+      },
+      // Cleanup cases begin with a local-only task branch.
+      "ls-remote --heads origin refs/heads/quack/TASK-042": { stdout: "" },
+      [`diff ${MOCK_EVIDENCE_RANGE}`]: { stdout: "diff content" },
       "diff --name-only": { stdout: "src/test.ts" },
-      "push -u origin": { stdout: "Branch pushed" },
       "gh pr create": { stdout: "https://github.com/org/repo/pull/42" },
       // Default: branch doesn't exist (rev-parse fails)
       "rev-parse --verify": { error: true, stderr: "unknown revision" },
@@ -438,7 +494,7 @@ describe("Branch-Aware Dispatch", () => {
       setupSuccessPath();
 
       // Override: branch exists
-      mockGitResults["rev-parse --verify"] = { stdout: SEALED_HEAD };
+      mockGitResults["rev-parse --verify"] = { stdout: "abc123" };
 
       // Set up checkpoint with incomplete stages — "branch" NOT in completedStages
       // so the branch-aware code path is entered (branch exists in git but
@@ -486,7 +542,7 @@ describe("Branch-Aware Dispatch", () => {
       setupSuccessPath();
 
       // Override: branch exists
-      mockGitResults["rev-parse --verify"] = { stdout: SEALED_HEAD };
+      mockGitResults["rev-parse --verify"] = { stdout: "abc123" };
 
       // Set up checkpoint with REVISE verdict — "branch" NOT in completedStages
       // so the branch-aware code path is entered
@@ -538,7 +594,7 @@ describe("Branch-Aware Dispatch", () => {
       setupSuccessPath();
 
       // Override: branch exists
-      mockGitResults["rev-parse --verify"] = { stdout: SEALED_HEAD };
+      mockGitResults["rev-parse --verify"] = { stdout: "abc123" };
 
       // No checkpoint set — _mockCheckpoints is empty
 
@@ -567,7 +623,7 @@ describe("Branch-Aware Dispatch", () => {
       setupSuccessPath();
 
       // Override: branch exists
-      mockGitResults["rev-parse --verify"] = { stdout: SEALED_HEAD };
+      mockGitResults["rev-parse --verify"] = { stdout: "abc123" };
 
       // Set up checkpoint with exhausted retries and no gitDiff — "branch" NOT in
       // completedStages so the branch-aware code path is entered
@@ -622,7 +678,7 @@ describe("Branch-Aware Dispatch", () => {
       setupSuccessPath();
 
       // Override: branch exists
-      mockGitResults["rev-parse --verify"] = { stdout: SEALED_HEAD };
+      mockGitResults["rev-parse --verify"] = { stdout: "abc123" };
 
       // Set up a perfectly valid checkpoint (would normally resume) — "branch"
       // NOT in completedStages so the branch-aware code path is entered
@@ -681,8 +737,7 @@ describe("Branch-Aware Dispatch", () => {
       // creating the branch; that specific rev-parse must succeed while the
       // generic default still reports the task branch as missing.
       mockGitResults = {
-        "rev-parse --verify origin/main": { stdout: SEALED_HEAD },
-        "rev-parse --verify refs/heads/quack/TASK-042": { stdout: SEALED_HEAD },
+        "rev-parse --verify origin/main": { stdout: "abc123" },
         ...mockGitResults,
       };
 

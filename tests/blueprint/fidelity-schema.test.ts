@@ -59,6 +59,41 @@ describe("TASK-1324 Decided Facts parsing", () => {
   });
 });
 
+describe("TASK-1325 Mandated Checks parsing", () => {
+  it("extracts exact bullet-text forms into mandatedChecks[]", () => {
+    const task = parseTaskFile(
+      taskDoc(
+        [
+          "## Mandated Checks",
+          "- `npm test -- --runInBand` expect: exactly-0",
+          "- grep: every queue writer appears in the guard test by name",
+          "",
+        ].join("\n"),
+      ),
+    );
+    expect(task.mandatedChecks).toEqual([
+      "`npm test -- --runInBand` expect: exactly-0",
+      "grep: every queue writer appears in the guard test by name",
+    ]);
+  });
+
+  it("omits the field when the section is absent or contains only prose/fences", () => {
+    expect(parseTaskFile(taskDoc()).mandatedChecks).toBeUndefined();
+    const fencedOnly = parseTaskFile(
+      taskDoc(
+        [
+          "## Mandated Checks",
+          "Prose is not a machine-readable mandate.",
+          "```sh",
+          "npm test -- --runInBand",
+          "```",
+        ].join("\n"),
+      ),
+    );
+    expect(fencedOnly.mandatedChecks).toBeUndefined();
+  });
+});
+
 describe("TASK-1324 normalizer: typed directives + specFacts + fidelity", () => {
   const base = {
     taskId: "TASK-999",
@@ -104,6 +139,24 @@ describe("TASK-1324 normalizer: typed directives + specFacts + fidelity", () => 
     expect(result?.specFacts).toEqual(["fact one", "fact two"]);
   });
 
+  it("normalizes mandate echoes and carries exact pattern links", () => {
+    const result = validateBlueprint({
+      ...base,
+      mandatedChecks: [" `npm test` expect: exactly-0 ", 42, ""],
+      verificationPatterns: [
+        {
+          criterion: "The mandated verification form is preserved",
+          checkType: "grep",
+          pattern: "npm test",
+          fileGlob: "docs/tasks/*.md",
+          mandatedCheck: " `npm test` expect: exactly-0 ",
+        },
+      ],
+    });
+    expect(result?.mandatedChecks).toEqual([" `npm test` expect: exactly-0 "]);
+    expect(result?.verificationPatterns[0]?.mandatedCheck).toBe(" `npm test` expect: exactly-0 ");
+  });
+
   it("carries a well-formed persisted fidelity result through (cached path)", () => {
     const result = validateBlueprint({
       ...base,
@@ -115,16 +168,18 @@ describe("TASK-1324 normalizer: typed directives + specFacts + fidelity", () => 
             detail: "upsertAppointments is not exported",
             anchor: "src/importers/hot.ts",
           },
+          { kind: "mandated_check_softened", detail: "exact-zero form changed" },
           { kind: "bogus_kind", detail: "dropped" },
         ],
         checkedAt: "2026-08-10T02:00:00.000Z",
-        scope: "typed-surface+file-existence",
+        scope: "typed-surface+file-existence+mandated-checks",
       },
     });
     expect(result?.fidelity?.status).toBe("failed");
-    expect(result?.fidelity?.violations).toHaveLength(1);
+    expect(result?.fidelity?.violations).toHaveLength(2);
     expect(result?.fidelity?.violations[0]?.kind).toBe("unexported_symbol");
     expect(result?.fidelity?.checkedAt).toBe("2026-08-10T02:00:00.000Z");
+    expect(result?.fidelity?.scope).toBe("typed-surface+file-existence+mandated-checks");
   });
 
   it("drops a malformed fidelity value (bad status) instead of trusting it", () => {

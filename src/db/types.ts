@@ -149,3 +149,7 @@ export interface VerifiedHistoryRow {
   /** The verdict this write replaced; null on the first write for a task. */
   previous_verdict: string | null;
 }
+
+export type QuackDbHealth =
+  | { mode: "sqlite"; available: true }
+  | { mode: "sqlite" | "noop"; available: false; reason: string };

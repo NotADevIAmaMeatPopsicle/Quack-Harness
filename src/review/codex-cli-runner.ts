@@ -16,6 +16,10 @@ import type { ReviewRequest, ReviewRunResult } from "./reviewer-types.js";
 import type { ReviewerRunnerConfig } from "./reviewer-config.js";
 import { buildCodexBootstrapPrompt, buildCodexRequestFileContent } from "./review-prompts.js";
 import { auditFindingAnchors, extractReviewResult } from "./verdict-extract.js";
+import {
+  buildCodexProcessEnv,
+  codexShellEnvironmentPolicyArgs,
+} from "../llm/codex-process-security.js";
 
 /** Spawn function shape used by this runner (subset of child_process.spawn). */
 export type SpawnFn = (
@@ -57,6 +61,9 @@ export function buildCodexArgs(
     "exec",
     "--sandbox",
     config.codex.sandbox, // z.literal("read-only") — no other value representable
+    ...(config.codex.profile ? ["-p", config.codex.profile] : []),
+    ...(config.codex.provider ? ["-c", `model_provider="${config.codex.provider}"`] : []),
+    ...codexShellEnvironmentPolicyArgs(),
     ...(config.model ? ["-m", config.model] : []),
     "--cd",
     projectRoot,
@@ -225,10 +232,7 @@ export async function runCodexCliReview(
     await fs.writeFile(outputFile, "", "utf-8");
 
     const args = buildCodexArgs(config, requestFile, request.projectRoot, outputFile);
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      ...(config.codex.codexHome ? { CODEX_HOME: config.codex.codexHome } : {}),
-    };
+    const env = buildCodexProcessEnv(config.codex);
 
     // QPI-050: baseline BEFORE the reviewer runs — pre-existing dirt
     // (e.g. the pipeline's own adapter sync) is never the reviewer's.

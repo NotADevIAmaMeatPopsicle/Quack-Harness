@@ -1,13 +1,13 @@
 // ─── Worktree Lifecycle ─────────────────────────────────────────────
 // Single entry point for worktree removal AND dep-prep for worktrees.
-// Tears down compose services before removing the git worktree.
+// Proves worktree-scoped Docker resources are absent before removal.
 // Symlinks gitignored dep directories (frontend(s)/node_modules) after creation.
 // Never throws — failures are logged.
 
 import { existsSync, symlinkSync, mkdirSync, lstatSync, readdirSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
-import { execSync } from "node:child_process";
-import { tearDown } from "../testing/docker-test-runner.js";
+import { cleanupWorktreeContainers } from "./docker-cleanup.js";
+import { runTrustedGitSync } from "./trusted-git.js";
 
 function frontendNodeModulesSources(
   projectRoot: string,
@@ -114,54 +114,54 @@ export function prepareWorktreeFrontendDeps(
   return linked > 0;
 }
 
-const COMPOSE_CANDIDATES = [
-  "docker-compose.yml",
-  "compose.yml",
-  "compose.yaml",
-  "docker-compose.yaml",
-] as const;
-
 /**
- * Tear down compose services and then remove the git worktree.
+ * Remove worktree-scoped containers by trusted metadata and then remove the
+ * git worktree.
  * Safe to call multiple times. Does not throw on cleanup failure.
  *
  * @param worktreePath Absolute path to the worktree directory
  * @param taskId Task ID for log messages
  * @param projectRoot Project root for git commands (defaults to worktreePath)
- * @param dockerCleanup Whether to attempt Docker compose cleanup (default true)
+ * @param dockerCleanup Whether to require verified Docker cleanup (default true)
  */
 export function removeWorktree(
   worktreePath: string,
   taskId: string,
   projectRoot?: string,
   dockerCleanup = true,
-): void {
-  // 1. Compose cleanup if a compose file is present
+): boolean {
+  // 1. Never parse a compose file from the worker-controlled checkout during
+  // cleanup. Use immutable Docker metadata to remove only containers tied to
+  // this exact worktree, and preserve recovery evidence unless absence is
+  // positively confirmed.
   if (dockerCleanup) {
-    for (const cf of COMPOSE_CANDIDATES) {
-      const full = join(worktreePath, cf);
-      if (existsSync(full)) {
-        console.info(`[worktree-lifecycle] tearing down compose for ${taskId} (${cf})`);
-        tearDown(full, worktreePath, 60_000);
-        break;
-      }
+    const cleanupConfirmed = cleanupWorktreeContainers(worktreePath, {
+      info: (message) => console.info(message),
+      warn: (message) => console.warn(message),
+    });
+    if (!cleanupConfirmed) {
+      console.error(
+        `[worktree-lifecycle] preserving worktree ${worktreePath} for ${taskId}: Docker cleanup could not be confirmed`,
+      );
+      return false;
     }
   }
 
   // 2. Git worktree remove
   const cwd = projectRoot ?? worktreePath;
   try {
-    execSync(`git worktree remove --force "${worktreePath}"`, {
-      cwd,
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
+    runTrustedGitSync(["worktree", "remove", "--force", worktreePath], cwd, {
+      timeoutMs: 30_000,
+      trustedBoundaryRoot: projectRoot ?? cwd,
     });
     console.info(`[worktree-lifecycle] removed worktree ${worktreePath} for ${taskId}`);
+    return true;
   } catch (err) {
     console.error(
       `[worktree-lifecycle] git worktree remove failed for ${taskId} at ${worktreePath}: ${(err as Error).message}`,
     );
     // Do not throw — surface the failure via log; operator must investigate.
     // Do NOT auto-retry: the worktree may be locked or corrupt.
+    return false;
   }
 }

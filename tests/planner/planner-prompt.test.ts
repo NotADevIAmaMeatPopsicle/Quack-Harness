@@ -5,6 +5,7 @@ import * as os from "node:os";
 import { buildPlannerPrompt } from "../../src/planner/planner-prompt.js";
 import type { ProjectAdapter } from "../../src/core/adapter-loader.js";
 import type { AdapterConfig } from "../../src/core/types.js";
+import { taskSpec } from "../helpers/divergent-task-fixture";
 
 describe("planner-prompt", () => {
   let tempDir: string;
@@ -116,8 +117,8 @@ describe("planner-prompt", () => {
     // Create task directory with existing tasks
     const taskDir = path.join(tempDir, "docs", "tasks");
     await fs.mkdir(taskDir, { recursive: true });
-    await fs.writeFile(path.join(taskDir, "TASK-001-first.md"), "content");
-    await fs.writeFile(path.join(taskDir, "TASK-005-fifth.md"), "content");
+    await fs.writeFile(path.join(taskDir, "TASK-001-first.md"), taskSpec("TASK-001"));
+    await fs.writeFile(path.join(taskDir, "TASK-005-fifth.md"), taskSpec("TASK-005"));
 
     const prompt = await buildPlannerPrompt("Add feature", mockAdapter);
 

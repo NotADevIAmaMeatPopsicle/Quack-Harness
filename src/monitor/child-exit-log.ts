@@ -25,12 +25,15 @@ export interface AppendDispatchChildExitOptions {
   taskId: string;
   /** Monitor-side job session id; the durable fallback target. */
   jobSessionId: string;
+  /** Newly launched monitor children use the host job ID for their event stream. */
+  exactSession?: boolean;
   /** ISO timestamp the monitor spawned the child. */
   jobStartedAt: string;
   exitCode: number | null;
   signal: string | null;
   worktreePath: string | null;
-  isolation: "worktree" | "shared-checkout" | "docker";
+  /** True when DispatchManager.stop() intentionally terminated the child. */
+  operatorRequested?: boolean;
 }
 
 export interface AppendDispatchChildExitResult {
@@ -49,10 +52,12 @@ export function appendDispatchChildExit(
   // created. Both timestamps are same-host toISOString values, so the
   // lexicographic compare is a time compare.
   let resolution: ChildExitSessionResolution = "job-fallback";
-  let target = taskSessions.find((s) => s.startTime >= options.jobStartedAt);
+  let target = options.exactSession
+    ? taskSessions.find((session) => session.sessionId === options.jobSessionId)
+    : taskSessions.find((session) => session.startTime >= options.jobStartedAt);
   if (target) {
     resolution = "child-session";
-  } else if (taskSessions.length > 0) {
+  } else if (!options.exactSession && taskSessions.length > 0) {
     // Every session predates this spawn (a resume reusing an earlier
     // session, or a child that died before its first recordSession this
     // run). The newest session for the task is still the file an
@@ -77,7 +82,7 @@ export function appendDispatchChildExit(
     signal: options.signal,
     killed: Boolean(options.signal),
     worktreePath: options.worktreePath,
-    isolation: options.isolation,
+    operatorRequested: options.operatorRequested ?? false,
     at: new Date().toISOString(),
     sessionResolution: resolution,
   };

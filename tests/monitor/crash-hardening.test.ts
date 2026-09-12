@@ -256,10 +256,10 @@ describe("TASK-073: Monitor Crash Hardening", () => {
       await reader.watch(jest.fn());
 
       expect(chokidar.watch).toHaveBeenCalledWith(
-        expect.arrayContaining([
-          expect.stringContaining("events-*.jsonl"),
-          expect.stringContaining("docker-import"),
-        ]),
+        [
+          path.join(tmpDir, "events-*.jsonl"),
+          path.join(tmpDir, "docker-import", "*", "events-*.jsonl"),
+        ],
         expect.objectContaining({ ignorePermissionErrors: true }),
       );
     });

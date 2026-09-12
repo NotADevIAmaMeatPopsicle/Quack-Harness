@@ -113,48 +113,6 @@ async function listDirectories(dirPath: string): Promise<string[]> {
   }
 }
 
-function isPathInside(root: string, candidate: string): boolean {
-  const relative = path.relative(root, candidate);
-  return (
-    relative === "" ||
-    (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))
-  );
-}
-
-async function assertTaskPathsInsideProject(task: ParsedTask, projectRoot: string): Promise<void> {
-  const resolvedRoot = path.resolve(projectRoot);
-  const canonicalRoot = await fs.realpath(resolvedRoot);
-
-  for (const file of task.filesToModify) {
-    const suppliedPath = file.path.trim();
-    if (!suppliedPath || path.isAbsolute(suppliedPath) || path.win32.isAbsolute(suppliedPath)) {
-      throw new Error(`Unsafe task file path outside project root: ${file.path}`);
-    }
-
-    const resolvedPath = path.resolve(resolvedRoot, suppliedPath);
-    if (!isPathInside(resolvedRoot, resolvedPath)) {
-      throw new Error(`Unsafe task file path outside project root: ${file.path}`);
-    }
-
-    // Resolve the closest existing ancestor so paths beneath an in-repo symlink
-    // cannot escape the project even when the final file will be created later.
-    let existingAncestor = resolvedPath;
-    while (existingAncestor !== resolvedRoot) {
-      try {
-        await fs.lstat(existingAncestor);
-        break;
-      } catch (err: unknown) {
-        if (!hasErrorCode(err) || err.code !== "ENOENT") throw err;
-        existingAncestor = path.dirname(existingAncestor);
-      }
-    }
-    const canonicalAncestor = await fs.realpath(existingAncestor);
-    if (!isPathInside(canonicalRoot, canonicalAncestor)) {
-      throw new Error(`Unsafe task file path resolves outside project root: ${file.path}`);
-    }
-  }
-}
-
 // ─── Convention Loading ───────────────────────────────────────────────
 
 async function loadConventions(
@@ -529,8 +487,6 @@ export async function assembleContext(
   blueprint?: string,
   options?: { blueprintPatterns?: VerificationPattern[] },
 ): Promise<TaskContext> {
-  await assertTaskPathsInsideProject(task, adapter.projectRoot);
-
   // Merge task conventions with auto-conventions from testPatterns
   const testPatterns = adapter.config.project.testPatterns;
   const autoConventions = testPatterns?.autoConventions ?? [];

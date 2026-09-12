@@ -151,14 +151,63 @@ export interface PreflightResult {
     decomposed: boolean;
     subtaskIds: string[];
     subtaskFiles: string[];
+    /** Commit exists, but durable recovery/authoritative status projection must finish before enqueue. */
+    recoveryPending?: boolean;
+    /** Exact decomposition transaction projection identity, when already materialized. */
+    statusProjectionId?: string;
     /** QPI-048 leg (e): a plan existed but writeSpecs suppressed the
      *  children - the ids above are a RECOMMENDATION, never enforced. */
     advisoryOnly?: boolean;
-    /** A write-capable run found more than one file declaring the parent id. */
-    refused?: {
-      errorType: "duplicate_claimants";
-      claimants: string[];
-    };
+    /** A write-capable run failed closed before a complete parent+child
+     * decomposition transaction could be committed. */
+    refused?:
+      | {
+          errorType: "duplicate_claimants";
+          claimants: string[];
+        }
+      | {
+          errorType: "coverage_gap";
+          unmappedFiles: string[];
+          unmappedCriteria: string[];
+          duplicatedFiles: string[];
+          duplicatedCriteria: string[];
+          unexpectedFiles: string[];
+          mismatchedFileActions: Array<{
+            filePath: string;
+            expectedAction: string;
+            actualAction: string;
+            ownedBy: string;
+          }>;
+          unexpectedCriteria: string[];
+        }
+      | {
+          errorType: "child_quality";
+          drafts: Array<{
+            subtaskId: string;
+            prepScore: number;
+            deficiencies: string[];
+            parseError?: string;
+          }>;
+          message?: string;
+        }
+      | {
+          errorType: "parent_spec_changed";
+          message: string;
+        }
+      | {
+          errorType: "invalid_plan";
+          message: string;
+        }
+      | {
+          errorType: "write_failed";
+          message: string;
+          rollbackErrors: string[];
+        }
+      | {
+          errorType: "recovery_pending";
+          message: string;
+          retryable: false;
+        };
   };
   /** Pipeline mode used to produce this result. */
   mode?: "full" | "deterministic";

@@ -4,30 +4,78 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import type { GitHubConfig, SyncEvent } from "../../../src/integrations/github/github-types";
+import { writeTestAdapter } from "../../helpers/divergent-task-fixture";
+
+type RunBoundGitHubCommand =
+  typeof import("../../../src/integrations/github/trusted-github").runBoundGitHubCommand;
+const mockRunBoundGitHubCommand = jest.fn<
+  ReturnType<RunBoundGitHubCommand>,
+  Parameters<RunBoundGitHubCommand>
+>();
+
+jest.mock("../../../src/integrations/github/trusted-github", () => ({
+  ...jest.requireActual<object>("../../../src/integrations/github/trusted-github"),
+  runBoundGitHubCommand: (...args: Parameters<RunBoundGitHubCommand>) =>
+    mockRunBoundGitHubCommand(...args),
+}));
+
 import { loadAdapter } from "../../../src/core/adapter-loader";
 import {
   syncDispatchStarted,
   syncLifecycleEvent,
 } from "../../../src/integrations/github/status-syncer";
-import type { GitHubConfig, SyncEvent } from "../../../src/integrations/github/github-types";
-import { writeTestAdapter } from "../../helpers/divergent-task-fixture";
 
-const mockExecCommands: string[] = [];
+const PROJECT_ROOT = "C:\\trusted\\project";
+const REPOSITORY = { host: "github.com", owner: "myorg", repo: "myrepo" };
+let issueEditArgs: string[][] = [];
+let currentLabels = new Set<string>();
+let comments: Array<{ url: string; body: string }> = [];
 
-jest.mock("../../../src/integrations/github/gh-cli", () => ({
-  runGh: jest.fn((args: string[]) => {
-    const command = [
-      "gh",
-      ...args.map((arg, index) =>
-        ["--add-label", "--remove-label", "--title", "--label"].includes(args[index - 1])
-          ? `"${arg}"`
-          : arg,
-      ),
-    ].join(" ");
-    mockExecCommands.push(command);
-    return Promise.resolve({ stdout: "", stderr: "" });
-  }),
-}));
+function installGitHubMock(): void {
+  let nextCommentId = 100;
+  mockRunBoundGitHubCommand.mockImplementation(
+    (
+      _root: string,
+      _config: GitHubConfig,
+      args: readonly string[],
+      options?: { input?: string },
+    ) => {
+      if (args[0] === "issue" && args[1] === "edit") {
+        issueEditArgs.push([...args]);
+        for (const arg of args) {
+          if (arg.startsWith("--add-label=")) currentLabels.add(arg.slice(12));
+          if (arg.startsWith("--remove-label=")) currentLabels.delete(arg.slice(15));
+        }
+        return Promise.resolve({ exitCode: 0, stdout: "", stderr: "", repository: REPOSITORY });
+      }
+      if (args[0] === "issue" && args[1] === "comment") {
+        const url = `https://github.com/myorg/myrepo/issues/42#issuecomment-${nextCommentId++}`;
+        comments.push({ url, body: options?.input ?? "" });
+        return Promise.resolve({
+          exitCode: 0,
+          stdout: `${url}\n`,
+          stderr: "",
+          repository: REPOSITORY,
+        });
+      }
+      if (args[0] === "issue" && args[1] === "view") {
+        return Promise.resolve({
+          exitCode: 0,
+          stdout: JSON.stringify({
+            number: 42,
+            url: "https://github.com/myorg/myrepo/issues/42",
+            labels: [...currentLabels].map((name) => ({ name })),
+            comments,
+          }),
+          stderr: "",
+          repository: REPOSITORY,
+        });
+      }
+      return Promise.reject(new Error(`Unexpected GitHub args: ${args.join(" ")}`));
+    },
+  );
+}
 
 describe("Status Syncer", () => {
   const baseConfig: GitHubConfig = {
@@ -45,83 +93,64 @@ describe("Status Syncer", () => {
   };
 
   beforeEach(() => {
-    mockExecCommands.length = 0;
+    issueEditArgs = [];
+    currentLabels = new Set<string>();
+    comments = [];
+    mockRunBoundGitHubCommand.mockReset();
+    installGitHubMock();
   });
 
-  it("syncs gate_passed to the configured ready label", async () => {
+  it("syncs gate_passed to the configured ready label and confirms readback", async () => {
     const event: SyncEvent = {
       type: "gate_passed",
       taskId: "TASK-051",
       timestamp: "2026-08-17T12:00:00.000Z",
     };
 
-    await syncLifecycleEvent(42, event, baseConfig);
+    await syncLifecycleEvent(42, event, baseConfig, PROJECT_ROOT);
 
-    const issueEditCommands = mockExecCommands.filter((command) =>
-      command.startsWith("gh issue edit "),
-    );
-    expect(issueEditCommands).toHaveLength(1);
-    expect(issueEditCommands).toEqual([
-      'gh issue edit 42 --repo myorg/myrepo --add-label "task-1342-ready-sentinel"',
+    expect(issueEditArgs).toEqual([
+      ["issue", "edit", "42", "--add-label=task-1342-ready-sentinel"],
     ]);
+    expect(comments).toHaveLength(1);
+    expect(mockRunBoundGitHubCommand.mock.calls.every((call) => call[0] === PROJECT_ROOT)).toBe(
+      true,
+    );
   });
 
   it("syncs dispatch_started to configured in-progress and ready labels", async () => {
+    currentLabels.add("task-1342-ready-sentinel");
     const event: SyncEvent = {
       type: "dispatch_started",
       taskId: "TASK-051",
       timestamp: "2026-08-17T12:00:00.000Z",
     };
 
-    await syncLifecycleEvent(42, event, baseConfig);
+    await syncLifecycleEvent(42, event, baseConfig, PROJECT_ROOT);
 
-    const issueEditCommands = mockExecCommands.filter((command) =>
-      command.startsWith("gh issue edit "),
-    );
-    expect(issueEditCommands).toHaveLength(2);
-    expect(issueEditCommands).toEqual([
-      'gh issue edit 42 --repo myorg/myrepo --add-label "task-1342-in-progress-sentinel"',
-      'gh issue edit 42 --repo myorg/myrepo --remove-label "task-1342-ready-sentinel"',
+    expect(issueEditArgs).toEqual([
+      ["issue", "edit", "42", "--add-label=task-1342-in-progress-sentinel"],
+      ["issue", "edit", "42", "--remove-label=task-1342-ready-sentinel"],
     ]);
   });
 
-  it("syncs an approved dispatch_complete to configured labels", async () => {
+  it.each([
+    ["approved", "task-1342-approved-sentinel"],
+    ["rejected", "task-1342-rejected-sentinel"],
+  ])("syncs a %s dispatch_complete to configured labels", async (outcome, outcomeLabel) => {
+    currentLabels.add("task-1342-in-progress-sentinel");
     const event: SyncEvent = {
       type: "dispatch_complete",
       taskId: "TASK-051",
       timestamp: "2026-08-17T12:00:00.000Z",
-      data: { outcome: "approved" },
+      data: { outcome, feedback: "Missing tests" },
     };
 
-    await syncLifecycleEvent(42, event, baseConfig);
+    await syncLifecycleEvent(42, event, baseConfig, PROJECT_ROOT);
 
-    const issueEditCommands = mockExecCommands.filter((command) =>
-      command.startsWith("gh issue edit "),
-    );
-    expect(issueEditCommands).toHaveLength(2);
-    expect(issueEditCommands).toEqual([
-      'gh issue edit 42 --repo myorg/myrepo --add-label "task-1342-approved-sentinel"',
-      'gh issue edit 42 --repo myorg/myrepo --remove-label "task-1342-in-progress-sentinel"',
-    ]);
-  });
-
-  it("syncs a rejected dispatch_complete to configured labels", async () => {
-    const event: SyncEvent = {
-      type: "dispatch_complete",
-      taskId: "TASK-051",
-      timestamp: "2026-08-17T12:00:00.000Z",
-      data: { outcome: "rejected", feedback: "Missing tests" },
-    };
-
-    await syncLifecycleEvent(42, event, baseConfig);
-
-    const issueEditCommands = mockExecCommands.filter((command) =>
-      command.startsWith("gh issue edit "),
-    );
-    expect(issueEditCommands).toHaveLength(2);
-    expect(issueEditCommands).toEqual([
-      'gh issue edit 42 --repo myorg/myrepo --add-label "task-1342-rejected-sentinel"',
-      'gh issue edit 42 --repo myorg/myrepo --remove-label "task-1342-in-progress-sentinel"',
+    expect(issueEditArgs).toEqual([
+      ["issue", "edit", "42", `--add-label=${outcomeLabel}`],
+      ["issue", "edit", "42", "--remove-label=task-1342-in-progress-sentinel"],
     ]);
   });
 
@@ -129,16 +158,7 @@ describe("Status Syncer", () => {
     const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "quack-status-syncer-report-back-"));
 
     try {
-      writeTestAdapter(projectRoot, {
-        reportBack: false,
-        labels: {
-          ready: "task-1342-disabled-ready-sentinel",
-          inProgress: "task-1342-disabled-in-progress-sentinel",
-          approved: "task-1342-disabled-approved-sentinel",
-          rejected: "task-1342-disabled-rejected-sentinel",
-          task: "task-1342-disabled-task-sentinel",
-        },
-      });
+      writeTestAdapter(projectRoot, { reportBack: false });
       const syncPath = path.join(projectRoot, ".quack", "sync", "github-sync.json");
       const originalSyncMap = JSON.stringify(
         {
@@ -161,32 +181,26 @@ describe("Status Syncer", () => {
       fs.writeFileSync(syncPath, originalSyncMap, "utf-8");
       const adapter = await loadAdapter(projectRoot);
 
-      await syncDispatchStarted("TASK-051", "task-1342-model-sentinel", 1, adapter.config);
+      await syncDispatchStarted(
+        "TASK-051",
+        "task-1342-model-sentinel",
+        1,
+        adapter.config,
+        adapter.projectRoot,
+      );
 
-      expect(mockExecCommands).toHaveLength(0);
-      expect(mockExecCommands).toEqual([]);
+      expect(mockRunBoundGitHubCommand).not.toHaveBeenCalled();
       expect(fs.readFileSync(syncPath, "utf-8")).toBe(originalSyncMap);
     } finally {
       fs.rmSync(projectRoot, { recursive: true, force: true });
     }
   });
 
-  it("uses every default label through production when labels config is missing", async () => {
-    const config: GitHubConfig = {
-      owner: "myorg",
-      repo: "myrepo",
-    };
+  it("uses every default label when labels config is missing", async () => {
+    const config: GitHubConfig = { owner: "myorg", repo: "myrepo" };
     const events: SyncEvent[] = [
-      {
-        type: "gate_passed",
-        taskId: "TASK-051",
-        timestamp: "2026-08-17T12:00:00.000Z",
-      },
-      {
-        type: "dispatch_started",
-        taskId: "TASK-051",
-        timestamp: "2026-08-17T12:00:00.000Z",
-      },
+      { type: "gate_passed", taskId: "TASK-051", timestamp: "2026-08-17T12:00:00.000Z" },
+      { type: "dispatch_started", taskId: "TASK-051", timestamp: "2026-08-17T12:00:00.000Z" },
       {
         type: "dispatch_complete",
         taskId: "TASK-051",
@@ -201,22 +215,45 @@ describe("Status Syncer", () => {
       },
     ];
 
-    for (const event of events) {
-      await syncLifecycleEvent(42, event, config);
-    }
+    for (const event of events) await syncLifecycleEvent(42, event, config, PROJECT_ROOT);
 
-    const issueEditCommands = mockExecCommands.filter((command) =>
-      command.startsWith("gh issue edit "),
-    );
-    expect(issueEditCommands).toHaveLength(7);
-    expect(issueEditCommands).toEqual([
-      'gh issue edit 42 --repo myorg/myrepo --add-label "quack-ready"',
-      'gh issue edit 42 --repo myorg/myrepo --add-label "quack-in-progress"',
-      'gh issue edit 42 --repo myorg/myrepo --remove-label "quack-ready"',
-      'gh issue edit 42 --repo myorg/myrepo --add-label "quack-approved"',
-      'gh issue edit 42 --repo myorg/myrepo --remove-label "quack-in-progress"',
-      'gh issue edit 42 --repo myorg/myrepo --add-label "quack-rejected"',
-      'gh issue edit 42 --repo myorg/myrepo --remove-label "quack-in-progress"',
+    expect(issueEditArgs).toEqual([
+      ["issue", "edit", "42", "--add-label=quack-ready"],
+      ["issue", "edit", "42", "--add-label=quack-in-progress"],
+      ["issue", "edit", "42", "--remove-label=quack-ready"],
+      ["issue", "edit", "42", "--add-label=quack-approved"],
+      ["issue", "edit", "42", "--remove-label=quack-in-progress"],
+      ["issue", "edit", "42", "--add-label=quack-rejected"],
+      ["issue", "edit", "42", "--remove-label=quack-in-progress"],
     ]);
+  });
+
+  it("fails closed when label readback does not confirm the mutation", async () => {
+    mockRunBoundGitHubCommand
+      .mockReset()
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "", stderr: "", repository: REPOSITORY })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          number: 42,
+          url: "https://github.com/myorg/myrepo/issues/42",
+          labels: [],
+        }),
+        stderr: "",
+        repository: REPOSITORY,
+      });
+
+    await expect(
+      syncLifecycleEvent(
+        42,
+        {
+          type: "gate_passed",
+          taskId: "TASK-051",
+          timestamp: "2026-08-17T12:00:00.000Z",
+        },
+        baseConfig,
+        PROJECT_ROOT,
+      ),
+    ).rejects.toThrow("did not confirm addition");
   });
 });

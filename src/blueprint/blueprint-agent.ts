@@ -1,3 +1,4 @@
+import { getClaudeSdkEnvironment } from "../sdk/claude-auth.js";
 // ─── Blueprint Agent Runner ────────────────────────────────────────
 // Runs a read-only agent session that analyzes the codebase and produces
 // a structured Blueprint with code-level implementation details.
@@ -12,6 +13,8 @@ import type { Blueprint, BriefBaseValidation, BriefHandBackItem } from "./bluepr
 import { buildBlueprintPrompt } from "./blueprint-prompt.js";
 import { stampBriefFidelity } from "./fidelity.js";
 import { getSdkPermissionOptions } from "../sdk/permission-mode.js";
+import { runCodexStructuredEvaluation } from "../llm/codex-structured-evaluator.js";
+import type { ModelProvenance } from "../review/reviewer-types.js";
 
 /**
  * Minimal SDK result message shape used for type narrowing.
@@ -69,6 +72,123 @@ export function _setQueryFn(fn: QueryFn | undefined): void {
 /** Default model for blueprint generation -- Sonnet is cost-effective */
 const DEFAULT_MODEL = "claude-sonnet-4-6";
 
+const BLUEPRINT_RESPONSE_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    taskId: { type: "string" },
+    fileAnalyses: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          filePath: { type: "string" },
+          action: { type: "string", enum: ["Create", "Modify", "Delete", "Reference"] },
+          currentStructure: { type: "string" },
+          integrationPoints: { type: "string" },
+          patternToFollow: { type: "string" },
+        },
+        required: [
+          "filePath",
+          "action",
+          "currentStructure",
+          "integrationPoints",
+          "patternToFollow",
+        ],
+        additionalProperties: false,
+      },
+    },
+    codeExamples: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          file: { type: "string" },
+          description: { type: "string" },
+          before: { type: "string" },
+          after: { type: "string" },
+        },
+        required: ["file", "description", "before", "after"],
+        additionalProperties: false,
+      },
+    },
+    verificationPatterns: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          criterion: { type: "string" },
+          checkType: {
+            type: "string",
+            enum: ["grep", "grep_count", "file_exists", "file_not_exists"],
+          },
+          pattern: { type: "string" },
+          fileGlob: { type: "string" },
+          expectedMatches: { type: "number" },
+          mandatedCheck: { type: "string" },
+        },
+        required: ["criterion", "checkType", "pattern", "fileGlob"],
+        additionalProperties: false,
+      },
+    },
+    antiPatterns: { type: "array", items: { type: "string" } },
+    preconditions: { type: "array", items: { type: "string" } },
+    baseValidation: {
+      type: "object",
+      properties: { observations: { type: "array", items: { type: "string" } } },
+      required: ["observations"],
+      additionalProperties: false,
+    },
+    handBack: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          summary: { type: "string" },
+          detail: { type: "string" },
+          anchors: { type: "array", items: { type: "string" } },
+        },
+        required: ["summary"],
+        additionalProperties: false,
+      },
+    },
+    constraints: { type: "array", items: { type: "string" } },
+    testsToRebaseline: { type: "array", items: { type: "string" } },
+    importsToUse: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          symbol: { type: "string" },
+          fromFile: { type: "string" },
+          kind: { type: "string", enum: ["value", "type"] },
+        },
+        required: ["symbol", "fromFile"],
+        additionalProperties: false,
+      },
+    },
+    entryPoints: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { symbol: { type: "string" }, file: { type: "string" } },
+        required: ["symbol", "file"],
+        additionalProperties: false,
+      },
+    },
+    specFacts: { type: "array", items: { type: "string" } },
+    mandatedChecks: { type: "array", items: { type: "string" } },
+  },
+  required: [
+    "taskId",
+    "fileAnalyses",
+    "codeExamples",
+    "verificationPatterns",
+    "antiPatterns",
+    "preconditions",
+  ],
+  additionalProperties: false,
+};
+
 /**
  * Generates an implementation blueprint by running a read-only agent session
  * that scans the codebase and produces code-level integration details.
@@ -91,8 +211,46 @@ export async function generateBlueprint(
 ): Promise<Blueprint> {
   const prompt = buildBlueprintPrompt(task, adapter.conventionsDoc);
 
-  const model = options?.model ?? adapter.config.agent.enrichModel ?? DEFAULT_MODEL;
+  const evaluator = adapter.config.evaluationProviders?.blueprint;
+  const model =
+    options?.model ?? evaluator?.model ?? adapter.config.agent.enrichModel ?? DEFAULT_MODEL;
   const maxTurns = options?.maxTurns ?? 25;
+  const producerProvenance: ModelProvenance =
+    evaluator?.runner === "codex-cli"
+      ? {
+          runner: "codex-cli",
+          ...(evaluator.codex.provider ? { provider: evaluator.codex.provider } : {}),
+          model,
+        }
+      : { runner: "claude-sdk", provider: "anthropic", model };
+
+  if (evaluator?.runner === "codex-cli") {
+    const result = await runCodexStructuredEvaluation(
+      {
+        projectRoot: adapter.projectRoot,
+        model,
+        prompt: `${prompt}\n\nUse read-only shell commands to inspect the repository. Return only the JSON object required above.`,
+        outputSchema: BLUEPRINT_RESPONSE_SCHEMA,
+        parse: extractBlueprintJson,
+      },
+      evaluator,
+    );
+    if (result.status === "completed") {
+      return stampBriefFidelity(
+        stampBriefProvenance(result.value, adapter.projectRoot, producerProvenance),
+        adapter.projectRoot,
+        task.mandatedChecks,
+      );
+    }
+    console.warn(
+      `Codex blueprint evaluation failed (${result.errorKind}: ${result.message}). Falling back to minimal blueprint.`,
+    );
+    return stampBriefFidelity(
+      createMinimalBlueprint(task.id),
+      adapter.projectRoot,
+      task.mandatedChecks,
+    );
+  }
 
   const queryFn = await getQueryFn();
 
@@ -104,6 +262,7 @@ export async function generateBlueprint(
       allowedTools: ["Read", "Glob", "Grep"],
       disallowedTools: ["Edit", "Write", "Bash", "WebSearch", "WebFetch"],
       ...getSdkPermissionOptions(),
+      env: getClaudeSdkEnvironment(adapter.config.agent.apiKeys),
       model,
       maxTurns,
       cwd: adapter.projectRoot,
@@ -136,7 +295,7 @@ export async function generateBlueprint(
           if (blueprint) {
             // TASK-1306: stamp brief provenance in code — only on a REAL
             // parse (the minimal fallback is not a brief).
-            return stampBriefProvenance(blueprint, adapter.projectRoot);
+            return stampBriefProvenance(blueprint, adapter.projectRoot, producerProvenance);
           }
 
           console.warn(
@@ -173,11 +332,16 @@ export async function generateBlueprint(
     return stampBriefFidelity(
       await Promise.race([iterateGenerator(), timeoutPromise]),
       adapter.projectRoot,
+      task.mandatedChecks,
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`Blueprint generation failed: ${msg}. Falling back to minimal blueprint.`);
-    return stampBriefFidelity(createMinimalBlueprint(task.id), adapter.projectRoot);
+    return stampBriefFidelity(
+      createMinimalBlueprint(task.id),
+      adapter.projectRoot,
+      task.mandatedChecks,
+    );
   }
 }
 
@@ -259,13 +423,16 @@ export function validateBlueprint(obj: unknown): Blueprint | null {
   const importsToUse = normalizeDirectives(bp.importsToUse, "symbol", "fromFile");
   const entryPoints = normalizeDirectives(bp.entryPoints, "symbol", "file");
   const specFacts = normalizeStringArray(bp.specFacts);
+  const mandatedChecks = normalizeStringArray(bp.mandatedChecks);
+  const verificationPatterns = normalizeVerificationPatterns(bp.verificationPatterns);
   const fidelity = normalizeFidelity(bp.fidelity);
+  const producerProvenance = normalizeProducerProvenance(bp.producerProvenance);
 
   return {
     taskId: bp.taskId,
     fileAnalyses: bp.fileAnalyses ?? [],
     codeExamples: bp.codeExamples ?? [],
-    verificationPatterns: bp.verificationPatterns ?? [],
+    verificationPatterns,
     antiPatterns: bp.antiPatterns ?? [],
     preconditions: bp.preconditions ?? [],
     ...(typeof bp.briefSchemaVersion === "number"
@@ -275,14 +442,53 @@ export function validateBlueprint(obj: unknown): Blueprint | null {
       ? { generatedAt: bp.generatedAt }
       : {}),
     ...(baseValidation ? { baseValidation } : {}),
+    ...(producerProvenance ? { producerProvenance } : {}),
     ...(handBack ? { handBack } : {}),
     ...(constraints ? { constraints } : {}),
     ...(testsToRebaseline ? { testsToRebaseline } : {}),
     ...(importsToUse ? { importsToUse } : {}),
     ...(entryPoints ? { entryPoints } : {}),
     ...(specFacts ? { specFacts } : {}),
+    ...(mandatedChecks ? { mandatedChecks } : {}),
     ...(fidelity ? { fidelity } : {}),
   };
+}
+
+/**
+ * Normalize verification patterns at the JSON/cache boundary. TASK-1325's
+ * optional mandatedCheck link is carried byte-for-byte when non-blank;
+ * malformed pattern entries are dropped under the existing tolerant contract.
+ */
+function normalizeVerificationPatterns(raw: unknown): Blueprint["verificationPatterns"] {
+  if (!Array.isArray(raw)) return [];
+  const checkTypes = new Set(["grep", "grep_count", "file_exists", "file_not_exists"]);
+  const patterns: Blueprint["verificationPatterns"] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const record = entry as Record<string, unknown>;
+    if (
+      typeof record.criterion !== "string" ||
+      typeof record.checkType !== "string" ||
+      !checkTypes.has(record.checkType) ||
+      typeof record.pattern !== "string" ||
+      typeof record.fileGlob !== "string"
+    ) {
+      continue;
+    }
+    patterns.push({
+      criterion: record.criterion,
+      checkType: record.checkType as Blueprint["verificationPatterns"][number]["checkType"],
+      pattern: record.pattern,
+      fileGlob: record.fileGlob,
+      ...(typeof record.expectedMatches === "number"
+        ? { expectedMatches: record.expectedMatches }
+        : {}),
+      ...(typeof record.mandatedCheck === "string" && record.mandatedCheck.trim().length > 0
+        ? { mandatedCheck: record.mandatedCheck }
+        : {}),
+    });
+  }
+  return patterns;
 }
 
 /**
@@ -333,25 +539,42 @@ function normalizeFidelity(value: unknown): Blueprint["fidelity"] {
   if (record.status !== "ok" && record.status !== "failed") return undefined;
   if (!Array.isArray(record.violations)) return undefined;
   const violations = record.violations.filter(
-    (
-      v,
-    ): v is {
-      kind: "missing_file" | "unexported_symbol" | "type_only_export" | "empty_brief";
-      detail: string;
-      anchor?: string;
-    } =>
+    (v): v is NonNullable<Blueprint["fidelity"]>["violations"][number] =>
       typeof v === "object" &&
       v !== null &&
-      ["missing_file", "unexported_symbol", "type_only_export", "empty_brief"].includes(
-        (v as Record<string, unknown>).kind as string,
-      ) &&
+      [
+        "missing_file",
+        "unexported_symbol",
+        "type_only_export",
+        "empty_brief",
+        "mandated_check_softened",
+      ].includes((v as Record<string, unknown>).kind as string) &&
       typeof (v as Record<string, unknown>).detail === "string",
   );
+  const scope =
+    record.scope === "typed-surface+file-existence+mandated-checks"
+      ? record.scope
+      : "typed-surface+file-existence";
   return {
     status: record.status,
     violations,
     checkedAt: typeof record.checkedAt === "string" ? record.checkedAt : "",
-    scope: "typed-surface+file-existence",
+    scope,
+  };
+}
+
+/** Carry only a pipeline-stamped producer identity through cache rehydration. */
+function normalizeProducerProvenance(value: unknown): ModelProvenance | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.runner !== "claude-sdk" && record.runner !== "codex-cli") return undefined;
+  const provider =
+    typeof record.provider === "string" && record.provider.trim() ? record.provider : undefined;
+  const model = typeof record.model === "string" && record.model.trim() ? record.model : undefined;
+  return {
+    runner: record.runner,
+    ...(provider ? { provider } : {}),
+    ...(model ? { model } : {}),
   };
 }
 
@@ -363,13 +586,18 @@ function normalizeFidelity(value: unknown): Blueprint["fidelity"] {
  * agent observations are preserved. Git failure degrades to absent provenance
  * (observations kept when present) and never throws.
  */
-export function stampBriefProvenance(blueprint: Blueprint, projectRoot: string): Blueprint {
+export function stampBriefProvenance(
+  blueprint: Blueprint,
+  projectRoot: string,
+  producerProvenance?: ModelProvenance,
+): Blueprint {
   const now = new Date().toISOString();
   const observations = blueprint.baseValidation?.observations ?? [];
   const stamped: Blueprint = {
     ...blueprint,
     briefSchemaVersion: 1,
     generatedAt: now,
+    ...(producerProvenance ? { producerProvenance } : {}),
   };
 
   try {

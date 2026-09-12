@@ -17,6 +17,7 @@ import { queueCommand } from "./cli/queue.js";
 import { decomposeCommand } from "./cli/decompose.js";
 import { handleImport } from "./cli/import.js";
 import { handlePublish } from "./cli/publish.js";
+import { migrateGitHubSyncMap } from "./cli/migrate-github-sync-map.js";
 import { handleSync } from "./cli/sync.js";
 import { templatesCommand } from "./cli/templates.js";
 import { reviseCommand } from "./cli/revise.js";
@@ -25,6 +26,7 @@ import { overnightCommand } from "./cli/overnight.js";
 import { repairDbCommand } from "./cli/repair-db.js";
 import { repairSpecsCommand } from "./cli/repair-specs.js";
 import { repairStateCommand } from "./cli/repair-state.js";
+import { repairFederationLockCommand } from "./cli/repair-federation-lock.js";
 import { workerEnrollCommand, workerInstallCommand, workerRuntimeCommand } from "./cli/worker.js";
 
 const program = new Command();
@@ -316,7 +318,7 @@ program
   .option("--drafts-file <path>", "Path to drafts JSON from a previous materialize run")
   .option("--review-acknowledged", "Acknowledge child draft review (required for finalize)")
   .option("--enqueue", "Enqueue subtasks in dispatch queue after finalize")
-  .option("--max-subtasks <n>", "Max subtasks to generate (default: 4)", parseInt)
+  .option("--max-subtasks <n>", "Max subtasks to generate, 2-6 (default: 4)", parseInt)
   .option("--port <n>", "Monitor server port for enqueue (default: 3333)", parseInt)
   .action(
     (
@@ -347,7 +349,7 @@ program
   .option("--write", "Write repaired specs back to disk (default: dry-run report)")
   .option("--json", "Output a JSON report")
   .action((dir: string, options: { write?: boolean; json?: boolean }) => {
-    repairSpecsCommand(dir, options);
+    void repairSpecsCommand(dir, options);
   });
 
 program
@@ -399,6 +401,29 @@ program
       apply?: boolean;
     }) => {
       void repairStateCommand(options);
+    },
+  );
+
+program
+  .command("repair-federation-lock <jobId>")
+  .description("Inspect or explicitly recover one stale pre-v2 federation lock while offline")
+  .option("--project <path>", "Path to project root (default: cwd)")
+  .option("--stale-ms <milliseconds>", "Minimum lock age (default: 30000)")
+  .option("--apply", "Apply the inspected recovery transaction")
+  .option("--confirm-offline", "Attest every Quack process sharing the project is stopped")
+  .option("--expected-fingerprint <sha256>", "Bind apply to the exact dry-run evidence")
+  .action(
+    (
+      jobId: string,
+      options: {
+        project?: string;
+        staleMs?: string;
+        apply?: boolean;
+        confirmOffline?: boolean;
+        expectedFingerprint?: string;
+      },
+    ) => {
+      void repairFederationLockCommand(jobId, options);
     },
   );
 
@@ -460,6 +485,15 @@ program
   .option("--project <path>", "Path to project root (default: cwd)")
   .action((taskId: string | undefined, options: { allBacklog?: boolean; project?: string }) => {
     void handlePublish({ taskId, ...options });
+  });
+
+program
+  .command("migrate-github-sync-map")
+  .description("Migrate legacy GitHub sync-map task ids to declared ids")
+  .requiredOption("--project <path>", "Path to the project root")
+  .option("--dry-run", "Print the exact report without writing map or report files")
+  .action((options: { project: string; dryRun?: boolean }) => {
+    void migrateGitHubSyncMap(options);
   });
 
 program
@@ -556,7 +590,10 @@ program
     "--no-auto-decompose",
     "Do not automatically write subtasks when preflight recommends decomposition",
   )
-  .option("--max-subtasks <n>", "Maximum subtasks to generate when auto-decomposing (default: 4)")
+  .option(
+    "--max-subtasks <n>",
+    "Maximum subtasks to generate when auto-decomposing, 2-6 (default: 4)",
+  )
   .option("--no-verify-after-dispatch", "Do not call the verify API after approved dispatches")
   .option("--full-gate", "Do not skip the gate on dispatch, even after prep passes")
   .option("--allow-parse-errors", "Warn/checkpoint parse errors instead of halting")

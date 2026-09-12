@@ -1,7 +1,9 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { declaredTaskIdFromSpec } from "../core/task-spec-declaration.js";
 
 import type { TaskStatusRow } from "../db/types.js";
+import type { ProjectAdapter } from "../core/adapter-loader.js";
 import { updateTaskStatus } from "../dispatcher/lifecycle-manager.js";
 import { normalizeTaskStatus, type TaskStatus } from "../core/task-status.js";
 
@@ -31,9 +33,8 @@ export interface ReconcileSpecStatusResult {
 
 export interface ReconcileSpecStatusOptions {
   apply?: boolean;
+  adapter?: ProjectAdapter;
 }
-
-const TASK_FILE_RE = /^(TASK-\d+(?:-[A-Z]+)?)(?=-|\.|$)/;
 
 export function parseSpecStatus(content: string): ParsedSpecStatus {
   const statusLineMatch = content.match(/^\s*-\s*\*\*Status:\*\*\s*(.+)\s*$/im);
@@ -68,9 +69,10 @@ async function buildTaskFileIndex(taskDir: string): Promise<Map<string, string>>
     if (!entry.isFile() || !entry.name.endsWith(".md")) {
       continue;
     }
-    const match = entry.name.match(TASK_FILE_RE);
-    if (!match) continue;
-    index.set(match[1].toUpperCase(), path.join(taskDir, entry.name));
+    const filePath = path.join(taskDir, entry.name);
+    const content = await fs.readFile(filePath, "utf-8");
+    const taskId = declaredTaskIdFromSpec(content, { allowLegacyIds: true });
+    if (taskId) index.set(taskId, filePath);
   }
 
   return index;
@@ -140,7 +142,14 @@ export async function reconcileSpecStatuses(
         failedToFix.push(item.taskId);
         continue;
       }
-      const updated = await updateTaskStatus(item.taskId, taskDir, item.dbStatus);
+      const updated = await updateTaskStatus(
+        item.taskId,
+        taskDir,
+        item.dbStatus,
+        undefined,
+        options.adapter,
+        item.dbStatus === "COMPLETE",
+      );
       if (updated) {
         fixed.push(item.taskId);
       } else {

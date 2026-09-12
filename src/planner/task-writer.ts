@@ -2,9 +2,21 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { ProjectAdapter } from "../core/adapter-loader.js";
+import { listTaskClaimantDeclarations } from "../core/task-file-resolver.js";
 import { matchTaskHeading, parseTaskFile, TaskParseError } from "../core/task-parser.js";
+import {
+  assertTaskCreationIdsAvailable,
+  readTaskCreationClaimants,
+  TaskCreationIdentityConflictError,
+  withTaskCreationReservation,
+} from "../core/task-creation-reservation.js";
 import { validateTaskSchema } from "../gate/schema-validator.js";
 import type { FileModification, TaskPriority, TaskStatus } from "../core/types.js";
+import { recoverPendingTaskSpecMutationsWithinReservation } from "../preflight/decomposition-transaction-journal.js";
+import {
+  removeDecompositionFileIfExact,
+  writeDecompositionFileAtomicExclusive,
+} from "../preflight/decomposition-file-io.js";
 
 /**
  * Parsed task spec structure from planner agent.
@@ -59,7 +71,10 @@ export class TaskCreateValidationError extends Error {
 }
 
 export class TaskCreateConflictError extends Error {
-  constructor(public readonly conflictIds: string[]) {
+  constructor(
+    public readonly conflictIds: string[],
+    public readonly claimants: Record<string, string[]> = {},
+  ) {
     super(`Task ID conflict: ${conflictIds.join(", ")}`);
     this.name = "TaskCreateConflictError";
   }
@@ -122,26 +137,6 @@ export async function writeTaskFilesWithResult(
     }
   }
 
-  // Phase 2: Cross-validate dependency references against existing + generated IDs
-  if (validationErrors.length === 0) {
-    const existingIds = await getExistingTaskIds(taskDir);
-    const generatedIds = new Set(taskSpecs.map((s) => s.id));
-    const allValidIds = new Set([...existingIds, ...generatedIds]);
-
-    for (const spec of taskSpecs) {
-      const parsed = parseTaskFile(spec.content);
-      const depErrors: string[] = [];
-      for (const dep of [...parsed.blockedBy, ...parsed.blocks]) {
-        if (!allValidIds.has(dep)) {
-          depErrors.push(`Dependency ${dep} references non-existent task ID`);
-        }
-      }
-      if (depErrors.length > 0) {
-        validationErrors.push({ taskId: spec.id, errors: depErrors });
-      }
-    }
-  }
-
   if (validationErrors.length > 0) {
     const errorMessages = validationErrors
       .map((err) => `${err.taskId}:\n  ${err.errors.join("\n  ")}`)
@@ -151,59 +146,123 @@ export async function writeTaskFilesWithResult(
     );
   }
 
-  // Phase 3: Write with lock to prevent concurrent ID collisions
-  const lockPath = path.join(taskDir, ".plan.lock");
+  const duplicateIds = findDuplicates(taskSpecs.map((spec) => spec.id));
+  if (duplicateIds.length > 0) {
+    throw new TaskCreateConflictError(duplicateIds);
+  }
+
+  // Preserve the legacy planner lock as an explicit compatibility refusal.
+  // All current creators coordinate through the shared reservation below.
+  const legacyLockPath = path.join(taskDir, ".plan.lock");
   try {
-    await fs.writeFile(lockPath, `${process.pid}\n${new Date().toISOString()}`, { flag: "wx" });
-  } catch {
-    throw new Error(`Another plan operation is in progress. If stale, delete ${lockPath}`);
+    await fs.stat(legacyLockPath);
+    throw new Error(`Another plan operation is in progress. If stale, delete ${legacyLockPath}`);
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
   }
 
   const plannedWrites = taskSpecs.map((spec) => {
     const fileName = `${spec.id}-${slugify(extractTitle(spec.content))}.md`;
     const filePath = path.join(taskDir, fileName);
-    const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-    return { spec, filePath, tempPath };
+    return { spec, filePath };
   });
   const createdFinalPaths: string[] = [];
 
-  try {
-    const writtenIds: string[] = [];
-
-    const conflictIds = new Set<string>();
-    for (const planned of plannedWrites) {
-      try {
-        await fs.stat(planned.filePath);
-        conflictIds.add(planned.spec.id);
-      } catch {
-        // file doesn't exist
+  return withTaskCreationReservation(
+    taskDir,
+    {
+      creator: "planner",
+      requestedIds: taskSpecs.map((spec) => spec.id),
+    },
+    async () => {
+      await recoverPendingTaskSpecMutationsWithinReservation(adapter);
+      // Recovery can remove a partially-created child or restore a parent, so
+      // dependency existence must be evaluated from the reserved post-recovery
+      // namespace rather than from the earlier optimistic snapshot.
+      const existingIds = await getExistingTaskIds(taskDir);
+      const generatedIds = new Set(taskSpecs.map((spec) => spec.id));
+      const allValidIds = new Set([...existingIds, ...generatedIds]);
+      const dependencyErrors: TaskValidationError[] = [];
+      for (const spec of taskSpecs) {
+        const parsed = parseTaskFile(spec.content);
+        const errors = [...parsed.blockedBy, ...parsed.blocks]
+          .filter((dependency) => !allValidIds.has(dependency))
+          .map((dependency) => `Dependency ${dependency} references non-existent task ID`);
+        if (errors.length > 0) dependencyErrors.push({ taskId: spec.id, errors });
       }
-    }
-    if (conflictIds.size > 0) {
-      throw new TaskCreateConflictError(Array.from(conflictIds).sort());
-    }
+      if (dependencyErrors.length > 0) {
+        const messages = dependencyErrors
+          .map((entry) => `${entry.taskId}:\n  ${entry.errors.join("\n  ")}`)
+          .join("\n\n");
+        throw new Error(
+          `Task validation failed for ${dependencyErrors.length} task(s):\n\n${messages}`,
+        );
+      }
+      const writtenIds: string[] = [];
 
-    for (const planned of plannedWrites) {
-      await fs.writeFile(planned.tempPath, planned.spec.content, "utf-8");
-    }
+      const conflictIds = new Set<string>();
+      for (const planned of plannedWrites) {
+        try {
+          await fs.stat(planned.filePath);
+          conflictIds.add(planned.spec.id);
+        } catch (err: unknown) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        }
+      }
+      if (conflictIds.size > 0) {
+        throw new TaskCreateConflictError(Array.from(conflictIds).sort());
+      }
 
-    for (const planned of plannedWrites) {
-      await fs.rename(planned.tempPath, planned.filePath);
-      writtenIds.push(planned.spec.id);
-      createdFinalPaths.push(planned.filePath);
-    }
-    return { taskIds: writtenIds, filePaths: [...createdFinalPaths] };
-  } catch (err) {
-    for (const planned of plannedWrites) {
-      await fs.unlink(planned.tempPath).catch(() => {});
-    }
-    for (const filePath of createdFinalPaths) {
-      await fs.unlink(filePath).catch(() => {});
-    }
-    throw err;
-  } finally {
-    await fs.unlink(lockPath).catch(() => {});
-  }
+      try {
+        const claimants = await readTaskCreationClaimants(taskDir);
+        assertTaskCreationIdsAvailable(
+          claimants,
+          plannedWrites.map(({ spec, filePath }) => ({
+            taskId: spec.id,
+            fileName: path.basename(filePath),
+          })),
+        );
+      } catch (err) {
+        if (err instanceof TaskCreationIdentityConflictError) {
+          throw new TaskCreateConflictError(
+            err.conflicts.map((conflict) => conflict.taskId).sort(),
+            Object.fromEntries(
+              err.conflicts.map((conflict) => [conflict.taskId, conflict.claimants]),
+            ),
+          );
+        }
+        throw err;
+      }
+
+      try {
+        for (const planned of plannedWrites) {
+          await writeDecompositionFileAtomicExclusive(planned.filePath, planned.spec.content);
+          createdFinalPaths.push(planned.filePath);
+          writtenIds.push(planned.spec.id);
+        }
+        return { taskIds: writtenIds, filePaths: [...createdFinalPaths] };
+      } catch (err) {
+        const rollbackErrors: unknown[] = [];
+        for (const filePath of createdFinalPaths) {
+          const planned = plannedWrites.find((item) => item.filePath === filePath);
+          if (!planned) continue;
+          try {
+            await removeDecompositionFileIfExact(filePath, planned.spec.content);
+          } catch (rollbackError) {
+            rollbackErrors.push(rollbackError);
+          }
+        }
+        if (rollbackErrors.length > 0) {
+          throw new AggregateError(
+            [err, ...rollbackErrors],
+            `Task creation failed and ${rollbackErrors.length} published path(s) could not be safely rolled back: ${err instanceof Error ? err.message : String(err)}`,
+            { cause: err },
+          );
+        }
+        throw err;
+      }
+    },
+  );
 }
 
 export async function createTaskFilesFromInput(
@@ -232,14 +291,6 @@ export async function createTaskFilesFromInput(
 
   const taskSpecs = normalizedInputs.map((input) => buildTaskSpecFromInput(input));
 
-  const taskDir = path.resolve(adapter.projectRoot, adapter.config.project.taskDir);
-  await fs.mkdir(taskDir, { recursive: true });
-  const existingIds = await getExistingTaskIds(taskDir);
-  const existingConflicts = taskSpecs.map((spec) => spec.id).filter((id) => existingIds.has(id));
-  if (existingConflicts.length > 0) {
-    throw new TaskCreateConflictError(Array.from(new Set(existingConflicts)).sort());
-  }
-
   return writeTaskFilesWithResult(taskSpecs, adapter);
 }
 
@@ -248,13 +299,8 @@ export async function createTaskFilesFromInput(
  */
 async function getExistingTaskIds(taskDir: string): Promise<Set<string>> {
   try {
-    const entries = await fs.readdir(taskDir);
-    const ids = new Set<string>();
-    for (const entry of entries) {
-      const match = entry.match(/^((?:TASK-\d{3}|SAURUS-REM-\d{3}))/);
-      if (match) ids.add(match[1]);
-    }
-    return ids;
+    const declarations = await listTaskClaimantDeclarations(taskDir);
+    return new Set(declarations.map(({ declaredId }) => declaredId));
   } catch {
     return new Set();
   }
@@ -293,7 +339,7 @@ function normalizeTaskCreateInput(
   const recommendedApproach = readOptionalString(record, "recommendedApproach", index, errors);
   const filesToModify = readFilesToModify(record, index, errors);
 
-  if (id && !/^(?:TASK-\d{3}(?:-[A-Z]+)?|SAURUS-REM-\d{3})$/.test(id)) {
+  if (id && matchTaskHeading(id)?.id !== id) {
     errors.push({
       index,
       field: "id",
@@ -626,14 +672,14 @@ function validateTaskSpec(spec: TaskSpec, adapter: ProjectAdapter): string[] {
   }
 
   // Validate dependency references (must reference valid task IDs)
-  // For now, we only validate format (TASK-NNN)
+  // Use the same ID grammar as the parser and generated heading.
   for (const dep of parsedTask.blockedBy) {
-    if (!dep.match(/^TASK-\d{3}$/)) {
+    if (matchTaskHeading(dep)?.id !== dep) {
       errors.push(`Invalid blockedBy reference: ${dep} (must be TASK-NNN format)`);
     }
   }
   for (const dep of parsedTask.blocks) {
-    if (!dep.match(/^TASK-\d{3}$/)) {
+    if (matchTaskHeading(dep)?.id !== dep) {
       errors.push(`Invalid blocks reference: ${dep} (must be TASK-NNN format)`);
     }
   }

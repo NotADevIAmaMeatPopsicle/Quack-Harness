@@ -1,6 +1,8 @@
 import type { ReviewerRunnerConfig } from "./reviewer-config.js";
 import { createReviewerRunner } from "./reviewer-runner.js";
 import type {
+  CrossModelEvidence,
+  ModelProvenance,
   ReviewerRunner,
   ReviewerRunnerKind,
   ReviewRequest,
@@ -22,6 +24,11 @@ import type { IntentJudgmentRunnerConfig } from "../judgment/runner/intent-judgm
 
 export interface LoopReviewGateFacts {
   crossModelSatisfied: boolean;
+  /**
+   * Optional only for persisted pre-provenance approvals. Every new loop
+   * evaluation records both identities and the exact comparison basis.
+   */
+  crossModelEvidence?: CrossModelEvidence;
   anchorAuditPassed: boolean;
   treeClean: boolean;
   /** TASK-1324: the brief's deterministic fidelity audit. True when the
@@ -56,6 +63,113 @@ export interface LoopJudgmentCutover {
 
 type ReviewerRunnerFactory = (config: unknown) => ReviewerRunner;
 
+function normalized(value: string | undefined): string | undefined {
+  const trimmed = value?.trim().toLowerCase();
+  return trimmed ? trimmed : undefined;
+}
+
+function reviewerProvenance(
+  config: ReviewerRunnerConfig,
+  runnerKind: ReviewerRunnerKind,
+  result: ReviewRunResult,
+): ModelProvenance {
+  const model = result.status === "completed" ? (result.model ?? config.model) : config.model;
+  return {
+    runner: runnerKind,
+    ...(runnerKind === "claude-sdk"
+      ? { provider: "anthropic" }
+      : config.codex.provider
+        ? { provider: config.codex.provider }
+        : {}),
+    ...(model ? { model } : {}),
+  };
+}
+
+/**
+ * Compare the full producer/reviewer identity. A known mismatch is enough to
+ * prove independence; a full known match proves sameness; everything else is
+ * UNKNOWN and therefore cannot satisfy a required cross-model gate.
+ */
+export function assessCrossModelEvidence(
+  producer: ModelProvenance | undefined,
+  reviewer: ModelProvenance,
+): CrossModelEvidence {
+  if (!producer) {
+    return { status: "unknown", basis: "producer_unknown", reviewer };
+  }
+  if (producer.runner !== reviewer.runner) {
+    return {
+      status: "satisfied",
+      basis: "different_runner",
+      producer,
+      reviewer,
+    };
+  }
+
+  const producerProvider = normalized(producer.provider);
+  const reviewerProvider = normalized(reviewer.provider);
+  if (producerProvider && reviewerProvider && producerProvider !== reviewerProvider) {
+    return {
+      status: "satisfied",
+      basis: "different_provider",
+      producer,
+      reviewer,
+    };
+  }
+
+  const producerModel = normalized(producer.model);
+  const reviewerModel = normalized(reviewer.model);
+  if (producerModel && reviewerModel && producerModel !== reviewerModel) {
+    return {
+      status: "satisfied",
+      basis: "different_model",
+      producer,
+      reviewer,
+    };
+  }
+
+  if (!producerProvider || !producerModel) {
+    return {
+      status: "unknown",
+      basis: "producer_incomplete",
+      producer,
+      reviewer,
+    };
+  }
+  if (!reviewerProvider || !reviewerModel) {
+    return {
+      status: "unknown",
+      basis: "reviewer_incomplete",
+      producer,
+      reviewer,
+    };
+  }
+
+  return {
+    status: "same",
+    basis: "same_identity",
+    producer,
+    reviewer,
+  };
+}
+
+/**
+ * Existing human approvals remain authoritative on resume. Automatic loop
+ * approvals, however, may be reused under `requireCrossModel` only when the
+ * persisted evidence proves a different producer/reviewer identity. This
+ * prevents a pre-provenance `crossModelSatisfied: true` boolean from being
+ * grandfathered into an automatic clearance.
+ */
+export function mayReuseLoopReviewApproval(
+  reviewGate: LoopReviewGateFacts,
+  requireCrossModel: boolean,
+  humanApproved: boolean,
+): boolean {
+  if (humanApproved) return true;
+  if (!requireCrossModel) return true;
+  return reviewGate.crossModelSatisfied && reviewGate.crossModelEvidence?.status === "satisfied";
+}
+
 /**
  * Run one loop review and derive fail-closed approval facts without rewriting
  * the runner's typed result or verdict.
@@ -79,12 +193,18 @@ export async function evaluateLoopReview(
    *  the BRIEF gate only (diff/retry gates omit it — the brief's
    *  fidelity was settled before any build ran). */
   briefFidelity?: import("../blueprint/blueprint-types.js").BriefFidelityResult,
+  /** Identity of the model that produced `request.artifact`. */
+  producerProvenance?: ModelProvenance,
 ): Promise<LoopReviewEvaluation> {
   const stage = stageForReviewKind(request.kind);
   const mode = cutover?.mode ?? "off";
   const runner = runnerFactory(config);
   const result = await runner.run(request);
-  const crossModelSatisfied = runner.kind === "codex-cli";
+  const crossModelEvidence = assessCrossModelEvidence(
+    producerProvenance,
+    reviewerProvenance(config, runner.kind, result),
+  );
+  const crossModelSatisfied = crossModelEvidence.status === "satisfied";
   // TASK-1313: injected safety signals (enforce mode) block auto-approval
   // as defense-in-depth; the dispatcher's safety_stop transition is the
   // primary control.
@@ -190,6 +310,7 @@ export async function evaluateLoopReview(
   if (result.status === "runner_error") {
     return finalize({
       crossModelSatisfied,
+      crossModelEvidence,
       anchorAuditPassed: false,
       treeClean: false,
       fidelityPassed,
@@ -216,9 +337,17 @@ export async function evaluateLoopReview(
     reasons.push("review left the project tree dirty");
   }
   if (requireCrossModel && !crossModelSatisfied) {
-    reasons.push("configured reviewer does not satisfy required cross-model review");
+    reasons.push(
+      crossModelEvidence.status === "same"
+        ? "reviewer identity matches the artifact producer; required cross-model review is not satisfied"
+        : "cross-model provenance is incomplete; required cross-model review cannot be verified",
+    );
   } else if (!requireCrossModel && !crossModelSatisfied) {
-    reasons.push("same-provider review allowed by configuration");
+    reasons.push(
+      crossModelEvidence.status === "same"
+        ? "same-provider review allowed by configuration"
+        : "unverified cross-model provenance allowed by configuration",
+    );
   }
   if (injectedSafety) {
     reasons.push("producer safety signal present");
@@ -234,6 +363,7 @@ export async function evaluateLoopReview(
 
   return finalize({
     crossModelSatisfied,
+    crossModelEvidence,
     anchorAuditPassed,
     treeClean,
     fidelityPassed,

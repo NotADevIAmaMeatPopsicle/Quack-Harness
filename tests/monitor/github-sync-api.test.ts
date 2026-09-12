@@ -148,12 +148,12 @@ function setupSyncFixture(projectRoot: string): void {
 
 describe("GitHub Sync Map API", () => {
   let logDir: string;
-  let projectRoots: string[];
+  let projectRoot: string;
   let stopServer: (() => Promise<void>) | undefined;
 
   beforeEach(() => {
     logDir = makeTempDir();
-    projectRoots = [];
+    projectRoot = makeTempDir();
   });
 
   afterEach(async () => {
@@ -161,23 +161,28 @@ describe("GitHub Sync Map API", () => {
       await stopServer();
       stopServer = undefined;
     }
-    for (const projectRoot of projectRoots) {
-      fs.rmSync(projectRoot, { recursive: true, force: true });
-    }
+    fs.rmSync(projectRoot, { recursive: true, force: true });
     fs.rmSync(logDir, { recursive: true, force: true });
   });
 
+  async function startServer(): Promise<number> {
+    const serverObj = createMonitorServer({
+      logDir,
+      port: 0,
+      host: "127.0.0.1",
+      projectRoot,
+    });
+    const started = await serverObj.start();
+    stopServer = started.stop;
+    return started.port;
+  }
+
   it("GET /api/github/sync-map returns all entries", async () => {
-    const projectRoot = makeTempDir();
-    projectRoots.push(projectRoot);
     setupSyncFixture(projectRoot);
 
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port, projectRoot });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    const port = await startServer();
 
-    const { status, body } = await httpGet(`http://localhost:${port}/api/github/sync-map`);
+    const { status, body } = await httpGet(`http://127.0.0.1:${port}/api/github/sync-map`);
     expect(status).toBe(200);
 
     const data = JSON.parse(body) as { entries: Array<{ taskId: string; issueNumber: number }> };
@@ -186,17 +191,12 @@ describe("GitHub Sync Map API", () => {
   });
 
   it("GET /api/github/sync-map?taskId=X filters correctly", async () => {
-    const projectRoot = makeTempDir();
-    projectRoots.push(projectRoot);
     setupSyncFixture(projectRoot);
 
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port, projectRoot });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    const port = await startServer();
 
     const { status, body } = await httpGet(
-      `http://localhost:${port}/api/github/sync-map?taskId=TASK-002`,
+      `http://127.0.0.1:${port}/api/github/sync-map?taskId=TASK-002`,
     );
     expect(status).toBe(200);
 
@@ -207,17 +207,12 @@ describe("GitHub Sync Map API", () => {
   });
 
   it("GET /api/github/sync-map?issueNumber=Y filters correctly", async () => {
-    const projectRoot = makeTempDir();
-    projectRoots.push(projectRoot);
     setupSyncFixture(projectRoot);
 
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port, projectRoot });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    const port = await startServer();
 
     const { status, body } = await httpGet(
-      `http://localhost:${port}/api/github/sync-map?issueNumber=44`,
+      `http://127.0.0.1:${port}/api/github/sync-map?issueNumber=44`,
     );
     expect(status).toBe(200);
 
@@ -227,17 +222,12 @@ describe("GitHub Sync Map API", () => {
   });
 
   it("DELETE /api/github/sync-map/:taskId removes entry and persists", async () => {
-    const projectRoot = makeTempDir();
-    projectRoots.push(projectRoot);
     setupSyncFixture(projectRoot);
 
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port, projectRoot });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    const port = await startServer();
 
     const { status, body } = await httpDelete(
-      `http://localhost:${port}/api/github/sync-map/TASK-001`,
+      `http://127.0.0.1:${port}/api/github/sync-map/TASK-001`,
     );
     expect(status).toBe(200);
 
@@ -255,17 +245,12 @@ describe("GitHub Sync Map API", () => {
   });
 
   it("DELETE /api/github/sync-map/:taskId returns 404 for non-existent entry", async () => {
-    const projectRoot = makeTempDir();
-    projectRoots.push(projectRoot);
     setupSyncFixture(projectRoot);
 
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port, projectRoot });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    const port = await startServer();
 
     const { status, body } = await httpDelete(
-      `http://localhost:${port}/api/github/sync-map/TASK-999`,
+      `http://127.0.0.1:${port}/api/github/sync-map/TASK-999`,
     );
     expect(status).toBe(404);
 
@@ -274,17 +259,12 @@ describe("GitHub Sync Map API", () => {
   });
 
   it("POST /api/github/sync-map/:taskId/refresh returns 404 for non-existent entry", async () => {
-    const projectRoot = makeTempDir();
-    projectRoots.push(projectRoot);
     setupSyncFixture(projectRoot);
 
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port, projectRoot });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    const port = await startServer();
 
     const { status, body } = await httpPost(
-      `http://localhost:${port}/api/github/sync-map/TASK-999/refresh`,
+      `http://127.0.0.1:${port}/api/github/sync-map/TASK-999/refresh`,
     );
     expect(status).toBe(404);
 

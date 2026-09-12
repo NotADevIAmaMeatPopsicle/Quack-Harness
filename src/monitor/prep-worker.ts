@@ -5,22 +5,42 @@
 
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import {
+  buildClaudeChildEnvironment,
+  sanitizeClaudeDiagnostic,
+  selectClaudeApiKey,
+} from "../sdk/claude-auth.js";
+import type { KeyManager } from "../dispatcher/key-manager.js";
+import { parsePrepGateResult, type PrepGateResult } from "./prep-job-result.js";
+import { PrepJobStore } from "./prep-job-store.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import {
+  cleanupTrustedNodeLaunch,
+  confirmWindowsNodeLaunchAlreadyExited,
+  spawnTrustedNode,
+  terminateWindowsNodeJob,
+  type TrustedNodeLaunch,
+} from "./trusted-node-launch.js";
 
 export interface PrepJob {
   taskId: string;
   pid: number;
   startedAt: string;
   status: "running" | "completed" | "failed";
-  result?: {
-    schemaValid: boolean;
-    schemaErrors: string[];
-    depthScore: number;
-    depthReady: boolean;
-    deficiencies: string[];
-    outcome: "pass" | "enriched" | "rejected";
+  /** Stable attempt identity; optional only for older in-memory fixture consumers. */
+  jobId?: string;
+  completedAt?: string;
+  exitCode?: number | null;
+  signal?: NodeJS.Signals | null;
+  result?: PrepGateResult;
+  diagnostics?: {
+    stdout: string;
+    stderr: string;
+    stdoutTruncated: boolean;
+    stderrTruncated: boolean;
   };
+  persistenceError?: string;
   error?: string;
 }
 
@@ -53,11 +73,27 @@ export interface PrepWorkerRuntime {
   killProcess?: typeof process.kill;
 }
 
+export interface PrepWorkerOptions {
+  keyManager?: KeyManager;
+  logDir?: string;
+  projectId?: string;
+  onTerminal?: (job: PrepJob) => void;
+}
+
+const PREP_OUTPUT_LIMIT = 64 * 1024;
 const PREP_SHUTDOWN_SURVIVOR_VERSION = 1;
 
 export class PrepWorker {
   private jobs = new Map<string, PrepJob>();
+  private terminalFinalizers = new Map<string, () => void>();
+  private readonly jobStore: PrepJobStore;
   private processes = new Map<string, ChildProcess>();
+  private launches = new Map<string, TrustedNodeLaunch>();
+  private liveProcesses = new Set<ChildProcess>();
+  private idleWaiters = new Set<() => void>();
+  private stopping = new Set<string>();
+  private terminationUnconfirmed = new Set<string>();
+  private terminalDrainStarted = false;
   private stopRequestedTasks = new Set<string>();
   private unconfirmedProcessGroups = new Map<string, number>();
   private shutdownSurvivors = new Map<string, PrepShutdownSurvivor>();
@@ -72,7 +108,12 @@ export class PrepWorker {
     private readonly projectRoot: string,
     private readonly quackBin: string,
     private readonly runtime: PrepWorkerRuntime = {},
+    private readonly options: PrepWorkerOptions = {},
   ) {
+    this.jobStore = new PrepJobStore(
+      options.logDir ?? path.join(projectRoot, ".quack", "logs"),
+      options.projectId ?? path.basename(projectRoot),
+    );
     this.refreshShutdownSurvivors();
   }
 
@@ -266,16 +307,18 @@ export class PrepWorker {
    * The prep runs as a child process to avoid nested session blocker.
    */
   start(taskId: string): PrepJob {
+    if (this.terminalDrainStarted) {
+      throw new Error("Prep admission is closed because the monitor is shutting down.");
+    }
     if (this.shutdownInProgress) {
-      throw new Error("Prep worker is shutting down; resume the fleet before starting new prep");
+      throw new Error("Prep worker is shutting down");
     }
     this.refreshShutdownSurvivors();
     if (this.shutdownSurvivors.size > 0 || this.unreadableSurvivorMarkers.size > 0) {
       throw new Error(
-        "Prep worker has unresolved Windows shutdown survivor evidence or POSIX process-group evidence; reconcile it before starting new prep",
+        "Cannot start prep while unresolved Windows shutdown survivor evidence or POSIX process-group evidence remains",
       );
     }
-
     // Prevent double-prep
     const existing = this.getActiveJob(taskId);
     if (existing) {
@@ -286,62 +329,68 @@ export class PrepWorker {
     // We'll implement this as a flag to the existing gate module
     const args = ["prep", taskId, "--project", this.projectRoot];
 
-    const child = (this.runtime.spawnProcess ?? spawn)("node", [this.quackBin, ...args], {
+    const selected = this.options.keyManager
+      ? selectClaudeApiKey(this.options.keyManager)
+      : undefined;
+    const childEnvironment = buildClaudeChildEnvironment(process.env, selected, true);
+    const launch = spawnTrustedNode({
+      projectRoot: this.projectRoot,
+      scriptPath: this.quackBin,
+      args,
       cwd: this.projectRoot,
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-      // On POSIX the prep CLI and every agent process it spawns share a
-      // dedicated process group. Shutdown can therefore prove that the whole
-      // tree exited rather than observing only the short-lived CLI wrapper.
-      detached: (this.runtime.platform ?? process.platform) !== "win32",
-      env: {
-        ...process.env,
-        CLAUDECODE: undefined,
-        CLAUDE_CODE: undefined,
-      },
+      env: childEnvironment,
+      spawnProcess: this.runtime.spawnProcess,
+      platform: this.runtime.platform,
     });
+    const child = launch.child;
+    this.liveProcesses.add(child);
 
     const job: PrepJob = {
       taskId,
-      pid: child.pid ?? 0,
+      jobId: randomUUID(),
+      pid: launch.processId,
       startedAt: new Date().toISOString(),
       status: "running",
     };
 
     let stdout = "";
     let stderr = "";
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
+    let spawnError: string | undefined;
+    let exitCode: number | null = null;
+    let exitSignal: NodeJS.Signals | null = null;
+    const sanitize = (value: string): string =>
+      sanitizeClaudeDiagnostic(
+        sanitizeClaudeDiagnostic(value, childEnvironment),
+        process.env,
+      ).slice(0, PREP_OUTPUT_LIMIT);
     this.stopRequestedTasks.delete(taskId);
     this.confirmedWindowsTreeKills.delete(taskId);
 
     child.stdout?.on("data", (data: Buffer) => {
-      stdout += data.toString();
+      const next = stdout + data.toString();
+      stdoutTruncated ||= next.length > PREP_OUTPUT_LIMIT;
+      stdout = next.slice(0, PREP_OUTPUT_LIMIT);
     });
 
     child.stderr?.on("data", (data: Buffer) => {
-      stderr += data.toString();
+      const next = stderr + data.toString();
+      stderrTruncated ||= next.length > PREP_OUTPUT_LIMIT;
+      stderr = next.slice(0, PREP_OUTPUT_LIMIT);
     });
 
-    child.on("exit", (code) => {
-      const stopRequested = this.stopRequestedTasks.delete(taskId);
-      if (stopRequested) {
-        job.status = "failed";
-        job.error ||= "Prep stopped before completion";
-      } else if (code === 0 && stdout) {
-        try {
-          // Parse JSON output from the prep command
-          const result = JSON.parse(stdout.trim()) as PrepJob["result"];
-          job.status = "completed";
-          job.result = result;
-        } catch (err) {
-          job.status = "failed";
-          job.error = `Failed to parse prep output: ${err instanceof Error ? err.message : String(err)}`;
+    child.on("exit", (code, signal) => {
+      exitCode = code ?? null;
+      exitSignal = signal ?? null;
+      // Exit is sufficient for wrapper ownership cleanup, but not for deciding
+      // whether the complete stdout stream contains a valid gate result.
+      if (!this.terminationUnconfirmed.has(taskId)) {
+        if (this.processes.get(taskId) === child) this.processes.delete(taskId);
+        if (this.launches.get(taskId) === launch) {
+          this.launches.delete(taskId);
+          cleanupTrustedNodeLaunch(launch);
         }
-      } else {
-        job.status = "failed";
-        job.error = stderr || `Exit code ${code}`;
-      }
-      if (this.processes.get(taskId) === child) {
-        this.processes.delete(taskId);
       }
       if ((this.runtime.platform ?? process.platform) !== "win32" && child.pid) {
         const marker = this.shutdownSurvivors.get(taskId);
@@ -358,17 +407,96 @@ export class PrepWorker {
     });
 
     child.on("error", (err) => {
-      job.status = "failed";
-      job.error = this.stopRequestedTasks.delete(taskId)
-        ? "Prep stopped before completion"
-        : err.message;
-      if (this.processes.get(taskId) === child) {
-        this.processes.delete(taskId);
+      spawnError = sanitize(err.message);
+      if (this.terminationUnconfirmed.has(taskId)) {
+        job.error = job.error ?? "Prep process-tree termination remains unconfirmed";
+        return;
       }
+      if (this.processes.get(taskId) === child) this.processes.delete(taskId);
+      if (this.launches.get(taskId) === launch) {
+        this.launches.delete(taskId);
+        cleanupTrustedNodeLaunch(launch);
+      }
+    });
+
+    const finalize = (): void => {
+      if (
+        this.liveProcesses.has(child) ||
+        this.terminationUnconfirmed.has(taskId) ||
+        job.completedAt
+      )
+        return;
+      job.completedAt = new Date(Math.max(Date.now(), Date.parse(job.startedAt))).toISOString();
+      job.exitCode = exitCode;
+      job.signal = exitSignal;
+      job.diagnostics = {
+        stdout: stdoutTruncated
+          ? "[prep stdout exceeded output limit; content omitted]"
+          : sanitize(stdout),
+        stderr: stderrTruncated
+          ? "[prep stderr exceeded output limit; content omitted]"
+          : sanitize(stderr),
+        stdoutTruncated,
+        stderrTruncated,
+      };
+      delete job.result;
+      job.status = "failed";
+      if (this.stopRequestedTasks.has(taskId) || this.stopping.has(taskId)) {
+        job.error = "Prep stopped by operator";
+      } else if (spawnError) {
+        job.error = spawnError;
+      } else if (exitCode !== 0 || exitSignal) {
+        job.error =
+          job.diagnostics.stderr ||
+          `Prep child exited with code ${exitCode}, signal ${exitSignal ?? "none"}`;
+      } else if (stdoutTruncated) {
+        job.error = "Prep output exceeded the bounded result size; refusing an incomplete result";
+      } else {
+        try {
+          job.result = parsePrepGateResult(JSON.parse(stdout.trim()) as unknown);
+          // Sanitize diagnostics carried inside a valid rejected result too.
+          job.result.schemaErrors = job.result.schemaErrors.map(sanitize);
+          job.result.deficiencies = job.result.deficiencies.map(sanitize);
+          job.status = "completed";
+          delete job.error;
+        } catch (error) {
+          job.error = sanitize(
+            `Invalid prep output: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      this.stopping.delete(taskId);
+      try {
+        this.jobStore.write(job);
+      } catch (error) {
+        job.persistenceError = sanitize(
+          `Prep diagnostic persistence failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        console.error(job.persistenceError);
+      }
+      this.terminalFinalizers.delete(taskId);
+      // Observers cannot prevent close bookkeeping or subsequent drain work.
+      try {
+        this.options.onTerminal?.(job);
+      } catch (error) {
+        console.error(`Prep terminal observer failed: ${sanitize(String(error))}`);
+      }
+    };
+    this.terminalFinalizers.set(taskId, finalize);
+
+    // Only close proves that stdout/stderr finished. Keep the job running and
+    // duplicate admission fenced until this boundary, even after wrapper exit.
+    child.once("close", (code: number | null, signal: NodeJS.Signals | null) => {
+      exitCode = code ?? exitCode;
+      exitSignal = signal ?? exitSignal;
+      this.liveProcesses.delete(child);
+      finalize();
+      this.notifyIdleWaiters();
     });
 
     this.jobs.set(taskId, job);
     this.processes.set(taskId, child);
+    this.launches.set(taskId, launch);
 
     return job;
   }
@@ -381,11 +509,45 @@ export class PrepWorker {
     if (!child) return false;
 
     this.stopRequestedTasks.add(taskId);
-    try {
-      this.signalProcessTree(taskId, child, "SIGTERM", 1_000);
-    } catch {
-      // The child may have exited between lookup and signalling. Its lifecycle
-      // handler remains responsible for clearing the process record.
+    const launch = this.launches.get(taskId);
+    let alreadyExited = false;
+    if (process.platform === "win32") {
+      if (!launch?.windowsJob) return false;
+      let termination = terminateWindowsNodeJob(launch.windowsJob);
+      if (!termination.confirmed && confirmWindowsNodeLaunchAlreadyExited(launch)) {
+        termination = { confirmed: true };
+        alreadyExited = true;
+      }
+      if (!termination.confirmed) {
+        const job = this.jobs.get(taskId);
+        if (job) job.error = termination.warning;
+        this.terminationUnconfirmed.add(taskId);
+        return false;
+      }
+      // Positive tree proof may arrive after this owned wrapper already closed.
+      alreadyExited ||= child.exitCode != null || child.signalCode != null;
+    } else {
+      try {
+        this.signalProcessTree(taskId, child, "SIGTERM", 1_000);
+      } catch {
+        // A concurrent root exit is retained as explicit reconciliation
+        // evidence by signalProcessTree; never re-signal its numeric PGID.
+      }
+    }
+    this.terminationUnconfirmed.delete(taskId);
+    this.stopping.add(taskId);
+    const job = this.jobs.get(taskId);
+    if (job) job.error = "Prep stop requested";
+    if (alreadyExited) {
+      this.stopping.delete(taskId);
+      if (job) job.error = "Prep stopped by operator";
+      if (this.processes.get(taskId) === child) this.processes.delete(taskId);
+      if (launch && this.launches.get(taskId) === launch) {
+        this.launches.delete(taskId);
+        cleanupTrustedNodeLaunch(launch);
+      }
+      this.terminalFinalizers.get(taskId)?.();
+      this.notifyIdleWaiters();
     }
     return true;
   }
@@ -394,7 +556,7 @@ export class PrepWorker {
    * Get job by task ID (any status).
    */
   getJob(taskId: string): PrepJob | undefined {
-    return this.jobs.get(taskId);
+    return this.jobs.get(taskId) ?? this.jobStore.read(taskId);
   }
 
   /**
@@ -410,6 +572,49 @@ export class PrepWorker {
    */
   getActiveJobs(): PrepJob[] {
     return Array.from(this.jobs.values()).filter((j) => j.status === "running");
+  }
+
+  /** Whether a prep wrapper, trusted launch, or stdio close is still outstanding. */
+  hasLiveProcesses(): boolean {
+    return (
+      this.liveProcesses.size > 0 ||
+      this.processes.size > 0 ||
+      this.launches.size > 0 ||
+      this.terminationUnconfirmed.size > 0
+    );
+  }
+
+  /** Wait for child close/cleanup, returning false instead of hanging forever. */
+  waitForIdle(timeoutMs = 5_000): Promise<boolean> {
+    if (!this.hasLiveProcesses()) return Promise.resolve(true);
+
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (idle: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.idleWaiters.delete(onIdle);
+        resolve(idle);
+      };
+      const onIdle = (): void => finish(true);
+      this.idleWaiters.add(onIdle);
+      const timer = setTimeout(() => finish(false), timeoutMs);
+
+      // Avoid missing a close that landed between the initial check and waiter
+      // registration.
+      if (!this.hasLiveProcesses()) finish(true);
+    });
+  }
+
+  private notifyIdleWaiters(): void {
+    if (this.hasLiveProcesses()) return;
+    for (const waiter of [...this.idleWaiters]) waiter();
+  }
+
+  /** Permanently close prep admission before terminal server draining. */
+  beginTerminalDrain(): void {
+    this.terminalDrainStarted = true;
   }
 
   /**
@@ -438,10 +643,7 @@ export class PrepWorker {
     }
   }
 
-  /**
-   * A POSIX process-group ID is trustworthy only while its original root
-   * ChildProcess identity is still live and tracked for this task.
-   */
+  /** A POSIX PGID is trustworthy only while its original root is still live. */
   private isPosixRootIdentityLive(taskId: string, child: ChildProcess): boolean {
     return (
       this.processes.get(taskId) === child && child.exitCode == null && child.signalCode == null
@@ -680,15 +882,11 @@ export class PrepWorker {
    * trees but preserves lifecycle tracking. Callers that can await confirmation
    * should use shutdownAll().
    */
-  killAll(): void {
-    this.shutdownInProgress = true;
-    for (const [taskId, child] of this.processes) {
-      this.stopRequestedTasks.add(taskId);
-      try {
-        this.signalProcessTree(taskId, child, "SIGKILL", 1_000);
-      } catch {
-        // Preserve tracking and fail closed until bounded shutdown can confirm.
-      }
+  killAll(): boolean {
+    let allConfirmed = true;
+    for (const taskId of [...this.processes.keys()]) {
+      if (!this.stop(taskId)) allConfirmed = false;
     }
+    return allConfirmed;
   }
 }

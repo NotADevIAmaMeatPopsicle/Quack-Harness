@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -447,6 +447,149 @@ describe("DispatchManager exact Docker approval resume", () => {
     expect(restarted.getDockerPausedRuntimeDir(taskId)).toBeUndefined();
     expect(dockerManager.releaseSealedResumeRef).toHaveBeenCalledTimes(1);
     expect(dockerManager.releaseSealedPublicationRef).toHaveBeenCalled();
+  });
+
+  test("refuses publication when a resumed result differs from its judge-approved diff hash", async () => {
+    const taskId = "TASK-018-A";
+    const parentTaskId = "TASK-018";
+    const sharedBranchName = "quack/TASK-018";
+    const child = new FakeChild();
+    const runtimeDir = path.join(worktreePath, ".quack", "docker-runtime", randomUUID());
+    const approvedDiff = "diff --git a/README.md b/README.md\n+approved\n";
+    const resultDiff = "diff --git a/README.md b/README.md\n+different\n";
+    const approvedDiffHash = createHash("sha256").update(approvedDiff, "utf-8").digest("hex");
+    const sourceSessionId = `quack-${taskId}-${randomUUID()}`;
+    const sourceOwnershipId = randomUUID();
+    fs.mkdirSync(runtimeDir, { recursive: true });
+
+    const dockerManager = {
+      reconcileExistingContainers: jest.fn().mockResolvedValue({
+        discoveredTaskIds: [],
+        ambiguousContainerIds: [],
+        removedTaskIds: [],
+        failedTaskIds: [],
+      }),
+      createContainer: jest.fn().mockResolvedValue({
+        containerId: "container-diff-mismatch",
+        containerName: "container-diff-mismatch",
+        taskId,
+        image: "fixture",
+        workDir: "/workspace",
+        logsVolume: `/workspace/.quack/docker-runtime/${path.basename(runtimeDir)}`,
+        worktreePath,
+        runtimeLogDir: runtimeDir,
+        gitDir: "/workspace/.quack/docker-git/diff-mismatch",
+        privateGitDir: path.join(worktreePath, ".quack", "docker-git", "diff-mismatch"),
+        gitObjectsDir: path.join(projectRoot, ".git", "objects"),
+        dotGitOverlay: path.join(root, "overlay-diff-mismatch"),
+        authoritativeRef: `refs/heads/${sharedBranchName}`,
+        authoritativeHead: baseHead,
+        authoritativeWorktreeGitDir: path.dirname(
+          fs.realpathSync.native(
+            path.resolve(
+              worktreePath,
+              fs
+                .readFileSync(path.join(worktreePath, ".git"), "utf-8")
+                .trim()
+                .replace(/^gitdir:\s*/i, ""),
+            ),
+          ),
+        ),
+        resumeSource: {
+          archiveName: `resume-${sourceOwnershipId}`,
+          dispatchSessionId: sourceSessionId,
+          eventSessionId: sourceSessionId,
+          ownershipId: sourceOwnershipId,
+          approvedGate: "judge" as const,
+          approvedDiffHash,
+          gitState: {
+            authoritativeRef: `refs/heads/${sharedBranchName}`,
+            baseHead,
+            candidateHead: "b".repeat(40),
+            sealedRef: `refs/quack/docker-resume/${taskId}/${sourceOwnershipId}`,
+          },
+          parentTaskId,
+          sharedBranchName,
+        },
+        parentTaskId,
+        sharedBranchName,
+        startedAt: new Date().toISOString(),
+        status: "running" as const,
+      }),
+      execAgent: jest.fn(() => child),
+      stopContainer: jest.fn(() => Promise.resolve({ removed: true, retained: false })),
+      forceRemoveContainer: jest.fn(() => Promise.resolve(true)),
+      extractResults: jest.fn(() =>
+        Promise.resolve({ diff: resultDiff, log: "candidate", branch: sharedBranchName }),
+      ),
+      sealPrivateGitForResume: jest.fn(),
+      preparePrivateGitForPublication: jest.fn(),
+      sealPreparedPublicationRef: jest.fn((binding: unknown) => binding),
+      releaseSealedResumeRef: jest.fn(() => true),
+      releaseSealedPublicationRef: jest.fn(() => true),
+      getActiveContainers: jest.fn(() => []),
+      getTrackedContainers: jest.fn(() => []),
+      abortPendingCommands: jest.fn(),
+      cleanupAll: jest.fn(() => Promise.resolve({ removedTaskIds: [], failedTaskIds: [] })),
+      getContainer: jest.fn(),
+      containerPathForHost: jest.fn(() => "/quack-runtime/dist/index.js"),
+    };
+    const manager = new DispatchManager(projectRoot, path.join(projectRoot, "dist", "index.js"), {
+      method: "docker",
+      docker: {
+        image: "fixture",
+        volumes: [],
+        envPassthrough: [],
+        resourceLimits: { memoryMb: 512, cpus: 1 },
+        networkMode: "none",
+        cleanupPolicy: "remove",
+      },
+    });
+    (manager as unknown as { dockerManager: typeof dockerManager }).dockerManager = dockerManager;
+    (manager as unknown as { createWorktree(): string }).createWorktree = () => worktreePath;
+    (manager as unknown as { removeWorktree(): void }).removeWorktree = () => undefined;
+
+    const job = manager.start(taskId, {
+      skipGate: true,
+      parentTaskId,
+      sharedBranchName,
+      provenance: { channel: "api-direct", principal: "approving-operator" },
+    });
+    await flush();
+    fs.appendFileSync(
+      path.join(runtimeDir, `events-${job.sessionId}.jsonl`),
+      `${JSON.stringify({
+        sessionId: job.sessionId,
+        taskId,
+        project: path.basename(projectRoot),
+        timestamp: new Date().toISOString(),
+        stage: "session_start",
+        payload: {
+          model: "fixture",
+          maxTurns: 10,
+          maxBudget: 1,
+          taskId,
+          federated: false,
+          provenance: { channel: "api-direct", principal: "approving-operator" },
+        },
+      })}\n`,
+      "utf-8",
+    );
+    child.emit("exit", 0, null);
+    await flush(12);
+
+    expect(createHash("sha256").update(resultDiff, "utf-8").digest("hex")).not.toBe(
+      approvedDiffHash,
+    );
+    expect(job.status).toBe("failed");
+    expect(job.output.join("\n")).toContain(
+      "resumed Git result differs from the exact judge-approved diff",
+    );
+    expect(dockerManager.extractResults).toHaveBeenCalledTimes(1);
+    expect(dockerManager.preparePrivateGitForPublication).not.toHaveBeenCalled();
+    expect(initializeDockerPublicationRecovery).not.toHaveBeenCalled();
+    expect(publishDockerPromotedResult).not.toHaveBeenCalled();
+    expect(job.publicationRecoveryPath).toBeUndefined();
   });
 
   test("completed publication preserves a worktree retained with its container", () => {

@@ -30,8 +30,8 @@ export function registerGitHubSyncRoutes(
 
     try {
       const adapterPath = path.join(p.projectRoot, ".quack", "adapter.json");
-      const config = JSON.parse(fs.readFileSync(adapterPath, "utf-8")) as AdapterConfig;
-      const syncMap = await getSyncMap(config);
+      JSON.parse(fs.readFileSync(adapterPath, "utf-8"));
+      const syncMap = await getSyncMap(p.projectRoot);
       let entries = syncMap.getAllEntries();
 
       if (taskId) {
@@ -59,8 +59,8 @@ export function registerGitHubSyncRoutes(
 
     try {
       const adapterPath = path.join(p.projectRoot, ".quack", "adapter.json");
-      const config = JSON.parse(fs.readFileSync(adapterPath, "utf-8")) as AdapterConfig;
-      const syncMap = await getSyncMap(config);
+      JSON.parse(fs.readFileSync(adapterPath, "utf-8"));
+      const syncMap = await getSyncMap(p.projectRoot);
 
       const entry = syncMap.getEntryByTaskId(taskId);
       if (!entry) {
@@ -68,18 +68,8 @@ export function registerGitHubSyncRoutes(
         return;
       }
 
-      // Remove entry by reconstructing without it
-      const allEntries = syncMap.getAllEntries();
-      const filteredEntries = allEntries.filter((e) => e.taskId !== taskId);
-
-      // Save the filtered entries back
-      const syncFilePath = path.join(p.projectRoot, ".quack", "sync", "github-sync.json");
-      await fs.promises.mkdir(path.dirname(syncFilePath), { recursive: true });
-      await fs.promises.writeFile(
-        syncFilePath,
-        JSON.stringify({ entries: filteredEntries }, null, 2),
-        "utf-8",
-      );
+      syncMap.removeEntry(taskId);
+      await syncMap.save();
 
       res.json({ ok: true, deleted: entry });
     } catch (err: unknown) {
@@ -100,7 +90,7 @@ export function registerGitHubSyncRoutes(
     try {
       const adapterPath = path.join(p.projectRoot, ".quack", "adapter.json");
       const config = JSON.parse(fs.readFileSync(adapterPath, "utf-8")) as AdapterConfig;
-      const syncMap = await getSyncMap(config);
+      const syncMap = await getSyncMap(p.projectRoot);
 
       const entry = syncMap.getEntryByTaskId(taskId);
       if (!entry) {
@@ -109,10 +99,10 @@ export function registerGitHubSyncRoutes(
       }
 
       // Sync task status to the linked issue
-      await syncTaskStatusToIssue(taskId, entry.taskStatus, config);
+      await syncTaskStatusToIssue(taskId, entry.taskStatus, config, p.projectRoot);
 
       // Reload the entry to get updated sync timestamp
-      const updatedSyncMap = await getSyncMap(config);
+      const updatedSyncMap = await getSyncMap(p.projectRoot);
       const updatedEntry = updatedSyncMap.getEntryByTaskId(taskId);
 
       res.json({ ok: true, entry: updatedEntry });

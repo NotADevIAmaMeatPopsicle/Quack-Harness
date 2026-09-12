@@ -4,6 +4,7 @@
 // handles failure propagation, and persists state for crash recovery.
 
 import { EventEmitter } from "node:events";
+import type { DecompositionDispatchAdmission } from "../preflight/decomposition-transaction-journal.js";
 import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
 
@@ -124,6 +125,7 @@ export class DispatchQueue extends EventEmitter {
   private recoveryScan?: Promise<RecoveryScanResult>;
   private recoveryScanUnavailableReason?: string;
   private dispatchChecks = new Set<string>();
+  private completionChecks = new Set<string>();
 
   constructor(
     private readonly dispatchManager: DispatchManager,
@@ -133,6 +135,10 @@ export class DispatchQueue extends EventEmitter {
     logDir: string,
     private readonly onEvent?: QueueEventCallback,
     private readonly projectionDb?: QuackDB | NoopDB,
+    private readonly dispatchAdmissionFence?: <T>(
+      taskId: string,
+      dispatch: (admission: DecompositionDispatchAdmission) => T,
+    ) => Promise<T>,
   ) {
     super();
 
@@ -481,7 +487,7 @@ export class DispatchQueue extends EventEmitter {
   /**
    * Abort immediately: stop queue and kill all running tasks.
    */
-  abort(): void {
+  abort(): boolean {
     this.running = false;
     this.paused = false;
 
@@ -490,15 +496,28 @@ export class DispatchQueue extends EventEmitter {
       clearTimeout(this.loopTimer);
       this.loopTimer = null;
     }
-    for (const timer of this.pollTimers.values()) {
-      clearInterval(timer);
-    }
-    this.pollTimers.clear();
-
-    // Stop all running tasks
+    // Stop all tasks that still hold a queue lane.
+    let allStopped = true;
     for (const [taskId, item] of this.items) {
-      if (item.status === "running") {
-        this.dispatchManager.stop(taskId);
+      if (item.status === "running" || item.status === "awaiting_approval") {
+        const managedJob = this.dispatchManager.getJob(taskId);
+        const alreadyStopped = Boolean(
+          managedJob &&
+          managedJob.status !== "running" &&
+          managedJob.status !== "awaiting_approval" &&
+          managedJob.operatorStopCleanupPending !== true,
+        );
+        if (!alreadyStopped && !this.dispatchManager.stop(taskId)) {
+          allStopped = false;
+          this.ensurePollTimer(taskId);
+          continue;
+        }
+        const timer = this.pollTimers.get(taskId);
+        if (timer) {
+          clearInterval(timer);
+          this.pollTimers.delete(taskId);
+        }
+        this.guard.onTaskComplete(item.costUsd ?? 0);
         item.status = "stopped";
         item.completedAt = new Date().toISOString();
 
@@ -514,7 +533,9 @@ export class DispatchQueue extends EventEmitter {
 
     this.emitQueueEvent("dispatch_queue_stopped", "", {
       stats: this.getStats(),
+      stopConfirmed: allStopped,
     });
+    return allStopped;
   }
 
   /**
@@ -524,8 +545,18 @@ export class DispatchQueue extends EventEmitter {
     const item = this.items.get(taskId);
     if (!item) return false;
 
-    if (item.status === "running") {
-      this.dispatchManager.stop(taskId);
+    if (item.status === "running" || item.status === "awaiting_approval") {
+      const managedJob = this.dispatchManager.getJob(taskId);
+      const alreadyStopped = Boolean(
+        managedJob &&
+        managedJob.status !== "running" &&
+        managedJob.status !== "awaiting_approval" &&
+        managedJob.operatorStopCleanupPending !== true,
+      );
+      if (!alreadyStopped && !this.dispatchManager.stop(taskId)) {
+        this.ensurePollTimer(taskId);
+        return false;
+      }
       const timer = this.pollTimers.get(taskId);
       if (timer) {
         clearInterval(timer);
@@ -587,8 +618,8 @@ export class DispatchQueue extends EventEmitter {
     const item = this.items.get(taskId);
     if (!item) return false;
 
-    // Can't remove running tasks — must cancel first
-    if (item.status === "running") return false;
+    // Can't remove lane-holding tasks — must cancel first
+    if (item.status === "running" || item.status === "awaiting_approval") return false;
 
     this.items.delete(taskId);
     return true;
@@ -618,6 +649,7 @@ export class DispatchQueue extends EventEmitter {
       queued: 0,
       ready: 0,
       running: 0,
+      awaitingApproval: 0,
       completed: 0,
       failed: 0,
       blocked: 0,
@@ -634,6 +666,8 @@ export class DispatchQueue extends EventEmitter {
     for (const item of items) {
       if (item.status === "recovered_pending_scan") {
         stats.recoveredPendingScan++;
+      } else if (item.status === "awaiting_approval") {
+        stats.awaitingApproval++;
       } else {
         stats[item.status]++;
       }
@@ -673,6 +707,104 @@ export class DispatchQueue extends EventEmitter {
   }
 
   /**
+   * Durably record a local approval resume before the approval route starts
+   * the replacement child. This is deliberately write-ahead: if the monitor
+   * exits after the child starts but before the normal completion poll runs,
+   * replay resets this running row to a queued resume instead of restoring a
+   * stale awaiting-approval state. `managerPauseReleased` is the exact CAS
+   * proof returned by DispatchManager when its pause outruns this queue's poll.
+   */
+  recordApprovalResume(taskId: string, managerPauseReleased = false): boolean {
+    const item = this.items.get(taskId);
+    const queuePollLagged = item?.status === "running" && managerPauseReleased;
+    if (!item || (item.status !== "awaiting_approval" && !queuePollLagged)) return false;
+    // A running queue row still represents a live lane unless the manager
+    // proves it just released this exact exited pause. Never let a bare caller
+    // rewrite an ordinary running dispatch into a resumable attempt.
+    if (queuePollLagged && this.dispatchManager.getActiveJob(taskId)) return false;
+    this.handleTaskResumed(item, queuePollLagged);
+    return true;
+  }
+
+  /**
+   * Settle a queue-owned human-gate pause after the operator rejects that
+   * dispatch attempt. The exited child no longer exists for the completion
+   * poller to observe, so the route must explicitly release the held lane.
+   *
+   * The rejected item becomes an ordinary failed item: it is not selected by
+   * the scheduler again unless an operator explicitly retries it, and normal
+   * failure propagation remains intact. Independent ready work can proceed as
+   * soon as the guard slot is released.
+   */
+  settleApprovalRejection(
+    taskId: string,
+    reason: string,
+    outcome = "rejected",
+    managerPauseReleased = false,
+  ): boolean {
+    const item = this.items.get(taskId);
+    if (
+      !item ||
+      (item.status !== "awaiting_approval" && !(item.status === "running" && managerPauseReleased))
+    ) {
+      return false;
+    }
+    // A running queue row may lag the manager's child-exit observation by one
+    // poll interval. Only an exact release proof may bridge that state gap;
+    // otherwise a still-live child could lose its lane and overlap the next
+    // dispatch. Even an awaiting row remains occupied while the manager still
+    // owns an active job.
+    if (this.dispatchManager.getActiveJob(taskId)) return false;
+
+    const timer = this.pollTimers.get(taskId);
+    if (timer) {
+      clearInterval(timer);
+      this.pollTimers.delete(taskId);
+    }
+
+    this.guard.onTaskComplete(item.costUsd ?? 0);
+    this.handleTaskFailure(item, reason, outcome);
+    this.scheduleNext();
+    return true;
+  }
+
+  /**
+   * Roll a write-ahead approval resume back to runnable queue state when the
+   * synchronous DispatchManager.start() call fails. The resume option remains
+   * persisted, the held lane is released, and retryCount is untouched because
+   * no replacement worker actually started.
+   */
+  requeueApprovalResume(taskId: string, reason: string): boolean {
+    const item = this.items.get(taskId);
+    if (!item || item.status !== "running" || item.dispatchOptions?.resume !== true) {
+      return false;
+    }
+
+    const timer = this.pollTimers.get(taskId);
+    if (timer) {
+      clearInterval(timer);
+      this.pollTimers.delete(taskId);
+    }
+    this.guard.onTaskComplete(0);
+    item.status = "ready";
+
+    if (this.config.persistState) {
+      this.persistence.append({
+        ts: new Date().toISOString(),
+        type: "task_ready",
+        taskId,
+        reason: `Approval resume start failed: ${reason}`,
+      });
+    }
+
+    this.emitQueueEvent("dispatch_queue_task_ready", taskId, {
+      reason: `Approval resume start failed; queued for retry: ${reason}`,
+    });
+    this.scheduleNext();
+    return true;
+  }
+
+  /**
    * Update configuration at runtime.
    */
   updateConfig(config: Partial<DispatchQueueConfig>): void {
@@ -708,6 +840,10 @@ export class DispatchQueue extends EventEmitter {
 
     // 1. Update readiness: transition queued → ready if dependencies met
     await this.updateReadiness();
+    // stop(), abort(), or pause() may have run while readiness I/O was in
+    // flight. A continuation from the old lifecycle must not dispatch work or
+    // report the stopped queue as drained.
+    if (!this.running || this.paused) return;
 
     // 2. Check if we can start a task
     const guardResult = this.guard.canStart(DEFAULT_ESTIMATED_COST);
@@ -850,8 +986,10 @@ export class DispatchQueue extends EventEmitter {
    * Dispatch a task via DispatchManager and watch for completion.
    */
   private async dispatchTask(item: QueueItem): Promise<void> {
+    let dispatchAttempted = false;
     try {
       const dependencyState = await this.resolveCurrentDependencies(item.taskId);
+      if (!this.running || this.paused || item.status !== "ready") return;
       if (dependencyState.unmet.length > 0) {
         item.status = "queued";
         item.blockedBy = dependencyState.unmet;
@@ -860,6 +998,7 @@ export class DispatchQueue extends EventEmitter {
 
       const claimantIds = [item.taskId, ...dependencyState.satisfiers];
       const claimantChecks = await this.scanDuplicateClaimants(claimantIds);
+      if (!this.running || this.paused || item.status !== "ready") return;
       const contested = claimantIds
         .map((id) => claimantChecks.get(id))
         .filter((check): check is DuplicateClaimantCheck =>
@@ -891,35 +1030,54 @@ export class DispatchQueue extends EventEmitter {
         ...item.dispatchOptions,
         duplicateClaimantCheck: claimantCheck,
       };
-      const job = this.dispatchManager.start(item.taskId, dispatchOptions, claimantCheck);
-
-      item.status = "running";
-      item.startedAt = new Date().toISOString();
-
-      this.guard.onTaskStart();
+      const startDispatch = (admission?: DecompositionDispatchAdmission) => {
+        // The admission fence may wait behind an active decomposition. A
+        // lifecycle action during that wait wins; never spawn from a stale
+        // ready snapshot after pause, stop, cancel, or another transition.
+        if (!this.running || this.paused || item.status !== "ready") return undefined;
+        dispatchAttempted = true;
+        const started = this.dispatchManager.start(
+          item.taskId,
+          {
+            ...dispatchOptions,
+            ...(admission ? { admittedTaskContentHash: admission.contentHash } : {}),
+          },
+          claimantCheck,
+        );
+        // Occupy the queue lane before the admission fence releases its
+        // filesystem reservation. abort()/cancel() can now observe and stop
+        // the already-started manager job during that release window.
+        const startedAt = new Date().toISOString();
+        item.status = "running";
+        item.startedAt = startedAt;
+        this.guard.onTaskStart();
+        return { job: started, startedAt };
+      };
+      const started = this.dispatchAdmissionFence
+        ? await this.dispatchAdmissionFence(item.taskId, startDispatch)
+        : startDispatch();
+      if (!started) return;
+      if (!this.running || this.paused || this.items.get(item.taskId)?.status !== "running") return;
 
       if (this.config.persistState) {
         this.persistence.append({
-          ts: item.startedAt,
+          ts: started.startedAt,
           type: "task_started",
           taskId: item.taskId,
         });
       }
 
       this.emitQueueEvent("dispatch_queue_task_started", item.taskId, {
-        pid: job.pid,
+        pid: started.job.pid,
       });
 
       // Poll for completion
-      const pollTimer = setInterval(() => {
-        void this.checkTaskCompletion(item.taskId);
-      }, POLL_INTERVAL_MS).unref();
-
-      this.pollTimers.set(item.taskId, pollTimer);
+      this.ensurePollTimer(item.taskId);
 
       // Schedule next task (for concurrent dispatch)
       this.scheduleNext();
     } catch (err) {
+      if (!this.running || this.paused || item.status !== "ready") return;
       const msg = err instanceof Error ? err.message : String(err);
       if (err instanceof DuplicateClaimantAdmissionError) {
         item.status = "blocked";
@@ -935,6 +1093,36 @@ export class DispatchQueue extends EventEmitter {
           message: item.blockedReason,
           duplicateBlockedBy: item.duplicateBlockedBy,
         });
+      } else if (this.dispatchAdmissionFence && !dispatchAttempted) {
+        const details =
+          typeof err === "object" && err !== null && "details" in err
+            ? (err.details as Record<string, unknown>)
+            : undefined;
+        const decomposed = details?.admissionDisposition === "decomposed";
+        item.status = decomposed ? "skipped" : "queued";
+        item.blockedReason = msg;
+        item.outcome = decomposed ? "decomposed" : "admission_deferred";
+        if (this.config.persistState) {
+          this.persistence.append({
+            ts: new Date().toISOString(),
+            type: decomposed ? "task_skipped" : "task_ready",
+            taskId: item.taskId,
+            reason: msg,
+          });
+        }
+        this.emitQueueEvent("dispatch_queue_task_refused", item.taskId, {
+          error: decomposed ? "parent_decomposed" : "decomposition_admission_deferred",
+          message: msg,
+          retryable: !decomposed,
+        });
+        if (decomposed) {
+          this.scheduleNext();
+        } else if (!this.loopTimer) {
+          this.loopTimer = setTimeout(() => {
+            this.loopTimer = null;
+            this.scheduleNext();
+          }, POLL_INTERVAL_MS).unref();
+        }
       } else {
         this.handleTaskFailure(item, msg, "dispatch_error");
       }
@@ -948,38 +1136,112 @@ export class DispatchQueue extends EventEmitter {
    */
   private async checkTaskCompletion(taskId: string): Promise<void> {
     const item = this.items.get(taskId);
-    if (!item || item.status !== "running") return;
+    if (
+      !item ||
+      (item.status !== "running" && item.status !== "awaiting_approval") ||
+      this.completionChecks.has(taskId)
+    )
+      return;
 
-    const job = this.dispatchManager.getJob(taskId);
-    if (!job || job.status === "running") return;
+    this.completionChecks.add(taskId);
+    try {
+      const job = this.dispatchManager.getJob(taskId);
+      if (!job) return;
 
-    // Task finished
-    const timer = this.pollTimers.get(taskId);
-    if (timer) {
-      clearInterval(timer);
-      this.pollTimers.delete(taskId);
+      if (job.status === "awaiting_approval") {
+        this.handleTaskAwaitingApproval(item);
+        return;
+      }
+
+      if (job.status === "running") {
+        if (item.status === "awaiting_approval") {
+          this.handleTaskResumed(item);
+        }
+        return;
+      }
+
+      // Task finished. A human-gate pause deliberately keeps this timer and
+      // its guard slot; only a real terminal status releases both.
+      const timer = this.pollTimers.get(taskId);
+      if (timer) {
+        clearInterval(timer);
+        this.pollTimers.delete(taskId);
+      }
+
+      // Read session outcome. EventReader returns newest sessions first, so
+      // the first task match is the approval-resumed run rather than its pend.
+      const sessions = this.eventReader.getExecutionSessions();
+      const session = sessions.find((s) => s.taskId === taskId);
+
+      const costUsd = session?.totalCostUsd ?? 0;
+      const durationMs = session?.durationMs ?? 0;
+      const outcome = session?.outcome ?? (job.status === "completed" ? "completed" : "failed");
+
+      this.guard.onTaskComplete(costUsd);
+
+      if (outcome === "approved") {
+        await this.handleTaskSuccess(item, outcome, costUsd, durationMs);
+      } else if (outcome === "spec_changed") {
+        this.handleTaskBlocked(item, this.specChangedReason(session), outcome, costUsd, durationMs);
+      } else {
+        this.handleTaskFailure(item, outcome, outcome, costUsd, durationMs);
+      }
+
+      // Schedule next task
+      this.scheduleNext();
+    } finally {
+      this.completionChecks.delete(taskId);
+    }
+  }
+
+  private ensurePollTimer(taskId: string): void {
+    if (this.pollTimers.has(taskId)) return;
+    const pollTimer = setInterval(() => {
+      void this.checkTaskCompletion(taskId);
+    }, POLL_INTERVAL_MS).unref();
+    this.pollTimers.set(taskId, pollTimer);
+  }
+
+  private handleTaskAwaitingApproval(item: QueueItem): void {
+    if (item.status === "awaiting_approval") return;
+    item.status = "awaiting_approval";
+    item.awaitingApprovalAt = new Date().toISOString();
+
+    if (this.config.persistState) {
+      this.persistence.append({
+        ts: item.awaitingApprovalAt,
+        type: "task_awaiting_approval",
+        taskId: item.taskId,
+      });
     }
 
-    // Read session outcome
-    const sessions = this.eventReader.getExecutionSessions();
-    const session = sessions.find((s) => s.taskId === taskId);
+    this.emitQueueEvent("dispatch_queue_task_awaiting_approval", item.taskId, {
+      awaitingApprovalAt: item.awaitingApprovalAt,
+    });
+  }
 
-    const costUsd = session?.totalCostUsd ?? 0;
-    const durationMs = session?.durationMs ?? 0;
-    const outcome = session?.outcome ?? (job.status === "completed" ? "completed" : "failed");
+  private handleTaskResumed(item: QueueItem, allowRunningRow = false): void {
+    if (item.status !== "awaiting_approval" && !(item.status === "running" && allowRunningRow)) {
+      return;
+    }
+    item.status = "running";
+    const resumedAt = new Date().toISOString();
+    const resumedOptions: StartOptions = {
+      ...item.dispatchOptions,
+      resume: true,
+    };
+    item.dispatchOptions = resumedOptions;
 
-    this.guard.onTaskComplete(costUsd);
-
-    if (outcome === "approved") {
-      await this.handleTaskSuccess(item, outcome, costUsd, durationMs);
-    } else if (outcome === "spec_changed") {
-      this.handleTaskBlocked(item, this.specChangedReason(session), outcome, costUsd, durationMs);
-    } else {
-      this.handleTaskFailure(item, outcome, outcome, costUsd, durationMs);
+    if (this.config.persistState) {
+      this.persistence.append({
+        ts: resumedAt,
+        type: "task_resumed",
+        taskId: item.taskId,
+        dispatchOptions: resumedOptions,
+      });
     }
 
-    // Schedule next task
-    this.scheduleNext();
+    this.emitQueueEvent("dispatch_queue_task_resumed", item.taskId, { resumedAt });
   }
 
   /**
@@ -1177,12 +1439,17 @@ export class DispatchQueue extends EventEmitter {
    * Check if queue is fully drained (no pending work).
    */
   private checkDrained(): void {
+    // An in-flight scheduling pass can reach this method after stop/abort.
+    // Those lifecycle actions are explicit terminal commands, not a drain.
+    if (!this.running) return;
+
     const hasWork = Array.from(this.items.values()).some(
       (item) =>
         item.status === "recovered_pending_scan" ||
         item.status === "queued" ||
         item.status === "ready" ||
-        item.status === "running",
+        item.status === "running" ||
+        item.status === "awaiting_approval",
     );
 
     if (!hasWork) {
@@ -1432,9 +1699,14 @@ export class DispatchQueue extends EventEmitter {
     this.items = items;
 
     // Replayed runnable rows stay inert until the strict claimant scan settles.
+    // Human-gate rows are different: the dispatch is intentionally nonterminal,
+    // so they keep their lane and watcher until an operator decision resumes it.
     for (const item of items.values()) {
       if (item.status === "queued" || item.status === "ready" || item.status === "running") {
         item.status = "recovered_pending_scan";
+      } else if (item.status === "awaiting_approval") {
+        this.guard.onTaskStart();
+        this.ensurePollTimer(item.taskId);
       }
     }
 

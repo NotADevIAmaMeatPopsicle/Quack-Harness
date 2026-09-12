@@ -5,23 +5,98 @@ import { handlePublish } from "../../src/cli/publish";
 import { taskSpec } from "../helpers/divergent-task-fixture";
 import { createContestedTaskFixture } from "../helpers/task-1338e-fixture";
 
-let failGh = false;
+type RunBoundGitHubCommand =
+  typeof import("../../src/integrations/github/trusted-github").runBoundGitHubCommand;
+const mockRunBoundGitHubCommand = jest.fn<
+  ReturnType<RunBoundGitHubCommand>,
+  Parameters<RunBoundGitHubCommand>
+>();
 
-jest.mock("../../src/integrations/github/gh-cli", () => ({
-  runGh: jest.fn(() => {
-    if (failGh) return Promise.reject(new Error("CLI injected gh failure"));
-    return Promise.resolve({
-      stdout: "https://github.com/fixture/repo/issues/710\n",
-      stderr: "",
-    });
-  }),
+type ReadBoundGitHubIssuePage =
+  typeof import("../../src/integrations/github/trusted-github").readBoundGitHubIssuePage;
+const mockReadBoundGitHubIssuePage = jest.fn<
+  ReturnType<ReadBoundGitHubIssuePage>,
+  Parameters<ReadBoundGitHubIssuePage>
+>();
+
+jest.mock("../../src/integrations/github/trusted-github", () => ({
+  ...jest.requireActual<object>("../../src/integrations/github/trusted-github"),
+  runBoundGitHubCommand: (...args: Parameters<RunBoundGitHubCommand>) =>
+    mockRunBoundGitHubCommand(...args),
+  readBoundGitHubIssuePage: (...args: Parameters<ReadBoundGitHubIssuePage>) =>
+    mockReadBoundGitHubIssuePage(...args),
 }));
+
+const REPOSITORY = { host: "github.com", owner: "fixture-owner", repo: "fixture-repo" };
+const ISSUE_URL = "https://github.com/fixture-owner/fixture-repo/issues/710";
+let failGh = false;
 
 describe("TASK-1338-E: publish CLI discriminated batch outcome", () => {
   beforeEach(() => {
     failGh = false;
     jest.useFakeTimers();
     jest.setSystemTime(new Date("2026-08-18T15:00:00.000Z"));
+    let createdIssue: { title: string; body: string; label: string } | undefined;
+    const result = (stdout: string) =>
+      Promise.resolve({
+        exitCode: 0,
+        stdout,
+        stderr: "",
+        repository: REPOSITORY,
+      });
+    mockReadBoundGitHubIssuePage.mockReset().mockImplementation((_root, config, after) => {
+      expect(config).toMatchObject({ owner: REPOSITORY.owner, repo: REPOSITORY.repo });
+      if (after !== undefined) return Promise.reject(new Error("Unexpected issue-page cursor"));
+      if (failGh) return Promise.reject(new Error("CLI injected gh failure"));
+      return result(
+        JSON.stringify({
+          data: {
+            repository: {
+              nameWithOwner: "fixture-owner/fixture-repo",
+              issues: {
+                nodes: [],
+                totalCount: 0,
+                pageInfo: { hasNextPage: false, endCursor: null },
+              },
+            },
+          },
+        }),
+      );
+    });
+    mockRunBoundGitHubCommand.mockReset().mockImplementation((_root, config, args, options) => {
+      expect(config).toMatchObject({ owner: REPOSITORY.owner, repo: REPOSITORY.repo });
+      if (
+        args.length === 6 &&
+        args[0] === "issue" &&
+        args[1] === "create" &&
+        args[2]?.startsWith("--title=") &&
+        args[3]?.startsWith("--label=") &&
+        args[4] === "--body-file" &&
+        args[5] === "-" &&
+        typeof options?.input === "string"
+      ) {
+        createdIssue = { title: args[2].slice(8), label: args[3].slice(8), body: options.input };
+        return result(ISSUE_URL + "\n");
+      }
+      const viewArgs = ["issue", "view", "710", "--json", "number,url,title,body,labels,state"];
+      if (
+        createdIssue &&
+        args.length === viewArgs.length &&
+        args.every((argument, index) => argument === viewArgs[index])
+      ) {
+        return result(
+          JSON.stringify({
+            number: 710,
+            url: ISSUE_URL,
+            title: createdIssue.title,
+            body: createdIssue.body,
+            labels: [{ name: createdIssue.label }],
+            state: "OPEN",
+          }),
+        );
+      }
+      return Promise.reject(new Error("Unexpected GitHub args: " + args.join(" ")));
+    });
   });
 
   afterEach(() => {
@@ -57,7 +132,7 @@ describe("TASK-1338-E: publish CLI discriminated batch outcome", () => {
       };
       expect(syncMap.entries).toEqual([
         {
-          taskId: "TASK-510-clean",
+          taskId: "TASK-510",
           issueNumber: 710,
           direction: "published",
           createdAt: "2026-08-18T15:00:00.000Z",
@@ -115,7 +190,7 @@ describe("TASK-1338-E: publish CLI discriminated batch outcome", () => {
       await handlePublish({ allBacklog: true, project: fixture.root });
 
       const output = [...log.mock.calls, ...error.mock.calls].flat().join("\n");
-      expect(output).toContain("TASK-500-alpha");
+      expect(output).toContain("TASK-500");
       expect(output).toContain("unparseable:TASK-511-malformed.md");
       expect(output).toContain("TASK-511-malformed.md");
       expect(output).toContain("publish_failed");
@@ -126,7 +201,7 @@ describe("TASK-1338-E: publish CLI discriminated batch outcome", () => {
       const syncMap = JSON.parse(fs.readFileSync(syncPath, "utf-8")) as {
         entries: Array<{ taskId: string }>;
       };
-      expect(syncMap.entries.map((entry) => entry.taskId)).toEqual(["TASK-500-alpha"]);
+      expect(syncMap.entries.map((entry) => entry.taskId)).toEqual(["TASK-500"]);
     } finally {
       fixture.cleanup();
     }

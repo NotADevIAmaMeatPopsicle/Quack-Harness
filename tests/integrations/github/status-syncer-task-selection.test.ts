@@ -16,8 +16,18 @@ import {
   type FixtureCreationOrder,
 } from "../../helpers/divergent-task-fixture";
 
-jest.mock("../../../src/integrations/github/gh-cli", () => ({
-  runGh: jest.fn(() => Promise.resolve({ stdout: "", stderr: "" })),
+type RunBoundGitHubCommand =
+  typeof import("../../../src/integrations/github/trusted-github").runBoundGitHubCommand;
+const mockRunBoundGitHubCommand = jest.fn<
+  ReturnType<RunBoundGitHubCommand>,
+  Parameters<RunBoundGitHubCommand>
+>();
+let labelsByIssue = new Map<number, Set<string>>();
+
+jest.mock("../../../src/integrations/github/trusted-github", () => ({
+  ...jest.requireActual<object>("../../../src/integrations/github/trusted-github"),
+  runBoundGitHubCommand: (...args: Parameters<RunBoundGitHubCommand>) =>
+    mockRunBoundGitHubCommand(...args),
 }));
 
 const INITIAL_SYNC = "2026-08-17T00:00:00.000Z";
@@ -64,6 +74,32 @@ describe.each<FixtureCreationOrder>(["child-first", "parent-first"])(
         child: { status: "READY" },
       });
       writeTestAdapter(fixture.root, { reportBack: true });
+      labelsByIssue = new Map();
+      mockRunBoundGitHubCommand.mockImplementation(
+        (_root: string, config: { owner: string; repo: string }, args: readonly string[]) => {
+          const issueNumber = Number(args[2]);
+          const labels = labelsByIssue.get(issueNumber) ?? new Set<string>();
+          labelsByIssue.set(issueNumber, labels);
+          const repository = { host: "github.com", owner: config.owner, repo: config.repo };
+          if (args[1] === "edit") {
+            for (const arg of args) {
+              if (arg.startsWith("--add-label=")) labels.add(arg.slice(12));
+              if (arg.startsWith("--remove-label=")) labels.delete(arg.slice(15));
+            }
+            return Promise.resolve({ exitCode: 0, stdout: "", stderr: "", repository });
+          }
+          return Promise.resolve({
+            exitCode: 0,
+            stdout: JSON.stringify({
+              number: issueNumber,
+              url: `https://github.com/${config.owner}/${config.repo}/issues/${issueNumber}`,
+              labels: [...labels].map((name) => ({ name })),
+            }),
+            stderr: "",
+            repository,
+          });
+        },
+      );
       jest.clearAllMocks();
     });
 
@@ -77,7 +113,7 @@ describe.each<FixtureCreationOrder>(["child-first", "parent-first"])(
       const syncPath = writeSyncMap(fixture, { taskId: "TASK-100", taskStatus: "READY" });
       const adapter = await loadAdapter(fixture.root);
 
-      const outcome = await syncAllTasks(adapter.config);
+      const outcome = await syncAllTasks(adapter.config, adapter.projectRoot);
       const persisted = JSON.parse(fs.readFileSync(syncPath, "utf-8")) as {
         entries: Array<{ taskStatus: string; lastSyncedAt: string }>;
       };
@@ -106,7 +142,7 @@ describe.each<FixtureCreationOrder>(["child-first", "parent-first"])(
       });
       const adapter = await loadAdapter(fixture.root);
 
-      const outcome = await syncAllTasks(adapter.config);
+      const outcome = await syncAllTasks(adapter.config, adapter.projectRoot);
       const persisted = JSON.parse(fs.readFileSync(syncPath, "utf-8")) as {
         entries: Array<{ taskStatus: string; lastSyncedAt: string }>;
       };

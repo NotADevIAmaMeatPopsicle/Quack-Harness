@@ -37,10 +37,24 @@ export interface MachineryIntegrityResult {
   mismatches: MachineryMismatch[];
 }
 
+/**
+ * Git may materialize the same text blob with CRLF or LF depending on the
+ * checkout's line-ending configuration. Normalize that representation-only
+ * difference, but keep byte-exact hashing for binary and malformed text.
+ */
+function normalizeTextLineEndings(buffer: Buffer): Buffer {
+  if (buffer.includes(0)) return buffer;
+
+  const text = buffer.toString("utf8");
+  if (!Buffer.from(text, "utf8").equals(buffer)) return buffer;
+
+  return Buffer.from(text.replace(/\r\n/g, "\n"), "utf8");
+}
+
 async function hashFile(filePath: string): Promise<string | undefined> {
   try {
     const buffer = await fs.readFile(filePath);
-    return createHash("sha256").update(buffer).digest("hex");
+    return createHash("sha256").update(normalizeTextLineEndings(buffer)).digest("hex");
   } catch {
     return undefined;
   }

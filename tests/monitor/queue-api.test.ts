@@ -163,17 +163,17 @@ describe("Queue API Endpoints", () => {
   });
 
   async function startServer(): Promise<number> {
-    const port = 30000 + Math.floor(Math.random() * 10000);
     const serverObj = createMonitorServer({
       logDir,
-      port,
+      port: 0,
+      host: "127.0.0.1",
       projectRoot,
       adapterPath: path.join(projectRoot, ".quack", "adapter.json"),
       taskDir: "docs/tasks",
     });
-    const { stop } = await serverObj.start();
+    const { port, stop } = await serverObj.start();
     stopServer = stop;
-    baseUrl = `http://localhost:${port}`;
+    baseUrl = `http://127.0.0.1:${port}`;
     return port;
   }
 
@@ -358,11 +358,10 @@ describe("Queue API without projectRoot", () => {
   });
 
   it("queue endpoints return 500 when queue not available", async () => {
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port });
-    const { stop } = await serverObj.start();
+    const serverObj = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+    const { port, stop } = await serverObj.start();
     stopServer = stop;
-    baseUrl = `http://localhost:${port}`;
+    baseUrl = `http://127.0.0.1:${port}`;
 
     const { status, body } = await httpGet(`${baseUrl}/api/queue`);
     expect(status).toBe(500);

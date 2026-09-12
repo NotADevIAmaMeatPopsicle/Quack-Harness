@@ -1,3 +1,10 @@
+import {
+  buildClaudeChildEnvironment,
+  inspectClaudeAuth,
+  ClaudeAuthConfigurationError,
+  isClaudeCredentialEnvironmentName,
+  type selectClaudeApiKey,
+} from "../sdk/claude-auth.js";
 // ─── Docker Manager ────────────────────────────────────────────────
 // Manages Docker container lifecycle for task isolation.
 // Uses child_process.execFile to call Docker CLI — no Docker SDK dependency.
@@ -12,6 +19,16 @@ import { promisify } from "node:util";
 import { inflateSync } from "node:zlib";
 import type { DockerIsolationConfig } from "../core/types.js";
 import { resolvePrepStorageDirSync } from "../core/prep-storage.js";
+import {
+  buildTrustedGitEnvironment,
+  resolveTrustedExecutable,
+  runTrustedGitSync,
+} from "../worker/trusted-executable.js";
+import {
+  assertDecompositionDispatchAdmissionScope,
+  removeDecompositionDispatchAdmissionScope,
+} from "../preflight/decomposition-dispatch-admission.js";
+import { resolveTrustedDockerExecutable, trustedDockerEnvironment } from "./docker-cleanup.js";
 import {
   inspectValidatedDockerResumeArchive,
   seedDockerResumeState,
@@ -160,6 +177,333 @@ function resolveThroughExistingAncestor(value: string): string {
   }
 }
 
+const CONTAINER_WORKSPACE = "/workspace";
+const CONTAINER_PREP_DIRECTORY = "/workspace/.quack/prep";
+const CONTAINER_ADMISSION_DIRECTORY = "/workspace/.quack/decomposition-admissions";
+export const TRUSTED_MANAGED_DOCKER_IMAGES_ENV = "QUACK_TRUSTED_MANAGED_DOCKER_IMAGES";
+const PROTECTED_CONTAINER_MOUNTS = [
+  CONTAINER_WORKSPACE,
+  CONTAINER_PREP_DIRECTORY,
+  CONTAINER_ADMISSION_DIRECTORY,
+] as const;
+
+interface ValidatedConfiguredVolume {
+  argument: string;
+}
+
+function loadTrustedManagedDockerImages(): ReadonlySet<string> {
+  const raw = process.env[TRUSTED_MANAGED_DOCKER_IMAGES_ENV];
+  if (!raw) return new Set();
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(
+      `${TRUSTED_MANAGED_DOCKER_IMAGES_ENV} must be a JSON array of immutable Docker image references.`,
+    );
+  }
+  if (
+    !Array.isArray(parsed) ||
+    parsed.some((entry) => typeof entry !== "string" || entry.length === 0)
+  ) {
+    throw new Error(
+      `${TRUSTED_MANAGED_DOCKER_IMAGES_ENV} must be a JSON array of immutable Docker image references.`,
+    );
+  }
+  return new Set(parsed);
+}
+
+function isImmutableDockerImageReference(image: string): boolean {
+  return /^[^@\s]+@sha256:[0-9a-f]{64}$/.test(image);
+}
+
+function isManagedDockerOperatorEnvironmentName(name: string): boolean {
+  return name.toUpperCase() === TRUSTED_MANAGED_DOCKER_IMAGES_ENV;
+}
+
+/**
+ * Managed Docker admission mounts a one-use dispatch capability before the
+ * Quack child can consume it. Therefore the image itself is an explicit
+ * operator trust boundary: a malicious allowlisted image can inspect that
+ * capability and any credentials intentionally passed to the container.
+ */
+export function assertTrustedManagedDockerImage(
+  image: string,
+  trustedImages: ReadonlySet<string> = loadTrustedManagedDockerImages(),
+): void {
+  if (!isImmutableDockerImageReference(image)) {
+    throw new Error("Managed Docker dispatch requires an immutable sha256 digest-pinned image.");
+  }
+  if (!trustedImages.has(image)) {
+    throw new Error(
+      `Managed Docker image is not present in the operator-owned ${TRUSTED_MANAGED_DOCKER_IMAGES_ENV} allowlist: ${image}`,
+    );
+  }
+}
+
+function isPathContainedBy(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return (
+    relative === "" ||
+    (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`))
+  );
+}
+
+function pathsOverlap(root: string, candidate: string): boolean {
+  return isPathContainedBy(root, candidate) || isPathContainedBy(candidate, root);
+}
+
+function isPosixPathContainedBy(root: string, candidate: string): boolean {
+  const relative = path.posix.relative(root, candidate);
+  return (
+    relative === "" ||
+    (!path.posix.isAbsolute(relative) && relative !== ".." && !relative.startsWith("../"))
+  );
+}
+
+function posixPathsOverlap(left: string, right: string): boolean {
+  return isPosixPathContainedBy(left, right) || isPosixPathContainedBy(right, left);
+}
+
+function dockerConfirmedContainerAbsent(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /\bno such container\b/i.test(message);
+}
+
+function validateConfiguredBindSource(projectRoot: string, source: string): string {
+  if (!path.isAbsolute(source)) {
+    throw new Error("Docker configured volume source must be an absolute host path.");
+  }
+
+  const resolvedRoot = path.resolve(projectRoot);
+  const resolvedSource = path.resolve(source);
+  if (!fs.existsSync(resolvedRoot) || !fs.existsSync(resolvedSource)) {
+    throw new Error("Docker configured volume source and project root must already exist.");
+  }
+  if (!isPathContainedBy(resolvedRoot, resolvedSource)) {
+    throw new Error("Docker configured volume source must stay inside the project root.");
+  }
+  const privateRuntimeRoot = path.resolve(resolvedRoot, ".quack");
+  if (pathsOverlap(resolvedSource, privateRuntimeRoot)) {
+    throw new Error(
+      "Docker configured volume source must not expose the project root or private .quack runtime state.",
+    );
+  }
+
+  const rootStat = fs.lstatSync(resolvedRoot);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    throw new Error("Docker project root must be a real directory for configured volumes.");
+  }
+  const realRoot = fs.realpathSync(resolvedRoot);
+  let cursor = resolvedRoot;
+  const relative = path.relative(resolvedRoot, resolvedSource);
+  for (const component of relative === "" ? [] : relative.split(path.sep)) {
+    cursor = path.join(cursor, component);
+    const stat = fs.lstatSync(cursor);
+    if (stat.isSymbolicLink()) {
+      throw new Error(`Docker configured volume source traverses a symbolic link: ${cursor}`);
+    }
+    if (cursor !== resolvedSource && !stat.isDirectory()) {
+      throw new Error(`Docker configured volume source has a non-directory component: ${cursor}`);
+    }
+  }
+
+  const sourceStat = fs.lstatSync(resolvedSource);
+  if (
+    (!sourceStat.isDirectory() && !sourceStat.isFile()) ||
+    sourceStat.isSymbolicLink() ||
+    (sourceStat.isFile() && sourceStat.nlink !== 1)
+  ) {
+    throw new Error(
+      "Docker configured volume source must be a real directory or single-link file.",
+    );
+  }
+  const realSource = fs.realpathSync(resolvedSource);
+  if (!isPathContainedBy(realRoot, realSource)) {
+    throw new Error("Docker configured volume source escapes the real project root.");
+  }
+  return realSource;
+}
+
+function validatePrepMountSource(projectRoot: string): string {
+  const resolvedRoot = path.resolve(projectRoot);
+  const resolvedPrep = path.resolve(resolvePrepStorageDirSync(projectRoot));
+  const allowed = [
+    path.resolve(resolvedRoot, ".quack", "prep"),
+    path.resolve(resolvedRoot, ".quack", "runtime-prep"),
+  ];
+  if (!allowed.some((candidate) => candidate === resolvedPrep)) {
+    throw new Error("Docker prep storage must resolve to a project-local .quack prep directory.");
+  }
+  const admissionRoot = path.resolve(resolvedRoot, ".quack", "decomposition-admissions");
+  if (pathsOverlap(resolvedPrep, admissionRoot)) {
+    throw new Error("Docker prep storage overlaps the private admission marker directory.");
+  }
+  if (!fs.existsSync(resolvedRoot)) return resolvedPrep;
+  ensureSafeDockerDirectoryWithin(resolvedRoot, resolvedPrep, resolvedPrep, "Docker prep storage");
+  const realRoot = fs.realpathSync(resolvedRoot);
+  const realPrep = fs.realpathSync(resolvedPrep);
+  if (!isPathContainedBy(realRoot, realPrep)) {
+    throw new Error("Docker prep storage escapes the real project root.");
+  }
+  return realPrep;
+}
+
+function validateConfiguredVolume(projectRoot: string, volume: string): ValidatedConfiguredVolume {
+  if (volume.trim() !== volume || /[\0\r\n]/.test(volume)) {
+    throw new Error("Docker configured volume has unsafe whitespace or control characters.");
+  }
+
+  // Parse from the container destination so a Windows drive colon remains
+  // part of the host source (for example C:\\repo\\cache:/cache:ro).
+  const match = /^(.+):(\/[^:]*)(?::([^:]+))?$/.exec(volume);
+  if (!match) {
+    throw new Error(
+      "Docker configured volumes must use absolute-host-path:absolute-container-path:ro.",
+    );
+  }
+  const [, source, rawDestination, rawOptions] = match;
+  const destination = path.posix.normalize(rawDestination);
+  const canonicalRawDestination =
+    rawDestination.length > 1 ? rawDestination.replace(/\/$/, "") : rawDestination;
+  if (
+    !path.posix.isAbsolute(rawDestination) ||
+    destination !== canonicalRawDestination ||
+    rawDestination.includes("\\")
+  ) {
+    throw new Error(
+      "Docker configured volume destination must be a canonical absolute POSIX path.",
+    );
+  }
+  if (
+    PROTECTED_CONTAINER_MOUNTS.some((protectedPath) =>
+      posixPathsOverlap(protectedPath, destination),
+    )
+  ) {
+    throw new Error(
+      `Docker configured volume destination overlaps a protected mount: ${destination}`,
+    );
+  }
+
+  const options = rawOptions?.split(",") ?? [];
+  if (options.length !== 1 || options[0] !== "ro") {
+    throw new Error(
+      "Docker configured bind volumes must use exactly the non-mutating 'ro' option.",
+    );
+  }
+
+  const realSource = validateConfiguredBindSource(projectRoot, source);
+  return {
+    argument: `${realSource.replace(/\\/g, "/")}:${destination}:${options.join(",")}`,
+  };
+}
+
+function ensureSafeDockerDirectoryWithin(
+  projectRoot: string,
+  directory: string,
+  allowedRoot: string,
+  label: string,
+): void {
+  const resolvedRoot = path.resolve(projectRoot);
+  const resolvedAllowedRoot = path.resolve(allowedRoot);
+  const resolvedDirectory = path.resolve(directory);
+  const relative = path.relative(resolvedAllowedRoot, resolvedDirectory);
+  if (path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`)) {
+    throw new Error(`${label} must stay within its dedicated runtime tree.`);
+  }
+
+  // Unit callers may build arguments for a synthetic root. A real dispatch
+  // always has an existing project root; validate and create each runtime
+  // component there without following a repository-controlled redirect.
+  if (!fs.existsSync(resolvedRoot)) return;
+  const realRoot = fs.realpathSync(resolvedRoot);
+  const allowedRelative = path.relative(resolvedRoot, resolvedAllowedRoot);
+  if (
+    path.isAbsolute(allowedRelative) ||
+    allowedRelative === ".." ||
+    allowedRelative.startsWith(`..${path.sep}`)
+  ) {
+    throw new Error(`${label} must stay inside the project root.`);
+  }
+  let cursor = resolvedRoot;
+  const components = [
+    ...(allowedRelative === "" ? [] : allowedRelative.split(path.sep)),
+    ...(relative === "" ? [] : relative.split(path.sep)),
+  ];
+  for (const component of components) {
+    cursor = path.join(cursor, component);
+    try {
+      fs.mkdirSync(cursor);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    const stat = fs.lstatSync(cursor);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error(`${label} component is not a regular directory: ${cursor}`);
+    }
+    const realCursor = fs.realpathSync(cursor);
+    if (!isPathContainedBy(realRoot, realCursor)) {
+      throw new Error(`${label} escapes the real project root: ${cursor}`);
+    }
+  }
+}
+
+function ensureSafeDockerRuntimeDirectory(projectRoot: string, directory: string): void {
+  ensureSafeDockerDirectoryWithin(
+    projectRoot,
+    directory,
+    path.resolve(projectRoot, ".quack", "logs"),
+    "Docker logging directory",
+  );
+}
+
+function assertSafeWritableLogTree(projectRoot: string, logsDirectory: string): void {
+  if (!fs.existsSync(projectRoot) || !fs.existsSync(logsDirectory)) return;
+  const realRoot = fs.realpathSync(projectRoot);
+  const pending = [logsDirectory];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    for (const name of fs.readdirSync(current)) {
+      const entry = path.join(current, name);
+      const stat = fs.lstatSync(entry);
+      if (stat.isSymbolicLink()) {
+        throw new Error(`Docker writable log tree contains a symbolic link: ${entry}`);
+      }
+      if (stat.isDirectory()) {
+        const realEntry = fs.realpathSync(entry);
+        if (!isPathContainedBy(realRoot, realEntry)) {
+          throw new Error(`Docker writable log tree escapes the real project root: ${entry}`);
+        }
+        pending.push(entry);
+        continue;
+      }
+      if (!stat.isFile() || stat.nlink !== 1) {
+        throw new Error(
+          `Docker writable log tree contains a non-regular or hard-linked file: ${entry}`,
+        );
+      }
+    }
+  }
+}
+
+function assertLogsDoNotOverlapProtectedRuntimeDirectories(
+  projectRoot: string,
+  logsDirectory: string,
+): void {
+  const resolvedPrep = path.resolve(resolvePrepStorageDirSync(projectRoot));
+  const protectedDirectories = [
+    path.resolve(projectRoot, ".quack", "prep"),
+    path.resolve(projectRoot, ".quack", "runtime-prep"),
+    resolvedPrep,
+    path.resolve(projectRoot, ".quack", "decomposition-admissions"),
+  ];
+  const conflict = protectedDirectories.find((directory) => pathsOverlap(directory, logsDirectory));
+  if (conflict) {
+    throw new Error(`Docker logging directory overlaps a protected runtime directory: ${conflict}`);
+  }
+}
+
 export interface DockerContainer {
   containerId: string;
   containerName: string;
@@ -298,6 +642,12 @@ export class DockerManager {
   private readonly uncertainCreateWindowMs: number;
   private readonly uncertainCreateProbeIntervalMs: number;
   private readonly runtimeRoot?: string;
+  private readonly dockerExecutable: string;
+  private readonly dockerEnvironment: NodeJS.ProcessEnv;
+  private readonly logsDirectory: string;
+  private readonly containerLogsDirectory: string;
+  private readonly admissionScopes = new Map<string, string>();
+  private readonly trustedManagedDockerImages: ReadonlySet<string>;
 
   constructor(
     private readonly projectRoot: string,
@@ -309,12 +659,36 @@ export class DockerManager {
     this.projectFingerprint = createHash("sha256")
       .update(process.platform === "win32" ? resolvedRoot.toLowerCase() : resolvedRoot)
       .digest("hex");
+    const defaultLogDir = path.resolve(projectRoot, ".quack", "logs");
+    const resolvedThird = stateRoot ? path.resolve(stateRoot) : undefined;
+    // The pre-reliability constructor used its third argument as logging.dir.
+    // Preserve that source-compatible form only for paths inside .quack/logs;
+    // all other third arguments are durable Docker ownership state roots.
+    const legacyLogDir =
+      options.logDir === undefined &&
+      resolvedThird !== undefined &&
+      isSameOrDescendant(resolvedThird, defaultLogDir) &&
+      path.basename(resolvedThird) !== "docker-create-uncertainty"
+        ? resolvedThird
+        : undefined;
     this.uncertaintyDir =
-      stateRoot ?? path.join(projectRoot, ".quack", "logs", "docker-create-uncertainty");
+      legacyLogDir !== undefined
+        ? path.join(legacyLogDir, "docker-create-uncertainty")
+        : (resolvedThird ?? path.join(defaultLogDir, "docker-create-uncertainty"));
     this.retentionDir = path.join(this.uncertaintyDir, "retained");
-    this.hostLogDir = path.resolve(options.logDir ?? path.join(projectRoot, ".quack", "logs"));
-    this.assertSafeLogDir();
-    this.assertSafeConfiguredVolumes();
+    this.hostLogDir = path.resolve(options.logDir ?? legacyLogDir ?? defaultLogDir);
+    this.trustedManagedDockerImages = loadTrustedManagedDockerImages();
+    this.dockerExecutable = resolveTrustedDockerExecutable([projectRoot, process.cwd()]);
+    this.dockerEnvironment = trustedDockerEnvironment(this.dockerExecutable);
+    this.logsDirectory = this.hostLogDir;
+    assertLogsDoNotOverlapProtectedRuntimeDirectories(projectRoot, this.logsDirectory);
+    ensureSafeDockerRuntimeDirectory(projectRoot, this.logsDirectory);
+    assertSafeWritableLogTree(projectRoot, this.logsDirectory);
+    const relativeLogsDirectory = path.relative(path.resolve(projectRoot), this.logsDirectory);
+    this.containerLogsDirectory = path.posix.join(
+      CONTAINER_WORKSPACE,
+      relativeLogsDirectory.replace(/\\/g, "/"),
+    );
     this.uncertainCreateWindowMs = Math.max(
       1,
       options.uncertainCreateWindowMs ?? UNCERTAIN_CREATE_WINDOW_MS,
@@ -326,44 +700,40 @@ export class DockerManager {
     this.runtimeRoot = options.runtimeRoot
       ? resolveThroughExistingAncestor(path.resolve(options.runtimeRoot))
       : undefined;
+    this.validateMountConfiguration();
+    this.assertSafeLogDir();
+    this.assertSafeConfiguredVolumes();
     this.refreshCreateUncertainty();
     this.refreshRetentionMarkers();
+  }
+
+  /** Validate the current adapter image before publishing a managed admission. */
+  assertManagedAdmissionImageTrusted(): void {
+    assertTrustedManagedDockerImage(this.config.image, this.trustedManagedDockerImages);
   }
 
   /** Translate a trusted host runtime entry point to its read-only container mount. */
   containerPathForHost(hostPath: string): string {
     const resolved = resolveThroughExistingAncestor(path.resolve(hostPath));
-    // The runtime root may itself be the managed project. Prefer its dedicated
-    // read-only mount so a self-hosted dispatch never executes Quack from the
-    // task's writable worktree copy.
     if (this.runtimeRoot && isSameOrDescendant(resolved, this.runtimeRoot)) {
       const relative = path.relative(this.runtimeRoot, resolved);
       return path.posix.join("/quack-runtime", relative.replace(/\\/g, "/"));
     }
-    if (isSameOrDescendant(resolved, resolveThroughExistingAncestor(this.projectRoot))) {
-      const relative = path.relative(resolveThroughExistingAncestor(this.projectRoot), resolved);
-      return path.posix.join("/workspace", relative.replace(/\\/g, "/"));
+    const realProjectRoot = resolveThroughExistingAncestor(this.projectRoot);
+    if (isSameOrDescendant(resolved, realProjectRoot)) {
+      const relative = path.relative(realProjectRoot, resolved);
+      return path.posix.join(CONTAINER_WORKSPACE, relative.replace(/\\/g, "/"));
     }
     throw new Error("Quack runtime entry point is outside trusted Docker runtime mounts");
   }
 
   private assertSafeLogDir(): void {
     const resolvedRoot = path.resolve(this.projectRoot);
-    const relativeLogDir = path.relative(resolvedRoot, this.hostLogDir);
     const dedicatedLogDir = path.join(resolvedRoot, ".quack", "logs");
     const canonicalPrep = path.join(resolvedRoot, ".quack", "prep");
     const protectedPrep = path.resolve(resolvePrepStorageDirSync(resolvedRoot));
-    if (
-      path.isAbsolute(relativeLogDir) ||
-      relativeLogDir === ".." ||
-      relativeLogDir.startsWith(`..${path.sep}`)
-    ) {
-      throw new Error("Docker logging.dir must remain inside the project root");
-    }
-    if (comparablePath(this.hostLogDir) !== comparablePath(dedicatedLogDir)) {
-      throw new Error(
-        "Docker isolation requires logging.dir to be the dedicated .quack/logs runtime directory",
-      );
+    if (!isSameOrDescendant(this.hostLogDir, dedicatedLogDir)) {
+      throw new Error("Docker logging.dir must remain inside the dedicated .quack/logs directory");
     }
     if (
       isSameOrDescendant(this.hostLogDir, canonicalPrep) ||
@@ -373,19 +743,20 @@ export class DockerManager {
     }
 
     this.assertNoPathAliases(resolvedRoot, this.hostLogDir, "Docker logging.dir");
-
     const realRoot = resolveThroughExistingAncestor(resolvedRoot);
     const realLogDir = resolveThroughExistingAncestor(this.hostLogDir);
-    const realCanonicalPrepDir = resolveThroughExistingAncestor(canonicalPrep);
-    const realPrepDir = resolveThroughExistingAncestor(protectedPrep);
-    if (!isSameOrDescendant(realLogDir, realRoot)) {
-      throw new Error("Docker logging.dir resolves outside the project root");
-    }
+    const realDedicatedLogDir = resolveThroughExistingAncestor(dedicatedLogDir);
     if (
-      isSameOrDescendant(realLogDir, realCanonicalPrepDir) ||
-      isSameOrDescendant(realLogDir, realPrepDir)
+      !isSameOrDescendant(realLogDir, realRoot) ||
+      !isSameOrDescendant(realLogDir, realDedicatedLogDir)
     ) {
-      throw new Error("Docker logging.dir resolves into the protected .quack/prep tree");
+      throw new Error("Docker logging.dir resolves outside the dedicated .quack/logs directory");
+    }
+    if (fs.existsSync(this.hostLogDir)) {
+      const stat = fs.lstatSync(this.hostLogDir);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        throw new Error("Docker logging.dir is not a regular directory");
+      }
     }
   }
 
@@ -461,23 +832,14 @@ export class DockerManager {
   }
 
   private assertSafeConfiguredVolumes(worktreePath?: string): void {
-    for (const volume of this.config.volumes ?? []) {
-      this.safeConfiguredVolume(volume, worktreePath);
-      // safeConfiguredVolume confines every destination to /quack-inputs/*.
-      // Keep parsing all entries here so constructor-time validation remains
-      // side-effect free and create-time validation can repeat the same gate.
-    }
+    for (const volume of this.config.volumes ?? []) this.safeConfiguredVolume(volume, worktreePath);
   }
 
   private projectGitOutput(args: string[]): string {
-    return String(
-      execFileSync("git", args, {
-        cwd: this.projectRoot,
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: 10_000,
-      }),
-    ).trim();
+    return runTrustedGitSync(args, this.projectRoot, {
+      timeoutMs: 10_000,
+      maxBuffer: 1024 * 1024,
+    }).trim();
   }
 
   private readSafeCoreGitConfig(
@@ -522,9 +884,8 @@ export class DockerManager {
         throw new Error(`Docker bind source contains an unsupported entry: ${current}`);
       }
       entries += 1;
-      if (entries > 100_000) {
+      if (entries > 100_000)
         throw new Error("Docker bind source exceeds the safe validation limit");
-      }
       for (const entry of fs.readdirSync(current)) pending.push(path.join(current, entry));
     }
   }
@@ -583,6 +944,29 @@ export class DockerManager {
     throw new Error(`Docker dispatch could not resolve authoritative branch ${refName}`);
   }
 
+  private resolveAuthoritativeGitRoot(): string {
+    const projectGitPath = path.join(this.projectRoot, ".git");
+    const projectGitStat = fs.lstatSync(projectGitPath);
+    if (projectGitStat.isDirectory() && !projectGitStat.isSymbolicLink()) {
+      return fs.realpathSync.native(projectGitPath);
+    }
+    if (projectGitStat.isFile() && !projectGitStat.isSymbolicLink()) {
+      const projectGitFile = readTrustedTextFile(projectGitPath, 4_096).trim();
+      const projectGitMatch = /^gitdir:\s*(.+)$/i.exec(projectGitFile);
+      if (!projectGitMatch) throw new Error("Project .git file has an invalid worktree target");
+      const projectAdminDir = fs.realpathSync.native(
+        path.resolve(this.projectRoot, projectGitMatch[1].trim()),
+      );
+      const commonDirFile = path.join(projectAdminDir, "commondir");
+      return fs.realpathSync.native(
+        fs.existsSync(commonDirFile)
+          ? path.resolve(projectAdminDir, readTrustedTextFile(commonDirFile, 4_096).trim())
+          : projectAdminDir,
+      );
+    }
+    throw new Error("Project Git metadata has an untrusted identity");
+  }
+
   private preparePrivateGit(
     worktreePath: string,
     token: string,
@@ -590,33 +974,11 @@ export class DockerManager {
     authoritativeHeadOverride?: string,
     privateHeadOverride?: string,
   ): PrivateGitLayout {
-    const projectGitPath = path.join(this.projectRoot, ".git");
-    const projectGitStat = fs.lstatSync(projectGitPath);
-    let hostGitRoot: string;
-    if (projectGitStat.isDirectory() && !projectGitStat.isSymbolicLink()) {
-      hostGitRoot = fs.realpathSync.native(projectGitPath);
-    } else if (projectGitStat.isFile() && !projectGitStat.isSymbolicLink()) {
-      const projectGitFile = fs.readFileSync(projectGitPath, "utf-8").trim();
-      const projectGitMatch = /^gitdir:\s*(.+)$/i.exec(projectGitFile);
-      if (!projectGitMatch) throw new Error("Project .git file has an invalid worktree target");
-      const projectAdminDir = fs.realpathSync.native(
-        path.resolve(this.projectRoot, projectGitMatch[1].trim()),
-      );
-      const commonDirFile = path.join(projectAdminDir, "commondir");
-      hostGitRoot = fs.realpathSync.native(
-        fs.existsSync(commonDirFile)
-          ? path.resolve(projectAdminDir, fs.readFileSync(commonDirFile, "utf-8").trim())
-          : projectAdminDir,
-      );
-    } else {
-      throw new Error("Project Git metadata has an untrusted identity");
-    }
+    const hostGitRoot = this.resolveAuthoritativeGitRoot();
     const dotGitPath = path.join(worktreePath, ".git");
     const dotGit = fs.readFileSync(dotGitPath, "utf-8").trim();
     const match = /^gitdir:\s*(.+)$/i.exec(dotGit);
-    if (!match) {
-      throw new Error("Docker dispatch requires a linked Git worktree");
-    }
+    if (!match) throw new Error("Docker dispatch requires a linked Git worktree");
     const worktreeGitDir = fs.realpathSync.native(path.resolve(worktreePath, match[1].trim()));
     const worktreeAdminRoot = path.join(hostGitRoot, "worktrees");
     if (!isSameOrDescendant(worktreeGitDir, worktreeAdminRoot)) {
@@ -662,10 +1024,6 @@ export class DockerManager {
     }
 
     const safeToken = token.replace(/[^A-Za-z0-9._-]/g, "_");
-    // Preserve only Git's inert line-ending normalization knobs. A Windows
-    // checkout made with core.autocrlf=true otherwise appears wholly dirty to
-    // the Linux container's private repository, while copying the host config
-    // itself would re-expose aliases, hooks, remotes, and credential helpers.
     const autoCrlf = this.readSafeCoreGitConfig("core.autocrlf", ["true", "false", "input"]);
     const coreEol = this.readSafeCoreGitConfig("core.eol", ["native", "lf", "crlf"]);
     const safeCrlf = this.readSafeCoreGitConfig("core.safecrlf", ["true", "false", "warn"]);
@@ -707,10 +1065,7 @@ export class DockerManager {
       encoding: "utf-8",
       flag: "wx",
     });
-    fs.writeFileSync(privateRefPath, `${privateHead}\n`, {
-      encoding: "utf-8",
-      flag: "wx",
-    });
+    fs.writeFileSync(privateRefPath, `${privateHead}\n`, { encoding: "utf-8", flag: "wx" });
     fs.writeFileSync(
       path.join(hostPrivateGitDir, "objects", "info", "alternates"),
       "/quack-git-objects\n",
@@ -723,20 +1078,11 @@ export class DockerManager {
     );
 
     const hostObjectsDir = fs.realpathSync.native(path.join(hostGitRoot, "objects"));
-    const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
-    execFileSync(
-      "git",
-      ["--git-dir", hostPrivateGitDir, "--work-tree", worktreePath, "read-tree", privateHead],
-      {
-        cwd: worktreePath,
-        stdio: "ignore",
-        env: {
-          ...process.env,
-          GIT_ALTERNATE_OBJECT_DIRECTORIES: hostObjectsDir,
-          GIT_CONFIG_NOSYSTEM: "1",
-          GIT_CONFIG_GLOBAL: nullDevice,
-        },
-      },
+    this.runTrustedPrivateGit(
+      hostPrivateGitDir,
+      worktreePath,
+      ["read-tree", privateHead],
+      hostObjectsDir,
     );
 
     const containerGitDir = path.posix.join("/workspace/.quack/docker-git", safeToken);
@@ -776,12 +1122,18 @@ export class DockerManager {
       ) {
         throw new Error(`Docker policy file has an untrusted identity: .quack/${fileName}`);
       }
-      mounts.push({
-        source: realSource,
-        destination: `/workspace/.quack/${fileName}`,
-      });
+      mounts.push({ source: realSource, destination: `/workspace/.quack/${fileName}` });
     }
     return mounts;
+  }
+
+  private validateMountConfiguration(): ValidatedConfiguredVolume[] {
+    assertLogsDoNotOverlapProtectedRuntimeDirectories(this.projectRoot, this.logsDirectory);
+    ensureSafeDockerRuntimeDirectory(this.projectRoot, this.logsDirectory);
+    assertSafeWritableLogTree(this.projectRoot, this.logsDirectory);
+    return (this.config.volumes ?? []).map((volume) =>
+      validateConfiguredVolume(this.projectRoot, volume),
+    );
   }
 
   private uncertaintyPath(containerName: string): string {
@@ -792,8 +1144,6 @@ export class DockerManager {
     taskId: string,
     worktreePath: string,
   ): { hostPath: string; containerPath: string } {
-    // Container output belongs to the disposable task worktree. Never expose
-    // the monitor's authoritative log/control tree as a writable bind mount.
     const base = path.join(worktreePath, ".quack", "docker-runtime");
     const realWorktree = resolveThroughExistingAncestor(worktreePath);
     const prospectiveBase = resolveThroughExistingAncestor(base);
@@ -821,10 +1171,7 @@ export class DockerManager {
       throw new Error("Docker dispatch log directory is not a fresh contained directory");
     }
     const relative = path.relative(realWorktree, realRuntimeLogDir).replace(/\\/g, "/");
-    return {
-      hostPath: realRuntimeLogDir,
-      containerPath: path.posix.join("/workspace", relative),
-    };
+    return { hostPath: realRuntimeLogDir, containerPath: path.posix.join("/workspace", relative) };
   }
 
   private assertRuntimeLogDirSafe(runtimeLogDir: string, worktreePath: string): string {
@@ -843,9 +1190,6 @@ export class DockerManager {
     ) {
       throw new Error("Docker dispatch log directory changed identity before mount");
     }
-    // The leaf is freshly created for this dispatch. Refuse any pre-mount
-    // descendant, including hard links and reparse/symlink aliases, so the RW
-    // mount cannot expose data that predates this run.
     if (fs.readdirSync(realRuntimeLogDir).length !== 0) {
       throw new Error("Docker dispatch log directory must remain empty until container creation");
     }
@@ -900,9 +1244,6 @@ export class DockerManager {
       return {
         ...marker,
         version: 2,
-        // Markers written by the previous release used only a one-second
-        // confirmAfter value. Upgrade them in memory to the full Docker command
-        // acceptance window instead of trusting one negative daemon lookup.
         ...(marker.version === 1
           ? {
               interruptedAt: marker.createdAt,
@@ -1111,7 +1452,7 @@ export class DockerManager {
       try {
         fs.rmSync(temporaryPath, { force: true });
       } catch {
-        // Best effort only; the original unconfirmed marker remains.
+        // Keep the original unconfirmed marker as durable fail-closed evidence.
       }
       return false;
     }
@@ -1141,8 +1482,6 @@ export class DockerManager {
       (name) => `uncertainty:${name}`,
     );
     for (const marker of this.uncertainCreations.values()) {
-      // A create intent with no observed interruption may still be executing in
-      // another process. Absence is never proof in that state.
       if (!marker.interruptedAt || !marker.confirmAfter || !marker.reconcileUntil) {
         const outcome = await this.removeContainerOnce(marker.containerName);
         if (outcome === "removed" && this.clearCreateUncertainty(marker)) continue;
@@ -1154,12 +1493,7 @@ export class DockerManager {
       let resolved = false;
       while (!resolved) {
         const delayMs = Math.max(0, nextProbeAt - Date.now());
-        if (delayMs > 0) {
-          await new Promise<void>((resolve) => {
-            setTimeout(resolve, delayMs);
-          });
-        }
-
+        if (delayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
         const outcome = await this.removeContainerOnce(marker.containerName);
         if (outcome === "removed") {
           resolved = this.clearCreateUncertainty(marker);
@@ -1167,8 +1501,6 @@ export class DockerManager {
         }
         if (outcome === "unconfirmed") break;
         if (Date.now() >= deadline) {
-          // Repeated name probes covered the entire bounded period in which the
-          // interrupted Docker CLI could still have delivered its create.
           resolved = this.clearCreateUncertainty(marker);
           break;
         }
@@ -1208,12 +1540,7 @@ export class DockerManager {
     return this.hostPathMatchesRoot(source, this.projectRoot);
   }
 
-  /**
-   * Discover Quack containers that survived a monitor process and remove this
-   * project's containers before new admission. Legacy containers without a
-   * project fingerprint are accepted only when their /workspace mount proves
-   * ownership; ambiguous records fail closed and are never removed.
-   */
+  /** Reconcile containers left by a previous monitor before new admission. */
   async reconcileExistingContainers(
     registeredProjectRoots: readonly string[] = [this.projectRoot],
   ): Promise<DockerReconciliationResult> {
@@ -1270,11 +1597,11 @@ export class DockerManager {
       const labels = record.Config?.Labels;
       const taskId = labels?.["quack.taskId"];
       const owner = labels?.["quack.projectFingerprint"];
-      if (typeof taskId !== "string" || !taskId) {
-        ambiguousContainerIds.push(containerId);
-        continue;
-      }
-      if (owner !== undefined && typeof owner !== "string") {
+      if (
+        typeof taskId !== "string" ||
+        !taskId ||
+        (owner !== undefined && typeof owner !== "string")
+      ) {
         ambiguousContainerIds.push(containerId);
         continue;
       }
@@ -1283,7 +1610,7 @@ export class DockerManager {
       const inspectedName = typeof record.Name === "string" ? record.Name.replace(/^\//, "") : "";
       if (owner === undefined) {
         const workspaceSource = record.Mounts?.find(
-          (mount) => mount.Destination === "/workspace" && typeof mount.Source === "string",
+          (mount) => mount.Destination === CONTAINER_WORKSPACE && typeof mount.Source === "string",
         )?.Source;
         if (typeof workspaceSource !== "string") {
           ambiguousContainerIds.push(containerId);
@@ -1314,7 +1641,7 @@ export class DockerManager {
           containerName: inspectedName || retained.containerName,
           taskId,
           image: typeof record.Config?.Image === "string" ? record.Config.Image : this.config.image,
-          workDir: "/workspace",
+          workDir: CONTAINER_WORKSPACE,
           logsVolume: this.containerRuntimeLogPath(retained.worktreePath, retained.runtimeLogDir),
           worktreePath: retained.worktreePath,
           runtimeLogDir: retained.runtimeLogDir,
@@ -1337,25 +1664,25 @@ export class DockerManager {
       }
 
       const workspaceSource = record.Mounts?.find(
-        (mount) => mount.Destination === "/workspace" && typeof mount.Source === "string",
+        (mount) => mount.Destination === CONTAINER_WORKSPACE && typeof mount.Source === "string",
       )?.Source;
       const labeledRuntimeLog = labels?.["quack.runtimeLogPath"];
       const labeledGitDir = labels?.["quack.gitDir"];
       const runtimeLogRelative =
         typeof labeledRuntimeLog === "string" &&
         labeledRuntimeLog.startsWith("/workspace/.quack/docker-runtime/")
-          ? path.posix.relative("/workspace", labeledRuntimeLog)
+          ? path.posix.relative(CONTAINER_WORKSPACE, labeledRuntimeLog)
           : undefined;
       const runtimeLogSource =
         typeof workspaceSource === "string" && runtimeLogRelative
           ? path.resolve(workspaceSource, runtimeLogRelative)
           : undefined;
       const info: DockerContainer = {
-        containerId: inspectedId.length > 0 ? inspectedId : containerId,
+        containerId: inspectedId || containerId,
         containerName: inspectedName || containerId,
         taskId,
         image: typeof record.Config?.Image === "string" ? record.Config.Image : this.config.image,
-        workDir: "/workspace",
+        workDir: CONTAINER_WORKSPACE,
         logsVolume:
           typeof labeledRuntimeLog === "string"
             ? labeledRuntimeLog
@@ -1364,9 +1691,10 @@ export class DockerManager {
           typeof workspaceSource === "string" ? workspaceSource : path.resolve(this.projectRoot),
         runtimeLogDir: typeof runtimeLogSource === "string" ? runtimeLogSource : this.hostLogDir,
         gitDir:
-          typeof labeledGitDir === "string" && labeledGitDir.startsWith("/quack-git/worktrees/")
+          typeof labeledGitDir === "string" &&
+          labeledGitDir.startsWith("/workspace/.quack/docker-git/")
             ? labeledGitDir
-            : "/quack-git/worktrees/unresolved",
+            : "/workspace/.quack/docker-git/unresolved",
         startedAt: typeof record.Created === "string" ? record.Created : new Date().toISOString(),
         status: record.State?.Running === true ? "running" : "stopped",
       };
@@ -1390,17 +1718,11 @@ export class DockerManager {
       discoveredContainers.push(info);
     }
 
-    // A retained marker whose container is absent from a complete daemon list
-    // has been explicitly removed out of band. Clear only its exact tokened
-    // generation; a concurrent replacement cannot be erased.
     for (const [taskId, marker] of this.retainedContainers) {
       if (seenRetentionTasks.has(taskId)) continue;
       this.clearRetention(marker);
     }
 
-    // A complete, unambiguous daemon list is proof that a previously
-    // cleanup-pending, fully-created container is absent. Keep ambiguous
-    // scans fail-closed and never infer absence from them.
     if (ambiguousContainerIds.length === 0) {
       for (const [taskId, tracked] of this.containers) {
         if (
@@ -1447,6 +1769,16 @@ export class DockerManager {
     };
   }
 
+  private execDocker(args: string[], timeout = 120_000) {
+    return execFileAsync(this.dockerExecutable, args, {
+      cwd: path.dirname(this.dockerExecutable),
+      env: this.dockerEnvironment,
+      encoding: "utf8",
+      windowsHide: true,
+      timeout,
+    });
+  }
+
   private async runDocker(
     args: string[],
     timeoutMs = DOCKER_COMMAND_TIMEOUT_MS,
@@ -1454,7 +1786,9 @@ export class DockerManager {
     const controller = new AbortController();
     this.pendingCommands.add(controller);
     try {
-      const result = await execFileAsync("docker", args, {
+      const result = await execFileAsync(this.dockerExecutable, args, {
+        cwd: path.dirname(this.dockerExecutable),
+        env: this.dockerEnvironment,
         encoding: "utf-8",
         timeout: Math.max(1, timeoutMs),
         windowsHide: true,
@@ -1477,7 +1811,7 @@ export class DockerManager {
    */
   async checkDocker(): Promise<string> {
     try {
-      const { stdout } = await this.runDocker(["info", "--format", "{{.ServerVersion}}"]);
+      const { stdout } = await this.execDocker(["info", "--format", "{{.ServerVersion}}"], 30_000);
       return stdout.trim();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1487,8 +1821,9 @@ export class DockerManager {
 
   /**
    * Create and start a container for a task dispatch.
-   * Mounts only a task worktree read-write. Git metadata is mounted separately
-   * so commits work, while authoritative policy/prep files stay read-only.
+   * Mounts project root and prep state read-only. Runtime logs use a
+   * container-private tmpfs so repository code never receives a writable
+   * handle to the host's authoritative log or control tree.
    */
   async createContainer(
     taskId: string,
@@ -1500,6 +1835,7 @@ export class DockerManager {
       authoritativeHead?: string;
       parentTaskId?: string;
       sharedBranchName?: string;
+      admissionScopeDirectory?: string;
     } = {},
   ): Promise<DockerContainer> {
     this.assertSafeLogDir();
@@ -1508,185 +1844,216 @@ export class DockerManager {
         `Docker decomposition for ${taskId} requires paired parentTaskId and sharedBranchName`,
       );
     }
-    const expectedWorktree = path.resolve(this.projectRoot, ".quack", "worktrees", taskId);
-    const resolvedWorktree = path.resolve(worktreePath);
-    if (comparablePath(resolvedWorktree) !== comparablePath(expectedWorktree)) {
-      throw new Error(`Docker dispatch ${taskId} requires its task-specific managed worktree`);
-    }
-    const realWorktree = resolveThroughExistingAncestor(resolvedWorktree);
-    const realProject = resolveThroughExistingAncestor(this.projectRoot);
-    if (
-      !fs.existsSync(resolvedWorktree) ||
-      comparablePath(realWorktree) === comparablePath(realProject) ||
-      !isSameOrDescendant(realWorktree, path.join(realProject, ".quack", "worktrees"))
-    ) {
-      throw new Error(`Docker dispatch ${taskId} worktree identity could not be verified`);
-    }
-    this.assertSafeConfiguredVolumes(realWorktree);
-    // Prevent double-create
-    const existing = this.containers.get(taskId);
-    if (existing && existing.status !== "removed") {
-      throw new Error(
-        `Container cleanup is unresolved for ${taskId} (${existing.containerId}, ${existing.status})`,
-      );
-    }
-    const containerName = `quack-${taskId}-${randomUUID()}`;
-    const inspectedResumeSource = options.resumeStateDir
-      ? inspectValidatedDockerResumeArchive(options.resumeStateDir, taskId)
-      : undefined;
-    const resumeSource: DockerResumeSourceBinding | undefined = inspectedResumeSource
-      ? {
-          archiveName: inspectedResumeSource.archiveName,
-          dispatchSessionId: inspectedResumeSource.dispatchSessionId,
-          eventSessionId: inspectedResumeSource.eventSessionId,
-          ownershipId: inspectedResumeSource.ownershipId,
-          approvedGate: inspectedResumeSource.approvedGate,
-          gitState: inspectedResumeSource.gitState,
-          ...(inspectedResumeSource.approvedDiffHash
-            ? { approvedDiffHash: inspectedResumeSource.approvedDiffHash }
-            : {}),
-          ...(inspectedResumeSource.parentTaskId
-            ? { parentTaskId: inspectedResumeSource.parentTaskId }
-            : {}),
-          ...(inspectedResumeSource.sharedBranchName
-            ? { sharedBranchName: inspectedResumeSource.sharedBranchName }
-            : {}),
-        }
-      : undefined;
-    if (
-      resumeSource &&
-      (resumeSource.gitState.authoritativeRef !== `refs/heads/${options.authoritativeBranch}` ||
-        resumeSource.gitState.baseHead.toLowerCase() !== options.authoritativeHead?.toLowerCase() ||
-        resumeSource.parentTaskId !== options.parentTaskId ||
-        resumeSource.sharedBranchName !== options.sharedBranchName)
-    ) {
-      throw new Error(`Docker resume archive for ${taskId} does not match the admitted Git ref`);
-    }
-    if (resumeSource) this.assertSealedResumeRef(resumeSource);
-    const runtimeLog = this.createRuntimeLogDir(taskId, realWorktree);
-    const gitMount = this.preparePrivateGit(
-      realWorktree,
-      containerName,
-      options.authoritativeBranch,
-      options.authoritativeHead,
-      resumeSource?.gitState.candidateHead,
-    );
-    const runtimeLogDir = runtimeLog.hostPath;
-    const info: DockerContainer = {
-      // Docker commands accept the unique name as well as the eventual ID,
-      // which lets shutdown clean up even if `docker create` is interrupted
-      // before stdout returns the ID.
-      containerId: containerName,
-      containerName,
-      taskId,
-      image: this.config.image,
-      workDir: "/workspace",
-      logsVolume: runtimeLog.containerPath,
-      worktreePath: realWorktree,
-      runtimeLogDir,
-      gitDir: gitMount.containerGitDir,
-      privateGitDir: gitMount.hostPrivateGitDir,
-      gitObjectsDir: gitMount.hostObjectsDir,
-      dotGitOverlay: gitMount.dotGitOverlay,
-      authoritativeRef: gitMount.authoritativeRef,
-      authoritativeHead: gitMount.authoritativeHead,
-      authoritativeWorktreeGitDir: gitMount.authoritativeWorktreeGitDir,
-      ...(options.eventSessionId ? { eventSessionId: options.eventSessionId } : {}),
-      ...(options.parentTaskId ? { parentTaskId: options.parentTaskId } : {}),
-      ...(options.sharedBranchName ? { sharedBranchName: options.sharedBranchName } : {}),
-      startedAt: new Date().toISOString(),
-      status: "creating",
-    };
-    if (resumeSource) info.resumeSource = resumeSource;
-    if (resumeSource) {
-      const dirty = this.gitOutput(
-        gitMount.hostPrivateGitDir,
-        realWorktree,
-        ["status", "--porcelain", "--untracked-files=all"],
-        gitMount.hostObjectsDir,
-      );
-      if (dirty) {
-        throw new Error(`Docker resume worktree for ${taskId} no longer matches its sealed commit`);
-      }
-    }
-    this.containers.set(taskId, info);
-    let uncertainty: DockerCreateUncertainty;
-    try {
-      // Persist intent before Docker can accept the create. If the monitor is
-      // lost before stdout arrives, the next monitor owns a bounded name-based
-      // reconciliation rather than trusting a one-shot label scan.
-      uncertainty = this.persistCreateUncertainty(containerName, taskId);
-    } catch (error: unknown) {
-      this.containers.delete(taskId);
-      const detail = error instanceof Error ? error.message : String(error);
-      throw new Error(
-        `Cannot create container for ${taskId}: durable create ownership could not be recorded (${detail})`,
-      );
-    }
 
+    let ownsAdmissionScope = false;
     try {
-      const createArgs = this.buildCreateArgs(
-        taskId,
+      if (options.admissionScopeDirectory) {
+        const admissionScope = assertDecompositionDispatchAdmissionScope(
+          this.projectRoot,
+          options.admissionScopeDirectory,
+        );
+        if (this.admissionScopes.has(taskId)) {
+          throw new Error(`A Docker admission scope remains unresolved for ${taskId}.`);
+        }
+        this.admissionScopes.set(taskId, admissionScope);
+        ownsAdmissionScope = true;
+        this.assertManagedAdmissionImageTrusted();
+        if (this.config.preInstallCommand) {
+          throw new Error(
+            "Docker preInstallCommand is not allowed on a managed dispatch container before its one-use admission is consumed.",
+          );
+        }
+      }
+
+      this.validateMountConfiguration();
+
+      const expectedWorktree = path.resolve(this.projectRoot, ".quack", "worktrees", taskId);
+      const resolvedWorktree = path.resolve(worktreePath);
+      if (comparablePath(resolvedWorktree) !== comparablePath(expectedWorktree)) {
+        throw new Error(`Docker dispatch ${taskId} requires its task-specific managed worktree`);
+      }
+      const realWorktree = resolveThroughExistingAncestor(resolvedWorktree);
+      const realProject = resolveThroughExistingAncestor(this.projectRoot);
+      if (
+        !fs.existsSync(resolvedWorktree) ||
+        comparablePath(realWorktree) === comparablePath(realProject) ||
+        !isSameOrDescendant(realWorktree, path.join(realProject, ".quack", "worktrees"))
+      ) {
+        throw new Error(`Docker dispatch ${taskId} worktree identity could not be verified`);
+      }
+      this.assertSafeConfiguredVolumes(realWorktree);
+      const existing = this.containers.get(taskId);
+      if (existing && existing.status !== "removed") {
+        throw new Error(
+          `Container cleanup is unresolved for ${taskId} (${existing.containerId}, ${existing.status})`,
+        );
+      }
+
+      const containerName = `quack-${taskId}-${randomUUID()}`;
+      const inspectedResumeSource = options.resumeStateDir
+        ? inspectValidatedDockerResumeArchive(options.resumeStateDir, taskId)
+        : undefined;
+      const resumeSource: DockerResumeSourceBinding | undefined = inspectedResumeSource
+        ? {
+            archiveName: inspectedResumeSource.archiveName,
+            dispatchSessionId: inspectedResumeSource.dispatchSessionId,
+            eventSessionId: inspectedResumeSource.eventSessionId,
+            ownershipId: inspectedResumeSource.ownershipId,
+            approvedGate: inspectedResumeSource.approvedGate,
+            gitState: inspectedResumeSource.gitState,
+            ...(inspectedResumeSource.approvedDiffHash
+              ? { approvedDiffHash: inspectedResumeSource.approvedDiffHash }
+              : {}),
+            ...(inspectedResumeSource.parentTaskId
+              ? { parentTaskId: inspectedResumeSource.parentTaskId }
+              : {}),
+            ...(inspectedResumeSource.sharedBranchName
+              ? { sharedBranchName: inspectedResumeSource.sharedBranchName }
+              : {}),
+          }
+        : undefined;
+      if (
+        resumeSource &&
+        (resumeSource.gitState.authoritativeRef !== `refs/heads/${options.authoritativeBranch}` ||
+          resumeSource.gitState.baseHead.toLowerCase() !==
+            options.authoritativeHead?.toLowerCase() ||
+          resumeSource.parentTaskId !== options.parentTaskId ||
+          resumeSource.sharedBranchName !== options.sharedBranchName)
+      ) {
+        throw new Error(`Docker resume archive for ${taskId} does not match the admitted Git ref`);
+      }
+      if (resumeSource) this.assertSealedResumeRef(resumeSource);
+      const runtimeLog = this.createRuntimeLogDir(taskId, realWorktree);
+      const gitMount = this.preparePrivateGit(
         realWorktree,
-        runtimeLogDir,
-        runtimeLog.containerPath,
-        gitMount.hostObjectsDir,
-        gitMount.containerGitDir,
-        gitMount.dotGitOverlay,
         containerName,
+        options.authoritativeBranch,
+        options.authoritativeHead,
+        resumeSource?.gitState.candidateHead,
       );
-      if (options.resumeStateDir) {
-        if (!options.eventSessionId) {
-          throw new Error(`Docker resume for ${taskId} has no host-assigned event session`);
-        }
-        const seeded = seedDockerResumeState(
-          options.resumeStateDir,
-          runtimeLogDir,
-          taskId,
-          options.eventSessionId,
+      const runtimeLogDir = runtimeLog.hostPath;
+      const info: DockerContainer = {
+        containerId: containerName,
+        containerName,
+        taskId,
+        image: this.config.image,
+        workDir: CONTAINER_WORKSPACE,
+        logsVolume: runtimeLog.containerPath,
+        worktreePath: realWorktree,
+        runtimeLogDir,
+        gitDir: gitMount.containerGitDir,
+        privateGitDir: gitMount.hostPrivateGitDir,
+        gitObjectsDir: gitMount.hostObjectsDir,
+        dotGitOverlay: gitMount.dotGitOverlay,
+        authoritativeRef: gitMount.authoritativeRef,
+        authoritativeHead: gitMount.authoritativeHead,
+        authoritativeWorktreeGitDir: gitMount.authoritativeWorktreeGitDir,
+        ...(options.eventSessionId ? { eventSessionId: options.eventSessionId } : {}),
+        ...(options.parentTaskId ? { parentTaskId: options.parentTaskId } : {}),
+        ...(options.sharedBranchName ? { sharedBranchName: options.sharedBranchName } : {}),
+        startedAt: new Date().toISOString(),
+        status: "creating",
+      };
+      if (resumeSource) info.resumeSource = resumeSource;
+      if (resumeSource) {
+        const dirty = this.runTrustedPrivateGit(
+          gitMount.hostPrivateGitDir,
+          realWorktree,
+          ["status", "--porcelain", "--untracked-files=all"],
+          gitMount.hostObjectsDir,
         );
-        if (JSON.stringify(seeded) !== JSON.stringify(info.resumeSource)) {
-          throw new Error(`Docker resume archive for ${taskId} changed during container setup`);
+        if (dirty) {
+          throw new Error(
+            `Docker resume worktree for ${taskId} no longer matches its sealed commit`,
+          );
         }
       }
-      const { stdout } = await this.runDocker(createArgs);
-      const containerId = stdout.trim() || containerName;
-      info.containerId = containerId;
-      // Start the container
-      await this.runDocker(["start", containerId]);
-      info.status = "running";
-
-      // Run pre-install command if configured
-      if (this.config.preInstallCommand) {
-        await this.runDocker(
-          ["exec", containerId, "sh", "-c", this.config.preInstallCommand],
-          DOCKER_SETUP_TIMEOUT_MS,
-        );
-      }
-
-      // The creation transaction is complete only after every setup action
-      // succeeded. Until this exact token is cleared, restart admission stays
-      // blocked and reconciles the uniquely named attempt.
-      if (!this.clearCreateUncertainty(uncertainty)) {
-        throw new Error(`could not clear durable create ownership for ${containerName}`);
-      }
-
-      return info;
-    } catch (err) {
-      info.status = "stopped";
-      let interrupted = uncertainty;
+      this.containers.set(taskId, info);
+      let uncertainty: DockerCreateUncertainty;
       try {
-        interrupted = this.markCreateInterrupted(uncertainty) ?? uncertainty;
-      } catch {
-        // The original intent marker stays present and therefore fail-closed.
+        uncertainty = this.persistCreateUncertainty(containerName, taskId);
+      } catch (error: unknown) {
+        this.containers.delete(taskId);
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `Cannot create container for ${taskId}: durable create ownership could not be recorded (${detail})`,
+        );
       }
-      // When `docker create` did not return, the durable marker remains. An
-      // immediate "no such container" probe is not proof of absence while the
-      // daemon request may still land; restart reconciliation waits first.
-      const removed = await this.forceRemoveContainer(info.containerId).catch(() => false);
-      if (removed) this.clearCreateUncertainty(interrupted);
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`Failed to create container for ${taskId}: ${msg}`);
+
+      try {
+        const admissionScope = options.admissionScopeDirectory
+          ? assertDecompositionDispatchAdmissionScope(
+              this.projectRoot,
+              options.admissionScopeDirectory,
+            )
+          : undefined;
+        const createArgs = this.buildCreateArgs(
+          taskId,
+          realWorktree,
+          runtimeLogDir,
+          runtimeLog.containerPath,
+          gitMount.hostObjectsDir,
+          gitMount.containerGitDir,
+          gitMount.dotGitOverlay,
+          containerName,
+          admissionScope,
+        );
+        if (options.resumeStateDir) {
+          if (!options.eventSessionId) {
+            throw new Error(`Docker resume for ${taskId} has no host-assigned event session`);
+          }
+          const seeded = seedDockerResumeState(
+            options.resumeStateDir,
+            runtimeLogDir,
+            taskId,
+            options.eventSessionId,
+          );
+          if (JSON.stringify(seeded) !== JSON.stringify(info.resumeSource)) {
+            throw new Error(`Docker resume archive for ${taskId} changed during container setup`);
+          }
+        }
+        const { stdout } = await this.runDocker(createArgs);
+        info.containerId = stdout.trim() || containerName;
+        await this.runDocker(["start", info.containerId]);
+        info.status = "running";
+        if (this.config.preInstallCommand) {
+          await this.runDocker(
+            ["exec", info.containerId, "sh", "-c", this.config.preInstallCommand],
+            DOCKER_SETUP_TIMEOUT_MS,
+          );
+        }
+        if (!this.clearCreateUncertainty(uncertainty)) {
+          throw new Error(`could not clear durable create ownership for ${containerName}`);
+        }
+        return info;
+      } catch (error) {
+        info.status = "stopped";
+        let interrupted = uncertainty;
+        try {
+          interrupted = this.markCreateInterrupted(uncertainty) ?? uncertainty;
+        } catch {
+          // The original intent marker remains and keeps admission fail-closed.
+        }
+        const removed = await this.forceRemoveContainer(info.containerId).catch(() => false);
+        if (removed) this.clearCreateUncertainty(interrupted);
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`Failed to create container for ${taskId}: ${detail}`);
+      }
+    } catch (error) {
+      const tracked = this.containers.get(taskId);
+      const cleanupProven = !tracked || tracked.status === "removed";
+      if (ownsAdmissionScope && cleanupProven) {
+        try {
+          this.cleanupAdmissionScope(taskId);
+        } catch (cleanupError) {
+          throw new AggregateError(
+            [error, cleanupError],
+            `Docker admission failure and exact-scope revocation both failed for ${taskId}.`,
+            { cause: error },
+          );
+        }
+      }
+      throw error;
     }
   }
 
@@ -1694,22 +2061,43 @@ export class DockerManager {
    * Execute a command inside the container. Returns the ChildProcess
    * for stdout/stderr streaming (same interface as worktree spawn).
    */
-  execAgent(containerId: string, command: string[], env?: Record<string, string>): ChildProcess {
+  execAgent(
+    containerId: string,
+    command: string[],
+    env?: Record<string, string>,
+    selected?: ReturnType<typeof selectClaudeApiKey>,
+  ): ChildProcess {
     const args = ["exec"];
 
-    // Pass environment variables
-    if (env) {
-      for (const [key, value] of Object.entries(env)) {
-        args.push("-e", `${key}=${value}`);
-      }
+    const presence = inspectClaudeAuth(process.env, selected?.explicitPool === true);
+    if (presence.error) throw new ClaudeAuthConfigurationError(presence.error);
+    const admittedEnvironment: NodeJS.ProcessEnv = {};
+    for (const name of this.config.envPassthrough) {
+      if (!isManagedDockerOperatorEnvironmentName(name))
+        admittedEnvironment[name] = process.env[name];
     }
-
-    // Pass through configured env vars from host
-    for (const envVar of this.config.envPassthrough) {
-      const value = process.env[envVar];
-      if (value !== undefined) {
-        args.push("-e", `${envVar}=${value}`);
-      }
+    for (const [name, value] of Object.entries(env ?? {})) {
+      if (!isManagedDockerOperatorEnvironmentName(name)) admittedEnvironment[name] = value;
+    }
+    if (
+      !selected &&
+      presence.mode !== "cli-managed" &&
+      inspectClaudeAuth(admittedEnvironment).mode !== presence.mode
+    ) {
+      throw new ClaudeAuthConfigurationError(
+        "The selected Claude credential family is not admitted by Docker envPassthrough. Configure the intended credential explicitly.",
+      );
+    }
+    const effectiveEnvironment = buildClaudeChildEnvironment(admittedEnvironment, selected, true);
+    // Clear the other credential family in the actual docker exec environment,
+    // including keys inherited at container creation. Appending explicit child
+    // values last prevents passthrough from replacing a rotated API credential.
+    for (const name of [...Object.keys(process.env), ...this.config.envPassthrough]) {
+      if (isClaudeCredentialEnvironmentName(name) && effectiveEnvironment[name] === undefined)
+        effectiveEnvironment[name] = undefined;
+    }
+    for (const [name, value] of Object.entries(effectiveEnvironment)) {
+      args.push("-e", `${name}=${value ?? ""}`);
     }
 
     // Trusted task-isolation values are appended last so repository-owned
@@ -1757,8 +2145,12 @@ export class DockerManager {
 
     args.push(containerId, ...command);
 
-    return spawn("docker", args, {
+    return spawn(this.dockerExecutable, args, {
+      cwd: path.dirname(this.dockerExecutable),
+      env: this.dockerEnvironment,
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      shell: false,
     });
   }
 
@@ -1796,21 +2188,17 @@ export class DockerManager {
       stopConfirmed = /no such (?:object|container)/i.test(detail);
     }
 
-    // Update tracking
-    for (const info of this.containers.values()) {
-      if (info.containerId === containerId) {
-        if (stopConfirmed) info.status = "stopped";
-        break;
-      }
-    }
-
+    if (stopConfirmed && container) container.status = "stopped";
     if (shouldRemove) {
       return { removed: await this.forceRemoveContainer(containerId), retained: false };
     }
     if (!retention || !stopConfirmed || !this.confirmRetentionStopped(retention)) {
       return { removed: false, retained: false };
     }
-    if (container) container.retentionConfirmed = true;
+    if (container) {
+      container.retentionConfirmed = true;
+      this.cleanupAdmissionScope(container.taskId);
+    }
     return { removed: false, retained: true };
   }
 
@@ -1842,7 +2230,6 @@ export class DockerManager {
       }
       return false;
     }
-
     if (outcome === "absent" && uncertainty !== undefined) {
       if (
         !uncertainty.interruptedAt ||
@@ -1859,9 +2246,10 @@ export class DockerManager {
 
     // Update tracking
     for (const [taskId, info] of this.containers) {
-      if (info.containerId === containerId) {
+      if (info.containerId === containerId || info.containerName === containerId) {
         info.status = "removed";
         this.containers.delete(taskId);
+        this.cleanupAdmissionScope(taskId);
         break;
       }
     }
@@ -1917,16 +2305,111 @@ export class DockerManager {
     }
   }
 
-  private gitOutput(
+  /**
+   * Run the fixed subset of Git needed to inspect or promote container-private
+   * state. The caller cannot inject repository/worktree selectors, PATH is
+   * host-resolved, and the sole optional object alternate must be the exact
+   * authoritative object directory.
+   */
+  private runTrustedPrivateGit(
     gitDir: string,
     worktreePath: string,
     args: string[],
     alternates?: string,
   ): string {
+    const allowedCommands = new Set([
+      "diff",
+      "log",
+      "merge-base",
+      "read-tree",
+      "reset",
+      "rev-list",
+      "rev-parse",
+      "status",
+      "update-ref",
+    ]);
+    const command = args[0];
+    if (
+      !command ||
+      !allowedCommands.has(command) ||
+      args.some(
+        (argument) =>
+          argument.includes("\0") ||
+          /[\r\n]/u.test(argument) ||
+          argument === "-c" ||
+          argument.startsWith("--git-dir") ||
+          argument.startsWith("--work-tree") ||
+          argument.startsWith("--exec"),
+      )
+    ) {
+      throw new Error("Docker private Git invocation is outside the allowlisted operation set");
+    }
+
+    const canonicalProjectRoot = fs.realpathSync.native(this.projectRoot);
+    const canonicalWorktree = fs.realpathSync.native(worktreePath);
+    if (!isSameOrDescendant(canonicalWorktree, canonicalProjectRoot)) {
+      throw new Error("Docker private Git worktree is outside the managed project");
+    }
+    const dotGit = readTrustedTextFile(path.join(canonicalWorktree, ".git"), 4_096).trim();
+    const match = /^gitdir:\s*(.+)$/i.exec(dotGit);
+    if (!match) throw new Error("Docker private Git requires a linked worktree");
+    const authoritativeGitDir = fs.realpathSync.native(
+      path.resolve(canonicalWorktree, match[1].trim()),
+    );
+    const canonicalGitDir = fs.realpathSync.native(gitDir);
+    const privateGitRoot = path.join(canonicalWorktree, ".quack", "docker-git");
+    const authoritative = comparablePath(canonicalGitDir) === comparablePath(authoritativeGitDir);
+    if (authoritative) {
+      if (alternates) {
+        throw new Error("Authoritative Git execution cannot read container-private alternates");
+      }
+      return runTrustedGitSync(args, canonicalWorktree, {
+        timeoutMs: 30_000,
+        maxBuffer: 16 * 1024 * 1024,
+        trustedBoundaryRoot: canonicalProjectRoot,
+      }).trim();
+    }
+    const canonicalPrivateRoot = fs.realpathSync.native(privateGitRoot);
+    if (
+      !isSameOrDescendant(canonicalPrivateRoot, canonicalWorktree) ||
+      !isSameOrDescendant(path.resolve(gitDir), privateGitRoot) ||
+      !isSameOrDescendant(canonicalGitDir, canonicalPrivateRoot)
+    ) {
+      throw new Error("Docker private Git directory is outside its managed worktree");
+    }
+
+    const authoritativeGitRoot = this.resolveAuthoritativeGitRoot();
+    let trustedAlternates: string | undefined;
+    if (alternates) {
+      trustedAlternates = fs.realpathSync.native(alternates);
+      const authoritativeObjects = fs.realpathSync.native(
+        path.join(authoritativeGitRoot, "objects"),
+      );
+      if (comparablePath(trustedAlternates) !== comparablePath(authoritativeObjects)) {
+        throw new Error("Docker private Git alternate object directory is not host-authoritative");
+      }
+    }
+
+    const gitExecutable = resolveTrustedExecutable(
+      "git",
+      canonicalProjectRoot,
+      "Git",
+      process.env,
+      [
+        canonicalProjectRoot,
+        path.basename(authoritativeGitRoot).toLowerCase() === ".git"
+          ? path.dirname(authoritativeGitRoot)
+          : authoritativeGitRoot,
+      ],
+    );
+    const environment = buildTrustedGitEnvironment(gitExecutable);
+    if (trustedAlternates) {
+      environment.GIT_ALTERNATE_OBJECT_DIRECTORIES = trustedAlternates;
+    }
     const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
     return String(
       execFileSync(
-        "git",
+        gitExecutable,
         [
           "-c",
           `core.hooksPath=${nullDevice}`,
@@ -1934,24 +2417,29 @@ export class DockerManager {
           "core.fsmonitor=false",
           "-c",
           "core.untrackedCache=false",
-          `--git-dir=${gitDir}`,
-          `--work-tree=${worktreePath}`,
+          "-c",
+          `core.attributesFile=${nullDevice}`,
+          "-c",
+          `core.excludesFile=${nullDevice}`,
+          "-c",
+          "credential.helper=",
+          "-c",
+          "protocol.ext.allow=never",
+          `--git-dir=${canonicalGitDir}`,
+          `--work-tree=${canonicalWorktree}`,
           ...args,
         ],
         {
-          cwd: worktreePath,
+          cwd: path.dirname(gitExecutable),
           encoding: "utf-8",
-          maxBuffer: MAX_PRIVATE_GIT_REV_LIST_BYTES,
-          timeout: PRIVATE_GIT_COMMAND_TIMEOUT_MS,
+          stdio: ["ignore", "pipe", "pipe"],
           env: {
-            ...process.env,
-            GIT_ALTERNATE_OBJECT_DIRECTORIES: alternates ?? "",
-            GIT_CONFIG_NOSYSTEM: "1",
-            GIT_CONFIG_GLOBAL: nullDevice,
+            ...environment,
             GIT_NO_REPLACE_OBJECTS: "1",
-            GIT_EXTERNAL_DIFF: "",
-            GIT_PAGER: "cat",
           },
+          windowsHide: true,
+          timeout: PRIVATE_GIT_COMMAND_TIMEOUT_MS,
+          maxBuffer: MAX_PRIVATE_GIT_REV_LIST_BYTES,
         },
       ),
     ).trim();
@@ -2081,7 +2569,7 @@ export class DockerManager {
     if (!container.privateGitDir || !container.gitObjectsDir || !container.authoritativeHead) {
       throw new Error("Docker result object metadata is incomplete");
     }
-    const reachableOutput = this.gitOutput(
+    const reachableOutput = this.runTrustedPrivateGit(
       container.privateGitDir,
       container.worktreePath,
       [
@@ -2108,9 +2596,6 @@ export class DockerManager {
     }
     const targetRoot = fs.realpathSync.native(container.gitObjectsDir);
     for (const object of validated.values()) {
-      // A normal commit can leave objects from an amend/reset behind. They
-      // are not part of the sealed candidate graph, so never import them into
-      // the authoritative repository.
       if (!reachableObjects.has(object.objectId)) continue;
       const compressed = Buffer.from(
         readTrustedBinaryFile(object.source, MAX_PRIVATE_GIT_OBJECT_BYTES),
@@ -2224,7 +2709,7 @@ export class DockerManager {
     ) {
       throw new Error("Docker result metadata is incomplete");
     }
-    const currentHead = this.gitOutput(
+    const currentHead = this.runTrustedPrivateGit(
       container.authoritativeWorktreeGitDir,
       container.worktreePath,
       ["rev-parse", container.authoritativeRef],
@@ -2253,7 +2738,7 @@ export class DockerManager {
       ".quack/verify.js",
     ];
     for (const relativePath of protectedFiles) {
-      const committedChange = this.gitOutput(
+      const committedChange = this.runTrustedPrivateGit(
         container.privateGitDir,
         container.worktreePath,
         [
@@ -2272,7 +2757,7 @@ export class DockerManager {
       }
     }
 
-    const porcelain = this.gitOutput(
+    const porcelain = this.runTrustedPrivateGit(
       container.privateGitDir,
       container.worktreePath,
       ["status", "--porcelain", "--untracked-files=all"],
@@ -2282,7 +2767,7 @@ export class DockerManager {
       .split(/\r?\n/)
       .filter(Boolean)
       .filter((line) => {
-        // gitOutput trims the complete command output, which removes the
+        // The trusted runner trims the complete command output, which removes the
         // leading status-space from the first unstaged-only porcelain row.
         const pathOffset = line.length > 2 && line[2] === " " ? 3 : 2;
         const relativePath = line.slice(pathOffset).replace(/\\/g, "/");
@@ -2326,23 +2811,23 @@ export class DockerManager {
     if (!/^[0-9a-f-]{36}$/i.test(ownershipId)) {
       throw new Error("Docker private Git resume ownership is invalid");
     }
-    const { candidateHead, privateObjects } = this.preparePrivateGitForInspection(container);
-    // Complete the bounded, in-process object validation before any Git
-    // subprocess is allowed to parse container-authored objects.
+    const { candidateHead } = this.preparePrivateGitForInspection(container);
+    // Validate every container-authored loose object in-process before Git is
+    // allowed to parse any of them.
     const validatedObjects = this.validatePrivateObjectsForInspection(container);
     this.assertPrivateWorktreeClean(container, candidateHead, "pause");
     this.assertAuthoritativeRefUnchanged(container);
-    this.gitOutput(
-      container.authoritativeWorktreeGitDir,
+    this.runTrustedPrivateGit(
+      container.privateGitDir,
       container.worktreePath,
       ["merge-base", "--is-ancestor", container.authoritativeHead, candidateHead],
-      privateObjects,
+      container.gitObjectsDir,
     );
     this.copyReachablePrivateObjects(container, candidateHead, validatedObjects);
     const safeTask = container.taskId.replace(/[^A-Za-z0-9._-]/g, "_");
     const sealedRef = `refs/quack/docker-resume/${safeTask}/${ownershipId}`;
     const zero = "0".repeat(candidateHead.length);
-    this.gitOutput(container.authoritativeWorktreeGitDir, container.worktreePath, [
+    this.runTrustedPrivateGit(container.authoritativeWorktreeGitDir, container.worktreePath, [
       "update-ref",
       sealedRef,
       candidateHead,
@@ -2359,8 +2844,8 @@ export class DockerManager {
   /**
    * Validate and copy a completed container's candidate commit before host
    * publication. This deliberately does not create the sealed ref: callers
-   * persist the complete publication journal first, closing the ref-before-
-   * journal crash window.
+   * must persist the complete publication journal first, closing the
+   * ref-before-journal crash window.
    */
   preparePrivateGitForPublication(
     container: DockerContainer,
@@ -2380,20 +2865,18 @@ export class DockerManager {
     if (!/^[0-9a-f-]{36}$/i.test(ownershipId)) {
       throw new Error("Docker publication ownership is invalid");
     }
-    const { candidateHead, privateObjects } = this.preparePrivateGitForInspection(container);
-    // Complete the bounded, in-process object validation before any Git
-    // subprocess is allowed to parse container-authored objects.
+    const { candidateHead } = this.preparePrivateGitForInspection(container);
     const validatedObjects = this.validatePrivateObjectsForInspection(container);
     this.assertPrivateWorktreeClean(container, candidateHead, "publication");
     if (candidateHead === container.authoritativeHead) {
       throw new Error("Docker result has no committed change to publish");
     }
     this.assertAuthoritativeRefUnchanged(container);
-    this.gitOutput(
-      container.authoritativeWorktreeGitDir,
+    this.runTrustedPrivateGit(
+      container.privateGitDir,
       container.worktreePath,
       ["merge-base", "--is-ancestor", container.authoritativeHead, candidateHead],
-      privateObjects,
+      container.gitObjectsDir,
     );
     this.copyReachablePrivateObjects(container, candidateHead, validatedObjects);
     const safeTask = container.taskId.replace(/[^A-Za-z0-9._-]/g, "_");
@@ -2406,6 +2889,7 @@ export class DockerManager {
     };
   }
 
+  /** Pin a prepared publication only after its durable journal exists. */
   sealPreparedPublicationRef(binding: DockerResumeGitBinding): DockerResumeGitBinding {
     const candidate = this.projectGitOutput([
       "rev-parse",
@@ -2502,19 +2986,19 @@ export class DockerManager {
 
     // Replace container-controlled config with a fixed non-executable one and
     // remove its alternate pointer before invoking host Git on the private dir.
-    const { candidateHead, privateObjects } = this.preparePrivateGitForInspection(tracked);
+    const { candidateHead } = this.preparePrivateGitForInspection(tracked);
     const validatedObjects = this.validatePrivateObjectsForInspection(tracked);
     const branch =
       tracked.authoritativeRef === "HEAD"
         ? "HEAD"
         : tracked.authoritativeRef.slice("refs/heads/".length);
-    const diff = this.gitOutput(
+    const diff = this.runTrustedPrivateGit(
       tracked.privateGitDir,
       tracked.worktreePath,
       ["diff", "--no-ext-diff", tracked.authoritativeHead, candidateHead],
       tracked.gitObjectsDir,
     );
-    const log = this.gitOutput(
+    const log = this.runTrustedPrivateGit(
       tracked.privateGitDir,
       tracked.worktreePath,
       ["log", "--oneline", "-10", candidateHead],
@@ -2527,20 +3011,20 @@ export class DockerManager {
         throw new Error("Docker result has no committed change to promote");
       }
       this.assertAuthoritativeRefUnchanged(tracked);
-      this.gitOutput(
-        tracked.authoritativeWorktreeGitDir,
+      this.runTrustedPrivateGit(
+        tracked.privateGitDir,
         tracked.worktreePath,
         ["merge-base", "--is-ancestor", tracked.authoritativeHead, candidateHead],
-        privateObjects,
+        tracked.gitObjectsDir,
       );
       this.copyReachablePrivateObjects(tracked, candidateHead, validatedObjects);
-      this.gitOutput(tracked.authoritativeWorktreeGitDir, tracked.worktreePath, [
+      this.runTrustedPrivateGit(tracked.authoritativeWorktreeGitDir, tracked.worktreePath, [
         "update-ref",
         tracked.authoritativeRef,
         candidateHead,
         tracked.authoritativeHead,
       ]);
-      this.gitOutput(tracked.authoritativeWorktreeGitDir, tracked.worktreePath, [
+      this.runTrustedPrivateGit(tracked.authoritativeWorktreeGitDir, tracked.worktreePath, [
         "reset",
         "--mixed",
         candidateHead,
@@ -2559,7 +3043,7 @@ export class DockerManager {
       if (tail !== undefined) {
         args.push("--tail", String(tail));
       }
-      const { stdout } = await this.runDocker(args);
+      const { stdout } = await this.execDocker(args);
       return stdout;
     } catch {
       return "";
@@ -2611,8 +3095,6 @@ export class DockerManager {
             retained: c.retentionConfirmed === true,
           };
         }
-        // Shutdown is already in its forced phase. `rm -f` both terminates and
-        // removes without spending the entire bound on Docker's stop grace.
         const removed = await this.forceRemoveContainer(c.containerId);
         return { taskId: c.taskId, removed, retained: false };
       }),
@@ -2644,6 +3126,7 @@ export class DockerManager {
     containerGitDir: string,
     dotGitOverlay: string,
     containerName?: string,
+    admissionScope?: string,
   ): string[] {
     const args = ["create"];
 
@@ -2660,15 +3143,10 @@ export class DockerManager {
     // Network mode
     args.push("--network", this.config.networkMode);
 
-    // Volume mounts
-    // A task-specific Git worktree is the only writable source tree. The
-    // authoritative checkout is never mounted into the container.
+    // The task-specific worktree is the only writable source tree. Git writes
+    // go to a disposable private gitdir; authoritative objects are read-only.
     const normalizedWorktree = resolveThroughExistingAncestor(worktreePath).replace(/\\/g, "/");
-    args.push("-v", `${normalizedWorktree}:/workspace:rw`);
-    // Git writes go only to the disposable private gitdir inside the task
-    // worktree. The authoritative repository contributes immutable objects,
-    // never refs/config/hooks/worktree administration. Overlay .git so the
-    // child cannot damage the host worktree's real gitdir pointer.
+    args.push("-v", `${normalizedWorktree}:${CONTAINER_WORKSPACE}:rw`);
     args.push("-v", `${hostGitObjectsDir.replace(/\\/g, "/")}:/quack-git-objects:ro`);
     args.push("-v", `${dotGitOverlay.replace(/\\/g, "/")}:/workspace/.git:ro`);
 
@@ -2676,14 +3154,19 @@ export class DockerManager {
       args.push("-v", `${this.runtimeRoot.replace(/\\/g, "/")}:/quack-runtime:ro`);
     }
 
-    // The runtime output leaf is part of the disposable worktree already
-    // mounted above. Revalidate it, but never add a second RW bind from the
-    // authoritative host log/control tree.
+    // Runtime output is inside the disposable worktree; never mount the
+    // authoritative host log/control tree read-write.
     this.assertRuntimeLogDirSafe(runtimeLogDir, worktreePath);
 
+    // Mount only this dispatch's one-use capability. Sharing the admission
+    // root would let one container read or consume another task's marker.
+    if (admissionScope) {
+      args.push("-v", `${admissionScope.replace(/\\/g, "/")}:${CONTAINER_ADMISSION_DIRECTORY}:rw`);
+    }
+
     // .quack/prep → read-only
-    const prepDir = resolvePrepStorageDirSync(this.projectRoot).replace(/\\/g, "/");
-    args.push("-v", `${prepDir}:/workspace/.quack/prep:ro`);
+    const prepDir = validatePrepMountSource(this.projectRoot).replace(/\\/g, "/");
+    args.push("-v", `${prepDir}:${CONTAINER_PREP_DIRECTORY}:ro`);
 
     // Adapter policy is authoritative monitor input, not task output. Overlay
     // each policy file read-only on top of the writable worktree mount.
@@ -2693,12 +3176,17 @@ export class DockerManager {
 
     // Additional configured volumes
     this.assertSafeConfiguredVolumes(worktreePath);
-    for (const vol of this.config.volumes ?? []) {
-      args.push("-v", this.safeConfiguredVolume(vol, worktreePath).argument);
+    for (const volume of this.config.volumes ?? []) {
+      args.push("-v", this.safeConfiguredVolume(volume, worktreePath).argument);
     }
 
     // Environment variables — passed via --env args (no shell expansion)
     for (const envVar of this.config.envPassthrough) {
+      if (
+        isManagedDockerOperatorEnvironmentName(envVar) ||
+        isClaudeCredentialEnvironmentName(envVar)
+      )
+        continue;
       const value = process.env[envVar];
       if (value !== undefined) {
         args.push("--env", `${envVar}=${value}`);
@@ -2714,12 +3202,35 @@ export class DockerManager {
     args.push("--label", `quack.runtimeLogPath=${containerRuntimeLogDir}`);
     args.push("--label", `quack.gitDir=${containerGitDir}`);
 
+    // Do not allow an image-defined ENTRYPOINT to run before the one-use
+    // admission capability is consumed by Quack.
+    args.push("--entrypoint", "sleep");
+
     // Image
     args.push(this.config.image);
 
-    // Keep container running (sleep) so we can docker exec into it
-    args.push("sleep", "infinity");
+    // Keep the container running so the trusted docker exec can start Quack.
+    args.push("infinity");
 
     return args;
+  }
+
+  private cleanupAdmissionScope(taskId: string): void {
+    const scope = this.admissionScopes.get(taskId);
+    if (!scope) return;
+    removeDecompositionDispatchAdmissionScope(this.projectRoot, scope);
+    this.admissionScopes.delete(taskId);
+  }
+
+  private async removeContainerAfterCreateFailure(
+    identifier: string,
+    ambiguousCreate: boolean,
+  ): Promise<void> {
+    try {
+      await this.execDocker(["rm", "-f", identifier], 30_000);
+    } catch (error) {
+      if (!ambiguousCreate && dockerConfirmedContainerAbsent(error)) return;
+      throw error;
+    }
   }
 }

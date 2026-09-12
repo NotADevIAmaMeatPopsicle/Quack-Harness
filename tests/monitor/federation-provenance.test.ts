@@ -13,6 +13,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as http from "node:http";
 
+import { ListenerRegistry } from "../../src/federation/listener-registry";
 import { mintFederatedJobRecord, queueFederatedJobRecord } from "../../src/monitor/federation/jobs";
 import { recoverStaleFederatedLeases } from "../../src/monitor/federation/scheduling";
 import { QueuePersistence } from "../../src/queue/queue-persistence";
@@ -561,18 +562,18 @@ describe("TASK-1323 route stamps (HTTP)", () => {
     writeTaskFile(projectRoot, "TASK-910");
     writePassingPrep(projectRoot, "TASK-910");
 
-    const port = 48200 + Math.floor(Math.random() * 800);
     const server = createMonitorServer({
       projectRoot,
       taskDir: "docs/tasks",
       logDir: path.join(projectRoot, ".quack", "logs"),
       quackRoot,
-      port,
+      port: 0,
+      host: "127.0.0.1",
       federationGitExec,
     });
     const started = await server.start();
     stop = started.stop;
-    baseUrl = `http://127.0.0.1:${port}`;
+    baseUrl = `http://127.0.0.1:${started.port}`;
     await pause(150);
   });
 
@@ -817,7 +818,7 @@ describe("TASK-1323 route stamps (HTTP)", () => {
     },
   );
 
-  it("TASK-1338-F events new-lease clean twin attaches the worker and writes its log", async () => {
+  it("TASK-1338-F events cannot mint a new lease for a clean queued job", async () => {
     const queuedResponse = await httpPost(`${baseUrl}/v1/federation/queue`, {
       taskId: "TASK-910",
       jobType: "verify",
@@ -825,19 +826,25 @@ describe("TASK-1323 route stamps (HTTP)", () => {
       autoSchedule: false,
     });
     const queued = JSON.parse(queuedResponse.body) as { queued: FederatedJobRecord };
+    const eventCountBefore = readSessionEvents(
+      projectRoot,
+      `federation-${queued.queued.jobId}`,
+    ).length;
 
     const response = await httpPost(`${baseUrl}/v1/federation/jobs/${queued.queued.jobId}/events`, {
       hostId: "worker-b",
       status: "running",
     });
 
-    expect(response.status).toBe(202);
+    expect(response.status).toBe(409);
+    expect(response.body).toContain("federated_lease_epoch_required");
     const persisted = await loadFederatedJob(projectRoot, queued.queued.jobId);
-    expect(persisted).toMatchObject({ status: "running", hostId: "worker-b" });
-    expect(persisted?.lease).toBeDefined();
-    expect(
-      readSessionEvents(projectRoot, `federation-${queued.queued.jobId}`).length,
-    ).toBeGreaterThan(0);
+    expect(persisted).toMatchObject({ status: "queued" });
+    expect(persisted?.hostId).toBeUndefined();
+    expect(persisted?.lease).toBeUndefined();
+    expect(readSessionEvents(projectRoot, `federation-${queued.queued.jobId}`)).toHaveLength(
+      eventCountBefore,
+    );
   });
 
   it("TASK-1338-F terminal evidence stays writable without verification or scheduler refill", async () => {
@@ -915,6 +922,14 @@ describe("TASK-1323 route stamps (HTTP)", () => {
   });
 
   it("TASK-1338-F contested attached lease renewal remains writable", async () => {
+    await new ListenerRegistry(projectRoot).register(
+      {
+        hostId: "worker-b",
+        capabilities: ["verify"],
+        maxConcurrentJobs: 1,
+      },
+      "fed-test",
+    );
     const assignedResponse = await httpPost(`${baseUrl}/v1/federation/jobs`, {
       taskId: "TASK-910",
       jobType: "verify",
@@ -929,7 +944,11 @@ describe("TASK-1323 route stamps (HTTP)", () => {
 
     const response = await httpPost(
       `${baseUrl}/v1/federation/jobs/${assigned.job.jobId}/lease/renew`,
-      { hostId: "worker-b", leaseTtlMs: 120000 },
+      {
+        hostId: "worker-b",
+        leaseId: assigned.job.lease!.leaseId,
+        leaseTtlMs: 120000,
+      },
     );
 
     expect(response.status).toBe(200);
@@ -944,7 +963,7 @@ describe("TASK-1323 route stamps (HTTP)", () => {
     ["cross-population", "second-created"],
     ["cross-population", "first-created"],
   ] as const)(
-    "TASK-1338-F queued lease-renew veto: %s duplicate in %s order mints no lease",
+    "queued jobs cannot mint a lease through renewal: %s duplicate in %s order",
     async (shape, order) => {
       const queuedResponse = await httpPost(`${baseUrl}/v1/federation/queue`, {
         taskId: "TASK-910",
@@ -972,7 +991,7 @@ describe("TASK-1323 route stamps (HTTP)", () => {
 
       const response = await httpPost(
         `${baseUrl}/v1/federation/jobs/${queued.queued.jobId}/lease/renew`,
-        { hostId: "worker-b" },
+        { hostId: "worker-b", leaseId: "forged-queued-lease" },
       );
 
       expect(response.status).toBe(409);
@@ -984,7 +1003,7 @@ describe("TASK-1323 route stamps (HTTP)", () => {
     },
   );
 
-  it("TASK-1338-F queued lease-renew clean twin assigns the host and writes its log", async () => {
+  it("refuses queued lease renewal even when the task claimant is clean", async () => {
     const queuedResponse = await httpPost(`${baseUrl}/v1/federation/queue`, {
       taskId: "TASK-910",
       jobType: "verify",
@@ -995,16 +1014,14 @@ describe("TASK-1323 route stamps (HTTP)", () => {
 
     const response = await httpPost(
       `${baseUrl}/v1/federation/jobs/${queued.queued.jobId}/lease/renew`,
-      { hostId: "worker-b" },
+      { hostId: "worker-b", leaseId: "forged-queued-lease" },
     );
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(409);
     const persisted = await loadFederatedJob(projectRoot, queued.queued.jobId);
-    expect(persisted).toMatchObject({ status: "assigned", hostId: "worker-b" });
-    expect(persisted?.lease).toBeDefined();
-    expect(
-      readSessionEvents(projectRoot, `federation-${queued.queued.jobId}`).length,
-    ).toBeGreaterThan(0);
+    expect(persisted).toMatchObject({ status: "queued" });
+    expect(persisted?.hostId).toBeUndefined();
+    expect(persisted?.lease).toBeUndefined();
   });
 
   const externalCompletionPayload = (): Record<string, unknown> => ({
@@ -1117,10 +1134,6 @@ describe("TASK-1323 route stamps (HTTP)", () => {
           hostId: "host-unavailable",
           status: "assigned",
         }),
-      () =>
-        httpPost(`${baseUrl}/v1/federation/jobs/${seeded.jobId}/lease/renew`, {
-          hostId: "host-unavailable",
-        }),
       () => httpPost(`${baseUrl}/v1/federation/external-completions`, externalCompletionPayload()),
     ];
 
@@ -1182,7 +1195,7 @@ describe("TASK-1323 route stamps (HTTP)", () => {
     const registered = await httpPost(`${baseUrl}/v1/listeners/register`, {
       hostId: "laptop",
       alias: "Laptop",
-      baseUrl: "http://192.0.2.30:3337",
+      baseUrl: "http://100.1.2.3:3337",
       capabilities: ["dispatch"],
       maxConcurrentJobs: 1,
     });
@@ -1217,7 +1230,7 @@ describe("TASK-1323 route stamps (HTTP)", () => {
     const registered = await httpPost(`${baseUrl}/v1/listeners/register`, {
       hostId: "worker-b",
       alias: "Worker-B",
-      baseUrl: "http://192.0.2.40:3334",
+      baseUrl: "http://100.1.2.4:3334",
       capabilities: ["verify"],
       maxConcurrentJobs: 1,
     });
@@ -1242,6 +1255,7 @@ describe("TASK-1323 route stamps (HTTP)", () => {
       {
         federatedJobId: createdBody.job.jobId,
         federatedHostId: "worker-b",
+        federatedLeaseId: createdBody.job.lease!.leaseId,
       },
       "",
       { Cookie: cookie },
@@ -1358,8 +1372,12 @@ describe("TASK-1323 route stamps (HTTP)", () => {
       principal: "user:operator",
     });
 
-    // The same state-changing surface refuses anonymous callers when dashboard
-    // authentication is enabled.
+    // Configured users require a session; anonymous writes cannot change the queue.
+    const queuePersistence = new QueuePersistence(path.join(projectRoot, ".quack", "logs"));
+    const enqueuedBefore = queuePersistence
+      .readEvents()
+      .filter((event) => event.type === "task_enqueued");
+    expect(enqueuedBefore.map((event) => event.taskId)).toEqual(["TASK-910"]);
     const anon = await httpPost(
       `${baseUrl}/api/queue/enqueue`,
       {
@@ -1368,6 +1386,10 @@ describe("TASK-1323 route stamps (HTTP)", () => {
       "",
     );
     expect(anon.status).toBe(401);
-    expect(JSON.parse(anon.body)).toMatchObject({ error: "Authentication required" });
+    expect(JSON.parse(anon.body)).toEqual({ error: "Authentication required" });
+    expect(queuePersistence.readEvents().filter((event) => event.type === "task_enqueued")).toEqual(
+      enqueuedBefore,
+    );
+    expect(queuePersistence.replay().has("TASK-911")).toBe(false);
   });
 });

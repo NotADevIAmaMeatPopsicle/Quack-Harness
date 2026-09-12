@@ -2,11 +2,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as http from "node:http";
+import { execFileSync } from "node:child_process";
 
-import { createMonitorServer } from "../../src/monitor/server";
+import { createMonitorServer, stopDispatchManagersForShutdown } from "../../src/monitor/server";
 import { DispatchManager } from "../../src/monitor/dispatch-manager";
-import { PrepWorker } from "../../src/monitor/prep-worker";
-import { DispatchQueue } from "../../src/queue";
+import { TaskWatcher } from "../../src/monitor/task-watcher";
 import { computeContentHash } from "../../src/monitor/prep-cache";
 import { runReadinessGate } from "../../src/gate/gate";
 import type {
@@ -31,12 +31,6 @@ jest.mock("../../src/gate/gate", () => ({
 
 const mockedRunReadinessGate = runReadinessGate as jest.MockedFunction<typeof runReadinessGate>;
 
-// ─── Helpers ─────────────────────────────────────────────────────
-
-function makeTempDir(): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "quack-test-server-"));
-}
-
 function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const probe = http.createServer();
@@ -49,6 +43,161 @@ function freePort(): Promise<number> {
   });
 }
 
+describe("dispatch-aware monitor shutdown", () => {
+  test("single-project startup wires watcher repair to the configured task directory", async () => {
+    const projectRoot = makeTempDir();
+    const taskDir = path.join(projectRoot, "docs", "tasks");
+    const adapterPath = path.join(projectRoot, ".quack", "adapter.json");
+    fs.mkdirSync(taskDir, { recursive: true });
+    fs.mkdirSync(path.dirname(adapterPath), { recursive: true });
+    fs.writeFileSync(
+      adapterPath,
+      JSON.stringify({
+        version: "1.0",
+        project: {
+          name: "watcher-repair",
+          root: ".",
+          taskDir: "docs/tasks",
+          conventionsDir: ".quack",
+        },
+        agent: {
+          model: "claude-opus-4-20250514",
+          judgeModel: "claude-sonnet-4-20250514",
+          enrichModel: "claude-sonnet-4-20250514",
+          maxTurns: 30,
+          maxBudgetPerTask: 5,
+          maxRetries: 1,
+        },
+        verification: {
+          commands: [
+            {
+              name: "build",
+              command: "node --version",
+              required: true,
+              timeout: 10_000,
+            },
+          ],
+          conventionChecks: [],
+        },
+        sandbox: {
+          writablePaths: [],
+          deniedPaths: [],
+          allowedBashPatterns: [],
+          deniedBashPatterns: [],
+        },
+        git: {
+          branchPrefix: "quack/",
+          baseBranch: "main",
+          commitFormat: "[{taskId}] {message}",
+          commitTrailer: "Automated-By: Quack",
+          autoCreatePr: false,
+          autoPush: false,
+        },
+        logging: { dir: ".quack/logs", level: "info", retainDays: 30 },
+      }),
+      "utf-8",
+    );
+    execFileSync("git", ["init", "--initial-branch=main"], { cwd: projectRoot, stdio: "ignore" });
+
+    let capturedWatcher: TaskWatcher | undefined;
+    const startSpy = jest.spyOn(TaskWatcher.prototype, "start").mockImplementation(function (
+      this: TaskWatcher,
+    ) {
+      // eslint-disable-next-line @typescript-eslint/no-this-alias -- capture the real watcher receiver
+      capturedWatcher = this;
+      return Promise.resolve();
+    });
+    const server = createMonitorServer({
+      logDir: path.join(projectRoot, ".quack", "logs"),
+      port: 0,
+      host: "127.0.0.1",
+      projectRoot,
+      taskDir: "docs/tasks",
+      adapterPath,
+    });
+    let started: Awaited<ReturnType<typeof server.start>>;
+    try {
+      started = await server.start();
+    } catch (error) {
+      if (error instanceof AggregateError) {
+        throw new Error(
+          error.errors
+            .map((item) => (item instanceof Error ? (item.stack ?? item.message) : String(item)))
+            .join("\n--- cleanup/start error ---\n"),
+        );
+      }
+      throw error;
+    }
+    try {
+      expect(capturedWatcher).toBeDefined();
+      const watcherInternals = capturedWatcher as unknown as {
+        autoRepair: boolean;
+        repairMode: "off" | "deterministic" | "full";
+      };
+      watcherInternals.autoRepair = true;
+      watcherInternals.repairMode = "deterministic";
+      const taskPath = path.join(taskDir, "TASK-432-broken.md");
+      fs.writeFileSync(
+        taskPath,
+        [
+          "# TASK-432: Broken task",
+          "",
+          "## Metadata",
+          "- **Priority:** P1-HIGH",
+          "- **Effort:** 2 hours",
+          "- **Status:** READY",
+          "- **Blocked By:** []",
+          "",
+          "## Problem Statement",
+          "This repair must stay inside docs/tasks.",
+        ].join("\n"),
+        "utf-8",
+      );
+
+      await capturedWatcher!.processFile(taskPath);
+
+      const repaired = fs.readFileSync(taskPath, "utf-8");
+      expect(repaired).toContain("## Success Criteria");
+      expect(repaired).toContain("## Testing Requirements");
+      expect(repaired).toContain("(repair placeholder)");
+    } finally {
+      await started.stop();
+      startSpy.mockRestore();
+      removeTempDir(projectRoot);
+    }
+  });
+
+  test("propagates a dispatch stop refusal and still asks every manager to stop", () => {
+    const stopped = { killAll: jest.fn(() => true) };
+    const refused = { killAll: jest.fn(() => false) };
+    const threw = {
+      killAll: jest.fn((): boolean => {
+        throw new Error("barrier storage unavailable");
+      }),
+    };
+
+    expect(stopDispatchManagersForShutdown([stopped, refused, threw])).toBe(false);
+    expect(stopped.killAll).toHaveBeenCalledTimes(1);
+    expect(refused.killAll).toHaveBeenCalledTimes(1);
+    expect(threw.killAll).toHaveBeenCalledTimes(1);
+  });
+
+  test("allows shutdown only after every dispatch manager confirms its stops", () => {
+    const first = { killAll: jest.fn(() => true) };
+    const second = { killAll: jest.fn(() => true) };
+
+    expect(stopDispatchManagersForShutdown([first, second, first])).toBe(true);
+    expect(first.killAll).toHaveBeenCalledTimes(1);
+    expect(second.killAll).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── Helpers ─────────────────────────────────────────────────────
+
+function makeTempDir(): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), "quack-test-server-"));
+}
+
 function removeTempDir(dir: string): void {
   fs.rmSync(dir, {
     recursive: true,
@@ -56,6 +205,29 @@ function removeTempDir(dir: string): void {
     maxRetries: 20,
     retryDelay: 100,
   });
+}
+
+function initializeDispatchGitFixture(projectRoot: string): string {
+  // Local read grants may never point inside the mutable project boundary.
+  // Keep the test remote as a sibling, matching the isolated demo topology.
+  const originRoot = `${projectRoot}-origin.git`;
+  fs.mkdirSync(originRoot, { recursive: true });
+  fs.writeFileSync(path.join(projectRoot, ".gitignore"), ".quack/\n", "utf-8");
+
+  const git = (args: string[], cwd = projectRoot): void => {
+    execFileSync("git", args, { cwd, stdio: "ignore" });
+  };
+
+  git(["init", "--bare", "--initial-branch=main"], originRoot);
+  git(["init", "--initial-branch=main"]);
+  git(["config", "user.email", "quack-test@example.test"]);
+  git(["config", "user.name", "Quack Test"]);
+  git(["config", "commit.gpgsign", "false"]);
+  git(["add", ".gitignore", "docs/tasks/TASK-001-test.md"]);
+  git(["commit", "-m", "test fixture"]);
+  git(["remote", "add", "origin", originRoot]);
+  git(["push", "-u", "origin", "main"]);
+  return originRoot;
 }
 
 function writeJsonl<T>(filePath: string, entries: T[]): void {
@@ -209,12 +381,12 @@ describe("Monitor Server", () => {
   });
 
   it("serves health endpoint", async () => {
-    const port = await freePort();
-    const serverObj = createMonitorServer({ logDir, port });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    const serverObj = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+    const started = await serverObj.start();
+    stopServer = started.stop;
+    const baseUrl = `http://127.0.0.1:${started.port}`;
 
-    const { status, body } = await httpGet(`http://localhost:${port}/api/health`);
+    const { status, body } = await httpGet(`${baseUrl}/api/health`);
     expect(status).toBe(200);
 
     const data = JSON.parse(body) as { status: string; logDir: string };
@@ -222,84 +394,119 @@ describe("Monitor Server", () => {
     expect(data.logDir).toBe(logDir);
   });
 
-  it("waits for bounded dispatch and prep shutdown before the server stop resolves", async () => {
-    const projectRoot = makeTempDir();
-    fs.mkdirSync(path.join(projectRoot, "docs", "tasks"), { recursive: true });
-    let releaseShutdown!: () => void;
-    let markShutdownStarted!: () => void;
-    const shutdownMayFinish = new Promise<void>((resolve) => {
-      releaseShutdown = resolve;
+  it("atomically enters a terminal drain and rejects all further work", async () => {
+    const serverObj = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+    const started = await serverObj.start();
+    stopServer = started.stop;
+    const baseUrl = `http://127.0.0.1:${started.port}`;
+
+    const drained = await httpPost(`${baseUrl}/api/admin/drain`, {
+      reason: "test shutdown",
     });
-    const shutdownStarted = new Promise<void>((resolve) => {
-      markShutdownStarted = resolve;
+    expect(drained.status).toBe(200);
+    expect(JSON.parse(drained.body)).toMatchObject({
+      active: true,
+      acceptingWork: false,
+      safeToTerminate: true,
+      state: { reason: "test shutdown", quiesceComplete: true },
     });
-    let releasePrepShutdown!: () => void;
-    let markPrepShutdownStarted!: () => void;
-    const prepShutdownMayFinish = new Promise<void>((resolve) => {
-      releasePrepShutdown = resolve;
+
+    const rejected = await httpGet(`${baseUrl}/api/sessions`);
+    expect(rejected.status).toBe(503);
+    expect(JSON.parse(rejected.body)).toMatchObject({ code: "MONITOR_DRAINING" });
+
+    const health = await httpGet(`${baseUrl}/api/health`);
+    expect(health.status).toBe(200);
+    expect(JSON.parse(health.body)).toMatchObject({
+      status: "draining",
+      acceptingWork: false,
     });
-    const prepShutdownStarted = new Promise<void>((resolve) => {
-      markPrepShutdownStarted = resolve;
-    });
-    const shutdownSpy = jest
-      .spyOn(DispatchManager.prototype, "shutdownAll")
-      .mockImplementation(() => {
-        markShutdownStarted();
-        return shutdownMayFinish.then(() => ({
-          requested: [],
-          exited: [],
-          escalated: [],
-          timedOut: [],
-        }));
-      });
-    const prepShutdownSpy = jest
-      .spyOn(PrepWorker.prototype, "shutdownAll")
-      .mockImplementation(() => {
-        markPrepShutdownStarted();
-        return prepShutdownMayFinish.then(() => ({
-          requested: [],
-          exited: [],
-          escalated: [],
-          timedOut: [],
-        }));
-      });
-    const queueAbortSpy = jest.spyOn(DispatchQueue.prototype, "abort");
-    let stopPromise: Promise<void> | undefined;
+
+    const status = await httpGet(`${baseUrl}/api/admin/drain`);
+    expect(status.status).toBe(200);
+    expect(JSON.parse(status.body)).toMatchObject({ safeToTerminate: true });
+  });
+
+  it("keeps a failed watcher drain unsafe and retries it on the next status request", async () => {
+    const projectRoot = path.join(logDir, "project");
+    const taskDir = path.join(projectRoot, "tasks");
+    fs.mkdirSync(taskDir, { recursive: true });
+    const closeSpy = jest
+      .spyOn(TaskWatcher.prototype, "close")
+      .mockRejectedValueOnce(new Error("synthetic watcher close failure"));
 
     try {
-      const port = await freePort();
       const serverObj = createMonitorServer({
-        logDir: path.join(projectRoot, ".quack", "logs"),
-        port,
+        logDir,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
-        taskDir: "docs/tasks",
+        taskDir: "tasks",
       });
-      const { stop } = await serverObj.start();
-      let stopped = false;
-      stopPromise = stop().then(() => {
-        stopped = true;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
+
+      const first = await httpPost(`${baseUrl}/api/admin/drain`, {
+        reason: "retry watcher close",
+      });
+      expect(first.status).toBe(202);
+      const firstPayload = JSON.parse(first.body) as {
+        safeToTerminate?: unknown;
+        state?: { quiesceComplete?: unknown; lastError?: unknown };
+      };
+      expect(firstPayload.safeToTerminate).toBe(false);
+      expect(firstPayload.state?.quiesceComplete).toBe(false);
+      expect(firstPayload.state?.lastError).toEqual(
+        expect.stringContaining("synthetic watcher close failure"),
+      );
+
+      const retried = await httpGet(`${baseUrl}/api/admin/drain`);
+      expect(retried.status).toBe(200);
+      expect(JSON.parse(retried.body)).toMatchObject({
+        safeToTerminate: true,
+        state: { quiesceComplete: true },
+      });
+      expect(closeSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      closeSpy.mockRestore();
+    }
+  });
+
+  it("keeps drain unsafe when dispatch process-tree termination is unconfirmed", async () => {
+    const projectRoot = path.join(logDir, "unconfirmed-drain-project");
+    fs.mkdirSync(path.join(projectRoot, "tasks"), { recursive: true });
+    const serverObj = createMonitorServer({
+      logDir,
+      port: 0,
+      host: "127.0.0.1",
+      projectRoot,
+      taskDir: "tasks",
+    });
+    const started = await serverObj.start();
+    stopServer = started.stop;
+    const baseUrl = `http://127.0.0.1:${started.port}`;
+    const killSpy = jest.spyOn(DispatchManager.prototype, "killAll").mockReturnValue(false);
+
+    try {
+      const first = await httpPost(`${baseUrl}/api/admin/drain`, {
+        reason: "unconfirmed dispatch tree",
+      });
+      expect(first.status).toBe(202);
+      expect(JSON.parse(first.body)).toMatchObject({
+        safeToTerminate: false,
+        state: { dispatchStopConfirmed: false },
       });
 
-      await Promise.all([shutdownStarted, prepShutdownStarted]);
-      expect(queueAbortSpy).toHaveBeenCalledTimes(1);
-      expect(queueAbortSpy.mock.invocationCallOrder[0]).toBeLessThan(
-        shutdownSpy.mock.invocationCallOrder[0],
-      );
-      expect(stopped).toBe(false);
-      releaseShutdown();
-      await Promise.resolve();
-      expect(stopped).toBe(false);
-      releasePrepShutdown();
-      await stopPromise;
-      expect(stopped).toBe(true);
+      killSpy.mockRestore();
+      const retried = await httpGet(`${baseUrl}/api/admin/drain`);
+      expect(retried.status).toBe(200);
+      expect(JSON.parse(retried.body)).toMatchObject({
+        safeToTerminate: true,
+        state: { dispatchStopConfirmed: true },
+      });
     } finally {
-      releaseShutdown();
-      releasePrepShutdown();
-      await stopPromise?.catch(() => undefined);
-      shutdownSpy.mockRestore();
-      prepShutdownSpy.mockRestore();
-      queueAbortSpy.mockRestore();
-      removeTempDir(projectRoot);
+      killSpy.mockRestore();
     }
   });
 
@@ -307,12 +514,12 @@ describe("Monitor Server", () => {
     const sessions = [makeSession("s1", "completed", "approved"), makeSession("s2", "active")];
     writeJsonl(path.join(logDir, "sessions.jsonl"), sessions);
 
-    const port = await freePort();
-    const serverObj = createMonitorServer({ logDir, port });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    const serverObj = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+    const started = await serverObj.start();
+    stopServer = started.stop;
+    const baseUrl = `http://127.0.0.1:${started.port}`;
 
-    const { status, body } = await httpGet(`http://localhost:${port}/api/sessions`);
+    const { status, body } = await httpGet(`${baseUrl}/api/sessions`);
     expect(status).toBe(200);
 
     const data = JSON.parse(body) as Array<{ sessionId: string }>;
@@ -325,12 +532,12 @@ describe("Monitor Server", () => {
     const events = [makeEvent("s1", "session_start"), makeEvent("s1", "gate_result")];
     writeJsonl(path.join(logDir, "events-s1.jsonl"), events);
 
-    const port = await freePort();
-    const serverObj = createMonitorServer({ logDir, port });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    const serverObj = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+    const started = await serverObj.start();
+    stopServer = started.stop;
+    const baseUrl = `http://127.0.0.1:${started.port}`;
 
-    const { status, body } = await httpGet(`http://localhost:${port}/api/sessions/s1`);
+    const { status, body } = await httpGet(`${baseUrl}/api/sessions/s1`);
     expect(status).toBe(200);
 
     const data = JSON.parse(body) as Array<{ stage: string }>;
@@ -339,12 +546,12 @@ describe("Monitor Server", () => {
   });
 
   it("returns 404 for nonexistent session", async () => {
-    const port = await freePort();
-    const serverObj = createMonitorServer({ logDir, port });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    const serverObj = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+    const started = await serverObj.start();
+    stopServer = started.stop;
+    const baseUrl = `http://127.0.0.1:${started.port}`;
 
-    const { status } = await httpGet(`http://localhost:${port}/api/sessions/nope`);
+    const { status } = await httpGet(`${baseUrl}/api/sessions/nope`);
     expect(status).toBe(404);
   });
 
@@ -358,12 +565,12 @@ describe("Monitor Server", () => {
     fs.writeFileSync(path.join(logDir, "events-s1.jsonl"), "", "utf-8");
     fs.writeFileSync(path.join(logDir, "events-s2.jsonl"), "", "utf-8");
 
-    const port = await freePort();
-    const serverObj = createMonitorServer({ logDir, port });
-    const { stop } = await serverObj.start();
-    stopServer = stop;
+    const serverObj = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+    const started = await serverObj.start();
+    stopServer = started.stop;
+    const baseUrl = `http://127.0.0.1:${started.port}`;
 
-    const { status, body } = await httpGet(`http://localhost:${port}/api/escalations`);
+    const { status, body } = await httpGet(`${baseUrl}/api/escalations`);
     expect(status).toBe(200);
 
     const data = JSON.parse(body) as Array<{ session: { sessionId: string } }>;
@@ -442,27 +649,28 @@ describe("Monitor Server", () => {
     });
 
     it("returns 404 when task service not configured", async () => {
-      const port = await freePort();
-      const serverObj = createMonitorServer({ logDir, port });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const serverObj = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status } = await httpGet(`http://localhost:${port}/api/tasks`);
+      const { status } = await httpGet(`${baseUrl}/api/tasks`);
       expect(status).toBe(404);
     });
 
     it("lists all tasks", async () => {
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
         taskDir: "docs/tasks",
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(`http://localhost:${port}/api/tasks`);
+      const { status, body } = await httpGet(`${baseUrl}/api/tasks`);
       expect(status).toBe(200);
 
       const data = JSON.parse(body) as {
@@ -490,17 +698,18 @@ describe("Monitor Server", () => {
     });
 
     it("returns full task details", async () => {
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
         taskDir: "docs/tasks",
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(`http://localhost:${port}/api/tasks/TASK-001`);
+      const { status, body } = await httpGet(`${baseUrl}/api/tasks/TASK-001`);
       expect(status).toBe(200);
 
       const data = JSON.parse(body) as {
@@ -518,17 +727,18 @@ describe("Monitor Server", () => {
     });
 
     it("returns 404 for nonexistent task", async () => {
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
         taskDir: "docs/tasks",
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status } = await httpGet(`http://localhost:${port}/api/tasks/TASK-999`);
+      const { status } = await httpGet(`${baseUrl}/api/tasks/TASK-999`);
       expect(status).toBe(404);
     });
 
@@ -540,17 +750,18 @@ describe("Monitor Server", () => {
       ];
       writeJsonl(path.join(logDir, "sessions.jsonl"), sessions);
 
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
         taskDir: "docs/tasks",
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(`http://localhost:${port}/api/tasks/TASK-001/runs`);
+      const { status, body } = await httpGet(`${baseUrl}/api/tasks/TASK-001/runs`);
       expect(status).toBe(200);
 
       const data = JSON.parse(body) as Array<{ taskId: string }>;
@@ -560,17 +771,18 @@ describe("Monitor Server", () => {
     });
 
     it("returns empty array when no runs exist for task", async () => {
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
         taskDir: "docs/tasks",
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(`http://localhost:${port}/api/tasks/TASK-001/runs`);
+      const { status, body } = await httpGet(`${baseUrl}/api/tasks/TASK-001/runs`);
       expect(status).toBe(200);
 
       const data = JSON.parse(body) as unknown[];
@@ -620,19 +832,18 @@ describe("Monitor Server", () => {
         JSON.stringify(preflightResult, null, 2),
       );
 
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
         taskDir: "docs/tasks",
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(
-        `http://localhost:${port}/api/tasks/TASK-001/preflight`,
-      );
+      const { status, body } = await httpGet(`${baseUrl}/api/tasks/TASK-001/preflight`);
       expect(status).toBe(200);
 
       const data = JSON.parse(body) as {
@@ -646,17 +857,18 @@ describe("Monitor Server", () => {
     });
 
     it("GET /api/tasks/:id/preflight returns 404 when no cached result", async () => {
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
         taskDir: "docs/tasks",
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status } = await httpGet(`http://localhost:${port}/api/tasks/TASK-001/preflight`);
+      const { status } = await httpGet(`${baseUrl}/api/tasks/TASK-001/preflight`);
       expect(status).toBe(404);
     });
 
@@ -703,19 +915,18 @@ describe("Monitor Server", () => {
         ),
       );
 
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
         taskDir: "docs/tasks",
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(
-        `http://localhost:${port}/api/tasks/TASK-001/preflight`,
-      );
+      const { status, body } = await httpGet(`${baseUrl}/api/tasks/TASK-001/preflight`);
       expect(status).toBe(404);
 
       const data = JSON.parse(body) as { stale: boolean; currentSpecHash?: string; error: string };
@@ -747,17 +958,18 @@ describe("Monitor Server", () => {
         ),
       );
 
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
         taskDir: "docs/tasks",
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(`http://localhost:${port}/api/tasks/TASK-001/prep`);
+      const { status, body } = await httpGet(`${baseUrl}/api/tasks/TASK-001/prep`);
       expect(status).toBe(404);
 
       const data = JSON.parse(body) as { stale: boolean; currentSpecHash?: string; error: string };
@@ -777,8 +989,19 @@ describe("Monitor Server", () => {
     });
     let projectRoot: string;
     let taskDir: string;
+    let originRoot: string;
+    let previousTrustedLocalReadRemotes: string | undefined;
+
+    const createDispatchMonitorServer = (
+      options: Parameters<typeof createMonitorServer>[0],
+    ): ReturnType<typeof createMonitorServer> =>
+      createMonitorServer({
+        ...options,
+        trustedLocalReadRemotePaths: [originRoot],
+      });
 
     beforeEach(() => {
+      previousTrustedLocalReadRemotes = process.env.QUACK_TRUSTED_LOCAL_READ_REMOTES;
       projectRoot = makeTempDir();
       taskDir = path.join(projectRoot, "docs", "tasks");
       fs.mkdirSync(taskDir, { recursive: true });
@@ -807,43 +1030,61 @@ describe("Monitor Server", () => {
         ].join("\n"),
         "utf-8",
       );
+      originRoot = initializeDispatchGitFixture(projectRoot);
+      process.env.QUACK_TRUSTED_LOCAL_READ_REMOTES = JSON.stringify({
+        projectRoot,
+        paths: [originRoot],
+      });
     });
 
     afterEach(async () => {
-      // Wait for the server and its bounded dispatch shutdown to settle.
-      if (stopServer) {
-        await stopServer();
-        stopServer = undefined;
-      }
-      // Give processes time to fully exit before removing directories
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      if (projectRoot) {
-        removeTempDir(projectRoot);
+      const stop = stopServer;
+      stopServer = undefined;
+      try {
+        // Wait for server to shut down (which calls dispatchManager.killAll()).
+        if (stop) await stop();
+      } finally {
+        try {
+          // Give processes time to fully exit before removing directories.
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          if (projectRoot) removeTempDir(projectRoot);
+        } finally {
+          try {
+            if (originRoot) removeTempDir(originRoot);
+          } finally {
+            if (previousTrustedLocalReadRemotes === undefined) {
+              delete process.env.QUACK_TRUSTED_LOCAL_READ_REMOTES;
+            } else {
+              process.env.QUACK_TRUSTED_LOCAL_READ_REMOTES = previousTrustedLocalReadRemotes;
+            }
+          }
+        }
       }
     });
 
     it("returns 500 when dispatch not available", async () => {
-      const port = await freePort();
-      const serverObj = createMonitorServer({ logDir, port });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const serverObj = createDispatchMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status } = await httpPost(`http://localhost:${port}/api/tasks/TASK-001/start`);
+      const { status } = await httpPost(`${baseUrl}/api/tasks/TASK-001/start`);
       expect(status).toBe(500);
     });
 
     it("returns 404 for nonexistent task", async () => {
-      const port = await freePort();
-      const serverObj = createMonitorServer({
+      const serverObj = createDispatchMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
         taskDir: "docs/tasks",
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpPost(`http://localhost:${port}/api/tasks/TASK-999/start`);
+      const { status, body } = await httpPost(`${baseUrl}/api/tasks/TASK-999/start`);
       expect(status).toBe(404);
       const data = JSON.parse(body) as { error: string };
       expect(data.error).toContain("not found");
@@ -860,7 +1101,49 @@ describe("Monitor Server", () => {
       const adapterPath = path.join(projectRoot, ".quack", "adapter.json");
       const adapter = fs.existsSync(adapterPath)
         ? (JSON.parse(fs.readFileSync(adapterPath, "utf-8")) as Record<string, unknown>)
-        : {};
+        : {
+            version: "1.0",
+            project: {
+              name: "dispatch-test",
+              root: ".",
+              taskDir: "docs/tasks",
+              conventionsDir: ".quack",
+            },
+            agent: {
+              model: "test",
+              judgeModel: "test",
+              enrichModel: "test",
+              maxTurns: 10,
+              maxBudgetPerTask: 1,
+              maxRetries: 0,
+            },
+            verification: {
+              commands: [
+                {
+                  name: "build",
+                  command: "node --version",
+                  required: true,
+                  timeout: 10_000,
+                },
+              ],
+              conventionChecks: [],
+            },
+            sandbox: {
+              writablePaths: [],
+              deniedPaths: [],
+              allowedBashPatterns: [],
+              deniedBashPatterns: [],
+            },
+            git: {
+              baseBranch: "main",
+              branchPrefix: "quack/",
+              commitFormat: "[{taskId}] {message}",
+              commitTrailer: "",
+              autoCreatePr: false,
+              autoPush: false,
+            },
+            logging: { dir: ".quack/logs", level: "debug", retainDays: 30 },
+          };
       const preflight = (adapter.preflight as Record<string, unknown> | undefined) ?? {};
       adapter.preflight = {
         ...preflight,
@@ -924,17 +1207,18 @@ describe("Monitor Server", () => {
     async function startAndDispatch(
       adapterPath?: string,
     ): Promise<{ status: number; body: string }> {
-      const port = await freePort();
-      const serverObj = createMonitorServer({
+      const serverObj = createDispatchMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
         taskDir: "docs/tasks",
         ...(adapterPath ? { adapterPath } : {}),
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
-      return httpPost(`http://localhost:${port}/api/tasks/TASK-001/start`, { skipGate: true });
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
+      return httpPost(`${baseUrl}/api/tasks/TASK-001/start`, { skipGate: true });
     }
 
     it("blocks dispatch when cached preflight recommends decomposition and auto-decompose is ARMED", async () => {
@@ -961,17 +1245,18 @@ describe("Monitor Server", () => {
     });
 
     it("starts a task and returns session info", async () => {
-      const port = await freePort();
-      const serverObj = createMonitorServer({
+      const serverObj = createDispatchMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
         taskDir: "docs/tasks",
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpPost(`http://localhost:${port}/api/tasks/TASK-001/start`, {
+      const { status, body } = await httpPost(`${baseUrl}/api/tasks/TASK-001/start`, {
         skipGate: true,
       });
 
@@ -999,20 +1284,20 @@ describe("Monitor Server", () => {
       });
 
       try {
-        const port = await freePort();
-        const serverObj = createMonitorServer({
+        const serverObj = createDispatchMonitorServer({
           logDir,
-          port,
+          port: 0,
+          host: "127.0.0.1",
           projectRoot,
           taskDir: "docs/tasks",
         });
-        const { stop } = await serverObj.start();
-        stopServer = stop;
+        const started = await serverObj.start();
+        stopServer = started.stop;
+        const baseUrl = `http://127.0.0.1:${started.port}`;
 
-        const { status, body } = await httpPost(
-          `http://localhost:${port}/api/tasks/TASK-001/start`,
-          { skipDepthOnly: true },
-        );
+        const { status, body } = await httpPost(`${baseUrl}/api/tasks/TASK-001/start`, {
+          skipDepthOnly: true,
+        });
 
         expect(status).toBe(200);
         const data = JSON.parse(body) as { ok: boolean };
@@ -1028,83 +1313,193 @@ describe("Monitor Server", () => {
     });
 
     it("returns 409 when task is already running", async () => {
-      const port = await freePort();
-      const serverObj = createMonitorServer({
+      let dispatchStarted = false;
+      const runningJob = {
+        taskId: "TASK-001",
+        sessionId: "quack-TASK-001-running",
+        pid: 12345,
+        startedAt: new Date().toISOString(),
+        status: "running" as const,
+        output: [],
+      };
+      const activeSpy = jest
+        .spyOn(DispatchManager.prototype, "getActiveJob")
+        .mockImplementation(() => (dispatchStarted ? runningJob : undefined));
+      const startSpy = jest.spyOn(DispatchManager.prototype, "start").mockImplementation(() => {
+        dispatchStarted = true;
+        return runningJob;
+      });
+      const serverObj = createDispatchMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
         taskDir: "docs/tasks",
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      // Start the task
-      await httpPost(`http://localhost:${port}/api/tasks/TASK-001/start`, { skipGate: true });
+      try {
+        // Start the task
+        await httpPost(`${baseUrl}/api/tasks/TASK-001/start`, { skipGate: true });
 
-      // Try to start again
-      const { status, body } = await httpPost(`http://localhost:${port}/api/tasks/TASK-001/start`);
-      expect(status).toBe(409);
-      const data = JSON.parse(body) as { error: string };
-      expect(data.error).toContain("already running");
+        // Try to start again
+        const { status, body } = await httpPost(`${baseUrl}/api/tasks/TASK-001/start`);
+        expect(status).toBe(409);
+        const data = JSON.parse(body) as { error: string };
+        expect(data.error).toContain("already running");
+      } finally {
+        activeSpy.mockRestore();
+        startSpy.mockRestore();
+      }
     });
 
     it("stops a running task", async () => {
-      const port = await freePort();
-      const serverObj = createMonitorServer({
+      const serverObj = createDispatchMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
         taskDir: "docs/tasks",
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
       // Start the task
-      await httpPost(`http://localhost:${port}/api/tasks/TASK-001/start`, { skipGate: true });
+      await httpPost(`${baseUrl}/api/tasks/TASK-001/start`, { skipGate: true });
 
       // Stop it
-      const { status, body } = await httpPost(`http://localhost:${port}/api/tasks/TASK-001/stop`);
+      const { status, body } = await httpPost(`${baseUrl}/api/tasks/TASK-001/stop`);
       expect(status).toBe(200);
       const data = JSON.parse(body) as { ok: boolean };
       expect(data.ok).toBe(true);
     });
 
     it("returns 404 when stopping non-running task", async () => {
-      const port = await freePort();
-      const serverObj = createMonitorServer({
+      const serverObj = createDispatchMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
         taskDir: "docs/tasks",
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status } = await httpPost(`http://localhost:${port}/api/tasks/TASK-001/stop`);
+      const { status } = await httpPost(`${baseUrl}/api/tasks/TASK-001/stop`);
       expect(status).toBe(404);
     });
 
-    it("returns active jobs list", async () => {
-      const port = await freePort();
-      const serverObj = createMonitorServer({
+    it("reports a fenced but unconfirmed stop as a conflict", async () => {
+      const serverObj = createDispatchMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
         taskDir: "docs/tasks",
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
+      const stopSpy = jest.spyOn(DispatchManager.prototype, "stop").mockReturnValue(false);
+      const pendingSpy = jest
+        .spyOn(DispatchManager.prototype, "hasPendingOperatorStopCleanup")
+        .mockReturnValue(true);
+      const getJobSpy = jest.spyOn(DispatchManager.prototype, "getJob").mockReturnValue({
+        taskId: "TASK-001",
+        sessionId: "unconfirmed-stop",
+        pid: 4242,
+        startedAt: new Date().toISOString(),
+        status: "stopped",
+        output: [],
+        operatorStopCleanupPending: true,
+        operatorStopTreeTerminated: false,
+      });
+
+      try {
+        const response = await httpPost(`${baseUrl}/api/tasks/TASK-001/stop`);
+        expect(response.status).toBe(409);
+        expect(JSON.parse(response.body)).toMatchObject({
+          code: "DISPATCH_STOP_UNCONFIRMED",
+          cleanupPending: true,
+        });
+      } finally {
+        stopSpy.mockRestore();
+        pendingSpy.mockRestore();
+        getJobSpy.mockRestore();
+      }
+    });
+
+    it("does not report success while confirmed stop cleanup remains pending", async () => {
+      const serverObj = createDispatchMonitorServer({
+        logDir,
+        port: 0,
+        host: "127.0.0.1",
+        projectRoot,
+        taskDir: "docs/tasks",
+      });
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
+      const stopSpy = jest.spyOn(DispatchManager.prototype, "stop").mockReturnValue(true);
+      const waitSpy = jest.spyOn(DispatchManager.prototype, "waitForIdle").mockResolvedValue(true);
+      const pendingSpy = jest
+        .spyOn(DispatchManager.prototype, "hasPendingOperatorStopCleanup")
+        .mockReturnValue(true);
+      const getJobSpy = jest.spyOn(DispatchManager.prototype, "getJob").mockReturnValue({
+        taskId: "TASK-001",
+        sessionId: "confirmed-tree-pending-cleanup",
+        pid: 4243,
+        startedAt: new Date().toISOString(),
+        status: "stopped",
+        output: [],
+        operatorStopCleanupPending: true,
+        operatorStopTreeTerminated: true,
+      });
+
+      try {
+        const response = await httpPost(`${baseUrl}/api/tasks/TASK-001/stop`);
+        expect(response.status).toBe(409);
+        expect(JSON.parse(response.body)).toMatchObject({
+          code: "DISPATCH_STOP_CLEANUP_PENDING",
+          terminationConfirmed: true,
+          cleanupPending: true,
+          processExitPending: false,
+        });
+        expect(waitSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        stopSpy.mockRestore();
+        waitSpy.mockRestore();
+        pendingSpy.mockRestore();
+        getJobSpy.mockRestore();
+      }
+    });
+
+    it("returns active jobs list", async () => {
+      const serverObj = createDispatchMonitorServer({
+        logDir,
+        port: 0,
+        host: "127.0.0.1",
+        projectRoot,
+        taskDir: "docs/tasks",
+      });
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
       // No active jobs initially
-      let res = await httpGet(`http://localhost:${port}/api/tasks/active`);
+      let res = await httpGet(`${baseUrl}/api/tasks/active`);
       expect(res.status).toBe(200);
       expect(JSON.parse(res.body)).toEqual([]);
 
       // Start a task
-      await httpPost(`http://localhost:${port}/api/tasks/TASK-001/start`, { skipGate: true });
+      await httpPost(`${baseUrl}/api/tasks/TASK-001/start`, { skipGate: true });
 
       // Should show active job
-      res = await httpGet(`http://localhost:${port}/api/tasks/active`);
+      res = await httpGet(`${baseUrl}/api/tasks/active`);
       expect(res.status).toBe(200);
       const jobs = JSON.parse(res.body) as Array<{ taskId: string; status: string }>;
       expect(jobs).toHaveLength(1);
@@ -1138,17 +1533,18 @@ describe("Monitor Server", () => {
         "utf-8",
       );
 
-      const port = await freePort();
-      const serverObj = createMonitorServer({
+      const serverObj = createDispatchMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
         taskDir: "docs/tasks",
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpPost(`http://localhost:${port}/api/tasks/TASK-003/start`, {
+      const { status, body } = await httpPost(`${baseUrl}/api/tasks/TASK-003/start`, {
         skipGate: true,
       });
       expect(status).toBe(400);
@@ -1208,17 +1604,18 @@ describe("Monitor Server", () => {
         "utf-8",
       );
 
-      const port = await freePort();
-      const serverObj = createMonitorServer({
+      const serverObj = createDispatchMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
         taskDir: "docs/tasks",
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpPost(`http://localhost:${port}/api/tasks/TASK-005/start`, {
+      const { status, body } = await httpPost(`${baseUrl}/api/tasks/TASK-005/start`, {
         skipGate: true,
       });
       expect(status).toBe(200);
@@ -1241,18 +1638,17 @@ describe("Monitor Server", () => {
 `;
       fs.writeFileSync(path.join(projectRoot, "PROGRESS.md"), progressContent, "utf-8");
 
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(
-        `http://localhost:${port}/api/tasks/TASK-001/progress`,
-      );
+      const { status, body } = await httpGet(`${baseUrl}/api/tasks/TASK-001/progress`);
       expect(status).toBe(200);
 
       const data = JSON.parse(body) as {
@@ -1274,18 +1670,17 @@ describe("Monitor Server", () => {
     it("returns 404 when no PROGRESS.md exists", async () => {
       const projectRoot = makeTempDir();
 
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot,
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(
-        `http://localhost:${port}/api/tasks/TASK-001/progress`,
-      );
+      const { status, body } = await httpGet(`${baseUrl}/api/tasks/TASK-001/progress`);
       expect(status).toBe(404);
 
       const data = JSON.parse(body) as { error: string };
@@ -1295,28 +1690,29 @@ describe("Monitor Server", () => {
     });
 
     it("returns 404 when project root not configured", async () => {
-      const port = await freePort();
-      const serverObj = createMonitorServer({ logDir, port });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const serverObj = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status } = await httpGet(`http://localhost:${port}/api/tasks/TASK-001/progress`);
+      const { status } = await httpGet(`${baseUrl}/api/tasks/TASK-001/progress`);
       expect(status).toBe(404);
     });
   });
 
   describe("fleet containers endpoint", () => {
     it("returns empty array when no containers active", async () => {
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: logDir,
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(`http://localhost:${port}/api/fleet/containers`);
+      const { status, body } = await httpGet(`${baseUrl}/api/fleet/containers`);
       expect(status).toBe(200);
       expect(JSON.parse(body)).toEqual([]);
     });
@@ -1324,16 +1720,17 @@ describe("Monitor Server", () => {
 
   describe("cost velocity endpoint", () => {
     it("returns velocity data with config, baseline, and snapshots", async () => {
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: logDir,
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(`http://localhost:${port}/api/fleet/velocity`);
+      const { status, body } = await httpGet(`${baseUrl}/api/fleet/velocity`);
       expect(status).toBe(200);
       const data = JSON.parse(body) as {
         config: { enabled: boolean; warnMultiplier: number; killMultiplier: number };
@@ -1350,16 +1747,17 @@ describe("Monitor Server", () => {
 
   describe("agent health endpoints", () => {
     it("returns fleet health with config and empty agents list", async () => {
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: logDir,
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(`http://localhost:${port}/api/fleet/health`);
+      const { status, body } = await httpGet(`${baseUrl}/api/fleet/health`);
       expect(status).toBe(200);
       const data = JSON.parse(body) as {
         config: { enabled: boolean; warningMinutes: number };
@@ -1372,47 +1770,50 @@ describe("Monitor Server", () => {
     });
 
     it("returns 404 for health of non-tracked task", async () => {
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: logDir,
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status } = await httpGet(`http://localhost:${port}/api/tasks/TASK-999/health`);
+      const { status } = await httpGet(`${baseUrl}/api/tasks/TASK-999/health`);
       expect(status).toBe(404);
     });
   });
 
   describe("checkpoint endpoints", () => {
     it("GET /api/checkpoints returns empty array when no checkpoints exist", async () => {
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: logDir,
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(`http://localhost:${port}/api/checkpoints`);
+      const { status, body } = await httpGet(`${baseUrl}/api/checkpoints`);
       expect(status).toBe(200);
       expect(JSON.parse(body)).toEqual([]);
     });
 
     it("GET /api/checkpoints/:id returns 404 for non-existent checkpoint", async () => {
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: logDir,
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status } = await httpGet(`http://localhost:${port}/api/checkpoints/TASK-999`);
+      const { status } = await httpGet(`${baseUrl}/api/checkpoints/TASK-999`);
       expect(status).toBe(404);
     });
 
@@ -1432,16 +1833,17 @@ describe("Monitor Server", () => {
         JSON.stringify(checkpointData, null, 2),
       );
 
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: logDir,
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(`http://localhost:${port}/api/checkpoints/TASK-001`);
+      const { status, body } = await httpGet(`${baseUrl}/api/checkpoints/TASK-001`);
       expect(status).toBe(200);
       const parsed = JSON.parse(body) as { taskId: string; completedStages: string[] };
       expect(parsed.taskId).toBe("TASK-001");
@@ -1449,16 +1851,17 @@ describe("Monitor Server", () => {
     });
 
     it("resume endpoint returns 404 when no checkpoint or sessionId provided", async () => {
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: logDir,
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const result = await httpPost(`http://localhost:${port}/api/tasks/TASK-999/resume`, {});
+      const result = await httpPost(`${baseUrl}/api/tasks/TASK-999/resume`, {});
       expect(result.status).toBe(404);
     });
   });
@@ -1467,16 +1870,17 @@ describe("Monitor Server", () => {
 
   describe("Project endpoints (single-project fallback)", () => {
     it("GET /api/projects returns synthetic project in single-project mode", async () => {
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: logDir,
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(`http://localhost:${port}/api/projects`);
+      const { status, body } = await httpGet(`${baseUrl}/api/projects`);
       expect(status).toBe(200);
       const data = JSON.parse(body) as Array<{ id: string; active: boolean; path: string }>;
       expect(data).toHaveLength(1);
@@ -1488,44 +1892,46 @@ describe("Monitor Server", () => {
     });
 
     it("GET /api/projects returns empty array when no project root", async () => {
-      const port = await freePort();
-      const serverObj = createMonitorServer({ logDir, port });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const serverObj = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(`http://localhost:${port}/api/projects`);
+      const { status, body } = await httpGet(`${baseUrl}/api/projects`);
       expect(status).toBe(200);
       const data = JSON.parse(body) as unknown[];
       expect(data).toEqual([]);
     });
 
     it("POST /api/projects/active returns 404 in single-project mode", async () => {
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: logDir,
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status } = await httpPost(`http://localhost:${port}/api/projects/active`, {
+      const { status } = await httpPost(`${baseUrl}/api/projects/active`, {
         projectId: "test",
       });
       expect(status).toBe(404);
     });
 
     it("GET /api/projects/:id returns 404 in single-project mode", async () => {
-      const port = await freePort();
       const serverObj = createMonitorServer({
         logDir,
-        port,
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: logDir,
       });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status } = await httpGet(`http://localhost:${port}/api/projects/test`);
+      const { status } = await httpGet(`${baseUrl}/api/projects/test`);
       expect(status).toBe(404);
     });
   });
@@ -1652,13 +2058,17 @@ describe("Monitor Server", () => {
     });
 
     it("GET /api/projects returns all registered projects", async () => {
-      const port = await freePort();
       const adapters = makeAdapters();
-      const serverObj = createMonitorServer({ port, projectAdapters: adapters });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const serverObj = createMonitorServer({
+        port: 0,
+        host: "127.0.0.1",
+        projectAdapters: adapters,
+      });
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(`http://localhost:${port}/api/projects`);
+      const { status, body } = await httpGet(`${baseUrl}/api/projects`);
       expect(status).toBe(200);
       const data = JSON.parse(body) as Array<{ id: string; name: string; active: boolean }>;
       expect(data).toHaveLength(2);
@@ -1670,14 +2080,18 @@ describe("Monitor Server", () => {
     });
 
     it("POST /api/projects/active switches the active project", async () => {
-      const port = await freePort();
       const adapters = makeAdapters();
-      const serverObj = createMonitorServer({ port, projectAdapters: adapters });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const serverObj = createMonitorServer({
+        port: 0,
+        host: "127.0.0.1",
+        projectAdapters: adapters,
+      });
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
       // Switch to Project Beta
-      const switchRes = await httpPost(`http://localhost:${port}/api/projects/active`, {
+      const switchRes = await httpPost(`${baseUrl}/api/projects/active`, {
         projectId: "project-beta",
       });
       expect(switchRes.status).toBe(200);
@@ -1686,44 +2100,56 @@ describe("Monitor Server", () => {
       expect(switchData.activeProjectId).toBe("project-beta");
 
       // Verify the switch by listing projects
-      const { body } = await httpGet(`http://localhost:${port}/api/projects`);
+      const { body } = await httpGet(`${baseUrl}/api/projects`);
       const projects = JSON.parse(body) as Array<{ id: string; active: boolean }>;
       const activeProject = projects.find((p) => p.active);
       expect(activeProject?.id).toBe("project-beta");
     });
 
     it("POST /api/projects/active returns 404 for unknown project", async () => {
-      const port = await freePort();
       const adapters = makeAdapters();
-      const serverObj = createMonitorServer({ port, projectAdapters: adapters });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const serverObj = createMonitorServer({
+        port: 0,
+        host: "127.0.0.1",
+        projectAdapters: adapters,
+      });
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status } = await httpPost(`http://localhost:${port}/api/projects/active`, {
+      const { status } = await httpPost(`${baseUrl}/api/projects/active`, {
         projectId: "nonexistent",
       });
       expect(status).toBe(404);
     });
 
     it("POST /api/projects/active returns 400 when projectId is missing", async () => {
-      const port = await freePort();
       const adapters = makeAdapters();
-      const serverObj = createMonitorServer({ port, projectAdapters: adapters });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const serverObj = createMonitorServer({
+        port: 0,
+        host: "127.0.0.1",
+        projectAdapters: adapters,
+      });
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status } = await httpPost(`http://localhost:${port}/api/projects/active`, {});
+      const { status } = await httpPost(`${baseUrl}/api/projects/active`, {});
       expect(status).toBe(400);
     });
 
     it("GET /api/projects/:id returns project details", async () => {
-      const port = await freePort();
       const adapters = makeAdapters();
-      const serverObj = createMonitorServer({ port, projectAdapters: adapters });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const serverObj = createMonitorServer({
+        port: 0,
+        host: "127.0.0.1",
+        projectAdapters: adapters,
+      });
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(`http://localhost:${port}/api/projects/project-alpha`);
+      const { status, body } = await httpGet(`${baseUrl}/api/projects/project-alpha`);
       expect(status).toBe(200);
       const data = JSON.parse(body) as { id: string; name: string; path: string };
       expect(data.id).toBe("project-alpha");
@@ -1732,41 +2158,53 @@ describe("Monitor Server", () => {
     });
 
     it("GET /api/projects/:id returns 404 for unknown project", async () => {
-      const port = await freePort();
       const adapters = makeAdapters();
-      const serverObj = createMonitorServer({ port, projectAdapters: adapters });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const serverObj = createMonitorServer({
+        port: 0,
+        host: "127.0.0.1",
+        projectAdapters: adapters,
+      });
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status } = await httpGet(`http://localhost:${port}/api/projects/nonexistent`);
+      const { status } = await httpGet(`${baseUrl}/api/projects/nonexistent`);
       expect(status).toBe(404);
     });
 
     it("existing endpoints use active project context", async () => {
-      const port = await freePort();
       const adapters = makeAdapters();
-      const serverObj = createMonitorServer({ port, projectAdapters: adapters });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const serverObj = createMonitorServer({
+        port: 0,
+        host: "127.0.0.1",
+        projectAdapters: adapters,
+      });
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
       // sessions endpoint should work against active project (Project Alpha)
-      const sessRes = await httpGet(`http://localhost:${port}/api/sessions`);
+      const sessRes = await httpGet(`${baseUrl}/api/sessions`);
       expect(sessRes.status).toBe(200);
       expect(JSON.parse(sessRes.body)).toEqual([]);
 
       // costs endpoint should work
-      const costRes = await httpGet(`http://localhost:${port}/api/costs`);
+      const costRes = await httpGet(`${baseUrl}/api/costs`);
       expect(costRes.status).toBe(200);
     });
 
     it("health endpoint uses active project in multi-project mode", async () => {
-      const port = await freePort();
       const adapters = makeAdapters();
-      const serverObj = createMonitorServer({ port, projectAdapters: adapters });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const serverObj = createMonitorServer({
+        port: 0,
+        host: "127.0.0.1",
+        projectAdapters: adapters,
+      });
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(`http://localhost:${port}/api/health`);
+      const { status, body } = await httpGet(`${baseUrl}/api/health`);
       expect(status).toBe(200);
       const data = JSON.parse(body) as { status: string; projectRoot: string };
       expect(data.status).toBe("ok");
@@ -1774,11 +2212,15 @@ describe("Monitor Server", () => {
     });
 
     it("health endpoint surfaces degraded DB state", async () => {
-      const port = await freePort();
       const adapters = makeAdapters();
-      const serverObj = createMonitorServer({ port, projectAdapters: adapters });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const serverObj = createMonitorServer({
+        port: 0,
+        host: "127.0.0.1",
+        projectAdapters: adapters,
+      });
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
       const alpha = serverObj.registry?.getProject("project-alpha");
       expect(alpha).toBeDefined();
@@ -1792,7 +2234,7 @@ describe("Monitor Server", () => {
         error: "database disk image is malformed",
       };
 
-      const { status, body } = await httpGet(`http://localhost:${port}/api/health`);
+      const { status, body } = await httpGet(`${baseUrl}/api/health`);
       expect(status).toBe(200);
       const data = JSON.parse(body) as {
         status: string;
@@ -1810,11 +2252,14 @@ describe("Monitor Server", () => {
     });
 
     it("registry is exposed on server object", async () => {
-      const port = await freePort();
       const adapters = makeAdapters();
-      const serverObj = createMonitorServer({ port, projectAdapters: adapters });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const serverObj = createMonitorServer({
+        port: 0,
+        host: "127.0.0.1",
+        projectAdapters: adapters,
+      });
+      const started = await serverObj.start();
+      stopServer = started.stop;
 
       expect(serverObj.registry).toBeDefined();
       expect(serverObj.registry?.count()).toBe(2);
@@ -1824,56 +2269,48 @@ describe("Monitor Server", () => {
 
   describe("Preflight API", () => {
     it("POST /api/tasks/:id/preflight returns 500 when no project root", async () => {
-      const port = await freePort();
-      const serverObj = createMonitorServer({ logDir, port });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const serverObj = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpPost(
-        `http://localhost:${port}/api/tasks/TASK-001/preflight`,
-      );
+      const { status, body } = await httpPost(`${baseUrl}/api/tasks/TASK-001/preflight`);
       expect(status).toBe(500);
       const data = JSON.parse(body) as { error: string };
       expect(data.error).toContain("Preflight not available");
     });
 
     it("GET /api/tasks/:id/preflight returns 404 when no project root", async () => {
-      const port = await freePort();
-      const serverObj = createMonitorServer({ logDir, port });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const serverObj = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(
-        `http://localhost:${port}/api/tasks/TASK-001/preflight`,
-      );
+      const { status, body } = await httpGet(`${baseUrl}/api/tasks/TASK-001/preflight`);
       expect(status).toBe(404);
       const data = JSON.parse(body) as { error: string };
       expect(data.error).toContain("Preflight not available");
     });
 
     it("POST /api/tasks/:id/decompose returns 500 when no project root", async () => {
-      const port = await freePort();
-      const serverObj = createMonitorServer({ logDir, port });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const serverObj = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpPost(
-        `http://localhost:${port}/api/tasks/TASK-001/decompose`,
-      );
+      const { status, body } = await httpPost(`${baseUrl}/api/tasks/TASK-001/decompose`);
       expect(status).toBe(500);
       const data = JSON.parse(body) as { error: string };
       expect(data.error).toContain("Decompose not available");
     });
 
     it("GET /api/tasks/:id/subtasks returns 500 when no task service", async () => {
-      const port = await freePort();
-      const serverObj = createMonitorServer({ logDir, port });
-      const { stop } = await serverObj.start();
-      stopServer = stop;
+      const serverObj = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+      const started = await serverObj.start();
+      stopServer = started.stop;
+      const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      const { status, body } = await httpGet(
-        `http://localhost:${port}/api/tasks/TASK-001/subtasks`,
-      );
+      const { status, body } = await httpGet(`${baseUrl}/api/tasks/TASK-001/subtasks`);
       expect(status).toBe(500);
       const data = JSON.parse(body) as { error: string };
       expect(data.error).toContain("Task service not available");
@@ -2010,19 +2447,18 @@ describe("Monitor Server", () => {
           JSON.stringify(preflightResult, null, 2),
         );
 
-        const port = await freePort();
         const serverObj = createMonitorServer({
           logDir,
-          port,
+          port: 0,
+          host: "127.0.0.1",
           projectRoot,
           taskDir: "docs/tasks",
         });
-        const { stop } = await serverObj.start();
-        stopServer = stop;
+        const started = await serverObj.start();
+        stopServer = started.stop;
+        const baseUrl = `http://127.0.0.1:${started.port}`;
 
-        const { status, body } = await httpGet(
-          `http://localhost:${port}/api/tasks/TASK-010/preflight`,
-        );
+        const { status, body } = await httpGet(`${baseUrl}/api/tasks/TASK-010/preflight`);
         expect(status).toBe(200);
 
         const data = JSON.parse(body) as {
@@ -2122,19 +2558,18 @@ describe("Monitor Server", () => {
           ),
         );
 
-        const port = await freePort();
         const serverObj = createMonitorServer({
           logDir,
-          port,
+          port: 0,
+          host: "127.0.0.1",
           projectRoot,
           taskDir: "docs/tasks",
         });
-        const { stop } = await serverObj.start();
-        stopServer = stop;
+        const started = await serverObj.start();
+        stopServer = started.stop;
+        const baseUrl = `http://127.0.0.1:${started.port}`;
 
-        const { status, body } = await httpGet(
-          `http://localhost:${port}/v1/tasks/TASK-010/readiness`,
-        );
+        const { status, body } = await httpGet(`${baseUrl}/v1/tasks/TASK-010/readiness`);
         expect(status).toBe(200);
 
         const data = JSON.parse(body) as {
@@ -2198,19 +2633,18 @@ describe("Monitor Server", () => {
           "utf-8",
         );
 
-        const port = await freePort();
         const serverObj = createMonitorServer({
           logDir,
-          port,
+          port: 0,
+          host: "127.0.0.1",
           projectRoot,
           taskDir: "docs/tasks",
         });
-        const { stop } = await serverObj.start();
-        stopServer = stop;
+        const started = await serverObj.start();
+        stopServer = started.stop;
+        const baseUrl = `http://127.0.0.1:${started.port}`;
 
-        const { status, body } = await httpGet(
-          `http://localhost:${port}/api/tasks/TASK-010/subtasks`,
-        );
+        const { status, body } = await httpGet(`${baseUrl}/api/tasks/TASK-010/subtasks`);
         expect(status).toBe(200);
 
         const data = JSON.parse(body) as {
@@ -2226,19 +2660,18 @@ describe("Monitor Server", () => {
       });
 
       it("GET /api/tasks/:id/subtasks returns empty array when no subtasks exist", async () => {
-        const port = await freePort();
         const serverObj = createMonitorServer({
           logDir,
-          port,
+          port: 0,
+          host: "127.0.0.1",
           projectRoot,
           taskDir: "docs/tasks",
         });
-        const { stop } = await serverObj.start();
-        stopServer = stop;
+        const started = await serverObj.start();
+        stopServer = started.stop;
+        const baseUrl = `http://127.0.0.1:${started.port}`;
 
-        const { status, body } = await httpGet(
-          `http://localhost:${port}/api/tasks/TASK-010/subtasks`,
-        );
+        const { status, body } = await httpGet(`${baseUrl}/api/tasks/TASK-010/subtasks`);
         expect(status).toBe(200);
 
         const data = JSON.parse(body) as { ok: boolean; taskId: string; subtasks: unknown[] };
@@ -2248,38 +2681,37 @@ describe("Monitor Server", () => {
       });
 
       it("POST /api/tasks/:id/decompose returns 404 when task not found", async () => {
-        const port = await freePort();
         const serverObj = createMonitorServer({
           logDir,
-          port,
+          port: 0,
+          host: "127.0.0.1",
           projectRoot,
           taskDir: "docs/tasks",
         });
-        const { stop } = await serverObj.start();
-        stopServer = stop;
+        const started = await serverObj.start();
+        stopServer = started.stop;
+        const baseUrl = `http://127.0.0.1:${started.port}`;
 
-        const { status, body } = await httpPost(
-          `http://localhost:${port}/api/tasks/TASK-999/decompose`,
-        );
+        const { status, body } = await httpPost(`${baseUrl}/api/tasks/TASK-999/decompose`);
         expect(status).toBe(404);
+        expect(body).toContain("TASK-999 not found");
         const data = JSON.parse(body) as { error: string };
         expect(data.error).toContain("TASK-999 not found");
       });
 
       it("POST /api/tasks/:id/preflight returns 404 when task not found", async () => {
-        const port = await freePort();
         const serverObj = createMonitorServer({
           logDir,
-          port,
+          port: 0,
+          host: "127.0.0.1",
           projectRoot,
           taskDir: "docs/tasks",
         });
-        const { stop } = await serverObj.start();
-        stopServer = stop;
+        const started = await serverObj.start();
+        stopServer = started.stop;
+        const baseUrl = `http://127.0.0.1:${started.port}`;
 
-        const { status, body } = await httpPost(
-          `http://localhost:${port}/api/tasks/TASK-999/preflight`,
-        );
+        const { status, body } = await httpPost(`${baseUrl}/api/tasks/TASK-999/preflight`);
         expect(status).toBe(404);
         const data = JSON.parse(body) as { error: string };
         expect(data.error).toContain("TASK-999 not found");
@@ -2380,19 +2812,18 @@ describe("Monitor Server", () => {
           "utf-8",
         );
 
-        const port = await freePort();
         const serverObj = createMonitorServer({
           logDir,
-          port,
+          port: 0,
+          host: "127.0.0.1",
           projectRoot,
           taskDir: "docs/tasks",
         });
-        const { stop } = await serverObj.start();
-        stopServer = stop;
+        const started = await serverObj.start();
+        stopServer = started.stop;
+        const baseUrl = `http://127.0.0.1:${started.port}`;
 
-        const { status, body } = await httpPost(
-          `http://localhost:${port}/api/tasks/TASK-010/preflight`,
-        );
+        const { status, body } = await httpPost(`${baseUrl}/api/tasks/TASK-010/preflight`);
         expect(status).toBe(200);
 
         const data = JSON.parse(body) as {
@@ -2406,19 +2837,18 @@ describe("Monitor Server", () => {
       });
 
       it("GET /api/tasks/:id/preflight returns 404 when no cached result exists for task", async () => {
-        const port = await freePort();
         const serverObj = createMonitorServer({
           logDir,
-          port,
+          port: 0,
+          host: "127.0.0.1",
           projectRoot,
           taskDir: "docs/tasks",
         });
-        const { stop } = await serverObj.start();
-        stopServer = stop;
+        const started = await serverObj.start();
+        stopServer = started.stop;
+        const baseUrl = `http://127.0.0.1:${started.port}`;
 
-        const { status, body } = await httpGet(
-          `http://localhost:${port}/api/tasks/TASK-010/preflight`,
-        );
+        const { status, body } = await httpGet(`${baseUrl}/api/tasks/TASK-010/preflight`);
         expect(status).toBe(404);
         const data = JSON.parse(body) as { error: string };
         expect(data.error).toContain("No preflight result");
@@ -2603,12 +3033,12 @@ describe("Monitor Server", () => {
             "utf-8",
           );
 
-          const port = await freePort();
-          const serverObj = createMonitorServer({ projectRoot, port });
-          const { stop } = await serverObj.start();
-          stopServer = stop;
+          const serverObj = createMonitorServer({ projectRoot, port: 0, host: "127.0.0.1" });
+          const started = await serverObj.start();
+          stopServer = started.stop;
+          const baseUrl = `http://127.0.0.1:${started.port}`;
 
-          const { status, body } = await httpGet(`http://localhost:${port}/api/fleet/routing`);
+          const { status, body } = await httpGet(`${baseUrl}/api/fleet/routing`);
           expect(status).toBe(200);
 
           const data = JSON.parse(body) as {
@@ -2648,12 +3078,12 @@ describe("Monitor Server", () => {
             "utf-8",
           );
 
-          const port = await freePort();
-          const serverObj = createMonitorServer({ projectRoot, port });
-          const { stop } = await serverObj.start();
-          stopServer = stop;
+          const serverObj = createMonitorServer({ projectRoot, port: 0, host: "127.0.0.1" });
+          const started = await serverObj.start();
+          stopServer = started.stop;
+          const baseUrl = `http://127.0.0.1:${started.port}`;
 
-          const { status, body } = await httpPatch(`http://localhost:${port}/api/fleet/routing`, {
+          const { status, body } = await httpPatch(`${baseUrl}/api/fleet/routing`, {
             workerModel: "claude-opus-4-6",
             retryEscalation: false,
           });
@@ -2745,19 +3175,18 @@ describe("Monitor Server", () => {
           ].join("\n");
           fs.writeFileSync(path.join(taskDir, "TASK-001-test.md"), taskContent, "utf-8");
 
-          const port = await freePort();
           const serverObj = createMonitorServer({
             logDir,
-            port,
+            port: 0,
+            host: "127.0.0.1",
             projectRoot,
             taskDir: "docs/tasks",
           });
-          const { stop } = await serverObj.start();
-          stopServer = stop;
+          const started = await serverObj.start();
+          stopServer = started.stop;
+          const baseUrl = `http://127.0.0.1:${started.port}`;
 
-          const { status, body } = await httpGet(
-            `http://localhost:${port}/api/tasks/TASK-001/advisory`,
-          );
+          const { status, body } = await httpGet(`${baseUrl}/api/tasks/TASK-001/advisory`);
           expect(status).toBe(200);
 
           const data = JSON.parse(body) as {
@@ -2782,12 +3211,12 @@ describe("Monitor Server", () => {
         it("GET /api/templates returns empty registry when none exists", async () => {
           const projectRoot = makeTempDir();
 
-          const port = await freePort();
-          const serverObj = createMonitorServer({ projectRoot, port });
-          const { stop } = await serverObj.start();
-          stopServer = stop;
+          const serverObj = createMonitorServer({ projectRoot, port: 0, host: "127.0.0.1" });
+          const started = await serverObj.start();
+          stopServer = started.stop;
+          const baseUrl = `http://127.0.0.1:${started.port}`;
 
-          const { status, body } = await httpGet(`http://localhost:${port}/api/templates`);
+          const { status, body } = await httpGet(`${baseUrl}/api/templates`);
           expect(status).toBe(200);
 
           const data = JSON.parse(body) as {
@@ -2831,12 +3260,12 @@ describe("Monitor Server", () => {
             "utf-8",
           );
 
-          const port = await freePort();
-          const serverObj = createMonitorServer({ projectRoot, port });
-          const { stop } = await serverObj.start();
-          stopServer = stop;
+          const serverObj = createMonitorServer({ projectRoot, port: 0, host: "127.0.0.1" });
+          const started = await serverObj.start();
+          stopServer = started.stop;
+          const baseUrl = `http://127.0.0.1:${started.port}`;
 
-          const { status, body } = await httpGet(`http://localhost:${port}/api/analytics/summary`);
+          const { status, body } = await httpGet(`${baseUrl}/api/analytics/summary`);
           expect(status).toBe(200);
 
           const data = JSON.parse(body) as {
@@ -2880,12 +3309,12 @@ describe("Monitor Server", () => {
             "utf-8",
           );
 
-          const port = await freePort();
-          const serverObj = createMonitorServer({ projectRoot, port });
-          const { stop } = await serverObj.start();
-          stopServer = stop;
+          const serverObj = createMonitorServer({ projectRoot, port: 0, host: "127.0.0.1" });
+          const started = await serverObj.start();
+          stopServer = started.stop;
+          const baseUrl = `http://127.0.0.1:${started.port}`;
 
-          const { status, body } = await httpGet(`http://localhost:${port}/api/analytics/patterns`);
+          const { status, body } = await httpGet(`${baseUrl}/api/analytics/patterns`);
           expect(status).toBe(200);
 
           const data = JSON.parse(body) as { totalRuns: number; byTag: Record<string, unknown> };
@@ -2928,14 +3357,12 @@ describe("Monitor Server", () => {
             "utf-8",
           );
 
-          const port = await freePort();
-          const serverObj = createMonitorServer({ projectRoot, port });
-          const { stop } = await serverObj.start();
-          stopServer = stop;
+          const serverObj = createMonitorServer({ projectRoot, port: 0, host: "127.0.0.1" });
+          const started = await serverObj.start();
+          stopServer = started.stop;
+          const baseUrl = `http://127.0.0.1:${started.port}`;
 
-          const { status, body } = await httpGet(
-            `http://localhost:${port}/api/analytics/by-tag?tag=test-tag`,
-          );
+          const { status, body } = await httpGet(`${baseUrl}/api/analytics/by-tag?tag=test-tag`);
           expect(status).toBe(200);
 
           const data = JSON.parse(body) as { tag: string; data: { runs: number; rate: number } };
@@ -2973,13 +3400,13 @@ describe("Monitor Server", () => {
             "utf-8",
           );
 
-          const port = await freePort();
-          const serverObj = createMonitorServer({ projectRoot, port });
-          const { stop } = await serverObj.start();
-          stopServer = stop;
+          const serverObj = createMonitorServer({ projectRoot, port: 0, host: "127.0.0.1" });
+          const started = await serverObj.start();
+          stopServer = started.stop;
+          const baseUrl = `http://127.0.0.1:${started.port}`;
 
           // Send invalid data (retryEscalation should be boolean, not string)
-          const { status, body } = await httpPatch(`http://localhost:${port}/api/fleet/routing`, {
+          const { status, body } = await httpPatch(`${baseUrl}/api/fleet/routing`, {
             retryEscalation: "not-a-boolean",
           });
           expect(status).toBe(400);
@@ -2999,14 +3426,12 @@ describe("Monitor Server", () => {
 
       describe("Task verify endpoint", () => {
         it("POST /api/tasks/:id/verify returns 404 when project root not configured", async () => {
-          const port = await freePort();
-          const serverObj = createMonitorServer({ logDir, port });
-          const { stop } = await serverObj.start();
-          stopServer = stop;
+          const serverObj = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+          const started = await serverObj.start();
+          stopServer = started.stop;
+          const baseUrl = `http://127.0.0.1:${started.port}`;
 
-          const { status, body } = await httpPost(
-            `http://localhost:${port}/api/tasks/TASK-001/verify`,
-          );
+          const { status, body } = await httpPost(`${baseUrl}/api/tasks/TASK-001/verify`);
           expect(status).toBe(404);
 
           const data = JSON.parse(body) as { error: string };
@@ -3064,14 +3489,12 @@ describe("Monitor Server", () => {
             "utf-8",
           );
 
-          const port = await freePort();
-          const serverObj = createMonitorServer({ projectRoot, port });
-          const { stop } = await serverObj.start();
-          stopServer = stop;
+          const serverObj = createMonitorServer({ projectRoot, port: 0, host: "127.0.0.1" });
+          const started = await serverObj.start();
+          stopServer = started.stop;
+          const baseUrl = `http://127.0.0.1:${started.port}`;
 
-          const { status, body } = await httpPost(
-            `http://localhost:${port}/api/tasks/TASK-001/verify`,
-          );
+          const { status, body } = await httpPost(`${baseUrl}/api/tasks/TASK-001/verify`);
           expect(status).toBe(200);
 
           const data = JSON.parse(body) as {
@@ -3155,15 +3578,13 @@ describe("Monitor Server", () => {
             "utf-8",
           );
 
-          const port = await freePort();
-          const serverObj = createMonitorServer({ projectRoot, port });
-          const { stop } = await serverObj.start();
-          stopServer = stop;
+          const serverObj = createMonitorServer({ projectRoot, port: 0, host: "127.0.0.1" });
+          const started = await serverObj.start();
+          stopServer = started.stop;
+          const baseUrl = `http://127.0.0.1:${started.port}`;
 
           // When no dispatch is active, verify should run in projectRoot (fallback path)
-          const { status, body } = await httpPost(
-            `http://localhost:${port}/api/tasks/TASK-001/verify`,
-          );
+          const { status, body } = await httpPost(`${baseUrl}/api/tasks/TASK-001/verify`);
           expect(status).toBe(200);
 
           const data = JSON.parse(body) as {
@@ -3187,14 +3608,12 @@ describe("Monitor Server", () => {
 
       describe("Task enrich endpoints", () => {
         it("POST /api/tasks/:id/enrich returns 404 when project not configured", async () => {
-          const port = await freePort();
-          const serverObj = createMonitorServer({ logDir, port });
-          const { stop } = await serverObj.start();
-          stopServer = stop;
+          const serverObj = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+          const started = await serverObj.start();
+          stopServer = started.stop;
+          const baseUrl = `http://127.0.0.1:${started.port}`;
 
-          const { status, body } = await httpPost(
-            `http://localhost:${port}/api/tasks/TASK-001/enrich`,
-          );
+          const { status, body } = await httpPost(`${baseUrl}/api/tasks/TASK-001/enrich`);
           expect(status).toBe(404);
 
           const data = JSON.parse(body) as { error: string };
@@ -3330,19 +3749,18 @@ describe("Monitor Server", () => {
           }) as typeof clearTimeout);
 
           try {
-            const port = await freePort();
             const serverObj = createMonitorServer({
               logDir,
-              port,
+              port: 0,
+              host: "127.0.0.1",
               projectRoot,
               taskDir: "docs/tasks",
             });
-            const { stop } = await serverObj.start();
-            stopServer = stop;
+            const started = await serverObj.start();
+            stopServer = started.stop;
+            const baseUrl = `http://127.0.0.1:${started.port}`;
 
-            const { status, body } = await httpPost(
-              `http://localhost:${port}/api/tasks/TASK-001/enrich`,
-            );
+            const { status, body } = await httpPost(`${baseUrl}/api/tasks/TASK-001/enrich`);
             expect(status).toBe(200);
 
             const data = JSON.parse(body) as { outcome: string; gateScore: number };
@@ -3435,20 +3853,35 @@ describe("Monitor Server", () => {
             JSON.stringify(adapterConfig, null, 2),
             "utf-8",
           );
+          execFileSync("git", ["init"], { cwd: projectRoot, stdio: "ignore" });
+          execFileSync("git", ["config", "user.email", "quack-tests@example.invalid"], {
+            cwd: projectRoot,
+            stdio: "ignore",
+          });
+          execFileSync("git", ["config", "user.name", "Quack Tests"], {
+            cwd: projectRoot,
+            stdio: "ignore",
+          });
+          execFileSync("git", ["add", "."], { cwd: projectRoot, stdio: "ignore" });
+          execFileSync("git", ["commit", "-m", "fixture"], {
+            cwd: projectRoot,
+            stdio: "ignore",
+          });
 
-          const port = await freePort();
           const serverObj = createMonitorServer({
             logDir,
-            port,
+            port: 0,
+            host: "127.0.0.1",
             projectRoot,
             taskDir: "docs/tasks",
           });
-          const { stop } = await serverObj.start();
-          stopServer = stop;
+          const started = await serverObj.start();
+          stopServer = started.stop;
+          const baseUrl = `http://127.0.0.1:${started.port}`;
 
           // Send empty body (no content)
           const { status, body } = await httpPost(
-            `http://localhost:${port}/api/tasks/TASK-001/enrich/approve`,
+            `${baseUrl}/api/tasks/TASK-001/enrich/approve`,
             {},
           );
           expect(status).toBe(400);
@@ -3532,25 +3965,37 @@ describe("Monitor Server", () => {
             JSON.stringify(adapterConfig, null, 2),
             "utf-8",
           );
+          execFileSync("git", ["init"], { cwd: projectRoot, stdio: "ignore" });
+          execFileSync("git", ["config", "user.email", "quack-tests@example.invalid"], {
+            cwd: projectRoot,
+            stdio: "ignore",
+          });
+          execFileSync("git", ["config", "user.name", "Quack Tests"], {
+            cwd: projectRoot,
+            stdio: "ignore",
+          });
+          execFileSync("git", ["add", "."], { cwd: projectRoot, stdio: "ignore" });
+          execFileSync("git", ["commit", "-m", "fixture"], {
+            cwd: projectRoot,
+            stdio: "ignore",
+          });
 
-          const port = await freePort();
           const serverObj = createMonitorServer({
             logDir,
-            port,
+            port: 0,
+            host: "127.0.0.1",
             projectRoot,
             taskDir: "docs/tasks",
           });
-          const { stop } = await serverObj.start();
-          stopServer = stop;
+          const started = await serverObj.start();
+          stopServer = started.stop;
+          const baseUrl = `http://127.0.0.1:${started.port}`;
 
           const enrichedContent = originalContent + "\n\n## Enriched Section\nAdded by enrichment";
 
-          const { status, body } = await httpPost(
-            `http://localhost:${port}/api/tasks/TASK-001/enrich/approve`,
-            {
-              content: enrichedContent,
-            },
-          );
+          const { status, body } = await httpPost(`${baseUrl}/api/tasks/TASK-001/enrich/approve`, {
+            content: enrichedContent,
+          });
           expect(status).toBe(200);
 
           const data = JSON.parse(body) as {
@@ -3568,9 +4013,7 @@ describe("Monitor Server", () => {
           const fileContent = fs.readFileSync(path.join(taskDir, "TASK-001-test.md"), "utf-8");
           expect(fileContent).toContain("Enriched Section");
 
-          const readinessResponse = await httpGet(
-            `http://localhost:${port}/v1/tasks/TASK-001/readiness`,
-          );
+          const readinessResponse = await httpGet(`${baseUrl}/v1/tasks/TASK-001/readiness`);
           expect(readinessResponse.status).toBe(200);
 
           const readiness = JSON.parse(readinessResponse.body) as {
@@ -3636,12 +4079,12 @@ describe("Monitor Server", () => {
             "utf-8",
           );
 
-          const port = await freePort();
-          const serverObj = createMonitorServer({ projectRoot, port });
-          const { stop } = await serverObj.start();
-          stopServer = stop;
+          const serverObj = createMonitorServer({ projectRoot, port: 0, host: "127.0.0.1" });
+          const started = await serverObj.start();
+          stopServer = started.stop;
+          const baseUrl = `http://127.0.0.1:${started.port}`;
 
-          const { status, body } = await httpGet(`http://localhost:${port}/api/github/sync-map`);
+          const { status, body } = await httpGet(`${baseUrl}/api/github/sync-map`);
           expect(status).toBe(200);
 
           const data = JSON.parse(body) as {
@@ -3708,14 +4151,12 @@ describe("Monitor Server", () => {
             "utf-8",
           );
 
-          const port = await freePort();
-          const serverObj = createMonitorServer({ projectRoot, port });
-          const { stop } = await serverObj.start();
-          stopServer = stop;
+          const serverObj = createMonitorServer({ projectRoot, port: 0, host: "127.0.0.1" });
+          const started = await serverObj.start();
+          stopServer = started.stop;
+          const baseUrl = `http://127.0.0.1:${started.port}`;
 
-          const { status, body } = await httpDelete(
-            `http://localhost:${port}/api/github/sync-map/TASK-001`,
-          );
+          const { status, body } = await httpDelete(`${baseUrl}/api/github/sync-map/TASK-001`);
           expect(status).toBe(200);
 
           const data = JSON.parse(body) as { ok: boolean; deleted: { taskId: string } };

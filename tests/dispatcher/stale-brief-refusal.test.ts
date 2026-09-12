@@ -78,14 +78,33 @@ function structuredBlueprint(): Blueprint {
     fileAnalyses: ["src/a.ts", "src/b.ts", "src/c.ts"].map((filePath) => ({
       filePath,
       action: "Modify" as const,
-      currentBehavior: "x",
-      requiredChange: "y",
-      integrationPoints: [],
+      currentStructure: "The fixture module exports its current behavior.",
+      integrationPoints: "Update the fixture module in place.",
+      patternToFollow: "Use the neighboring fixture modules as the pattern.",
     })),
     codeExamples: [],
-    verificationPatterns: ["one"],
+    verificationPatterns: [
+      {
+        criterion: "The gate sees real counts",
+        checkType: "grep",
+        pattern: "fixture",
+        fileGlob: "src/*.ts",
+      },
+    ],
     antiPatterns: [],
-  } as unknown as Blueprint;
+    preconditions: [],
+  };
+}
+
+function installBlueprintQueryFixture(): void {
+  _setQueryFn((() =>
+    (async function* () {
+      yield await Promise.resolve({
+        type: "result",
+        subtype: "success",
+        result: JSON.stringify(structuredBlueprint()),
+      });
+    })()) as never);
 }
 
 function makePreflight(structured: Blueprint, contentHash: string): PreflightResult {
@@ -99,7 +118,7 @@ function makePreflight(structured: Blueprint, contentHash: string): PreflightRes
       codeExamples: structured.codeExamples.length,
       verificationPatterns: structured.verificationPatterns.length,
       antiPatterns: structured.antiPatterns.length,
-      markdown: "# brief",
+      formattedMarkdown: "# brief",
       structured,
     },
     contextEstimate: {
@@ -136,6 +155,13 @@ async function makeProject(): Promise<{
   await fs.mkdir(taskDir, { recursive: true });
   const specPath = path.join(taskDir, `${TASK_ID}.md`);
   await fs.writeFile(specPath, V1, "utf-8");
+  const sourceDir = path.join(tmpDir, "src");
+  await fs.mkdir(sourceDir, { recursive: true });
+  await Promise.all(
+    ["a.ts", "b.ts", "c.ts"].map((fileName) =>
+      fs.writeFile(path.join(sourceDir, fileName), "export const fixture = true;\n", "utf-8"),
+    ),
+  );
 
   const prepDir = path.join(tmpDir, ".quack", "prep");
   await fs.mkdir(prepDir, { recursive: true });
@@ -230,11 +256,9 @@ describe("TASK-1332: a resume cannot consume a brief whose contract has moved", 
   const tmpDirs: string[] = [];
 
   beforeAll(() => {
-    // Safety net: the blueprint agent must never make a real SDK call.
-    _setQueryFn((() =>
-      (async function* () {
-        /* empty */
-      })()) as never);
+    // Changed-spec and worktree controls intentionally miss the original
+    // cache. Keep those paths substantive without making a real SDK call.
+    installBlueprintQueryFixture();
   });
   afterAll(async () => {
     _setQueryFn(undefined as never);
@@ -330,6 +354,109 @@ describe("TASK-1332: a resume cannot consume a brief whose contract has moved", 
     expect(stale?.payload.verdict).toBe("stale");
   });
 
+  it("retires a rejection after a contract change and opens a gate for the fresh brief", async () => {
+    const { tmpDir, adapter, specPath } = await makeProject();
+    tmpDirs.push(tmpDir);
+    const logDir = path.join(tmpDir, ".quack", "logs");
+
+    const first = await run(adapter, []);
+    expect(first.outcome).toBe("awaiting_approval");
+    const rejectedGeneration = await loadApproval(TASK_ID, logDir);
+    expect(rejectedGeneration?.specIdentity?.contractHash).toBeDefined();
+    await updateApprovalState(
+      TASK_ID,
+      "rejected",
+      logDir,
+      undefined,
+      "Cross-provider review rejected generation one",
+    );
+
+    await fs.writeFile(specPath, spec("Build a MATERIALLY DIFFERENT second generation."), "utf-8");
+
+    const events: Captured[] = [];
+    const fresh = await run(adapter, events);
+
+    expect(fresh.outcome).toBe("awaiting_approval");
+    expect(fresh.error).toBe("Awaiting blueprint approval");
+    expect(events.some((event) => event.stage === "blueprint_generated")).toBe(true);
+    expect(events.some((event) => event.stage === "blueprint_pending_approval")).toBe(true);
+    expect(events.some((event) => event.stage === "session_error")).toBe(false);
+
+    const freshGeneration = await loadApproval(TASK_ID, logDir);
+    expect(freshGeneration).toMatchObject({ state: "pending" });
+    expect(freshGeneration?.rejectionReason).toBeUndefined();
+    expect(freshGeneration?.specIdentity?.contractHash).not.toBe(
+      rejectedGeneration?.specIdentity?.contractHash,
+    );
+  });
+
+  it("replaces a stale rejection when the fresh brief is auto-approved", async () => {
+    const { tmpDir, adapter, specPath } = await makeProject();
+    tmpDirs.push(tmpDir);
+    const logDir = path.join(tmpDir, ".quack", "logs");
+
+    expect((await run(adapter, [])).outcome).toBe("awaiting_approval");
+    const rejectedGeneration = await loadApproval(TASK_ID, logDir);
+    expect(rejectedGeneration?.specIdentity?.contractHash).toBeDefined();
+    await updateApprovalState(
+      TASK_ID,
+      "rejected",
+      logDir,
+      undefined,
+      "Generation one does not match the requested design",
+    );
+
+    // The replacement blueprint has three files. Widen the deterministic
+    // threshold so the new, changed-spec generation takes the non-loop
+    // auto-approval path that historically left the v1 rejection on disk.
+    const rules = adapter.config.preflight?.blueprintApproval?.autoApproveWhen;
+    if (!rules) throw new Error("fixture must configure blueprint auto-approval rules");
+    rules.maxFiles = 3;
+    await fs.writeFile(specPath, spec("Build a MATERIALLY DIFFERENT second generation."), "utf-8");
+
+    const events: Captured[] = [];
+    const fresh = await run(adapter, events);
+
+    expect(fresh.outcome).not.toBe("awaiting_approval");
+    expect(events.some((event) => event.stage === "blueprint_pending_approval")).toBe(false);
+    // The fixture is not a Git repository, so reaching branch setup proves
+    // the fresh generation crossed the approval gate.
+    expect(fresh.error ?? "").toMatch(
+      /not a git repository|spawn EPERM|Refusing local or helper-backed Git transport target: origin/,
+    );
+
+    const replacement = await loadApproval(TASK_ID, logDir);
+    expect(replacement).toMatchObject({ state: "auto-approved" });
+    expect(replacement?.rejectionReason).toBeUndefined();
+    expect(replacement?.specIdentity?.contractHash).not.toBe(
+      rejectedGeneration?.specIdentity?.contractHash,
+    );
+  });
+
+  it("keeps a same-contract rejection authoritative on a fresh dispatch", async () => {
+    const { tmpDir, adapter } = await makeProject();
+    tmpDirs.push(tmpDir);
+    const logDir = path.join(tmpDir, ".quack", "logs");
+
+    expect((await run(adapter, [])).outcome).toBe("awaiting_approval");
+    await updateApprovalState(
+      TASK_ID,
+      "rejected",
+      logDir,
+      undefined,
+      "The generated approach is unsafe",
+    );
+
+    const events: Captured[] = [];
+    const repeated = await run(adapter, events);
+
+    expect(repeated.outcome).toBe("error");
+    expect(events.find((event) => event.stage === "session_error")?.payload.error).toContain(
+      "The generated approach is unsafe",
+    );
+    expect((await loadApproval(TASK_ID, logDir))?.state).toBe("rejected");
+  });
+
   it("DOES reuse an approval for a fresh brief when the contract has NOT moved", async () => {
     // The control for the arm above, and it is not vacuous: without it,
     // refusing every fresh dispatch that finds an approved record would
@@ -343,9 +470,12 @@ describe("TASK-1332: a resume cannot consume a brief whose contract has moved", 
     expect(events.some((e) => e.stage === "stage_skipped" && e.payload.stage === "approve")).toBe(
       true,
     );
-    // Went PAST the gate: the branch stage's git fetch fails in a non-repo
-    // temp dir, which is this harness's established proof of progress.
-    expect(fresh.error ?? "").toMatch(/not a git repository|spawn EPERM/);
+    // Went PAST the gate: the branch stage's Git fetch fails in this non-repo
+    // temp directory. The trusted launcher may reject the unresolved `origin`
+    // before Git itself emits its historical not-a-repository error.
+    expect(fresh.error ?? "").toMatch(
+      /not a git repository|spawn EPERM|Refusing local or helper-backed Git transport target: origin/,
+    );
   });
 
   it("does NOT refuse when only the Status line moved (round-1 R1-2, the bypass)", async () => {
@@ -360,9 +490,12 @@ describe("TASK-1332: a resume cannot consume a brief whose contract has moved", 
     const r2 = await run(adapter, events, true);
 
     expect(r2.error ?? "").not.toContain("contract has changed");
-    // Went PAST the gate: the branch stage's git fetch fails in a non-repo
-    // temp dir, which is the harness's established proof of progress.
-    expect(r2.error ?? "").toMatch(/not a git repository|spawn EPERM/);
+    // Went PAST the gate: the branch stage's Git fetch fails in this non-repo
+    // temp directory. The trusted launcher may reject the unresolved `origin`
+    // before Git itself emits its historical not-a-repository error.
+    expect(r2.error ?? "").toMatch(
+      /not a git repository|spawn EPERM|Refusing local or helper-backed Git transport target: origin/,
+    );
     const skipped = events.find(
       (e) => e.stage === "stage_skipped" && e.payload.stage === "blueprint",
     );
@@ -477,10 +610,8 @@ describe("TASK-1332 R3-2: a run whose spec is not the authoritative one refuses 
   const tmpDirs: string[] = [];
 
   beforeAll(() => {
-    _setQueryFn((() =>
-      (async function* () {
-        /* empty */
-      })()) as never);
+    // Worktree fixtures intentionally have no local preflight cache.
+    installBlueprintQueryFixture();
   });
   afterAll(async () => {
     _setQueryFn(undefined as never);

@@ -1,10 +1,11 @@
+import { getClaudeSdkEnvironment } from "../../sdk/claude-auth.js";
 import { getSdkPermissionOptions } from "../../sdk/permission-mode.js";
 import type {
   IntentJudgmentRequest,
   IntentJudgmentRunnerErrorCode,
   IntentJudgmentRunResult,
 } from "../judgment-types.js";
-import type { IntentJudgmentRunnerConfig } from "./intent-judgment-config.js";
+import type { ClaudeIntentJudgmentRunnerConfig } from "./intent-judgment-config.js";
 import {
   INTENT_JUDGMENT_RESPONSE_SCHEMA,
   INTENT_JUDGMENT_SYSTEM_PROMPT,
@@ -46,7 +47,7 @@ function boundedMessage(message: string, maxChars = 500): string {
 }
 
 function errorResult(
-  config: IntentJudgmentRunnerConfig,
+  config: ClaudeIntentJudgmentRunnerConfig,
   startedAt: number,
   truncatedFields: string[],
   errorCode: IntentJudgmentRunnerErrorCode,
@@ -66,7 +67,7 @@ function errorResult(
 
 export async function runClaudeIntentJudgment(
   request: IntentJudgmentRequest,
-  config: IntentJudgmentRunnerConfig,
+  config: ClaudeIntentJudgmentRunnerConfig,
 ): Promise<IntentJudgmentRunResult> {
   const startedAt = Date.now();
   let truncatedFields: string[] = [];
@@ -92,6 +93,7 @@ export async function runClaudeIntentJudgment(
         },
         abortController,
         ...getSdkPermissionOptions(),
+        env: getClaudeSdkEnvironment(),
       },
     });
 

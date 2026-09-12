@@ -47,7 +47,8 @@ function setEnrichedResult(filePath: string): string {
 
 async function start(root: string, adapterPath: string) {
   const server = createMonitorServer({
-    port: 30_000 + Math.floor(Math.random() * 10_000),
+    port: 0,
+    host: "127.0.0.1",
     projectRoot: root,
     taskDir: "docs/tasks",
     adapterPath,

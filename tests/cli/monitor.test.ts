@@ -1,9 +1,9 @@
 // Test that the monitor command is properly registered in the CLI
 import {
-  describeMonitorNetwork,
-  formatMonitorUrlHost,
+  buildSingleProjectMonitorServerOptions,
   resolveMonitorBindHost,
 } from "../../src/cli/monitor";
+import type { ProjectAdapter } from "../../src/core/adapter-loader";
 
 describe("CLI monitor command", () => {
   it("is registered in the program", async () => {
@@ -29,17 +29,21 @@ describe("CLI monitor command", () => {
     expect(resolveMonitorBindHost("0.0.0.0")).toBe("0.0.0.0");
   });
 
-  it("brackets IPv6 hosts in displayed URLs while preserving the raw bind host", () => {
-    const host = resolveMonitorBindHost(" ::1 ");
-    const network = describeMonitorNetwork(host, 3333, "single");
+  it("forwards operator-owned local-read authorization in single-project mode", () => {
+    const trustedOrigin = "C:\\operator-owned\\demo-origin.git";
+    const adapter = {
+      projectRoot: "C:\\demo\\project",
+      config: {
+        project: { name: "demo", taskDir: "docs/tasks" },
+        logging: { dir: ".quack/logs" },
+      },
+      trustedLocalReadRemotePaths: [trustedOrigin],
+    } as ProjectAdapter;
 
-    expect(formatMonitorUrlHost(host)).toBe("[::1]");
-    expect(network.bindHost).toBe("::1");
-    expect(network.lines).toEqual([
-      "Bind:      [::1]:3333",
-      "Dashboard: http://[::1]:3333",
-      "SSE:       http://[::1]:3333/api/events/stream",
-      "Health:    http://[::1]:3333/api/health",
-    ]);
+    const options = buildSingleProjectMonitorServerOptions(adapter, 3347, "127.0.0.1");
+
+    expect(options.trustedLocalReadRemotePaths).toEqual([trustedOrigin]);
+    expect(options.projectRoot).toBe(adapter.projectRoot);
+    expect(options.runtimeRole).toBe("headnode");
   });
 });

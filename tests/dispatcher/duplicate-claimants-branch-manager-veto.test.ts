@@ -1,7 +1,7 @@
 // TASK-1338-B pre-change record: all four target-branch-only duplicate arms
 // executed and FAILED at the intended success:false assertion after commit and
-// push. REJECTED is the non-updatable CONTROL for the earlier no-write
-// return; COMPLETE separately proves the recovery path is idempotent.
+// push. The ON_HOLD-status target is a CONTROL for the earlier no-write
+// return and is covered behaviorally by the READY matrix.
 
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
@@ -18,6 +18,91 @@ import {
   taskSpec,
 } from "../helpers/duplicate-claimants-fixture";
 
+const MOCK_REPOSITORY = { host: "github.com", owner: "org", repo: "repo" } as const;
+const MOCK_PUSH_URL = "https://github.com/org/repo.git";
+let mockTransportFixture: { project: string; origin: string };
+let mockPublicationPushes: Array<{
+  projectRoot: string;
+  args: readonly string[];
+  expectedRepository: unknown;
+}>;
+
+// Keep real Git reads, worktrees, commits, and bare-repository writes. Only the
+// audited GitHub identity and exact status push delivery are fixture boundaries:
+// the fake push URL is never contacted, and no other transport can escape.
+jest.mock("../../src/worker/trusted-executable", () => {
+  const actual = jest.requireActual<typeof import("../../src/worker/trusted-executable")>(
+    "../../src/worker/trusted-executable",
+  );
+  return {
+    ...actual,
+    resolveTrustedGitHubRepository: async (
+      projectRoot: string,
+      options: Parameters<typeof actual.resolveTrustedGitHubRepository>[1],
+    ) => {
+      expect(projectRoot).toBe(mockTransportFixture.project);
+      const result = await actual.runTrustedGitResult(
+        projectRoot,
+        ["remote", "get-url", "--push", "--all", "origin"],
+        { timeoutMs: options.timeoutMs, maxBuffer: options.maxBuffer },
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(MOCK_PUSH_URL);
+      return actual.parseTrustedGitHubRepository(result.stdout);
+    },
+    runTrustedGitResult: (
+      projectRoot: string,
+      args: readonly string[],
+      options: Parameters<typeof actual.runTrustedGitResult>[2],
+    ) => {
+      if (args[0] === "fetch") {
+        expect(projectRoot).toBe(mockTransportFixture.project);
+        expect(args).toEqual(["fetch", "origin", "dev:refs/remotes/origin/dev"]);
+        expect(options.trustedLocalReadRemotePaths).toEqual([mockTransportFixture.origin]);
+        expect(git(projectRoot, ["remote", "get-url", "origin"])).toBe(mockTransportFixture.origin);
+      } else if (["clone", "ls-remote", "send-pack", "pull"].includes(args[0] ?? "")) {
+        throw new Error("Unexpected transport in the local status-publication fixture");
+      }
+      if (args[0] !== "push") return actual.runTrustedGitResult(projectRoot, args, options);
+
+      mockPublicationPushes.push({
+        projectRoot,
+        args,
+        expectedRepository: options.expectedRepository,
+      });
+      expect(projectRoot).toBe(
+        path.join(mockTransportFixture.project, ".quack", "tmp-status-update"),
+      );
+      expect(options.expectedRepository).toEqual(MOCK_REPOSITORY);
+      expect(git(projectRoot, ["remote", "get-url", "--push", "--all", "origin"])).toBe(
+        MOCK_PUSH_URL,
+      );
+      const headOid = git(projectRoot, ["rev-parse", "HEAD"]);
+      expect(headOid).toMatch(/^[a-f0-9]{40,64}$/u);
+      expect(args).toEqual(["push", "origin", `${headOid}:refs/heads/dev`]);
+      const executable = actual.resolveTrustedExecutable(
+        "git",
+        projectRoot,
+        "branch-veto fixture Git",
+      );
+      const stdout = execFileSync(
+        executable,
+        ["-C", projectRoot, "push", mockTransportFixture.origin, `${headOid}:refs/heads/dev`],
+        {
+          cwd: path.dirname(executable),
+          encoding: "utf8",
+          env: actual.buildTrustedGitEnvironment(executable),
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
+          timeout: 30_000,
+          maxBuffer: 1024 * 1024,
+        },
+      );
+      return Promise.resolve({ exitCode: 0, stdout, stderr: "" });
+    },
+  };
+});
+
 jest.setTimeout(120_000);
 
 function git(cwd: string, args: string[]): string {
@@ -28,13 +113,6 @@ function git(cwd: string, args: string[]): string {
     stdio: ["ignore", "pipe", "pipe"],
   }).trim();
 }
-
-// The provisioned Codex sandbox rejects git child processes. CI and admin
-// runs do not set CODEX_THREAD_ID and execute the real-repository suite.
-const gitAvailable = process.env.CODEX_THREAD_ID === undefined;
-
-const describeWithGit = gitAvailable ? describe : describe.skip;
-const itWithGit = gitAvailable ? it : it.skip;
 
 interface RepoFixture {
   root: string;
@@ -83,6 +161,9 @@ function createRepoFixture(
     git(project, ["add", "docs/tasks"]);
     git(project, ["commit", "-m", "admin branch has one claimant"]);
   }
+  git(project, ["remote", "set-url", "--push", "origin", MOCK_PUSH_URL]);
+  mockTransportFixture = { project, origin };
+  mockPublicationPushes = [];
 
   return {
     root,
@@ -92,11 +173,12 @@ function createRepoFixture(
     adapter: {
       projectRoot: project,
       config: { project: { taskDir: "docs/tasks" } },
+      trustedLocalReadRemotePaths: [origin],
     } as ProjectAdapter,
   };
 }
 
-describeWithGit.each(DUPLICATE_FIXTURE_CASES)(
+describe.each(DUPLICATE_FIXTURE_CASES)(
   "branch-manager duplicate claimant veto (%s, %s)",
   (kind, order) => {
     it("refuses inside the target-branch worktree before write, stage, commit, or push", async () => {
@@ -118,9 +200,14 @@ describeWithGit.each(DUPLICATE_FIXTURE_CASES)(
           "refs/heads/dev:docs/tasks/TASK-100-a.md",
         ]);
 
-        const result = await updateTaskFileStatus("TASK-100", fixture.adapter, "dev");
+        const result = await updateTaskFileStatus("TASK-100", fixture.adapter, "dev", {
+          host: "github.com",
+          owner: "org",
+          repo: "repo",
+        });
 
         expect(result.success).toBe(false);
+        expect(mockPublicationPushes).toEqual([]);
         expect(result.error).toContain("TASK-100");
         for (const claimant of fixture.claimants) expect(result.error).toContain(claimant);
         expect(
@@ -145,8 +232,8 @@ describeWithGit.each(DUPLICATE_FIXTURE_CASES)(
   },
 );
 
-itWithGit("non-updatable status returns before the veto", async () => {
-  const fixture = createRepoFixture("cross-population", "forward", "REJECTED");
+it("non-updatable status returns before the veto", async () => {
+  const fixture = createRepoFixture("cross-population", "forward", "ON_HOLD");
   try {
     const beforeSha = git(fixture.root, [
       "--git-dir",
@@ -154,9 +241,14 @@ itWithGit("non-updatable status returns before the veto", async () => {
       "rev-parse",
       "refs/heads/dev",
     ]);
-    const result = await updateTaskFileStatus("TASK-100", fixture.adapter, "dev");
+    const result = await updateTaskFileStatus("TASK-100", fixture.adapter, "dev", {
+      host: "github.com",
+      owner: "org",
+      repo: "repo",
+    });
     expect(result.success).toBe(false);
     expect(result.error).toContain("No updatable status");
+    expect(mockPublicationPushes).toEqual([]);
     expect(git(fixture.root, ["--git-dir", fixture.origin, "rev-parse", "refs/heads/dev"])).toBe(
       beforeSha,
     );
@@ -165,8 +257,8 @@ itWithGit("non-updatable status returns before the veto", async () => {
   }
 });
 
-itWithGit("an already-complete target is an idempotent success before the veto", async () => {
-  const fixture = createRepoFixture("cross-population", "forward", "COMPLETE");
+it("updates and pushes normally with one claimant", async () => {
+  const fixture = createRepoFixture("single", "forward");
   try {
     const beforeSha = git(fixture.root, [
       "--git-dir",
@@ -174,21 +266,26 @@ itWithGit("an already-complete target is an idempotent success before the veto",
       "rev-parse",
       "refs/heads/dev",
     ]);
-    const result = await updateTaskFileStatus("TASK-100", fixture.adapter, "dev");
+    const result = await updateTaskFileStatus("TASK-100", fixture.adapter, "dev", {
+      host: "github.com",
+      owner: "org",
+      repo: "repo",
+    });
     expect(result).toEqual({ success: true });
-    expect(git(fixture.root, ["--git-dir", fixture.origin, "rev-parse", "refs/heads/dev"])).toBe(
-      beforeSha,
-    );
-  } finally {
-    fs.rmSync(fixture.root, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
-  }
-});
-
-itWithGit("updates and pushes normally with one claimant", async () => {
-  const fixture = createRepoFixture("single", "forward");
-  try {
-    const result = await updateTaskFileStatus("TASK-100", fixture.adapter, "dev");
-    expect(result).toEqual({ success: true });
+    const publishedSha = git(fixture.root, [
+      "--git-dir",
+      fixture.origin,
+      "rev-parse",
+      "refs/heads/dev",
+    ]);
+    expect(publishedSha).not.toBe(beforeSha);
+    expect(mockPublicationPushes).toEqual([
+      {
+        projectRoot: path.join(fixture.project, ".quack", "tmp-status-update"),
+        args: ["push", "origin", `${publishedSha}:refs/heads/dev`],
+        expectedRepository: MOCK_REPOSITORY,
+      },
+    ]);
     expect(
       git(fixture.root, [
         "--git-dir",

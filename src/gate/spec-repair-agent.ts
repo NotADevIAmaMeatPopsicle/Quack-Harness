@@ -1,3 +1,4 @@
+import { getClaudeSdkEnvironment } from "../sdk/claude-auth.js";
 // ─── Spec Repair Agent ──────────────────────────────────────────────
 // Attempts to fix incomplete task specs by filling in missing required
 // sections. Uses a read-only agent session similar to the enrichment
@@ -92,6 +93,7 @@ export async function repairTaskSpec(
       allowedTools: ["Read", "Glob", "Grep"],
       disallowedTools: ["Edit", "Write", "Bash", "WebSearch", "WebFetch"],
       ...getSdkPermissionOptions(),
+      env: getClaudeSdkEnvironment(adapter.config.agent.apiKeys),
       model,
       maxTurns,
       cwd: adapter.projectRoot,

@@ -15,17 +15,38 @@ import {
 
 let capturedCommands: string[] = [];
 let failPublish = false;
+let latestCreateArgs: string[] = [];
+let latestBody = "";
+type RunBoundGitHubCommand =
+  typeof import("../../../src/integrations/github/trusted-github").runBoundGitHubCommand;
+const mockRunBoundGitHubCommand = jest.fn<
+  ReturnType<RunBoundGitHubCommand>,
+  Parameters<RunBoundGitHubCommand>
+>();
 
-jest.mock("../../../src/integrations/github/gh-cli", () => ({
-  runGh: jest.fn((args: string[]) => {
-    const command = ["gh", ...args.map((arg) => (arg.includes(" ") ? `"${arg}"` : arg))].join(" ");
-    capturedCommands.push(command);
-    if (failPublish) return Promise.reject(new Error("injected gh failure"));
-    return Promise.resolve({
-      stdout: "https://github.com/fixture/repo/issues/700\n",
-      stderr: "",
-    });
-  }),
+jest.mock("../../../src/integrations/github/trusted-github", () => ({
+  ...jest.requireActual<object>("../../../src/integrations/github/trusted-github"),
+  runBoundGitHubCommand: (...args: Parameters<RunBoundGitHubCommand>) =>
+    mockRunBoundGitHubCommand(...args),
+  readBoundGitHubIssuePage: async (root: string, config: GitHubConfig) => {
+    const result = await mockRunBoundGitHubCommand(root, config, ["issue", "list"]);
+    const nodes = JSON.parse(result.stdout) as unknown[];
+    return {
+      ...result,
+      stdout: JSON.stringify({
+        data: {
+          repository: {
+            nameWithOwner: `${result.repository.owner}/${result.repository.repo}`,
+            issues: {
+              nodes,
+              totalCount: nodes.length,
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      }),
+    };
+  },
 }));
 
 import { publishAllBacklog, publishTask } from "../../../src/integrations/github/issue-publisher";
@@ -66,6 +87,53 @@ describe("TASK-1338-E: GitHub issue publisher duplicate vetoes", () => {
   beforeEach(() => {
     capturedCommands = [];
     failPublish = false;
+    latestCreateArgs = [];
+    latestBody = "";
+    mockRunBoundGitHubCommand.mockReset();
+    mockRunBoundGitHubCommand.mockImplementation(
+      (
+        _root: string,
+        _config: GitHubConfig,
+        args: readonly string[],
+        options?: { input?: string },
+      ) => {
+        if (args[0] === "issue" && args[1] === "list") {
+          return Promise.resolve({
+            exitCode: 0,
+            stdout: "[]",
+            stderr: "",
+            repository: { host: "github.com", owner: "fixture", repo: "repo" },
+          });
+        }
+        if (args[0] === "issue" && args[1] === "create") {
+          capturedCommands.push(args.join(" "));
+          if (failPublish) return Promise.reject(new Error("injected gh failure"));
+          latestCreateArgs = [...args];
+          latestBody = options?.input ?? "";
+          return Promise.resolve({
+            exitCode: 0,
+            stdout: "https://github.com/fixture/repo/issues/700\n",
+            stderr: "",
+            repository: { host: "github.com", owner: "fixture", repo: "repo" },
+          });
+        }
+        const title = latestCreateArgs.find((arg) => arg.startsWith("--title="))?.slice(8);
+        const label = latestCreateArgs.find((arg) => arg.startsWith("--label="))?.slice(8);
+        return Promise.resolve({
+          exitCode: 0,
+          stdout: JSON.stringify({
+            number: 700,
+            url: "https://github.com/fixture/repo/issues/700",
+            title,
+            body: latestBody,
+            labels: [{ name: label }],
+            state: "open",
+          }),
+          stderr: "",
+          repository: { host: "github.com", owner: "fixture", repo: "repo" },
+        });
+      },
+    );
   });
 
   afterEach(() => {
@@ -161,7 +229,7 @@ describe("TASK-1338-E: GitHub issue publisher duplicate vetoes", () => {
 
       expect(outcome.published).toEqual([
         {
-          taskId: "TASK-501-clean",
+          taskId: "TASK-501",
           issueNumber: 700,
           url: "https://github.com/fixture/repo/issues/700",
         },
@@ -255,7 +323,7 @@ describe("TASK-1338-E: GitHub issue publisher duplicate vetoes", () => {
       await expect(publishAllBacklog(root, "docs/tasks", CONFIG)).resolves.toEqual({
         published: [
           {
-            taskId: "TASK-504-clean",
+            taskId: "TASK-504",
             issueNumber: 700,
             url: "https://github.com/fixture/repo/issues/700",
           },
@@ -283,7 +351,7 @@ describe("TASK-1338-E: GitHub issue publisher duplicate vetoes", () => {
       const outcome = await publishAllBacklog(root, "docs/tasks", CONFIG);
       expect(outcome.published).toEqual([
         {
-          taskId: "TASK-506-clean",
+          taskId: "TASK-506",
           issueNumber: 700,
           url: "https://github.com/fixture/repo/issues/700",
         },
@@ -366,8 +434,10 @@ describe("TASK-1338-E: GitHub issue publisher duplicate vetoes", () => {
     try {
       await publishAllBacklog(fixture.root, fixture.relativeTaskDir, CONFIG);
 
-      expect(readdirSpy).toHaveBeenCalledTimes(1);
-      expect(readdirSpy).toHaveBeenCalledWith(fixture.taskDir, { withFileTypes: true });
+      const taskDirectoryReads = readdirSpy.mock.calls.filter(
+        ([directory]) => directory === fixture.taskDir,
+      );
+      expect(taskDirectoryReads).toEqual([[fixture.taskDir, { withFileTypes: true }]]);
       expect(duplicateQuerySpy).not.toHaveBeenCalled();
       expect(parseSpy).toHaveBeenCalledTimes(3);
       for (const taskPath of [...fixture.claimantPaths, cleanPath]) {

@@ -71,6 +71,21 @@ describe("Docker publication restart discovery", () => {
     fs.rmSync(state.root, { recursive: true, force: true });
   });
 
+  test("rejects pull-request progress that has a timestamp but no URL", () => {
+    const state = fixture();
+    state.journal.progress = {
+      promotedAt: "2020-01-01T00:00:01.000Z",
+      pushedAt: "2020-01-01T00:00:02.000Z",
+      pullRequestAt: "2020-01-01T00:00:03.000Z",
+    };
+    fs.writeFileSync(state.finalPath, `${JSON.stringify(state.journal, null, 2)}\n`, "utf-8");
+
+    expect(() => readDockerPublicationRecovery(state.finalPath)).toThrow(
+      /inconsistent progress or ownership/,
+    );
+    fs.rmSync(state.root, { recursive: true, force: true });
+  });
+
   test("promotes one fully written orphan install temp into the durable final name", () => {
     const state = fixture();
     const temporary = `${state.finalPath}.2147483647.${randomUUID()}.tmp`;

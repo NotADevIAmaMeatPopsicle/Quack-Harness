@@ -28,16 +28,16 @@ function facts(overrides: Partial<SpecAnchorFacts> = {}): SpecAnchorFacts {
 describe("extractSpecAnchors", () => {
   it("finds paths with and without line numbers, deduped", () => {
     const anchors = extractSpecAnchors(`
-Writer lives at \`scripts/external-provider-import-appointments.js:502\` and again
-at scripts/external-provider-import-appointments.js:502 (same anchor, once).
+Writer lives at \`scripts/phorest-import-appointments.js:502\` and again
+at scripts/phorest-import-appointments.js:502 (same anchor, once).
 The DTO is src/dto/appointment.dto.js.
     `);
     expect(anchors.map((a) => a.raw).sort()).toEqual([
-      "scripts/external-provider-import-appointments.js:502",
+      "scripts/phorest-import-appointments.js:502",
       "src/dto/appointment.dto.js",
     ]);
     expect(anchors.find((a) => a.line === 502)?.file).toBe(
-      "scripts/external-provider-import-appointments.js",
+      "scripts/phorest-import-appointments.js",
     );
   });
 

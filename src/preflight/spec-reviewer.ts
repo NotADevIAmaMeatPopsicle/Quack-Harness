@@ -1,3 +1,4 @@
+import { getClaudeSdkEnvironment, type ClaudeApiKeys } from "../sdk/claude-auth.js";
 // ─── Spec Ambiguity Reviewer ───────────────────────────────────────
 // Fast LLM pass (Haiku by default) that evaluates task specs for ambiguity.
 // Runs between gate and blueprint in the preflight pipeline.
@@ -11,6 +12,8 @@ import type { ParsedTask } from "../core/types.js";
 import type { SpecReviewResult, AmbiguityFinding } from "./spec-review-types.js";
 import { buildSpecReviewPrompt } from "./spec-reviewer-prompt.js";
 import { getSdkPermissionOptions } from "../sdk/permission-mode.js";
+import type { ReviewerRunnerConfig } from "../review/reviewer-config.js";
+import { runCodexStructuredEvaluation } from "../llm/codex-structured-evaluator.js";
 
 /**
  * Minimal SDK message shape for the async generator.
@@ -131,10 +134,43 @@ const SDK_TIMEOUT_MS = 120_000;
 
 export async function reviewSpecAmbiguity(
   task: ParsedTask,
-  options?: { model?: string },
+  options?: {
+    model?: string;
+    evaluator?: ReviewerRunnerConfig;
+    projectRoot?: string;
+    apiKeys?: ClaudeApiKeys;
+  },
 ): Promise<SpecReviewResult> {
   const prompt = buildSpecReviewPrompt(task);
-  const model = options?.model ?? DEFAULT_MODEL;
+  const model = options?.model ?? options?.evaluator?.model ?? DEFAULT_MODEL;
+
+  if (options?.evaluator?.runner === "codex-cli") {
+    if (!options.projectRoot) {
+      throw new Error("Codex spec review requires projectRoot");
+    }
+    const result = await runCodexStructuredEvaluation(
+      {
+        projectRoot: options.projectRoot,
+        model,
+        systemPrompt:
+          "Review only the supplied task specification for ambiguity. Return the required JSON object; do not modify the repository.",
+        prompt,
+        outputSchema: SPEC_REVIEW_SCHEMA,
+        parse: (rawText) => {
+          try {
+            return parseSpecReviewResponse(rawText);
+          } catch {
+            return null;
+          }
+        },
+      },
+      options.evaluator,
+    );
+    if (result.status === "runner_error") {
+      throw new Error(`Codex spec review ${result.errorKind}: ${result.message}`);
+    }
+    return result.value;
+  }
 
   const queryFn = await getQueryFn();
 
@@ -145,6 +181,7 @@ export async function reviewSpecAmbiguity(
       maxTurns: 8,
       tools: [],
       ...getSdkPermissionOptions(),
+      env: getClaudeSdkEnvironment(options?.apiKeys),
       outputFormat: {
         type: "json_schema",
         schema: SPEC_REVIEW_SCHEMA,
@@ -250,7 +287,12 @@ function parseSpecReviewResponse(resultText: string): SpecReviewResult {
   }
 
   // Validate required fields exist
-  if (!Array.isArray(raw.findings) || !Array.isArray(raw.suggestedClarifications)) {
+  if (
+    !Array.isArray(raw.findings) ||
+    !raw.findings.every(isAmbiguityFinding) ||
+    !Array.isArray(raw.suggestedClarifications) ||
+    !raw.suggestedClarifications.every((item) => typeof item === "string")
+  ) {
     throw new Error("Spec review response missing required fields");
   }
 
@@ -264,6 +306,29 @@ function parseSpecReviewResponse(resultText: string): SpecReviewResult {
     findings,
     suggestedClarifications: raw.suggestedClarifications,
   };
+}
+
+const AMBIGUITY_DIMENSIONS = new Set<AmbiguityFinding["dimension"]>([
+  "criterion_ambiguity",
+  "interface_gap",
+  "file_mapping",
+  "visual_ambiguity",
+  "ownership_ambiguity",
+  "integration_gap",
+]);
+
+function isAmbiguityFinding(value: unknown): value is AmbiguityFinding {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const finding = value as Record<string, unknown>;
+  return (
+    typeof finding.criterionIndex === "number" &&
+    typeof finding.criterionText === "string" &&
+    typeof finding.dimension === "string" &&
+    AMBIGUITY_DIMENSIONS.has(finding.dimension as AmbiguityFinding["dimension"]) &&
+    typeof finding.explanation === "string" &&
+    typeof finding.clarificationQuestion === "string" &&
+    (finding.severity === "high" || finding.severity === "medium")
+  );
 }
 
 /**

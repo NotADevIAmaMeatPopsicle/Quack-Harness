@@ -2,7 +2,13 @@
 // Post structured lifecycle comments on GitHub issues.
 
 import type { GitHubConfig, SyncEvent } from "./github-types.js";
-import { runGh } from "./gh-cli.js";
+import {
+  assertIssueCommentUrl,
+  assertIssueNumber,
+  assertIssueUrl,
+  parseJsonObject,
+  runBoundGitHubCommand,
+} from "./trusted-github.js";
 
 // ─── Comment Formatting ─────────────────────────────────────────────
 
@@ -115,22 +121,55 @@ export async function postLifecycleComment(
   issueNumber: number,
   event: SyncEvent,
   config: GitHubConfig,
+  projectRoot: string = process.cwd(),
 ): Promise<void> {
   const comment = buildLifecycleComment(event);
 
   try {
-    await runGh(
-      [
-        "issue",
-        "comment",
-        String(issueNumber),
-        "--repo",
-        `${config.owner}/${config.repo}`,
-        "--body-file",
-        "-",
-      ],
+    assertIssueNumber(issueNumber);
+    const created = await runBoundGitHubCommand(
+      projectRoot,
+      config,
+      ["issue", "comment", String(issueNumber), "--body-file", "-"],
       { input: comment },
     );
+    const commentUrl = assertIssueCommentUrl(
+      created.stdout.trim(),
+      created.repository,
+      issueNumber,
+    );
+
+    const readback = await runBoundGitHubCommand(projectRoot, config, [
+      "issue",
+      "view",
+      String(issueNumber),
+      "--json",
+      "number,url,comments",
+    ]);
+    const data = parseJsonObject(readback.stdout, "GitHub issue comment readback");
+    if (data.number !== issueNumber) {
+      throw new Error("GitHub issue comment readback returned the wrong issue number");
+    }
+    assertIssueUrl(data.url, readback.repository, issueNumber);
+    if (!Array.isArray(data.comments)) {
+      throw new Error("GitHub issue comment readback did not contain a comments array");
+    }
+    const commentWasReadBack = data.comments.some((entry) => {
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+        throw new Error("GitHub issue comment readback contained an invalid comment");
+      }
+      const record = entry as Record<string, unknown>;
+      if (typeof record.url !== "string" || typeof record.body !== "string") {
+        throw new Error("GitHub issue comment readback contained an incomplete comment");
+      }
+      return (
+        assertIssueCommentUrl(record.url, readback.repository, issueNumber) === commentUrl &&
+        record.body.replace(/\r\n/gu, "\n") === comment.replace(/\r\n/gu, "\n")
+      );
+    });
+    if (!commentWasReadBack) {
+      throw new Error("GitHub issue comment readback did not confirm the created comment");
+    }
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(`Failed to post comment on issue #${issueNumber}: ${message}`);

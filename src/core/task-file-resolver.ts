@@ -15,7 +15,11 @@ export interface ResolvedTaskFile {
   duplicateClaimants: string[];
 }
 
-const TASK_DIRECTORY_FILE_PATTERN = /^(?:TASK-\d+|SAURUS-REM-\d{3}).*\.md$/;
+// Identity ownership follows parseable declarations, not filenames. A
+// differently named Markdown file can still claim a task id and must prevent
+// writes/dispatches that assume the id has one canonical owner. Non-task
+// documents simply fail parsing and are ignored.
+const TASK_DECLARATION_FILE_PATTERN = /\.md$/i;
 
 /** The one candidate predicate. Both the async and sync listers use it so
  *  they cannot drift (TASK-1332 round 7). */
@@ -137,7 +141,7 @@ export async function listTaskClaimantDeclarations(
 
   const declarations: Array<{ fileName: string; declaredId: string }> = [];
   for (const entry of entries) {
-    if (!isCandidateEntry(entry) || !TASK_DIRECTORY_FILE_PATTERN.test(entry.name)) {
+    if (!isCandidateEntry(entry) || !TASK_DECLARATION_FILE_PATTERN.test(entry.name)) {
       continue;
     }
 
@@ -164,7 +168,7 @@ export function listTaskClaimantDeclarationsSync(
   const declarations: Array<{ fileName: string; declaredId: string }> = [];
 
   for (const entry of entries) {
-    if (!isCandidateEntry(entry) || !TASK_DIRECTORY_FILE_PATTERN.test(entry.name)) {
+    if (!isCandidateEntry(entry) || !TASK_DECLARATION_FILE_PATTERN.test(entry.name)) {
       continue;
     }
 

@@ -23,7 +23,7 @@ describe("loadFederationPeerConfig", () => {
       "\uFEFF" +
         JSON.stringify(
           {
-            url: "http://headnode.example.test:3333",
+            url: "http://headnode.tail6d5e6a.ts.net:3333",
             remoteProjectId: "example-service",
             serviceToken: "qsvc_test",
             syncOnStartup: true,
@@ -38,7 +38,7 @@ describe("loadFederationPeerConfig", () => {
     );
 
     await expect(loadFederationPeerConfig(projectRoot)).resolves.toMatchObject({
-      url: "http://headnode.example.test:3333",
+      url: "http://headnode.tail6d5e6a.ts.net:3333",
       remoteProjectId: "example-service",
       serviceToken: "qsvc_test",
       pushOnWrite: false,

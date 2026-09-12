@@ -278,15 +278,14 @@ describe("transcript-linker", () => {
     }
 
     it("returns 404 for missing transcript", async () => {
-      const port = 30000 + Math.floor(Math.random() * 10000);
       const { createMonitorServer } =
         (await import("../../src/monitor/server")) as typeof import("../../src/monitor/server");
-      const server = createMonitorServer({ logDir, port });
-      const { stop } = await server.start();
+      const server = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+      const { port, stop } = await server.start();
       stopServer = stop;
 
       const { status, body } = await httpGet(
-        `http://localhost:${port}/api/tasks/TASK-027/transcript?run=quack-TASK-027-20240101&attempt=0`,
+        `http://127.0.0.1:${port}/api/tasks/TASK-027/transcript?run=quack-TASK-027-20240101&attempt=0`,
       );
 
       expect(status).toBe(404);
@@ -294,15 +293,14 @@ describe("transcript-linker", () => {
     });
 
     it("returns 400 when run parameter is missing", async () => {
-      const port = 30000 + Math.floor(Math.random() * 10000);
       const { createMonitorServer } =
         (await import("../../src/monitor/server")) as typeof import("../../src/monitor/server");
-      const server = createMonitorServer({ logDir, port });
-      const { stop } = await server.start();
+      const server = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+      const { port, stop } = await server.start();
       stopServer = stop;
 
       const { status, body } = await httpGet(
-        `http://localhost:${port}/api/tasks/TASK-027/transcript`,
+        `http://127.0.0.1:${port}/api/tasks/TASK-027/transcript`,
       );
 
       expect(status).toBe(400);
@@ -316,15 +314,14 @@ describe("transcript-linker", () => {
       const transcriptFile = "transcript-quack-TASK-027-20240101-120000-attempt-0.jsonl";
       fs.writeFileSync(path.join(logDir, transcriptFile), transcriptContent, "utf-8");
 
-      const port = 30000 + Math.floor(Math.random() * 10000);
       const { createMonitorServer } =
         (await import("../../src/monitor/server")) as typeof import("../../src/monitor/server");
-      const server = createMonitorServer({ logDir, port });
-      const { stop } = await server.start();
+      const server = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+      const { port, stop } = await server.start();
       stopServer = stop;
 
       const { status, body } = await httpGet(
-        `http://localhost:${port}/api/tasks/TASK-027/transcript?run=quack-TASK-027-20240101-120000&attempt=0`,
+        `http://127.0.0.1:${port}/api/tasks/TASK-027/transcript?run=quack-TASK-027-20240101-120000&attempt=0`,
       );
 
       expect(status).toBe(200);
@@ -336,15 +333,14 @@ describe("transcript-linker", () => {
       const transcriptFile = "transcript-sess-abc-attempt-0.jsonl";
       fs.writeFileSync(path.join(logDir, transcriptFile), transcriptContent, "utf-8");
 
-      const port = 30000 + Math.floor(Math.random() * 10000);
       const { createMonitorServer } =
         (await import("../../src/monitor/server")) as typeof import("../../src/monitor/server");
-      const server = createMonitorServer({ logDir, port });
-      const { stop } = await server.start();
+      const server = createMonitorServer({ logDir, port: 0, host: "127.0.0.1" });
+      const { port, stop } = await server.start();
       stopServer = stop;
 
       const { status, body } = await httpGet(
-        `http://localhost:${port}/api/tasks/TASK-001/transcript?run=sess-abc`,
+        `http://127.0.0.1:${port}/api/tasks/TASK-001/transcript?run=sess-abc`,
       );
 
       expect(status).toBe(200);

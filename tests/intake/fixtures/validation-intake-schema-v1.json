@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://example.test/schemas/validation-intake/v1.json",
+  "$id": "https://example.invalid/schemas/validation-intake/v1.json",
   "$comment": "Pinned example-side mirror of the Quack Validation Intake payload contract (schemaVersion:1). Source of truth: TASK-1106 (Quack platform — Validation Intake type) in example repo docs/page-by-page-audit/follow-up-tasks/TASK-1106-quack-validation-intake-platform-extension.md. Until TASK-1106 ships, this file IS the contract; once TASK-1106 publishes its Zod-derived schema, swap the $ref / pointer in /polish-handoff to TASK-1106's published version. Cross-repo coupling note: when bumping fields here, bump in Quack src/intake/task-intake.ts in lockstep — a Jest test (tests/intake/validation-intake-schema-compat.test.ts) asserts equal accept/reject sets across both validators.",
   "title": "Quack Validation Intake Payload (schemaVersion:1)",
   "description": "Evidence bundle a example teammate POSTs to Quack's /v1/intake/tasks endpoint with intakeType=validation. Inverts the Forward Intake contract (spec -> code -> verified) to branch + evidence -> validated -> verified. The submitter declares what changed, what is proven, what is NOT claimed (suppresses drift-detection REVISE), and what could still go wrong. additionalProperties:false at every level enforces the TASK-1107 anti-pattern guard: no secrets, .env contents, or untyped fields sneak through.",
@@ -124,7 +124,7 @@
     "submitter": {
       "type": "string",
       "minLength": 1,
-      "description": "Slack handle, GitHub handle, or email of the human responsible for the submission, e.g. 'contributor', 'contributor@example.test', or '@contributor.lopez'. Feeds TASK-1106 §12 per-submitter quality scoring (REVISE rate, scope-drift rate, non-claim completeness over rolling 30 days)."
+      "description": "Slack handle, GitHub handle, or email of the human responsible for the submission, e.g. 'contributor', 'contributor@example.invalid', or '@contributor.lopez'. Feeds TASK-1106 §12 per-submitter quality scoring (REVISE rate, scope-drift rate, non-claim completeness over rolling 30 days)."
     },
     "submittedAt": {
       "type": "string",

@@ -2,21 +2,27 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
+import { execFileSync } from "node:child_process";
 import { TaskWatcher } from "../../src/monitor/task-watcher";
 import type { ProjectAdapter } from "../../src/core/adapter-loader";
 import type { ParsedTask } from "../../src/core/types";
+import { listTaskClaimantDeclarations } from "../../src/core/task-file-resolver";
+import { writeTaskFiles } from "../../src/planner/task-writer";
+import { taskSpec } from "../helpers/duplicate-claimants-fixture";
 
 // ─── Helpers ──────────────────────────────────────────────────────
+
+let currentProjectRoot = "/test/project";
 
 function createMockAdapter(): ProjectAdapter {
   return {
     config: {
-      project: { name: "test-project", taskDir: "docs/tasks" },
+      project: { name: "test-project", taskDir: "." },
       agent: {},
       verification: { commands: [] },
     },
     conventionsDoc: "Use TypeScript strict mode.",
-    projectRoot: "/test/project",
+    projectRoot: currentProjectRoot,
   } as unknown as ProjectAdapter;
 }
 
@@ -104,6 +110,8 @@ const COMPLETE_TASK = [
   "- Verified it was done",
 ].join("\n");
 
+const DECOMPOSED_TASK = VALID_TASK.replace("- **Status:** READY", "- **Status:** DECOMPOSED");
+
 // ─── Tests ────────────────────────────────────────────────────────
 
 describe("TaskWatcher", () => {
@@ -111,10 +119,138 @@ describe("TaskWatcher", () => {
 
   beforeEach(async () => {
     tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "quack-tw-"));
+    currentProjectRoot = tmpDir;
+    execFileSync("git", ["init"], { cwd: tmpDir, stdio: "ignore" });
   });
 
   afterEach(async () => {
     await fsp.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  describe("lifecycle", () => {
+    it("does not create a watcher after close wins the startup race", async () => {
+      const watcher = new TaskWatcher(
+        tmpDir,
+        createMockAdapter(),
+        {},
+        { autoRepair: false, autoPreflight: false },
+      );
+
+      const starting = watcher.start();
+      const closing = watcher.close();
+
+      try {
+        await Promise.all([starting, closing]);
+        expect((watcher as unknown as { watcher: unknown }).watcher).toBeNull();
+      } finally {
+        // Keep the regression leak-free even if an assertion fails.
+        await watcher.close();
+      }
+    });
+
+    it("deduplicates concurrent starts onto one lifecycle promise", async () => {
+      const watcher = new TaskWatcher(
+        tmpDir,
+        createMockAdapter(),
+        {},
+        { autoRepair: false, autoPreflight: false },
+      );
+
+      const firstStart = watcher.start();
+      const secondStart = watcher.start();
+
+      try {
+        expect(secondStart).toBe(firstStart);
+        await firstStart;
+      } finally {
+        await watcher.close();
+      }
+    });
+
+    it("ignores a file event callback that arrives after close", async () => {
+      const filePath = path.join(tmpDir, "TASK-001-late.md");
+      fs.writeFileSync(filePath, VALID_TASK);
+      const onNewTask = jest.fn<void, [ParsedTask, string]>();
+      const watcher = new TaskWatcher(
+        tmpDir,
+        createMockAdapter(),
+        { onNewTask },
+        { debounceMs: 1, autoRepair: false, autoPreflight: false },
+      );
+      const internals = watcher as unknown as {
+        scheduleProcess: (candidate: string) => void;
+        debounceTimers: Map<string, ReturnType<typeof setTimeout>>;
+      };
+
+      await watcher.close();
+      internals.scheduleProcess(filePath);
+      await watcher.processFile(filePath);
+
+      expect(internals.debounceTimers.size).toBe(0);
+      expect(onNewTask).not.toHaveBeenCalled();
+    });
+
+    it("retains a watcher whose close rejects so cleanup can be retried", async () => {
+      const watcher = new TaskWatcher(
+        tmpDir,
+        createMockAdapter(),
+        {},
+        { autoRepair: false, autoPreflight: false },
+      );
+      const close = jest
+        .fn<Promise<void>, []>()
+        .mockRejectedValueOnce(new Error("synthetic close failure"))
+        .mockResolvedValueOnce(undefined);
+      const internals = watcher as unknown as {
+        watcher: { close: () => Promise<void> } | null;
+      };
+      const installedWatcher = { close };
+      internals.watcher = installedWatcher;
+
+      await expect(watcher.close()).rejects.toThrow("synthetic close failure");
+      expect(internals.watcher).toBe(installedWatcher);
+      await expect(watcher.close()).resolves.toBeUndefined();
+      expect(internals.watcher).toBeNull();
+      expect(close).toHaveBeenCalledTimes(2);
+    });
+
+    it("waits for an already-running file repair before close resolves", async () => {
+      const filePath = path.join(tmpDir, "TASK-002-in-flight.md");
+      fs.writeFileSync(filePath, UNRESOLVABLE_TASK);
+      let releaseRepair!: (value: string) => void;
+      let markRepairStarted!: () => void;
+      const repairStarted = new Promise<void>((resolve) => {
+        markRepairStarted = resolve;
+      });
+      const repairFn = jest.fn(
+        () =>
+          new Promise<string>((resolve) => {
+            releaseRepair = resolve;
+            markRepairStarted();
+          }),
+      );
+      const onRepaired = jest.fn<void, [string, string, string[]]>();
+      const watcher = new TaskWatcher(
+        tmpDir,
+        createMockAdapter(),
+        { onRepaired },
+        { autoRepair: true, autoPreflight: false, repairFn },
+      );
+
+      const processing = watcher.processFile(filePath);
+      await repairStarted;
+      let closeResolved = false;
+      const closing = watcher.close().then(() => {
+        closeResolved = true;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(closeResolved).toBe(false);
+      releaseRepair(UNRESOLVABLE_TASK_REPAIRED);
+      await Promise.all([processing, closing]);
+      expect(closeResolved).toBe(true);
+      expect(onRepaired).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe("processFile", () => {
@@ -372,6 +508,33 @@ describe("TaskWatcher", () => {
       expect(onPreflightQueued).not.toHaveBeenCalled();
     });
 
+    it("does not self-trigger preflight for a committed DECOMPOSED tracker", async () => {
+      const filePath = path.join(tmpDir, "TASK-001-decomposed.md");
+      fs.writeFileSync(filePath, DECOMPOSED_TASK);
+      const onNewTask = jest.fn<void, [ParsedTask, string]>();
+      const onPreflightQueued = jest.fn<void, [string]>();
+      const onTerminalStatus = jest.fn();
+      const queuePreflight = jest.fn<void, [string]>();
+      const isPreflightCurrent = jest.fn();
+      const watcher = new TaskWatcher(
+        tmpDir,
+        createMockAdapter(),
+        { onNewTask, onPreflightQueued, onTerminalStatus },
+        { autoRepair: false, autoPreflight: true, queuePreflight, isPreflightCurrent },
+      );
+
+      await watcher.processFile(filePath);
+
+      expect(onNewTask).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "TASK-001", status: "DECOMPOSED" }),
+        filePath,
+      );
+      expect(isPreflightCurrent).not.toHaveBeenCalled();
+      expect(queuePreflight).not.toHaveBeenCalled();
+      expect(onPreflightQueued).not.toHaveBeenCalled();
+      expect(onTerminalStatus).not.toHaveBeenCalled();
+    });
+
     it("queues preflight for non-complete tasks when cache is stale", async () => {
       const filePath = path.join(tmpDir, "TASK-001-test.md");
       fs.writeFileSync(filePath, VALID_TASK);
@@ -441,6 +604,144 @@ describe("TaskWatcher", () => {
 
       // Only one repair should have run (second was blocked while first was in-progress)
       expect(repairFn).toHaveBeenCalledTimes(1);
+    });
+
+    it("TASK-1345: deterministic promotion refuses an existing declared-id owner", async () => {
+      const ownerName = "TASK-002-existing-owner.md";
+      fs.writeFileSync(path.join(tmpDir, ownerName), taskSpec("TASK-002"));
+      const filePath = path.join(tmpDir, "TASK-900-needs-normalization.md");
+      fs.writeFileSync(filePath, INVALID_TASK);
+      const onRepairFailed = jest.fn<void, [string, string, string]>();
+      const onRepaired = jest.fn();
+      const onNewTask = jest.fn();
+      const queuePreflight = jest.fn();
+
+      const watcher = new TaskWatcher(
+        tmpDir,
+        createMockAdapter(),
+        { onRepairFailed, onRepaired, onNewTask },
+        { repairMode: "deterministic", autoPreflight: true, queuePreflight },
+      );
+      await watcher.processFile(filePath);
+
+      expect(fs.readFileSync(filePath, "utf-8")).toBe(INVALID_TASK);
+      expect(onRepairFailed).toHaveBeenCalledWith(
+        "TASK-002",
+        filePath,
+        expect.stringContaining(ownerName),
+      );
+      expect(onRepaired).not.toHaveBeenCalled();
+      expect(onNewTask).not.toHaveBeenCalled();
+      expect(queuePreflight).not.toHaveBeenCalled();
+    });
+
+    it("TASK-1345: LLM promotion refuses an existing declared-id owner", async () => {
+      const ownerName = "TASK-002-existing-owner.md";
+      fs.writeFileSync(path.join(tmpDir, ownerName), taskSpec("TASK-002"));
+      const filePath = path.join(tmpDir, "TASK-901-needs-llm.md");
+      fs.writeFileSync(filePath, UNRESOLVABLE_TASK);
+      const onRepairFailed = jest.fn<void, [string, string, string]>();
+      const onRepaired = jest.fn();
+      const onNewTask = jest.fn();
+      const queuePreflight = jest.fn();
+
+      const watcher = new TaskWatcher(
+        tmpDir,
+        createMockAdapter(),
+        { onRepairFailed, onRepaired, onNewTask },
+        {
+          repairMode: "full",
+          autoPreflight: true,
+          queuePreflight,
+          repairFn: () => Promise.resolve(UNRESOLVABLE_TASK_REPAIRED),
+        },
+      );
+      await watcher.processFile(filePath);
+
+      expect(fs.readFileSync(filePath, "utf-8")).toBe(UNRESOLVABLE_TASK);
+      expect(onRepairFailed).toHaveBeenCalledWith(
+        "TASK-002",
+        filePath,
+        expect.stringContaining(ownerName),
+      );
+      expect(onRepaired).not.toHaveBeenCalled();
+      expect(onNewTask).not.toHaveBeenCalled();
+      expect(queuePreflight).not.toHaveBeenCalled();
+    });
+
+    it("TASK-1345: two concurrent promotions of one declared id admit exactly one", async () => {
+      const firstPath = path.join(tmpDir, "TASK-900-first.md");
+      const secondPath = path.join(tmpDir, "TASK-901-second.md");
+      fs.writeFileSync(firstPath, INVALID_TASK);
+      fs.writeFileSync(secondPath, INVALID_TASK);
+      const firstRepaired = jest.fn();
+      const secondRepaired = jest.fn();
+      const firstFailed = jest.fn();
+      const secondFailed = jest.fn();
+      const first = new TaskWatcher(
+        tmpDir,
+        createMockAdapter(),
+        { onRepaired: firstRepaired, onRepairFailed: firstFailed },
+        { repairMode: "deterministic", autoPreflight: false },
+      );
+      const second = new TaskWatcher(
+        tmpDir,
+        createMockAdapter(),
+        { onRepaired: secondRepaired, onRepairFailed: secondFailed },
+        { repairMode: "deterministic", autoPreflight: false },
+      );
+
+      await Promise.all([first.processFile(firstPath), second.processFile(secondPath)]);
+
+      expect(firstRepaired.mock.calls.length + secondRepaired.mock.calls.length).toBe(1);
+      expect(firstFailed.mock.calls.length + secondFailed.mock.calls.length).toBe(1);
+      const declarations = await listTaskClaimantDeclarations(tmpDir);
+      expect(declarations.filter((item) => item.declaredId === "TASK-002")).toHaveLength(1);
+      expect(
+        [firstPath, secondPath].filter(
+          (candidate) => fs.readFileSync(candidate, "utf-8") === INVALID_TASK,
+        ),
+      ).toHaveLength(1);
+    });
+
+    it("TASK-1345: planner and watcher racing one id admit exactly one creator", async () => {
+      const filePath = path.join(tmpDir, "TASK-900-watcher-candidate.md");
+      const watcherCandidate = INVALID_TASK.replace(/TASK-002/g, "TASK-700");
+      fs.writeFileSync(filePath, watcherCandidate);
+      const onRepaired = jest.fn();
+      const onRepairFailed = jest.fn();
+      const targetAdapter = {
+        ...createMockAdapter(),
+        projectRoot: tmpDir,
+        config: {
+          ...createMockAdapter().config,
+          project: { name: "test-project", taskDir: "." },
+          sandbox: {
+            writablePaths: ["src/**"],
+            deniedPaths: [],
+            allowedBashPatterns: [],
+            deniedBashPatterns: [],
+          },
+        },
+      } as unknown as ProjectAdapter;
+      const watcher = new TaskWatcher(
+        tmpDir,
+        targetAdapter,
+        { onRepaired, onRepairFailed },
+        { repairMode: "deterministic", autoPreflight: false },
+      );
+
+      await Promise.allSettled([
+        watcher.processFile(filePath),
+        writeTaskFiles(
+          [{ id: "TASK-700", content: taskSpec("TASK-700", { title: "Planner candidate" }) }],
+          targetAdapter,
+        ),
+      ]);
+
+      const declarations = await listTaskClaimantDeclarations(tmpDir);
+      expect(declarations.filter((item) => item.declaredId === "TASK-700")).toHaveLength(1);
+      expect(onRepaired.mock.calls.length + onRepairFailed.mock.calls.length).toBe(1);
     });
   });
 

@@ -163,6 +163,16 @@ export function registerFleetRoutes(app: Express, deps: FleetRouteDeps): void {
       p.dispatchQueue?.abort();
       const result = await p.fleetController.emergencyStop(reason);
 
+      // Also abort the dispatch queue
+      if (p.dispatchQueue) {
+        const queueStopped = p.dispatchQueue.abort();
+        if (!queueStopped) {
+          result.errors.push(
+            "Dispatch queue stopped scheduling, but one or more active tasks remain unfenced",
+          );
+        }
+      }
+
       emitFleetEvent("fleet_emergency_stop", {
         reason,
         killedTasks: result.killedTasks,
@@ -170,7 +180,15 @@ export function registerFleetRoutes(app: Express, deps: FleetRouteDeps): void {
         prepKilledTasks: result.prepKilledTasks,
         prepTimedOutTasks: result.prepTimedOutTasks,
       });
-      res.json(result);
+      if (result.errors.length > 0) {
+        res.status(409).json({
+          ...result,
+          ok: false,
+          code: "FLEET_STOP_INCOMPLETE",
+        });
+        return;
+      }
+      res.json({ ...result, ok: true });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ error: `Emergency stop failed: ${msg}` });

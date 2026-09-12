@@ -240,8 +240,8 @@ describe("extractSpecBody (TASK-907)", () => {
       "## Grounded By",
       "",
       "This enrichment's concrete file paths, column names, and signatures were verified by:",
-      "- Read: src/migrations/20260506150000-add-per-tier-external-provider-markers.js (columns: last_appointments_delta_at, ...)",
-      "- Grep: 'CREATE TABLE.*external-provider_credentials' in src/init-scripts/",
+      "- Read: src/migrations/20260506150000-add-per-tier-phorest-markers.js (columns: last_appointments_delta_at, ...)",
+      "- Grep: 'CREATE TABLE.*phorest_credentials' in src/init-scripts/",
       "",
       'Claims marked "needs operator confirmation":',
       "- The deploy SHA currently running on staging (requires staging probe).",
@@ -250,9 +250,7 @@ describe("extractSpecBody (TASK-907)", () => {
     const body = extractSpecBody(content);
     expect(body).not.toBeNull();
     expect(body).toContain("## Grounded By");
-    expect(body).toContain(
-      "Read: src/migrations/20260506150000-add-per-tier-external-provider-markers.js",
-    );
+    expect(body).toContain("Read: src/migrations/20260506150000-add-per-tier-phorest-markers.js");
     expect(body).toContain("needs operator confirmation");
   });
 });
@@ -293,9 +291,9 @@ describe("buildEnrichmentPrompt", () => {
     const prompt = buildEnrichmentPrompt(makeValidTask(), [], [], "conventions");
 
     // The grounding instruction calls out the specific kinds of facts that
-    // require a Read/Grep before being asserted. Test the load-bearing phrases.
+    // require a real read-only tool call before being asserted. Test the load-bearing phrases.
     expect(prompt).toContain("Ground concrete technical claims in real reads");
-    expect(prompt).toContain("MUST be verified by a Read or Grep call");
+    expect(prompt).toContain("MUST be verified by an actual Read, Grep, or Glob tool call");
     expect(prompt).toContain("needs operator confirmation");
     // The instruction is positioned between step 6 and step 7.
     expect(prompt).toMatch(/6\.5\.\s+\*\*Ground concrete technical claims/);
@@ -306,11 +304,12 @@ describe("buildEnrichmentPrompt", () => {
 
     expect(prompt).toContain("## Grounded By footer");
     expect(prompt).toContain("## Grounded By");
-    // The example shows Read + Grep entries and the operator-confirmation escape hatch.
+    // The example shows all three read-only tools and the operator-confirmation escape hatch.
     expect(prompt).toContain(
-      "- Read: src/migrations/20260506150000-add-per-tier-external-provider-markers.js",
+      "- Read: src/migrations/20260506150000-add-per-tier-phorest-markers.js",
     );
-    expect(prompt).toContain("- Grep: 'CREATE TABLE.*external-provider_credentials'");
+    expect(prompt).toContain("- Grep: 'CREATE TABLE.*phorest_credentials'");
+    expect(prompt).toContain("- Glob: src/config/*.ts");
     expect(prompt).toContain('Claims marked "needs operator confirmation"');
   });
 

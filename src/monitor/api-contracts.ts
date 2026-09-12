@@ -85,6 +85,7 @@ export interface QueueItemSummary {
   priorityWeight?: number;
   enqueuedAt?: string;
   startedAt?: string;
+  awaitingApprovalAt?: string;
   completedAt?: string;
   blockedBy?: string[];
   blockedReason?: string;
@@ -113,6 +114,7 @@ export interface QueueStatsSummary {
   queued: number;
   ready: number;
   running: number;
+  awaitingApproval: number;
   completed: number;
   failed: number;
   blocked: number;

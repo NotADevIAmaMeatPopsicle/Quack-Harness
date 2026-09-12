@@ -99,7 +99,31 @@ describe("ProjectRegistry", () => {
   });
 
   describe("buildProjectContext DB state", () => {
-    it("records healthy sqlite state when the project DB opens", () => {
+    it("forwards operator-owned local-read authorization to the project manager", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "quack-project-trusted-origin-"));
+      const trustedOrigin = `${root}-origin.git`;
+      try {
+        fs.mkdirSync(path.join(root, ".quack", "logs"), { recursive: true });
+        fs.mkdirSync(path.join(root, "docs", "tasks"), { recursive: true });
+        const adapter = makeMinimalAdapter("Trusted Origin Project", root);
+        adapter.trustedLocalReadRemotePaths = [trustedOrigin];
+
+        const context = buildProjectContext(adapter, "/fake/quack.js");
+
+        expect(
+          (
+            context.dispatchManager as unknown as {
+              trustedLocalReadRemotePaths?: readonly string[];
+            }
+          ).trustedLocalReadRemotePaths,
+        ).toEqual([trustedOrigin]);
+        await teardownProjectContext(context);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it("records healthy sqlite state when the project DB opens", async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "quack-project-db-ok-"));
       try {
         fs.mkdirSync(path.join(root, ".quack", "logs"), { recursive: true });
@@ -116,13 +140,13 @@ describe("ProjectRegistry", () => {
           dbPath: path.join(root, ".quack", "quack.db"),
         });
 
-        teardownProjectContext(context);
+        await teardownProjectContext(context);
       } finally {
         fs.rmSync(root, { recursive: true, force: true });
       }
     });
 
-    it("records degraded noop state when the project DB cannot open", () => {
+    it("records degraded noop state when the project DB cannot open", async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "quack-project-db-bad-"));
       try {
         fs.mkdirSync(path.join(root, "docs", "tasks"), { recursive: true });
@@ -137,7 +161,7 @@ describe("ProjectRegistry", () => {
         expect(context.dbState?.dbPath).toBe(path.join(root, ".quack", "quack.db"));
         expect(context.dbState?.error).toBeTruthy();
 
-        teardownProjectContext(context);
+        await teardownProjectContext(context);
       } finally {
         fs.rmSync(root, { recursive: true, force: true });
       }
@@ -846,14 +870,80 @@ describe("ProjectRegistry", () => {
   });
 
   describe("teardownProjectContext", () => {
-    it("calls all cleanup functions on a project context", () => {
-      const stopWatcher = jest.fn();
+    it("calls and awaits all cleanup functions on a project context", async () => {
+      const stopWatcher = jest.fn().mockResolvedValue(undefined);
+      const closeTaskWatcher = jest.fn().mockResolvedValue(undefined);
       const stopChecking = jest.fn();
       const stopQueue = jest.fn();
       const stopScheduler = jest.fn();
+      const beginDispatchDrain = jest.fn();
+      const stopDispatches = jest.fn().mockReturnValue(true);
+      const waitForDispatchIdle = jest.fn().mockResolvedValue(true);
+      const hasPendingDispatchCleanup = jest.fn().mockReturnValue(false);
+      const beginPrepDrain = jest.fn();
+      const stopPrep = jest.fn().mockReturnValue(true);
+      const waitForPrepIdle = jest.fn().mockResolvedValue(true);
 
       const adapter = makeMinimalAdapter("Test Project", "/tmp/test");
       const dbClose = jest.fn();
+      const context = {
+        id: "test-project",
+        name: "Test Project",
+        rootPath: "/tmp/test",
+        logDir: "/tmp/test/.quack/logs",
+        adapter,
+        eventReader: {} as never,
+        dispatchManager: {
+          beginTerminalDrain: beginDispatchDrain,
+          killAll: stopDispatches,
+          waitForIdle: waitForDispatchIdle,
+          hasPendingOperatorStopCleanup: hasPendingDispatchCleanup,
+        } as never,
+        taskService: null,
+        prepCache: null,
+        prepWorker: {
+          beginTerminalDrain: beginPrepDrain,
+          killAll: stopPrep,
+          waitForIdle: waitForPrepIdle,
+        } as never,
+        prepScheduler: { stop: stopScheduler } as never,
+        fleetController: null,
+        costVelocityTracker: {} as never,
+        progressDetector: { stopChecking } as never,
+        dispatchQueue: { stop: stopQueue } as never,
+        keyManager: null,
+        stopWatcher,
+        taskWatcher: { close: closeTaskWatcher },
+        db: { close: dbClose } as never,
+      };
+
+      await teardownProjectContext(context);
+
+      expect(stopWatcher).toHaveBeenCalledTimes(1);
+      expect(closeTaskWatcher).toHaveBeenCalledTimes(1);
+      expect(stopChecking).toHaveBeenCalledTimes(1);
+      expect(stopQueue).toHaveBeenCalledTimes(1);
+      expect(stopScheduler).toHaveBeenCalledTimes(1);
+      expect(beginDispatchDrain).toHaveBeenCalledTimes(1);
+      expect(stopDispatches).toHaveBeenCalledTimes(1);
+      expect(waitForDispatchIdle).toHaveBeenCalledTimes(1);
+      expect(hasPendingDispatchCleanup).toHaveBeenCalledTimes(1);
+      expect(beginPrepDrain).toHaveBeenCalledTimes(1);
+      expect(stopPrep).toHaveBeenCalledTimes(1);
+      expect(waitForPrepIdle).toHaveBeenCalledTimes(1);
+      expect(dbClose).toHaveBeenCalledTimes(1);
+    });
+
+    it("attempts every cleanup and aggregates labeled failures", async () => {
+      const stopWatcher = jest.fn().mockRejectedValue(new Error("event close failed"));
+      const closeTaskWatcher = jest.fn().mockRejectedValue(new Error("task close failed"));
+      const stopChecking = jest.fn(() => {
+        throw new Error("detector stop failed");
+      });
+      const stopQueue = jest.fn();
+      const stopScheduler = jest.fn();
+      const dbClose = jest.fn();
+      const adapter = makeMinimalAdapter("Test Project", "/tmp/test");
       const context = {
         id: "test-project",
         name: "Test Project",
@@ -872,19 +962,157 @@ describe("ProjectRegistry", () => {
         dispatchQueue: { stop: stopQueue } as never,
         keyManager: null,
         stopWatcher,
+        taskWatcher: { close: closeTaskWatcher },
         db: { close: dbClose } as never,
       };
 
-      teardownProjectContext(context);
+      let failure: unknown;
+      try {
+        await teardownProjectContext(context);
+      } catch (error: unknown) {
+        failure = error;
+      }
 
+      expect(failure).toBeInstanceOf(AggregateError);
+      const messages = (failure as AggregateError).errors.map((error: Error) => error.message);
+      expect(messages).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining("event watcher close: event close failed"),
+          expect.stringContaining("task watcher close: task close failed"),
+          expect.stringContaining("progress detector stop: detector stop failed"),
+        ]),
+      );
       expect(stopWatcher).toHaveBeenCalledTimes(1);
-      expect(stopChecking).toHaveBeenCalledTimes(1);
+      expect(closeTaskWatcher).toHaveBeenCalledTimes(1);
       expect(stopQueue).toHaveBeenCalledTimes(1);
       expect(stopScheduler).toHaveBeenCalledTimes(1);
-      expect(dbClose).toHaveBeenCalledTimes(1);
+      expect(context.stopWatcher).toBe(stopWatcher);
+      expect(context.taskWatcher).toEqual({ close: closeTaskWatcher });
+      expect(dbClose).not.toHaveBeenCalled();
     });
 
-    it("handles undefined optional services gracefully", () => {
+    it("does not close the database when prep process termination is unconfirmed", async () => {
+      const beginTerminalDrain = jest.fn();
+      const killAll = jest.fn().mockReturnValue(false);
+      const dbClose = jest.fn();
+      const stopChecking = jest.fn();
+      const adapter = makeMinimalAdapter("Test Project", "/tmp/test");
+      const context = {
+        id: "test-project",
+        name: "Test Project",
+        rootPath: "/tmp/test",
+        logDir: "/tmp/test/.quack/logs",
+        adapter,
+        eventReader: {} as never,
+        dispatchManager: null,
+        taskService: null,
+        prepCache: null,
+        prepWorker: { beginTerminalDrain, killAll } as never,
+        prepScheduler: null,
+        fleetController: null,
+        costVelocityTracker: {} as never,
+        progressDetector: { stopChecking } as never,
+        dispatchQueue: null,
+        keyManager: null,
+        db: { close: dbClose } as never,
+      };
+
+      await expect(teardownProjectContext(context)).rejects.toThrow(
+        "Failed to fully tear down project test-project",
+      );
+      expect(beginTerminalDrain).toHaveBeenCalledTimes(1);
+      expect(killAll).toHaveBeenCalledTimes(1);
+      expect(stopChecking).toHaveBeenCalledTimes(1);
+      expect(dbClose).not.toHaveBeenCalled();
+    });
+
+    it("does not close the database when dispatch process termination is unconfirmed", async () => {
+      const beginTerminalDrain = jest.fn();
+      const killAll = jest.fn().mockReturnValue(false);
+      const waitForIdle = jest.fn().mockResolvedValue(true);
+      const dbClose = jest.fn();
+      const stopChecking = jest.fn();
+      const adapter = makeMinimalAdapter("Test Project", "/tmp/test");
+      const context = {
+        id: "test-project",
+        name: "Test Project",
+        rootPath: "/tmp/test",
+        logDir: "/tmp/test/.quack/logs",
+        adapter,
+        eventReader: {} as never,
+        dispatchManager: {
+          beginTerminalDrain,
+          killAll,
+          waitForIdle,
+          hasPendingOperatorStopCleanup: jest.fn().mockReturnValue(true),
+        } as never,
+        taskService: null,
+        prepCache: null,
+        prepWorker: null,
+        prepScheduler: null,
+        fleetController: null,
+        costVelocityTracker: {} as never,
+        progressDetector: { stopChecking } as never,
+        dispatchQueue: null,
+        keyManager: null,
+        db: { close: dbClose } as never,
+      };
+
+      await expect(teardownProjectContext(context)).rejects.toThrow(
+        "Failed to fully tear down project test-project",
+      );
+      expect(beginTerminalDrain).toHaveBeenCalledTimes(1);
+      expect(killAll).toHaveBeenCalledTimes(1);
+      expect(waitForIdle).not.toHaveBeenCalled();
+      expect(dbClose).not.toHaveBeenCalled();
+    });
+
+    it("does not close the database when recovery cleanup stays pending after process exit", async () => {
+      const dbClose = jest.fn();
+      const context = {
+        id: "test-project",
+        name: "Test Project",
+        rootPath: "/tmp/test",
+        logDir: "/tmp/test/.quack/logs",
+        adapter: makeMinimalAdapter("Test Project", "/tmp/test"),
+        eventReader: {} as never,
+        dispatchManager: {
+          beginTerminalDrain: jest.fn(),
+          killAll: jest.fn().mockReturnValue(true),
+          waitForIdle: jest.fn().mockResolvedValue(true),
+          hasPendingOperatorStopCleanup: jest.fn().mockReturnValue(true),
+        } as never,
+        taskService: null,
+        prepCache: null,
+        prepWorker: null,
+        prepScheduler: null,
+        fleetController: null,
+        costVelocityTracker: {} as never,
+        progressDetector: { stopChecking: jest.fn() } as never,
+        dispatchQueue: null,
+        keyManager: null,
+        db: { close: dbClose } as never,
+      };
+
+      let failure: unknown;
+      try {
+        await teardownProjectContext(context);
+      } catch (error: unknown) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(AggregateError);
+      const failureMessages = (failure as AggregateError).errors.map((error: Error) =>
+        String(error.message),
+      );
+      expect(
+        failureMessages.some((message) =>
+          message.includes("operator-stop recovery cleanup remains unconfirmed"),
+        ),
+      ).toBe(true);
+      expect(dbClose).not.toHaveBeenCalled();
+    });
+
+    it("handles undefined optional services gracefully", async () => {
       const stopChecking = jest.fn();
       const adapter = makeMinimalAdapter("Test Project", "/tmp/test");
 
@@ -910,7 +1138,7 @@ describe("ProjectRegistry", () => {
       };
 
       // Should not throw when optional services are null/undefined
-      expect(() => teardownProjectContext(context)).not.toThrow();
+      await expect(teardownProjectContext(context)).resolves.toBeUndefined();
       expect(stopChecking).toHaveBeenCalledTimes(1);
     });
   });

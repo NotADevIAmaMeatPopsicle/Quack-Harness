@@ -197,12 +197,16 @@ describe("wiki monitor APIs", () => {
   });
 
   it("serves wiki status, index, page detail, and search results", async () => {
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port, wikiRoot });
-    const { stop } = await serverObj.start();
+    const serverObj = createMonitorServer({
+      logDir,
+      port: 0,
+      host: "127.0.0.1",
+      wikiRoot,
+    });
+    const { port, stop } = await serverObj.start();
     stopServer = stop;
 
-    const status = await httpRequest(`http://localhost:${port}/api/wiki/status`);
+    const status = await httpRequest(`http://127.0.0.1:${port}/api/wiki/status`);
     expect(status.status).toBe(200);
     const statusBody = status.json as {
       available: boolean;
@@ -215,7 +219,7 @@ describe("wiki monitor APIs", () => {
     expect(statusBody.git.available).toBe(true);
     expect(statusBody.topLevelEntries).toEqual(expect.arrayContaining(["raw", "schema", "wiki"]));
 
-    const index = await httpRequest(`http://localhost:${port}/api/wiki/index`);
+    const index = await httpRequest(`http://127.0.0.1:${port}/api/wiki/index`);
     expect(index.status).toBe(200);
     const indexBody = index.json as {
       count: number;
@@ -230,7 +234,7 @@ describe("wiki monitor APIs", () => {
     );
 
     const page = await httpRequest(
-      `http://localhost:${port}/api/wiki/page?path=${encodeURIComponent("wiki/index.md")}`,
+      `http://127.0.0.1:${port}/api/wiki/page?path=${encodeURIComponent("wiki/index.md")}`,
     );
     expect(page.status).toBe(200);
     const pageBody = page.json as {
@@ -245,7 +249,7 @@ describe("wiki monitor APIs", () => {
     expect(pageBody.links[0]?.resolvedPath).toBe("wiki/quack/overview.md");
 
     const search = await httpRequest(
-      `http://localhost:${port}/api/wiki/search?q=${encodeURIComponent("monitor")}`,
+      `http://127.0.0.1:${port}/api/wiki/search?q=${encodeURIComponent("monitor")}`,
     );
     expect(search.status).toBe(200);
     const searchBody = search.json as { results: Array<{ path: string; title: string }> };
@@ -256,14 +260,18 @@ describe("wiki monitor APIs", () => {
     );
   });
 
-  it("creates changelog artifacts, commits them, and pushes to the remote wiki repo", async () => {
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port, wikiRoot });
-    const { stop } = await serverObj.start();
+  it("creates changelog artifacts, commits them, and refuses a local-path publication remote", async () => {
+    const serverObj = createMonitorServer({
+      logDir,
+      port: 0,
+      host: "127.0.0.1",
+      wikiRoot,
+    });
+    const { port, stop } = await serverObj.start();
     stopServer = stop;
 
     const createArtifact = await httpRequest(
-      `http://localhost:${port}/api/wiki/artifacts/changelog`,
+      `http://127.0.0.1:${port}/api/wiki/artifacts/changelog`,
       {
         method: "POST",
         body: {
@@ -292,7 +300,7 @@ describe("wiki monitor APIs", () => {
       }),
     );
 
-    const gitStatusBefore = await httpRequest(`http://localhost:${port}/api/wiki/git/status`);
+    const gitStatusBefore = await httpRequest(`http://127.0.0.1:${port}/api/wiki/git/status`);
     expect(gitStatusBefore.status).toBe(200);
     const gitBeforeBody = gitStatusBefore.json as {
       dirty: boolean;
@@ -305,7 +313,7 @@ describe("wiki monitor APIs", () => {
       ]),
     );
 
-    const commit = await httpRequest(`http://localhost:${port}/api/wiki/git/commit`, {
+    const commit = await httpRequest(`http://127.0.0.1:${port}/api/wiki/git/commit`, {
       method: "POST",
       body: {
         all: true,
@@ -314,30 +322,40 @@ describe("wiki monitor APIs", () => {
     });
     expect(commit.status).toBe(200);
 
-    const push = await httpRequest(`http://localhost:${port}/api/wiki/git/push`, {
+    const push = await httpRequest(`http://127.0.0.1:${port}/api/wiki/git/push`, {
       method: "POST",
       body: {},
     });
-    expect(push.status).toBe(200);
-    const pushBody = push.json as { git: { dirty: boolean; headSha: string | null } };
-    expect(pushBody.git.dirty).toBe(false);
-    expect(pushBody.git.headSha).toBeTruthy();
+    expect(push.status).toBe(409);
+    expect((push.json as { error: string }).error).toContain(
+      "Wiki publication requires a GitHub network origin",
+    );
+
+    const hostileRemote = await httpRequest(`http://127.0.0.1:${port}/api/wiki/git/push`, {
+      method: "POST",
+      body: { remote: "attacker" },
+    });
+    expect(hostileRemote.status).toBe(400);
 
     const localHead = runGit(wikiRoot, "rev-parse", "HEAD");
     const branch = runGit(wikiRoot, "branch", "--show-current");
     const remoteHead = runGit(wikiRoot, "rev-parse", `origin/${branch}`);
     expect(localHead).toBeTruthy();
-    expect(remoteHead).toBe(localHead);
+    expect(remoteHead).not.toBe(localHead);
   });
 
   it("creates bug report artifacts in the raw bug-report stream", async () => {
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port, wikiRoot });
-    const { stop } = await serverObj.start();
+    const serverObj = createMonitorServer({
+      logDir,
+      port: 0,
+      host: "127.0.0.1",
+      wikiRoot,
+    });
+    const { port, stop } = await serverObj.start();
     stopServer = stop;
 
     const createArtifact = await httpRequest(
-      `http://localhost:${port}/api/wiki/artifacts/bug-report`,
+      `http://127.0.0.1:${port}/api/wiki/artifacts/bug-report`,
       {
         method: "POST",
         body: {
@@ -387,22 +405,26 @@ describe("wiki monitor APIs", () => {
       },
     ];
 
-    const port = 30000 + Math.floor(Math.random() * 10000);
-    const serverObj = createMonitorServer({ logDir, port, wikiRoot });
-    const { stop } = await serverObj.start();
+    const serverObj = createMonitorServer({
+      logDir,
+      port: 0,
+      host: "127.0.0.1",
+      wikiRoot,
+    });
+    const { port, stop } = await serverObj.start();
     stopServer = stop;
 
-    const noToken = await httpRequest(`http://localhost:${port}/v1/wiki/status`);
+    const noToken = await httpRequest(`http://127.0.0.1:${port}/v1/wiki/status`);
     expect(noToken.status).toBe(401);
 
-    const withReadToken = await httpRequest(`http://localhost:${port}/v1/wiki/status`, {
+    const withReadToken = await httpRequest(`http://127.0.0.1:${port}/v1/wiki/status`, {
       headers: {
         "X-Quack-Service-Token": "wiki-reader-token",
       },
     });
     expect(withReadToken.status).toBe(200);
 
-    const writeDenied = await httpRequest(`http://localhost:${port}/v1/wiki/page`, {
+    const writeDenied = await httpRequest(`http://127.0.0.1:${port}/v1/wiki/page`, {
       method: "POST",
       headers: {
         "X-Quack-Service-Token": "wiki-reader-token",

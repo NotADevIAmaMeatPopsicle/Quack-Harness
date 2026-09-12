@@ -1,3 +1,6 @@
+import { verificationEntrySchema } from "../verification-schema.js";
+import { assertVerificationDatabaseAvailable } from "../verification-store.js";
+import { admitFederatedQueueRecord } from "../federation/queue-admission.js";
 import type { Express, Request, Response } from "express";
 import { execFileSync } from "node:child_process";
 import { promises as fsPromises } from "node:fs";
@@ -7,16 +10,21 @@ import type { EventPayload } from "../event-types.js";
 import type { EventWriter } from "../event-emitter.js";
 import { recordVerification } from "../verification-store.js";
 import { normalizeCapabilities } from "../../federation/host-registry.js";
+import {
+  ListenerRegistry,
+  ListenerTokenBindingError,
+  ListenerRecordReadError,
+} from "../../federation/listener-registry.js";
 import { routeFederatedJob } from "../../federation/job-router.js";
 import { validationDetails } from "../../intake/task-intake.js";
 import type { BlockReasonCode } from "../../workflow/workflow-state-types.js";
 import {
   applyActiveFederatedLeases,
   buildFederationClaimantIndex,
-  createFederatedLease,
   defaultFederatedHosts,
   emitFederatedSessionStart,
   federatedHostEventDetailsFromHost,
+  federatedJobHoldsWorkerAttachment,
   federatedJobId,
   federatedSessionId,
   holdsWorkerAttachment,
@@ -26,7 +34,6 @@ import {
   loadFederatedJob,
   maybeRunSwarmSchedulerRefill,
   normalizeFederatedRuntimeStatus,
-  queueFederatedJobRecord,
   mintFederatedJobRecord,
   readFederatedMergeLock,
   recordFederatedVerifiedTask,
@@ -37,6 +44,7 @@ import {
   restoreTaskStatusAfterFederatedCancel,
   runSwarmSchedulerTick,
   saveFederatedJob,
+  updateFederatedJob,
   sessionStatusForFederatedStatus,
   sessionTitleForFederatedTask,
   sortFederatedQueue,
@@ -44,10 +52,23 @@ import {
   upsertFederatedSessionIndex,
   workflowStateForFederatedStatus,
   reconcileFederatedJob,
+  releaseFederatedPause,
+  requestFederatedResume,
+  claimFederatedResume,
+  acknowledgeFederatedResumeStart,
+  transitionFederatedResumeRunning,
+  transitionFederatedResumeTerminal,
+  transitionFederatedPause,
+  exactFederatedResumeTerminalReceiptMatches,
+  FederatedJobLockBusyError,
+  markFederatedPauseManualRecovery,
+  FederatedPauseTransitionError,
   orchestrateFederatedCompletion,
+  CompletionIntentVerificationConflictError,
   assertSafeGitRef,
   type FederatedJobRecord,
   type FederatedRelayEvent,
+  type FederatedRuntimeStatus,
   type FederationProjectContext,
 } from "../federation/index.js";
 import {
@@ -81,15 +102,25 @@ const federatedHostSchema = z.object({
 
 export type FederationRouteProject = FederationProjectContext;
 
+export type FederationWriteScopeResult =
+  | {
+      ok: true;
+      project: FederationRouteProject;
+      /** An old, unscoped worker was resolved by a unique persisted job id. */
+      compatibilityFallback?: boolean;
+    }
+  | { ok: false; status: number; body: Record<string, unknown> };
+
 export interface FederationRouteDeps {
   resolveProject: (req: Request) => FederationRouteProject;
   /** TASK-1301: write-route project resolution — refuses to default to the
    *  active project on multi-project registries (PROJECT_SCOPE_REQUIRED). */
-  resolveProjectForWrite: (
+  resolveProjectForWrite: (req: Request) => FederationWriteScopeResult;
+  /** TASK-1302: existing-job writes get a bounded mixed-fleet fallback. */
+  resolveProjectForFederatedJobWrite: (
     req: Request,
-  ) =>
-    | { ok: true; project: FederationRouteProject }
-    | { ok: false; status: number; body: Record<string, unknown> };
+    jobId: string,
+  ) => Promise<FederationWriteScopeResult>;
   createWorkflowWriter: (
     p: FederationRouteProject,
     workflowId: string,
@@ -102,8 +133,6 @@ export interface FederationRouteDeps {
   ) => Promise<unknown>;
   requireServiceScope: (req: Request, res: Response, scope: string) => string | undefined;
   requireServiceScopeAny?: (req: Request, res: Response, scopes: string[]) => string | undefined;
-  /** Allow a local/open dashboard or an authenticated dashboard principal to read queue data. */
-  allowDashboardRead?: (req: Request) => boolean;
   federationSchedulingDeps: FederationSchedulingDeps;
   federationOrchestrationDeps: FederationOrchestrationDeps;
   /** Deterministic external-completion git seam used by route tests. */
@@ -124,9 +153,98 @@ function shouldAutoRefillAfterFederatedUpdate(
 ): boolean {
   if (current.error?.startsWith("duplicate_claimants")) return false;
   return (
-    federatedStatusTransitionFreedCapacity(previous.status, current.status) ||
+    (federatedJobHoldsWorkerAttachment(previous) && !federatedJobHoldsWorkerAttachment(current)) ||
     (previous.status !== "completed" && current.status === "completed") ||
     (previous.nextAction !== "run_fix_job" && current.nextAction === "run_fix_job")
+  );
+}
+
+const allowedFederatedStatusTransitions: Readonly<
+  Record<FederatedRuntimeStatus, ReadonlySet<FederatedRuntimeStatus>>
+> = {
+  queued: new Set([
+    "queued",
+    "assigned",
+    "running",
+    "verifying",
+    "fixing",
+    "awaiting_approval",
+    "completed",
+    "failed",
+    "rejected",
+    "blocked",
+    "canceled",
+  ]),
+  assigned: new Set([
+    "assigned",
+    "running",
+    "verifying",
+    "fixing",
+    "awaiting_approval",
+    "completed",
+    "failed",
+    "rejected",
+    "blocked",
+    "canceled",
+  ]),
+  running: new Set([
+    "running",
+    "verifying",
+    "fixing",
+    "awaiting_approval",
+    "completed",
+    "failed",
+    "rejected",
+    "blocked",
+    "canceled",
+  ]),
+  verifying: new Set([
+    "verifying",
+    "fixing",
+    "awaiting_approval",
+    "completed",
+    "failed",
+    "rejected",
+    "blocked",
+    "canceled",
+  ]),
+  fixing: new Set([
+    "fixing",
+    "verifying",
+    "awaiting_approval",
+    "completed",
+    "failed",
+    "rejected",
+    "blocked",
+    "canceled",
+  ]),
+  awaiting_approval: new Set([
+    "awaiting_approval",
+    "running",
+    "verifying",
+    "fixing",
+    "completed",
+    "failed",
+    "rejected",
+    "blocked",
+    "canceled",
+  ]),
+  completed: new Set(["completed"]),
+  failed: new Set(["failed"]),
+  rejected: new Set(["rejected"]),
+  blocked: new Set(["blocked"]),
+  canceled: new Set(["canceled"]),
+};
+
+function assertFederatedStatusTransition(
+  current: FederatedRuntimeStatus,
+  requested: FederatedRuntimeStatus,
+  jobId: string,
+): void {
+  if (allowedFederatedStatusTransitions[current].has(requested)) return;
+  throw new FederatedPauseTransitionError(
+    "federated_status_regression",
+    `Federated job ${jobId} cannot move from ${current} to ${requested}.`,
   );
 }
 
@@ -192,15 +310,31 @@ function resolveExternalBranchCommit(
   }
 }
 
+function sendFederationOrchestrationFailure(
+  res: Response,
+  error: unknown,
+  identity: { jobId?: string; taskId?: string } = {},
+): void {
+  const verificationConflict = error instanceof CompletionIntentVerificationConflictError;
+  res.status(verificationConflict ? 409 : 500).json({
+    ok: false,
+    error: verificationConflict
+      ? "federated_verification_conflict"
+      : "federated_orchestration_failed",
+    message: error instanceof Error ? error.message : String(error),
+    ...identity,
+  });
+}
+
 export function registerFederationRoutes(app: Express, deps: FederationRouteDeps): void {
   const {
     resolveProject,
     resolveProjectForWrite,
+    resolveProjectForFederatedJobWrite,
     createWorkflowWriter,
     resolveAndBroadcastProjection,
     requireServiceScope,
     requireServiceScopeAny,
-    allowDashboardRead,
     federationSchedulingDeps,
     federationOrchestrationDeps,
   } = deps;
@@ -222,45 +356,77 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
   ): Promise<boolean> =>
     sendFederationAdmissionRefusal(await buildFederationClaimantIndex(p), taskId, res);
 
-  const verificationEntrySchema = z.object({
-    taskId: z.string().trim().min(1),
-    verdict: z.enum(["VERIFIED", "FAILED", "REJECTED", "SOFT-VERIFIED", "CANNOT_VERIFY"]),
-    commitSha: z.string().trim().min(1),
-    method: z.string().trim().min(1),
-    criteriaChecked: z.number().int().min(0),
-    criteriaPassed: z.number().int().min(0),
-    notes: z.string().optional().nullable(),
-    verifiedAt: z.string().trim().min(1).optional(),
-    updatedAt: z.string().trim().min(1).optional(),
-    reviewId: z.string().trim().min(1).optional(),
-    workflowId: z.string().trim().min(1).optional(),
-  });
-
   const requireFederationRead = (req: Request, res: Response): string | undefined => {
-    if (allowDashboardRead?.(req)) {
-      return "dashboard";
-    }
     if (requireServiceScopeAny) {
       return requireServiceScopeAny(req, res, ["federation:read", "federation:write"]);
     }
     return requireServiceScope(req, res, "federation:write");
   };
 
-  app.get("/v1/federation/queue", async (req: Request, res: Response) => {
-    const tokenId = requireFederationRead(req, res);
-    if (!tokenId) return;
+  const resolveFederatedJobWrite = async (
+    req: Request,
+    res: Response,
+    jobId: string,
+  ): Promise<FederationRouteProject | undefined> => {
+    const scope = await resolveProjectForFederatedJobWrite(req, jobId);
+    if (!scope.ok) {
+      res.status(scope.status).json(scope.body);
+      return undefined;
+    }
+    if (scope.compatibilityFallback) {
+      res.setHeader(
+        "Warning",
+        '299 Quack "Legacy unscoped federation write accepted; send projectId."',
+      );
+      res.setHeader("X-Quack-Project-Scope", "legacy-job-id-fallback");
+    }
+    return scope.project;
+  };
 
+  const requireListenerTokenBinding = async (
+    p: FederationRouteProject,
+    hostId: string,
+    tokenId: string,
+    res: Response,
+  ): Promise<boolean> => {
+    if (!p.projectRoot) return false;
+    try {
+      await new ListenerRegistry(p.projectRoot).assertTokenBinding(hostId, tokenId);
+      return true;
+    } catch (error: unknown) {
+      if (error instanceof ListenerTokenBindingError) {
+        res.status(error.code === "listener_not_found" ? 409 : 403).json({
+          error: error.code,
+          message: error.message,
+          hostId,
+        });
+        return false;
+      }
+      res.status(503).json({
+        error: "listener_registry_unavailable",
+        message: "Listener identity cannot be verified from its current registry record.",
+        ...(error instanceof ListenerRecordReadError ? { issue: error.issue } : {}),
+      });
+      return false;
+    }
+  };
+
+  app.get("/v1/federation/queue", async (req: Request, res: Response) => {
     const p = resolveProject(req);
     if (!p.projectRoot) {
       res.status(404).json({ error: "Project root not configured" });
       return;
     }
-    const jobs = await listFederatedJobs(p.projectRoot);
-    const hosts = await defaultFederatedHosts(p.projectRoot);
+    const jobs = (await listFederatedJobs(p.projectRoot)).map((job) => ({
+      ...job,
+      projectId: job.projectId ?? p.projectId,
+    }));
+    const listenerSnapshot = await new ListenerRegistry(p.projectRoot).listWithDiagnostics();
+    const hosts = await defaultFederatedHosts(p.projectRoot, listenerSnapshot);
     const activeDispatchJobs = jobs
-      // TASK-1329: per-host dispatch load, so it counts attachment (a paused run
-      // still occupies its host) rather than assignability.
-      .filter((job) => job.jobType === "dispatch" && holdsWorkerAttachment(job.status));
+      // Per-host dispatch load counts durable attachment rather than scheduler
+      // eligibility. Released pause generations no longer consume a slot.
+      .filter((job) => job.jobType === "dispatch" && federatedJobHoldsWorkerAttachment(job));
     const activeDispatchByHost = activeDispatchJobs.reduce<Record<string, number>>((acc, job) => {
       const hostId = job.hostId ?? "unassigned";
       acc[hostId] = (acc[hostId] ?? 0) + 1;
@@ -279,6 +445,11 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       jobs: sortFederatedQueue(jobs),
       summary: {
         total: jobs.length,
+        listenerRegistry: {
+          healthy: listenerSnapshot.issues.length === 0,
+          unavailable: listenerSnapshot.unavailable,
+          issues: listenerSnapshot.issues,
+        },
         byStatus,
         mergeLaneActive,
         mergeLock,
@@ -314,6 +485,16 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       return;
     }
 
+    try {
+      assertVerificationDatabaseAvailable(p);
+    } catch (error: unknown) {
+      res.status(503).json({
+        error: "verification_database_unavailable",
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
+
     const since =
       typeof req.query.since === "string" && req.query.since.trim()
         ? req.query.since.trim()
@@ -335,6 +516,15 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
 
     const p = resolveProject(req);
     const taskId = req.params.taskId as string;
+    try {
+      assertVerificationDatabaseAvailable(p);
+    } catch (error: unknown) {
+      res.status(503).json({
+        error: "verification_database_unavailable",
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
     const row = p.db.getVerified(taskId) ?? null;
     res.json({ ok: true, tokenId, row });
   });
@@ -368,23 +558,42 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       return;
     }
 
+    try {
+      assertVerificationDatabaseAvailable(p);
+    } catch (error: unknown) {
+      res.status(503).json({
+        error: "verification_database_unavailable",
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
+
     const appliedTaskIds: string[] = [];
     const skipped: Array<{ taskId: string; reason: string }> = [];
     const refused: Array<{ taskId: string; claimants: string[]; reason: string }> = [];
     const claimantIndex = await buildFederationClaimantIndex(p);
-    for (const entry of parsed.data.entries) {
-      const result = await recordVerification(p, entry, { syncToPeers: false }, claimantIndex);
-      if (result.applied) {
-        appliedTaskIds.push(entry.taskId);
-      } else if (result.refusal) {
-        refused.push({
-          taskId: result.refusal.taskId,
-          claimants: result.refusal.claimants,
-          reason: result.refusal.message,
-        });
-      } else {
-        skipped.push({ taskId: entry.taskId, reason: result.skippedReason ?? "skipped" });
+    try {
+      for (const entry of parsed.data.entries) {
+        const result = await recordVerification(p, entry, { syncToPeers: false }, claimantIndex);
+        if (result.applied) {
+          appliedTaskIds.push(entry.taskId);
+        } else if (result.refusal) {
+          refused.push({
+            taskId: result.refusal.taskId,
+            claimants: result.refusal.claimants,
+            reason: result.refusal.message,
+          });
+        } else {
+          skipped.push({ taskId: entry.taskId, reason: result.skippedReason ?? "skipped" });
+        }
       }
+    } catch (error: unknown) {
+      res.status(500).json({
+        error: "verification_write_failed",
+        message: error instanceof Error ? error.message : String(error),
+        appliedTaskIds,
+      });
+      return;
     }
 
     res.json({
@@ -403,7 +612,12 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
     const tokenId = requireServiceScope(req, res, "federation:write");
     if (!tokenId) return;
 
-    const p = resolveProject(req);
+    const scope = resolveProjectForWrite(req);
+    if (!scope.ok) {
+      res.status(scope.status).json(scope.body);
+      return;
+    }
+    const p = scope.project;
     if (!p.projectRoot) {
       res.status(404).json({ error: "Project root not configured" });
       return;
@@ -450,51 +664,68 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
         ? body.requiredCapabilities
         : [body.jobType],
     );
-    const record = queueFederatedJobRecord({
-      taskId: body.taskId,
-      jobType: body.jobType,
-      requiredCapabilities,
-      // TASK-1323: channel derived from THIS route, never from the
-      // client; the tokenId that QPI-047's hunt found being discarded
-      // is now the first thing stamped.
-      provenance: {
-        channel: "federation-queue",
-        tokenId,
-        remoteAddr: req.ip,
-        claimedChannel: req.header("x-quack-channel") ?? undefined,
-      },
-      correlationId: body.correlationId,
-      parentJobId: body.parentJobId,
-      preferredHostId: body.preferredHostId,
-      priority: body.priority,
-      leaseTtlMs: body.leaseTtlMs,
-      maxRetries: body.maxRetries,
-      branchName: body.branchName,
-      commitSha: body.commitSha,
-      targetBranch: body.targetBranch,
-      reviewId: body.reviewId,
-      autoMerge: body.autoMerge,
-      skipDecomposeCheck: body.skipDecomposeCheck || undefined,
-    });
-    await saveFederatedJob(p.projectRoot, record);
-    const taskDetails = await resolveFederatedTaskEventDetails(p, record.taskId);
-    const taskTitle = sessionTitleForFederatedTask(taskDetails);
-    const writer = createWorkflowWriter(
-      p,
-      federatedSessionId(record.jobId),
-      record.taskId,
-      taskTitle ?? record.taskId,
-    );
-    writer.recordSession("active", { outcome: "federated_job_queued", title: taskTitle });
-    writer.emit("federated_job_status", {
-      jobId: record.jobId,
-      taskId: record.taskId,
-      taskTitle: taskDetails.taskTitle,
-      status: record.status,
-      workflowState: "assigned",
-      correlationId: record.correlationId,
-      message: "Queued for swarm scheduler.",
-    });
+    let admission: Awaited<ReturnType<typeof admitFederatedQueueRecord>>;
+    try {
+      admission = await admitFederatedQueueRecord(p, {
+        projectId: p.projectId,
+        taskId: body.taskId,
+        jobType: body.jobType,
+        requiredCapabilities,
+        // TASK-1323: channel derived from THIS route, never from the
+        // client; the tokenId that QPI-047's hunt found being discarded
+        // is now the first thing stamped.
+        provenance: {
+          channel: "federation-queue",
+          tokenId,
+          remoteAddr: req.ip,
+          claimedChannel: req.header("x-quack-channel") ?? undefined,
+        },
+        correlationId: body.correlationId,
+        parentJobId: body.parentJobId,
+        preferredHostId: body.preferredHostId,
+        priority: body.priority,
+        leaseTtlMs: body.leaseTtlMs,
+        maxRetries: body.maxRetries,
+        branchName: body.branchName,
+        commitSha: body.commitSha,
+        targetBranch: body.targetBranch,
+        reviewId: body.reviewId,
+        autoMerge: body.autoMerge,
+        skipDecomposeCheck: body.skipDecomposeCheck || undefined,
+      });
+    } catch (error: unknown) {
+      res.status(503).json({
+        ok: false,
+        error: "federated_queue_unavailable",
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
+    if (!admission.ok) {
+      res.status(409).json(admission);
+      return;
+    }
+    const record = admission.record;
+    if (admission.created) {
+      const taskDetails = await resolveFederatedTaskEventDetails(p, record.taskId);
+      const taskTitle = sessionTitleForFederatedTask(taskDetails);
+      const writer = createWorkflowWriter(
+        p,
+        federatedSessionId(record.jobId),
+        record.taskId,
+        taskTitle ?? record.taskId,
+      );
+      writer.recordSession("active", { outcome: "federated_job_queued", title: taskTitle });
+      writer.emit("federated_job_status", {
+        jobId: record.jobId,
+        taskId: record.taskId,
+        taskTitle: taskDetails.taskTitle,
+        status: record.status,
+        workflowState: "assigned",
+        correlationId: record.correlationId,
+        message: "Queued for swarm scheduler.",
+      });
+    }
 
     const scheduler = body.autoSchedule
       ? await runSwarmSchedulerTick(
@@ -515,6 +746,7 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       ok: true,
       accepted: true,
       tokenId,
+      reused: !admission.created,
       queued: record,
       job: current,
       scheduler,
@@ -525,7 +757,12 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
   app.post("/v1/federation/scheduler/tick", async (req: Request, res: Response) => {
     const tokenId = requireServiceScope(req, res, "federation:write");
     if (!tokenId) return;
-    const p = resolveProject(req);
+    const scope = resolveProjectForWrite(req);
+    if (!scope.ok) {
+      res.status(scope.status).json(scope.body);
+      return;
+    }
+    const p = scope.project;
     if (!p.projectRoot) {
       res.status(404).json({ error: "Project root not configured" });
       return;
@@ -545,8 +782,12 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       });
       return;
     }
-    const result = await runSwarmSchedulerTick(p, parsed.data, federationSchedulingDeps);
-    res.json({ ok: true, tokenId, ...result });
+    try {
+      const result = await runSwarmSchedulerTick(p, parsed.data, federationSchedulingDeps);
+      res.json({ ok: true, tokenId, ...result });
+    } catch (error: unknown) {
+      sendFederationOrchestrationFailure(res, error);
+    }
   });
 
   app.post("/v1/federation/external-completions", async (req: Request, res: Response) => {
@@ -736,6 +977,7 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       const jobId = federatedJobId(input.taskId);
       // TASK-1323: external completions mint through the one constructor.
       const job: FederatedJobRecord = mintFederatedJobRecord({
+        projectId: p.projectId,
         jobId,
         taskId: input.taskId,
         jobType: "verify",
@@ -946,7 +1188,12 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
     const tokenId = requireServiceScope(req, res, "federation:write");
     if (!tokenId) return;
 
-    const p = resolveProject(req);
+    const scope = resolveProjectForWrite(req);
+    if (!scope.ok) {
+      res.status(scope.status).json(scope.body);
+      return;
+    }
+    const p = scope.project;
     if (!p.projectRoot) {
       res.status(404).json({ error: "Project root not configured" });
       return;
@@ -1022,6 +1269,7 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
         const acquiredAt = now;
         const leaseExpiresAt = new Date(Date.parse(now) + 30 * 60 * 1000).toISOString();
         record = mintFederatedJobRecord({
+          projectId: p.projectId,
           jobId,
           taskId: body.taskId,
           jobType: body.jobType,
@@ -1058,6 +1306,7 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       }
 
       record = mintFederatedJobRecord({
+        projectId: p.projectId,
         jobId,
         taskId: body.taskId,
         jobType: body.jobType,
@@ -1100,7 +1349,9 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
     const tokenId = requireServiceScope(req, res, "federation:write");
     if (!tokenId) return;
 
-    const p = resolveProject(req);
+    const jobId = req.params.jobId as string;
+    const p = await resolveFederatedJobWrite(req, res, jobId);
+    if (!p) return;
     if (!p.projectRoot) {
       res.status(404).json({ error: "Project root not configured" });
       return;
@@ -1140,7 +1391,6 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       return;
     }
 
-    const jobId = req.params.jobId as string;
     const existing = await loadFederatedJob(p.projectRoot, jobId);
     if (!existing) {
       res.status(404).json({
@@ -1150,33 +1400,49 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       });
       return;
     }
+    existing.projectId ??= p.projectId;
+    if (["canceled", "failed", "rejected"].includes(existing.status)) {
+      res.status(409).json({
+        error: "federated_reconcile_terminal",
+        message: `Federated job ${jobId} is terminal (${existing.status}) and cannot be reconciled.`,
+        jobId,
+        status: existing.status,
+      });
+      return;
+    }
 
-    const orchestration = await reconcileFederatedJob(
-      p,
-      existing,
-      parsed.data,
-      federationOrchestrationDeps,
-      await buildFederationClaimantIndex(p),
-    );
-    const scheduler = shouldAutoRefillAfterFederatedUpdate(existing, orchestration.job)
-      ? await maybeRunSwarmSchedulerRefill(p, {}, federationSchedulingDeps)
-      : undefined;
-    const projection = await resolveAndBroadcastProjection(p, orchestration.job.taskId);
-    res.status(200).json({
-      ok: true,
-      tokenId,
-      job: orchestration.job,
-      orchestration,
-      scheduler,
-      projection,
-    });
+    try {
+      const orchestration = await reconcileFederatedJob(
+        p,
+        existing,
+        parsed.data,
+        federationOrchestrationDeps,
+        await buildFederationClaimantIndex(p),
+      );
+      const scheduler = shouldAutoRefillAfterFederatedUpdate(existing, orchestration.job)
+        ? await maybeRunSwarmSchedulerRefill(p, {}, federationSchedulingDeps)
+        : undefined;
+      const projection = await resolveAndBroadcastProjection(p, orchestration.job.taskId);
+      res.status(200).json({
+        ok: true,
+        tokenId,
+        job: orchestration.job,
+        orchestration,
+        scheduler,
+        projection,
+      });
+    } catch (error: unknown) {
+      sendFederationOrchestrationFailure(res, error, { jobId, taskId: existing.taskId });
+    }
   });
 
   app.post("/v1/federation/jobs/:jobId/events", async (req: Request, res: Response) => {
     const tokenId = requireServiceScope(req, res, "federation:write");
     if (!tokenId) return;
 
-    const p = resolveProject(req);
+    const jobId = req.params.jobId as string;
+    const p = await resolveFederatedJobWrite(req, res, jobId);
+    if (!p) return;
     if (!p.projectRoot) {
       res.status(404).json({ error: "Project root not configured" });
       return;
@@ -1192,6 +1458,7 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
     const relayPayloadSchema = z
       .object({
         hostId: z.string().trim().min(1).optional(),
+        leaseId: z.string().trim().min(1).optional(),
         status: z
           .enum([
             "assigned",
@@ -1215,6 +1482,8 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
           ])
           .optional(),
         remoteSessionId: z.string().trim().min(1).optional(),
+        resumeSessionId: z.string().trim().min(1).optional(),
+        resumeStartedAt: z.string().datetime().optional(),
         message: z.string().trim().min(1).optional(),
         sequence: z.number().int().nonnegative().optional(),
         blockReasonCode: z.string().trim().min(1).optional(),
@@ -1224,9 +1493,36 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
         pendingGate: z
           .object({
             stage: z.enum(["blueprint", "judge"]),
-            since: z.string().trim().min(1).optional(),
+            since: z.string().datetime(),
             reason: z.string().trim().min(1).optional(),
           })
+          .optional(),
+        pauseIdentity: z
+          .object({
+            jobId: z.string().trim().min(1),
+            taskId: z.string().trim().min(1),
+            jobType: z.literal("dispatch"),
+            hostId: z.string().trim().min(1),
+            sessionId: z.string().trim().min(1),
+          })
+          .optional(),
+        resumeGrant: z
+          .object({
+            token: z.string().trim().min(1),
+            projectId: z.string().trim().min(1),
+            jobId: z.string().trim().min(1),
+            taskId: z.string().trim().min(1),
+            jobType: z.literal("dispatch"),
+            hostId: z.string().trim().min(1),
+            originalSessionId: z.string().trim().min(1),
+            generation: z.number().int().positive(),
+            releaseNonce: z.string().trim().min(1),
+            claimToken: z.string().trim().min(1),
+            leaseId: z.string().trim().min(1),
+            issuedAt: z.string().datetime(),
+            expiresAt: z.string().datetime(),
+          })
+          .strict()
           .optional(),
         // (see the .superRefine below: pendingGate is REQUIRED when the status is
         // awaiting_approval, so the classification cannot be asserted without
@@ -1283,7 +1579,15 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
           message: "pendingGate is required when status is awaiting_approval.",
           path: ["pendingGate"],
         },
-      );
+      )
+      .refine((value) => value.status !== "awaiting_approval" || Boolean(value.pauseIdentity), {
+        message: "pauseIdentity is required when status is awaiting_approval.",
+        path: ["pauseIdentity"],
+      })
+      .refine((value) => value.status !== "awaiting_approval" || Boolean(value.leaseId), {
+        message: "leaseId is required when status is awaiting_approval.",
+        path: ["leaseId"],
+      });
 
     const parsed = relayPayloadSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
@@ -1294,7 +1598,6 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       return;
     }
 
-    const jobId = req.params.jobId as string;
     const existing = await loadFederatedJob(p.projectRoot, jobId);
     if (!existing) {
       res.status(404).json({
@@ -1304,8 +1607,22 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       });
       return;
     }
+    existing.projectId ??= p.projectId;
 
     const body = parsed.data;
+    if (
+      body.pauseIdentity &&
+      (body.pauseIdentity.jobId !== existing.jobId ||
+        body.pauseIdentity.taskId !== existing.taskId ||
+        body.pauseIdentity.jobType !== existing.jobType ||
+        body.pauseIdentity.hostId !== existing.hostId)
+    ) {
+      res.status(409).json({
+        error: "federated_pause_identity_mismatch",
+        message: `Recovered pause identity does not match federated job ${jobId}.`,
+      });
+      return;
+    }
     if (existing.hostId && body.hostId && body.hostId !== existing.hostId) {
       res.status(409).json({
         error: "federated_job_host_mismatch",
@@ -1316,19 +1633,32 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       });
       return;
     }
+    const resumeMutation = Boolean(body.pauseIdentity || body.resumeGrant || existing.pause);
+    const mutationHostId = body.hostId ?? existing.hostId;
+    if (
+      resumeMutation &&
+      (!mutationHostId || !(await requireListenerTokenBinding(p, mutationHostId, tokenId, res)))
+    ) {
+      if (!mutationHostId && !res.headersSent) {
+        res.status(409).json({
+          error: "federated_resume_host_required",
+          message: `Resume mutation for ${jobId} requires its bound worker host.`,
+        });
+      }
+      return;
+    }
 
     const now = new Date().toISOString();
-    const normalizedStatus = body.status
-      ? normalizeFederatedRuntimeStatus(body.status)
-      : existing.status;
+    const requestedStatus = body.status ? normalizeFederatedRuntimeStatus(body.status) : undefined;
+    const normalizedStatusAtRead = requestedStatus ?? existing.status;
     const hostId = body.hostId ?? existing.hostId;
     const newlyQueued = Boolean(
-      body.status && normalizedStatus === "queued" && existing.status !== "queued",
+      body.status && normalizedStatusAtRead === "queued" && existing.status !== "queued",
     );
     const newlyAttached = Boolean(
       body.status &&
       hostId &&
-      holdsWorkerAttachment(normalizedStatus) &&
+      holdsWorkerAttachment(normalizedStatusAtRead) &&
       (!holdsWorkerAttachment(existing.status) || !existing.lease),
     );
     if (
@@ -1337,96 +1667,335 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
     ) {
       return;
     }
-    const remoteSessionId =
-      body.workerCompletion?.canonicalSessionId ??
-      body.remoteSessionId ??
-      body.events.find((event) => event.sessionId)?.sessionId ??
-      existing.remoteSessionId;
     const lastEvent = body.events.at(-1);
-    const eventCount =
-      (existing.eventCount ?? 0) +
-      body.events.length +
-      (body.status ? 1 : 0) +
-      body.evidence.length;
     const statusUpdateReceived = Boolean(body.status);
-    // TASK-1329 R1-6: this MUST key off worker attachment, not the scheduler's
-    // active set. A run paused at a human gate still has its listener bound to
-    // it, so dropping the lease here would strand the job outside stale-lease
-    // recovery and it could never be reclaimed if that host later died.
-    const lease = !statusUpdateReceived
-      ? existing.lease
-      : hostId && holdsWorkerAttachment(normalizedStatus)
-        ? {
-            leaseId: existing.lease?.leaseId ?? `${jobId}:${hostId}`,
-            hostId,
-            acquiredAt: existing.lease?.acquiredAt ?? now,
-            expiresAt: new Date(Date.parse(now) + 30 * 60 * 1000).toISOString(),
-          }
-        : undefined;
-    // TASK-1329 / QPI-041: a pause is neither a failure nor a completion, so it
-    // gets its own action naming the DECISION and the gate. Before this, a
-    // paused run reached the operator as `investigate_failed_worker`, sending
-    // them to look for a crash that never happened.
-    const pendingGate =
-      normalizedStatus === "awaiting_approval"
-        ? (body.pendingGate ?? existing.pendingGate)
-        : undefined;
-    const nextAction = !statusUpdateReceived
-      ? existing.nextAction
-      : normalizedStatus === "awaiting_approval"
-        ? `decide_${pendingGate?.stage ?? "human"}_gate:${existing.taskId}`
-        : normalizedStatus === "failed"
-          ? "investigate_failed_worker"
-          : normalizedStatus === "rejected" || normalizedStatus === "blocked"
-            ? "manual_handoff"
-            : normalizedStatus === "canceled"
-              ? "canceled"
-              : (existing.nextAction ?? `run_${existing.jobType}`);
-    const blockReasonCode =
-      normalizedStatus === "blocked"
-        ? ((body.blockReasonCode as BlockReasonCode | undefined) ?? existing.blockReasonCode)
-        : undefined;
-    // A pause is deliberately absent here: populating `error` for a paused run
-    // is how "waiting on you" reads as "something went wrong" downstream.
-    const error =
-      normalizedStatus === "failed" ||
-      normalizedStatus === "rejected" ||
-      normalizedStatus === "blocked"
-        ? (body.message ?? existing.error)
-        : existing.error;
-    const updated: FederatedJobRecord = {
-      ...existing,
-      status: normalizedStatus,
-      hostId,
-      remoteSessionId,
-      branchName: body.branchName ?? existing.branchName,
-      commitSha: body.workerCompletion?.mergeCommitSha ?? body.commitSha ?? existing.commitSha,
-      targetBranch:
-        body.workerCompletion?.mergeTargetBranch ?? body.targetBranch ?? existing.targetBranch,
-      reviewId: body.reviewId ?? body.verification?.reviewId ?? existing.reviewId,
-      autoMerge: body.autoMerge || existing.autoMerge,
-      blockReasonCode,
-      // TASK-1329: cleared on any non-paused status so a stale gate never
-      // outlives the pause that produced it.
-      pendingGate,
-      error,
-      nextAction,
-      lastEventAt: now,
-      lastEventStage: lastEvent?.stage ?? existing.lastEventStage,
-      eventCount,
-      evidence:
-        body.evidence.length > 0
-          ? [...(existing.evidence ?? []), ...body.evidence]
-          : existing.evidence,
-      completedAt:
-        statusUpdateReceived && terminalFederatedStatus(normalizedStatus)
-          ? (existing.completedAt ?? now)
-          : existing.completedAt,
-      lease,
-      updatedAt: now,
-    };
+    let transitionFailure: FederatedPauseTransitionError | undefined;
+    let immutableTerminalReceipt = false;
+    let immutablePauseReceipt = false;
+    const atomicUpdate = await updateFederatedJob(p.projectRoot, jobId, (current) => {
+      try {
+        if (
+          body.pauseIdentity &&
+          (body.pauseIdentity.jobId !== current.jobId ||
+            body.pauseIdentity.taskId !== current.taskId ||
+            body.pauseIdentity.jobType !== current.jobType ||
+            body.pauseIdentity.hostId !== current.hostId)
+        ) {
+          throw new FederatedPauseTransitionError(
+            "federated_pause_identity_mismatch",
+            `Recovered pause identity does not match federated job ${jobId}.`,
+          );
+        }
+        if (current.hostId && body.hostId && body.hostId !== current.hostId) {
+          throw new FederatedPauseTransitionError(
+            "federated_job_host_mismatch",
+            `Job ${jobId} is assigned to ${current.hostId}; ${body.hostId} cannot report events for it.`,
+          );
+        }
 
-    await saveFederatedJob(p.projectRoot, updated);
+        let base = current;
+        const effectiveStatus = requestedStatus ?? base.status;
+        if (body.status && base.pause?.state === "manual_recovery") {
+          throw new FederatedPauseTransitionError(
+            "federated_pause_manual_recovery",
+            `Job ${jobId} is owned by manual recovery and cannot be advanced by a worker status event.`,
+          );
+        }
+        if (
+          effectiveStatus === "awaiting_approval" &&
+          base.status === "awaiting_approval" &&
+          body.pauseIdentity &&
+          body.pendingGate &&
+          base.pause &&
+          ["released", "resume_requested", "resume_claimed", "approved_but_not_started"].includes(
+            base.pause.state,
+          ) &&
+          base.pause.sessionId === body.pauseIdentity.sessionId &&
+          base.pause.gate === body.pendingGate.stage &&
+          base.pause.openedAt === body.pendingGate.since
+        ) {
+          // A release response may be lost after the lease was surrendered.
+          // Let the exact same pause occurrence observe the durable state
+          // without requiring or recreating a lease; this is a no-mutation
+          // receipt and cannot advance the generation.
+          immutablePauseReceipt = true;
+          return base;
+        }
+        if (terminalFederatedStatus(base.status)) {
+          if (body.status && effectiveStatus !== base.status) {
+            throw new FederatedPauseTransitionError(
+              "federated_status_regression",
+              `Terminal federated job ${jobId} cannot move from ${base.status} to ${effectiveStatus}.`,
+            );
+          }
+          if (base.pause?.startGrant?.consumedAt) {
+            if (
+              !body.resumeGrant ||
+              !exactFederatedResumeTerminalReceiptMatches(base, {
+                startGrant: body.resumeGrant,
+                resumedSessionId: body.resumeSessionId,
+              })
+            ) {
+              throw new FederatedPauseTransitionError(
+                "federated_resume_grant_mismatch",
+                `Terminal resume receipt is not bound to the consumed grant and session for ${jobId}.`,
+              );
+            }
+          }
+          // Terminal delivery is an immutable receipt. In particular it never
+          // extends a missing/expired/reassigned lease or appends mutable fields.
+          immutableTerminalReceipt = true;
+          return base;
+        }
+        if (body.status) {
+          assertFederatedStatusTransition(base.status, effectiveStatus, jobId);
+        }
+        if (
+          body.status &&
+          ["assigned", "running", "verifying", "fixing"].includes(effectiveStatus) &&
+          !base.pause &&
+          !base.lease
+        ) {
+          throw new FederatedPauseTransitionError(
+            "federated_lease_epoch_required",
+            `Job ${jobId} cannot attach a worker without a scheduler-issued lease epoch.`,
+          );
+        }
+        if (
+          effectiveStatus === "awaiting_approval" &&
+          body.pauseIdentity &&
+          (base.remoteSessionId !== body.pauseIdentity.sessionId ||
+            !base.lease ||
+            base.lease.leaseId !== body.leaseId ||
+            base.lease.hostId !== body.pauseIdentity.hostId ||
+            !Number.isFinite(Date.parse(base.lease.expiresAt)) ||
+            Date.parse(base.lease.expiresAt) <= Date.parse(now))
+        ) {
+          throw new FederatedPauseTransitionError(
+            "federated_pause_epoch_mismatch",
+            `Pause report for ${jobId} is not bound to its current worker session and live lease.`,
+          );
+        }
+
+        if (body.resumeGrant) {
+          if (!body.status || effectiveStatus === "awaiting_approval" || !base.pause) {
+            throw new FederatedPauseTransitionError(
+              "invalid_federated_resume_status",
+              "A resume grant must accompany a concrete post-pause status.",
+            );
+          }
+          const alreadyConsumed = Boolean(base.pause.startGrant?.consumedAt);
+          if (
+            alreadyConsumed &&
+            terminalFederatedStatus(base.status) &&
+            effectiveStatus !== base.status
+          ) {
+            throw new FederatedPauseTransitionError(
+              "federated_resume_status_regression",
+              `Terminal resumed job ${jobId} cannot move from ${base.status} back to ${effectiveStatus}.`,
+            );
+          }
+          if (
+            alreadyConsumed &&
+            ((base.status === "running" && effectiveStatus === "assigned") ||
+              (["verifying", "fixing"].includes(base.status) &&
+                ["assigned", "running"].includes(effectiveStatus)))
+          ) {
+            throw new FederatedPauseTransitionError(
+              "federated_resume_status_regression",
+              `Resumed job ${jobId} cannot move from ${base.status} back to ${effectiveStatus}.`,
+            );
+          }
+          if (
+            effectiveStatus === "rejected" &&
+            (!alreadyConsumed || !base.pause.startGrant?.resumedSessionId)
+          ) {
+            base = transitionFederatedResumeTerminal(base, {
+              startGrant: body.resumeGrant,
+              resumeStartedAt: body.resumeStartedAt,
+              now,
+            });
+          } else {
+            if (!body.resumeSessionId) {
+              throw new FederatedPauseTransitionError(
+                "federated_resume_session_required",
+                "A resumed worker status requires the exact locally started session id.",
+              );
+            }
+            if (!alreadyConsumed && effectiveStatus !== "running") {
+              throw new FederatedPauseTransitionError(
+                "federated_resume_running_required",
+                "The first grant-bound status must observe the newly started child as running.",
+              );
+            }
+            base = transitionFederatedResumeRunning(base, {
+              startGrant: body.resumeGrant,
+              resumedSessionId: body.resumeSessionId,
+              resumeStartedAt: body.resumeStartedAt,
+              now,
+            });
+          }
+        } else if (body.status && base.pause && effectiveStatus !== "awaiting_approval") {
+          // Once a pause generation exists, every attempt to leave it must be
+          // bound to that generation's exact grant.  This includes stale
+          // assigned/verifying/fixing reports and all terminal closeouts; a
+          // manual-recovery record remains operator-owned.
+          throw new FederatedPauseTransitionError(
+            "federated_resume_grant_required",
+            `Job ${jobId} can leave its pause only with the exact start grant.`,
+          );
+        }
+
+        const normalizedStatus = requestedStatus ?? base.status;
+        const currentHostId = body.hostId ?? base.hostId;
+        const remoteSessionId =
+          body.resumeSessionId ??
+          body.workerCompletion?.canonicalSessionId ??
+          body.remoteSessionId ??
+          body.events.find((event) => event.sessionId)?.sessionId ??
+          base.remoteSessionId;
+        const eventCount =
+          (base.eventCount ?? 0) +
+          body.events.length +
+          (body.status ? 1 : 0) +
+          body.evidence.length;
+        // A released pause has deliberately surrendered its lease.  Every
+        // other attached status may only extend an existing epoch; status
+        // traffic must never manufacture a replacement lease id.
+        const preservesReleasedPause =
+          normalizedStatus === "awaiting_approval" &&
+          base.pause !== undefined &&
+          !federatedJobHoldsWorkerAttachment(base);
+        if (
+          statusUpdateReceived &&
+          holdsWorkerAttachment(normalizedStatus) &&
+          base.lease &&
+          (!Number.isFinite(Date.parse(base.lease.expiresAt)) ||
+            Date.parse(base.lease.expiresAt) <= Date.parse(now))
+        ) {
+          throw new FederatedPauseTransitionError(
+            "federated_lease_expired",
+            `Expired lease ${base.lease.leaseId} cannot be extended by a status event for ${jobId}.`,
+          );
+        }
+        const lease =
+          !statusUpdateReceived || preservesReleasedPause
+            ? base.lease
+            : currentHostId && holdsWorkerAttachment(normalizedStatus) && base.lease
+              ? {
+                  ...base.lease,
+                  expiresAt: new Date(
+                    Date.parse(now) + (base.leaseTtlMs ?? 30 * 60 * 1000),
+                  ).toISOString(),
+                }
+              : undefined;
+        const pendingGate =
+          normalizedStatus === "awaiting_approval"
+            ? (body.pendingGate ?? base.pendingGate)
+            : undefined;
+        const nextAction = !statusUpdateReceived
+          ? base.nextAction
+          : normalizedStatus === "awaiting_approval"
+            ? `decide_${pendingGate?.stage ?? "human"}_gate:${base.taskId}`
+            : normalizedStatus === "running" && body.resumeGrant
+              ? `run_${base.jobType}`
+              : normalizedStatus === "failed"
+                ? "investigate_failed_worker"
+                : normalizedStatus === "rejected" || normalizedStatus === "blocked"
+                  ? "manual_handoff"
+                  : normalizedStatus === "canceled"
+                    ? "canceled"
+                    : (base.nextAction ?? `run_${base.jobType}`);
+        const blockReasonCode =
+          normalizedStatus === "blocked"
+            ? ((body.blockReasonCode as BlockReasonCode | undefined) ?? base.blockReasonCode)
+            : undefined;
+        const error =
+          normalizedStatus === "failed" ||
+          normalizedStatus === "rejected" ||
+          normalizedStatus === "blocked"
+            ? (body.message ?? base.error)
+            : base.error;
+        const reportedTargetBranch = body.workerCompletion?.mergeTargetBranch ?? body.targetBranch;
+        for (const [label, existingValue, reportedValue, caseInsensitive] of [
+          ["branchName", base.branchName, body.branchName, false],
+          ["commitSha", base.commitSha, body.commitSha, true],
+          ["targetBranch", base.targetBranch, reportedTargetBranch, false],
+        ] as const) {
+          if (
+            existingValue &&
+            reportedValue &&
+            (caseInsensitive
+              ? existingValue.toLowerCase() !== reportedValue.toLowerCase()
+              : existingValue !== reportedValue)
+          ) {
+            throw new FederatedPauseTransitionError(
+              "federated_publication_identity_mismatch",
+              `Federated completion cannot replace the recorded ${label} for ${jobId}.`,
+            );
+          }
+        }
+        const reportedCommitSha = body.commitSha;
+        const nextRecord: FederatedJobRecord = {
+          ...base,
+          status: normalizedStatus,
+          hostId: currentHostId,
+          remoteSessionId,
+          branchName: base.branchName ?? body.branchName,
+          commitSha: base.commitSha ?? reportedCommitSha,
+          targetBranch: base.targetBranch ?? reportedTargetBranch,
+          reviewId: body.reviewId ?? body.verification?.reviewId ?? base.reviewId,
+          autoMerge: body.autoMerge || base.autoMerge,
+          blockReasonCode,
+          pendingGate,
+          error,
+          nextAction,
+          lastEventAt: now,
+          lastEventStage: lastEvent?.stage ?? base.lastEventStage,
+          eventCount,
+          evidence:
+            body.evidence.length > 0 ? [...(base.evidence ?? []), ...body.evidence] : base.evidence,
+          completedAt:
+            statusUpdateReceived && terminalFederatedStatus(normalizedStatus)
+              ? (base.completedAt ?? now)
+              : base.completedAt,
+          lease,
+          updatedAt: now,
+        };
+        if (normalizedStatus === "awaiting_approval" && body.pauseIdentity && pendingGate) {
+          return transitionFederatedPause(nextRecord, {
+            identity: { ...body.pauseIdentity, projectId: p.projectId },
+            gate: pendingGate,
+            now,
+          });
+        }
+        return nextRecord;
+      } catch (error: unknown) {
+        transitionFailure =
+          error instanceof FederatedPauseTransitionError
+            ? error
+            : new FederatedPauseTransitionError(
+                "federated_job_event_transition_failed",
+                error instanceof Error ? error.message : String(error),
+              );
+        return undefined;
+      }
+    });
+    if (transitionFailure) {
+      res.status(409).json({ error: transitionFailure.code, message: transitionFailure.message });
+      return;
+    }
+    if (!atomicUpdate.record) {
+      res.status(404).json({ error: "federated_job_not_found", jobId });
+      return;
+    }
+    const updated: FederatedJobRecord = atomicUpdate.record;
+    if (immutableTerminalReceipt || immutablePauseReceipt) {
+      res.status(202).json({ accepted: true, duplicate: true, job: updated });
+      return;
+    }
+    const normalizedStatus = updated.status;
+    const remoteSessionId = updated.remoteSessionId;
 
     const taskDetails = await resolveFederatedTaskEventDetails(p, updated.taskId);
     const taskTitle = sessionTitleForFederatedTask(taskDetails);
@@ -1559,48 +2128,246 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       }
     }
 
-    const orchestration =
-      normalizedStatus === "completed"
-        ? await orchestrateFederatedCompletion(
-            p,
-            updated,
-            {
-              autoVerify: body.autoVerify,
-              autoMerge: body.autoMerge || existing.autoMerge === true,
-              targetBranch: body.targetBranch ?? updated.targetBranch,
-              branchName: body.branchName ?? updated.branchName,
-              commitSha: body.commitSha ?? updated.commitSha,
-              verification: body.verification
-                ? {
-                    ...body.verification,
-                    reviewId: body.verification.reviewId ?? body.reviewId ?? updated.reviewId,
-                  }
-                : body.reviewId
-                  ? { reviewId: body.reviewId }
-                  : undefined,
-              maxFixAttempts: body.maxFixAttempts,
-              workerCompletion: body.workerCompletion,
-            },
-            federationOrchestrationDeps,
-          )
+    try {
+      const orchestration =
+        normalizedStatus === "completed"
+          ? await orchestrateFederatedCompletion(
+              p,
+              updated,
+              {
+                autoVerify: body.autoVerify,
+                autoMerge: body.autoMerge || existing.autoMerge === true,
+                targetBranch: body.targetBranch ?? updated.targetBranch,
+                branchName: body.branchName ?? updated.branchName,
+                commitSha: body.commitSha ?? updated.commitSha,
+                verification: body.verification
+                  ? {
+                      ...body.verification,
+                      reviewId: body.verification.reviewId ?? body.reviewId ?? updated.reviewId,
+                    }
+                  : body.reviewId
+                    ? { reviewId: body.reviewId }
+                    : undefined,
+                maxFixAttempts: body.maxFixAttempts,
+                workerCompletion: body.workerCompletion,
+              },
+              federationOrchestrationDeps,
+            )
+          : undefined;
+      const finalJob =
+        orchestration?.job ?? (await loadFederatedJob(p.projectRoot, updated.jobId)) ?? updated;
+      const scheduler = shouldAutoRefillAfterFederatedUpdate(existing, finalJob)
+        ? await maybeRunSwarmSchedulerRefill(p, {}, federationSchedulingDeps)
         : undefined;
-    const finalJob =
-      orchestration?.job ?? (await loadFederatedJob(p.projectRoot, updated.jobId)) ?? updated;
-    const scheduler = shouldAutoRefillAfterFederatedUpdate(existing, finalJob)
-      ? await maybeRunSwarmSchedulerRefill(p, {}, federationSchedulingDeps)
-      : undefined;
-    const projection = await resolveAndBroadcastProjection(p, finalJob.taskId);
-    res.status(202).json({
-      ok: true,
-      accepted: true,
-      job: finalJob,
-      orchestration,
-      scheduler,
-      projection,
-      relayedEvents: body.events.length,
-      relayedSlackEvents: body.events.filter((event) => isRelayedSlackStage(event.stage)).length,
-      tokenId,
-    });
+      const projection = await resolveAndBroadcastProjection(p, finalJob.taskId);
+      res.status(202).json({
+        ok: true,
+        accepted: true,
+        job: finalJob,
+        orchestration,
+        scheduler,
+        projection,
+        relayedEvents: body.events.length,
+        relayedSlackEvents: body.events.filter((event) => isRelayedSlackStage(event.stage)).length,
+        tokenId,
+      });
+    } catch (error: unknown) {
+      sendFederationOrchestrationFailure(res, error, { jobId, taskId: updated.taskId });
+    }
+  });
+
+  app.post("/v1/federation/jobs/:jobId/pause/release", async (req: Request, res: Response) => {
+    const tokenId = requireServiceScope(req, res, "federation:write");
+    if (!tokenId) return;
+    const jobId = req.params.jobId as string;
+    const p = await resolveFederatedJobWrite(req, res, jobId);
+    if (!p) return;
+    if (!p.projectRoot) {
+      res.status(404).json({ error: "Project root not configured" });
+      return;
+    }
+    const parsed = z
+      .object({
+        hostId: z.string().trim().min(1),
+        generation: z.number().int().positive(),
+        releaseNonce: z.string().trim().min(1),
+        localStateArmed: z.literal(true),
+      })
+      .safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({
+        error: "invalid_federated_pause_release",
+        details: validationDetails(parsed.error),
+      });
+      return;
+    }
+    if (!(await requireListenerTokenBinding(p, parsed.data.hostId, tokenId, res))) return;
+    try {
+      const previous = await loadFederatedJob(p.projectRoot, jobId);
+      const job = await releaseFederatedPause(p.projectRoot, { jobId, ...parsed.data });
+      const scheduler =
+        previous && shouldAutoRefillAfterFederatedUpdate(previous, job)
+          ? await maybeRunSwarmSchedulerRefill(p, {}, federationSchedulingDeps)
+          : undefined;
+      res.json({ ok: true, tokenId, job, scheduler });
+    } catch (error: unknown) {
+      if (error instanceof FederatedPauseTransitionError) {
+        res
+          .status(error.code === "federated_job_not_found" ? 404 : 409)
+          .json({ error: error.code, message: error.message });
+        return;
+      }
+      throw error;
+    }
+  });
+
+  app.post("/v1/federation/jobs/:jobId/resume/request", async (req: Request, res: Response) => {
+    const tokenId = requireServiceScope(req, res, "federation:write");
+    if (!tokenId) return;
+    const jobId = req.params.jobId as string;
+    const p = await resolveFederatedJobWrite(req, res, jobId);
+    if (!p) return;
+    if (!p.projectRoot) {
+      res.status(404).json({ error: "Project root not configured" });
+      return;
+    }
+    const parsed = z
+      .object({
+        hostId: z.string().trim().min(1),
+        generation: z.number().int().positive(),
+        releaseNonce: z.string().trim().min(1),
+        decision: z.object({
+          action: z.enum(["approved", "rejected"]),
+          reason: z.string().optional(),
+        }),
+      })
+      .safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({
+        error: "invalid_federated_resume_request",
+        details: validationDetails(parsed.error),
+      });
+      return;
+    }
+    if (!(await requireListenerTokenBinding(p, parsed.data.hostId, tokenId, res))) return;
+    try {
+      const job = await requestFederatedResume(p.projectRoot, { jobId, ...parsed.data });
+      res.json({ ok: true, tokenId, job });
+    } catch (error: unknown) {
+      if (error instanceof FederatedPauseTransitionError) {
+        res
+          .status(error.code === "federated_job_not_found" ? 404 : 409)
+          .json({ error: error.code, message: error.message });
+        return;
+      }
+      throw error;
+    }
+  });
+
+  app.post("/v1/federation/jobs/:jobId/resume/claim", async (req: Request, res: Response) => {
+    const tokenId = requireServiceScope(req, res, "federation:write");
+    if (!tokenId) return;
+    const jobId = req.params.jobId as string;
+    const p = await resolveFederatedJobWrite(req, res, jobId);
+    if (!p) return;
+    if (!p.projectRoot) {
+      res.status(404).json({ error: "Project root not configured" });
+      return;
+    }
+    const parsed = z
+      .object({
+        hostId: z.string().trim().min(1),
+        generation: z.number().int().positive(),
+        releaseNonce: z.string().trim().min(1),
+      })
+      .safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res.status(400).json({
+        error: "invalid_federated_resume_claim",
+        details: validationDetails(parsed.error),
+      });
+      return;
+    }
+    if (!(await requireListenerTokenBinding(p, parsed.data.hostId, tokenId, res))) return;
+    try {
+      const hosts = await defaultFederatedHosts(p.projectRoot);
+      const host = hosts.find((candidate) => candidate.id === parsed.data.hostId);
+      if (!host || host.enabled === false || host.healthy !== true) {
+        const job = await markFederatedPauseManualRecovery(p.projectRoot, {
+          jobId,
+          hostId: parsed.data.hostId,
+          generation: parsed.data.generation,
+          releaseNonce: parsed.data.releaseNonce,
+          reason: `Original host ${parsed.data.hostId} is unavailable; explicit worktree recovery is required.`,
+        });
+        res.status(409).json({
+          error: "federated_resume_host_unavailable",
+          message: `Original host ${parsed.data.hostId} is unavailable; explicit worktree recovery is required.`,
+          job,
+        });
+        return;
+      }
+      if ((host.currentLoad ?? 0) >= (host.maxConcurrentJobs ?? 1)) {
+        res.status(409).json({ error: "federated_resume_host_at_capacity" });
+        return;
+      }
+      const job = await claimFederatedResume(p.projectRoot, { jobId, ...parsed.data });
+      res.json({ ok: true, tokenId, job, claim: job.pause?.claim });
+    } catch (error: unknown) {
+      if (error instanceof FederatedPauseTransitionError) {
+        res
+          .status(error.code === "federated_job_not_found" ? 404 : 409)
+          .json({ error: error.code, message: error.message });
+        return;
+      }
+      throw error;
+    }
+  });
+
+  app.post("/v1/federation/jobs/:jobId/resume/ack", async (req: Request, res: Response) => {
+    const tokenId = requireServiceScope(req, res, "federation:write");
+    if (!tokenId) return;
+    const jobId = req.params.jobId as string;
+    const p = await resolveFederatedJobWrite(req, res, jobId);
+    if (!p) return;
+    if (!p.projectRoot) {
+      res.status(404).json({ error: "Project root not configured" });
+      return;
+    }
+    const parsed = z
+      .object({
+        projectId: z.string().trim().min(1),
+        taskId: z.string().trim().min(1),
+        jobType: z.literal("dispatch"),
+        hostId: z.string().trim().min(1),
+        originalSessionId: z.string().trim().min(1),
+        generation: z.number().int().positive(),
+        releaseNonce: z.string().trim().min(1),
+        claimToken: z.string().trim().min(1),
+        leaseId: z.string().trim().min(1),
+        phase: z.literal("approved_but_not_started"),
+      })
+      .strict()
+      .safeParse(req.body ?? {});
+    if (!parsed.success) {
+      res
+        .status(400)
+        .json({ error: "invalid_federated_resume_ack", details: validationDetails(parsed.error) });
+      return;
+    }
+    if (!(await requireListenerTokenBinding(p, parsed.data.hostId, tokenId, res))) return;
+    try {
+      const job = await acknowledgeFederatedResumeStart(p.projectRoot, { jobId, ...parsed.data });
+      res.json({ ok: true, tokenId, job, startGrant: job.pause?.startGrant });
+    } catch (error: unknown) {
+      if (error instanceof FederatedPauseTransitionError) {
+        res
+          .status(error.code === "federated_job_not_found" ? 404 : 409)
+          .json({ error: error.code, message: error.message });
+        return;
+      }
+      throw error;
+    }
   });
 
   app.post("/v1/federation/jobs/:jobId/admin-closeout", async (req: Request, res: Response) => {
@@ -1713,7 +2480,6 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       });
       return;
     }
-
     const now = new Date().toISOString();
     const targetBranch = parsed.data.mergedBranch ?? existing.targetBranch ?? "dev";
 
@@ -1756,7 +2522,7 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       workflowId: updated.verificationWorkflowId ?? `admin-closeout-${jobId}`,
       claimantIndex,
     });
-    if (!verificationRecord.applied && verificationRecord.refusal) {
+    if (!verificationRecord.converged && verificationRecord.refusal) {
       updated = {
         ...updated,
         blockReasonCode: "pending_manual_handoff",
@@ -1825,16 +2591,21 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
     const tokenId = requireServiceScope(req, res, "federation:write");
     if (!tokenId) return;
 
-    const p = resolveProject(req);
+    const jobId = req.params.jobId as string;
+    const p = await resolveFederatedJobWrite(req, res, jobId);
+    if (!p) return;
     if (!p.projectRoot) {
       res.status(404).json({ error: "Project root not configured" });
       return;
     }
 
-    const schema = z.object({
-      hostId: z.string().trim().min(1),
-      leaseTtlMs: z.number().int().positive().optional(),
-    });
+    const schema = z
+      .object({
+        hostId: z.string().trim().min(1),
+        leaseId: z.string().trim().min(1),
+        leaseTtlMs: z.number().int().positive().optional(),
+      })
+      .strict();
     const parsed = schema.safeParse(req.body ?? {});
     if (!parsed.success) {
       res.status(400).json({
@@ -1843,10 +2614,70 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       });
       return;
     }
+    if (!(await requireListenerTokenBinding(p, parsed.data.hostId, tokenId, res))) return;
 
-    const jobId = req.params.jobId as string;
-    const existing = await loadFederatedJob(p.projectRoot, jobId);
-    if (!existing) {
+    const now = new Date().toISOString();
+    const nowMs = Date.parse(now);
+    let renewalFailure: { code: string; message: string } | undefined;
+    const renewed = await updateFederatedJob(p.projectRoot, jobId, (current) => {
+      const lease = current.lease;
+      if (
+        current.status === "awaiting_approval" &&
+        current.pause &&
+        !["attached", "resume_claimed", "approved_but_not_started"].includes(current.pause.state)
+      ) {
+        renewalFailure = {
+          code: "federated_pause_released",
+          message: `Pause generation ${current.pause.generation} is ${current.pause.state}; a stale lease renewal cannot reattach it.`,
+        };
+        return undefined;
+      }
+      if (
+        current.hostId !== parsed.data.hostId ||
+        !lease ||
+        lease.hostId !== parsed.data.hostId ||
+        lease.leaseId !== parsed.data.leaseId
+      ) {
+        renewalFailure = {
+          code: "federated_lease_epoch_mismatch",
+          message: `Lease ${parsed.data.leaseId} is not the current assignment for job ${jobId}.`,
+        };
+        return undefined;
+      }
+      const leaseExpiresAt = Date.parse(lease.expiresAt);
+      if (!Number.isFinite(leaseExpiresAt) || leaseExpiresAt <= nowMs) {
+        renewalFailure = {
+          code: "federated_lease_expired",
+          message: `Lease ${lease.leaseId} expired before renewal for job ${jobId}.`,
+        };
+        return undefined;
+      }
+      if (terminalFederatedStatus(current.status) || !federatedJobHoldsWorkerAttachment(current)) {
+        renewalFailure = {
+          code: terminalFederatedStatus(current.status)
+            ? "federated_job_terminal"
+            : "federated_job_not_attached",
+          message: `Job ${jobId} is ${current.status}; its lease cannot be renewed.`,
+        };
+        return undefined;
+      }
+      const ttlMs = Math.max(1, parsed.data.leaseTtlMs ?? current.leaseTtlMs ?? 30 * 60 * 1000);
+      return {
+        ...current,
+        projectId: current.projectId ?? p.projectId,
+        lease: {
+          ...lease,
+          expiresAt: new Date(nowMs + ttlMs).toISOString(),
+        },
+        nextAction: current.nextAction ?? `run_${current.jobType}`,
+        updatedAt: now,
+      };
+    });
+    if (renewalFailure) {
+      res.status(409).json({ error: renewalFailure.code, message: renewalFailure.message, jobId });
+      return;
+    }
+    if (!renewed.record) {
       res.status(404).json({
         error: "federated_job_not_found",
         message: `Federated job ${jobId} not found.`,
@@ -1854,50 +2685,7 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       });
       return;
     }
-
-    if (existing.hostId && existing.hostId !== parsed.data.hostId) {
-      res.status(409).json({
-        error: "federated_job_host_mismatch",
-        message: `Job ${jobId} is assigned to ${existing.hostId}; ${parsed.data.hostId} cannot renew it.`,
-        jobId,
-        expectedHostId: existing.hostId,
-        actualHostId: parsed.data.hostId,
-      });
-      return;
-    }
-
-    if (terminalFederatedStatus(existing.status)) {
-      res.status(409).json({
-        error: "federated_job_terminal",
-        message: `Job ${jobId} is ${existing.status}; its lease cannot be renewed.`,
-        jobId,
-        status: existing.status,
-      });
-      return;
-    }
-
-    if (
-      existing.status === "queued" &&
-      (await refuseFederationAdmission(p, existing.taskId, res))
-    ) {
-      return;
-    }
-
-    const now = new Date().toISOString();
-    const updated: FederatedJobRecord = {
-      ...existing,
-      status: existing.status === "queued" ? "assigned" : existing.status,
-      hostId: parsed.data.hostId,
-      lease: createFederatedLease(
-        existing.jobId,
-        parsed.data.hostId,
-        now,
-        parsed.data.leaseTtlMs ?? existing.leaseTtlMs,
-      ),
-      nextAction: existing.nextAction ?? `run_${existing.jobType}`,
-      updatedAt: now,
-    };
-    await saveFederatedJob(p.projectRoot, updated);
+    const updated = renewed.record;
 
     const writer = createWorkflowWriter(
       p,
@@ -1918,9 +2706,6 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
   });
 
   app.get("/v1/federation/jobs/:jobId", async (req: Request, res: Response) => {
-    const tokenId = requireFederationRead(req, res);
-    if (!tokenId) return;
-
     const p = resolveProject(req);
     if (!p.projectRoot) {
       res.status(404).json({ error: "Project root not configured" });
@@ -1938,22 +2723,56 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       return;
     }
 
-    res.json({ ok: true, job: record });
+    res.json({ ok: true, job: { ...record, projectId: record.projectId ?? p.projectId } });
   });
 
   app.post("/v1/federation/jobs/:jobId/cancel", async (req: Request, res: Response) => {
     const tokenId = requireServiceScope(req, res, "federation:write");
     if (!tokenId) return;
 
-    const p = resolveProject(req);
+    const jobId = req.params.jobId as string;
+    const p = await resolveFederatedJobWrite(req, res, jobId);
+    if (!p) return;
     if (!p.projectRoot) {
       res.status(404).json({ error: "Project root not configured" });
       return;
     }
 
-    const jobId = req.params.jobId as string;
-    const existing = await loadFederatedJob(p.projectRoot, jobId);
-    if (!existing) {
+    let cancelRefusal: "publication_in_progress" | "publication_committed" | undefined;
+    let canceledFromStatus: FederatedJobRecord["status"] | undefined;
+    let cancellation: Awaited<ReturnType<typeof updateFederatedJob>>;
+    try {
+      cancellation = await updateFederatedJob(p.projectRoot, jobId, (current) => {
+        if (current.mergeStatus === "publishing") {
+          cancelRefusal = "publication_in_progress";
+          return undefined;
+        }
+        if (current.mergeStatus === "merged") {
+          cancelRefusal = "publication_committed";
+          return undefined;
+        }
+        if (current.status === "canceled") return undefined;
+        canceledFromStatus = current.status;
+        return {
+          ...current,
+          projectId: current.projectId ?? p.projectId,
+          status: "canceled",
+          canceledBy: tokenId,
+          updatedAt: new Date().toISOString(),
+        };
+      });
+    } catch (error: unknown) {
+      if (!(error instanceof FederatedJobLockBusyError)) throw error;
+      res.set("Retry-After", "1");
+      res.status(423).json({
+        error: error.code,
+        message: error.message,
+        retryable: error.retryable,
+        jobId,
+      });
+      return;
+    }
+    if (!cancellation.record) {
       res.status(404).json({
         error: "federated_job_not_found",
         message: `Federated job ${jobId} not found.`,
@@ -1961,14 +2780,18 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       });
       return;
     }
-
-    const updated: FederatedJobRecord = {
-      ...existing,
-      status: "canceled",
-      canceledBy: tokenId,
-      updatedAt: new Date().toISOString(),
-    };
-    await saveFederatedJob(p.projectRoot, updated);
+    if (cancelRefusal) {
+      res.status(409).json({
+        error: `federated_${cancelRefusal}`,
+        message:
+          cancelRefusal === "publication_in_progress"
+            ? `Federated job ${jobId} is publishing an admitted commit and cannot be canceled.`
+            : `Federated job ${jobId} has already published its admitted commit and cannot be canceled.`,
+        jobId,
+      });
+      return;
+    }
+    const updated = cancellation.record;
     const taskDetails = await resolveFederatedTaskEventDetails(p, updated.taskId);
     const taskTitle = sessionTitleForFederatedTask(taskDetails);
     const writer = createWorkflowWriter(
@@ -2000,7 +2823,10 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       durationMs: 0,
       totalCostUsd: 0,
     });
-    const scheduler = federatedStatusTransitionFreedCapacity(existing.status, updated.status)
+    const scheduler = federatedStatusTransitionFreedCapacity(
+      canceledFromStatus ?? updated.status,
+      updated.status,
+    )
       ? await maybeRunSwarmSchedulerRefill(p, {}, federationSchedulingDeps)
       : undefined;
     const projection = await resolveAndBroadcastProjection(p, updated.taskId);

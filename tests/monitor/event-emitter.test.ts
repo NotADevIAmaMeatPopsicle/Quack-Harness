@@ -2,7 +2,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 
-import { EventWriter, generateSessionId, createNoOpWriter } from "../../src/monitor/event-emitter";
+import {
+  EventWriter,
+  generateSessionId,
+  createNoOpWriter,
+  resolveDurableEventLogDir,
+} from "../../src/monitor/event-emitter";
 import type { IEventWriter } from "../../src/monitor/event-emitter";
 import type { QuackEvent, SessionEntry } from "../../src/monitor/event-types";
 
@@ -43,6 +48,26 @@ describe("EventWriter", () => {
       logDir: nested,
     });
     expect(fs.existsSync(nested)).toBe(true);
+  });
+
+  it("keeps writing through the canonical target after a worktree log link is quarantined", () => {
+    const target = path.join(logDir, "canonical-logs");
+    const workspace = path.join(logDir, "worktree");
+    const linked = path.join(workspace, ".quack", "logs");
+    fs.mkdirSync(target, { recursive: true });
+    fs.mkdirSync(path.dirname(linked), { recursive: true });
+    fs.symlinkSync(target, linked, process.platform === "win32" ? "junction" : "dir");
+
+    const writer = new EventWriter({
+      sessionId: "linked-session",
+      taskId: "TASK-DETACHED",
+      project: "test-project",
+      logDir: linked,
+    });
+    fs.rmSync(linked, { recursive: true, force: true });
+
+    expect(() => writer.emit("session_start", { model: "test" })).not.toThrow();
+    expect(fs.existsSync(path.join(target, "events-linked-session.jsonl"))).toBe(true);
   });
 
   it("emits events to JSONL file", () => {
@@ -224,5 +249,50 @@ describe("createNoOpWriter", () => {
     const a = createNoOpWriter();
     const b = createNoOpWriter();
     expect(a).toBe(b);
+  });
+});
+
+describe("EventWriter durable worktree logging", () => {
+  let tempRoot: string;
+
+  beforeEach(() => {
+    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "quack-events-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  test("redirects linked-worktree logs to the primary checkout", () => {
+    const primaryRoot = path.join(tempRoot, "project");
+    const worktreeRoot = path.join(tempRoot, "worktree");
+    const worktreeGitDir = path.join(primaryRoot, ".git", "worktrees", "demo");
+    fs.mkdirSync(worktreeGitDir, { recursive: true });
+    fs.mkdirSync(worktreeRoot, { recursive: true });
+    fs.writeFileSync(path.join(worktreeRoot, ".git"), `gitdir: ${worktreeGitDir}\n`);
+    fs.writeFileSync(path.join(worktreeGitDir, "commondir"), "../..\n");
+
+    const worktreeLogDir = path.join(worktreeRoot, ".quack", "logs");
+    const primaryLogDir = path.join(primaryRoot, ".quack", "logs");
+    expect(resolveDurableEventLogDir(worktreeLogDir)).toBe(primaryLogDir);
+
+    const writer = new EventWriter({
+      sessionId: "session-1",
+      taskId: "TASK-1",
+      project: "demo",
+      logDir: worktreeLogDir,
+    });
+    writer.emit("session_start", { taskId: "TASK-1" });
+
+    expect(fs.existsSync(path.join(primaryLogDir, "events-session-1.jsonl"))).toBe(true);
+    expect(fs.existsSync(path.join(worktreeLogDir, "events-session-1.jsonl"))).toBe(false);
+  });
+
+  test("keeps logs in place for a primary checkout", () => {
+    const projectRoot = path.join(tempRoot, "project");
+    fs.mkdirSync(path.join(projectRoot, ".git"), { recursive: true });
+    const logDir = path.join(projectRoot, ".quack", "logs");
+
+    expect(resolveDurableEventLogDir(logDir)).toBe(logDir);
   });
 });

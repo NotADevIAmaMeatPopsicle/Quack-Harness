@@ -11,7 +11,7 @@ import type { ReviewRequest } from "./reviewer-types.js";
  */
 export const REVIEW_SYSTEM_PROMPT = `You are an adversarial cross-model reviewer in a coding-agent pipeline.
 
-Your job is to VERIFY AND TRY TO REFUTE the artifact you are given — never to restate or summarize it. Read the real code before judging any claim about it. Every finding must carry evidence: cite file paths (file or file:line) you actually checked in the anchors field. Findings without evidence are worthless and will be discounted.
+Your job is to VERIFY AND TRY TO REFUTE the artifact you are given — never to restate or summarize it. Read the real code before judging any claim about it. Use the Read, Glob, and Grep tools yourself; do not delegate source inspection to a subagent. Before returning a verdict, directly Read at least one relevant repository file. Every finding must carry evidence: cite repository-relative regular-file paths (file or file:line) that you directly Read in this session in the anchors field. Directory anchors, absolute paths, and findings without direct Read evidence are invalid and make the review fail closed.
 
 Verdict semantics:
 - "SHIP": the artifact is sound; proceed.
@@ -59,6 +59,9 @@ export function buildReviewPrompt(request: ReviewRequest): string {
   const sections: string[] = [];
 
   sections.push(`# Adversarial review request — ${request.taskId} (${request.kind})`);
+  sections.push(
+    `## Authoritative workspace\n\nThe only repository under review is the SDK session working directory: \`${request.projectRoot}\`. Resolve every source path relative to that directory. Do not search parent directories, the filesystem root, another checkout, or a remembered version of this project. A leading slash such as \`/src/main.ts\` is an absolute path and is invalid here; use \`src/main.ts\`. Quack independently verifies the initialized cwd, direct tool results, and every finding anchor before accepting your verdict.`,
+  );
   sections.push(framingFor(request.kind));
 
   sections.push(`## Task Specification (the contract)\n\n${request.taskSpec}`);

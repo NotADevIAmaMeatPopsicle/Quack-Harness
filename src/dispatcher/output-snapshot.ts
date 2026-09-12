@@ -1,7 +1,5 @@
-import { exec } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { promisify } from "node:util";
 
 import type { ProjectAdapter } from "../core/adapter-loader.js";
 import {
@@ -19,10 +17,20 @@ import type {
   AgentOutputSnapshotKind,
 } from "../core/types.js";
 import type { IEventWriter } from "../monitor/event-emitter.js";
+import { runTrustedGitResult } from "../worker/trusted-executable.js";
 
-const execAsync = promisify(exec);
 const MAX_BUFFER = 10 * 1024 * 1024;
 const GIT_TIMEOUT_MS = 30_000;
+const FULL_GIT_OBJECT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+
+let evidenceRefsResolvedHook: (() => Promise<void>) | undefined;
+
+/** @internal Test seam for deterministic ref/worktree race coverage. */
+export function _setOutputSnapshotEvidenceRefsResolvedHook(
+  hook: (() => Promise<void>) | undefined,
+): void {
+  evidenceRefsResolvedHook = hook;
+}
 
 export interface SealAgentOutputInput {
   taskId: string;
@@ -41,47 +49,30 @@ interface GitResult {
   stderr: string;
 }
 
-interface ExecError {
-  code: number | null;
-  stdout: string;
-  stderr: string;
-}
-
-function isExecError(err: unknown): err is ExecError {
-  return typeof err === "object" && err !== null && "stdout" in err && "stderr" in err;
-}
-
 async function runGit(
-  args: string,
+  args: readonly string[],
   cwd: string,
-  options: { allowFailure?: boolean } = {},
+  options: {
+    allowFailure?: boolean;
+    trustedLocalReadRemotePaths?: readonly string[];
+  } = {},
 ): Promise<GitResult> {
   try {
-    const { stdout, stderr } = await execAsync(`git ${args}`, {
-      cwd,
-      timeout: GIT_TIMEOUT_MS,
+    const result = await runTrustedGitResult(cwd, args, {
+      timeoutMs: GIT_TIMEOUT_MS,
       maxBuffer: MAX_BUFFER,
+      ...(options.trustedLocalReadRemotePaths
+        ? { trustedLocalReadRemotePaths: options.trustedLocalReadRemotePaths }
+        : {}),
     });
-    return { exitCode: 0, stdout, stderr };
+    if (result.exitCode === 0 || options.allowFailure) return result;
+    throw new Error(result.stderr || result.stdout || "git command failed");
   } catch (err: unknown) {
-    if (isExecError(err)) {
-      const result = {
-        exitCode: err.code ?? 1,
-        stdout: err.stdout ?? "",
-        stderr: err.stderr ?? "",
-      };
-      if (options.allowFailure) return result;
-      throw new Error(result.stderr || result.stdout || "git command failed");
-    }
     if (options.allowFailure) {
       return { exitCode: 1, stdout: "", stderr: String(err) };
     }
     throw err;
   }
-}
-
-function quoteGitPath(filePath: string): string {
-  return `"${filePath.replace(/\\/g, "/").replace(/"/g, '\\"')}"`;
 }
 
 function normalizeRepoPath(filePath: string): string {
@@ -176,17 +167,30 @@ function readGitPathToken(text: string, start: number): [string, number] {
   return [text.slice(start, end), end];
 }
 
-function statusPath(line: string): string | undefined {
+interface StatusPaths {
+  path: string;
+  previousPath?: string;
+  isRename: boolean;
+  statusCode: string;
+}
+
+function statusPaths(line: string): StatusPaths | undefined {
   const remainder = line.slice(3);
   const [first, next] = readGitPathToken(remainder, 0);
-  let chosen = first;
+  let destination = first;
+  let previousPath: string | undefined;
   if (remainder.startsWith(" -> ", next)) {
-    const [destination] = readGitPathToken(remainder, next + 4);
-    chosen = destination;
+    previousPath = normalizeRepoPath(first.trim());
+    [destination] = readGitPathToken(remainder, next + 4);
   }
-  const trimmed = chosen.trim();
+  const trimmed = destination.trim();
   if (!trimmed) return undefined;
-  return normalizeRepoPath(trimmed);
+  return {
+    path: normalizeRepoPath(trimmed),
+    ...(previousPath ? { previousPath } : {}),
+    isRename: Boolean(previousPath && line.slice(0, 2).includes("R")),
+    statusCode: line.slice(0, 2),
+  };
 }
 
 const EXCLUDED_EXACT_PATHS = new Set([
@@ -266,22 +270,49 @@ function parseChangedFiles(nameStatus: string): AgentOutputSnapshotFile[] {
  * progress check reuses THIS classification so "progress worth
  * resuming" and "work the sealer would commit" share one definition.
  */
-export function parseStatus(statusShort: string): { included: string[]; excluded: string[] } {
+export function parseStatus(statusShort: string): {
+  included: string[];
+  includedToStage: string[];
+  excluded: string[];
+  mixedPolicyRenames: Array<{ previousPath: string; path: string }>;
+} {
   const included: string[] = [];
+  const includedToStage: string[] = [];
   const excluded: string[] = [];
+  const mixedPolicyRenames: Array<{ previousPath: string; path: string }> = [];
   for (const line of statusShort.split(/\r?\n/)) {
     if (!line.trim()) continue;
-    const filePath = statusPath(line);
-    if (!filePath) continue;
-    if (isExcludedOutputPath(filePath)) {
-      excluded.push(filePath);
+    const paths = statusPaths(line);
+    if (!paths) continue;
+    if (paths.isRename && paths.previousPath) {
+      const previousExcluded = isExcludedOutputPath(paths.previousPath);
+      const destinationExcluded = isExcludedOutputPath(paths.path);
+      if (previousExcluded !== destinationExcluded) {
+        mixedPolicyRenames.push({ previousPath: paths.previousPath, path: paths.path });
+        excluded.push(paths.previousPath, paths.path);
+      } else if (destinationExcluded) {
+        excluded.push(paths.previousPath, paths.path);
+      } else {
+        // `git commit --only` needs both endpoints to record the deletion and
+        // addition as one rename. Destination-only silently leaves the old
+        // path staged and seals an incomplete change.
+        included.push(paths.previousPath, paths.path);
+        if (paths.statusCode[1] !== " ") includedToStage.push(paths.path);
+      }
+    } else if (isExcludedOutputPath(paths.path)) {
+      excluded.push(paths.path);
     } else {
-      included.push(filePath);
+      included.push(paths.path);
+      if (paths.statusCode === "??" || paths.statusCode[1] !== " ") {
+        includedToStage.push(paths.path);
+      }
     }
   }
   return {
     included: [...new Set(included)],
+    includedToStage: [...new Set(includedToStage)],
     excluded: [...new Set(excluded)],
+    mixedPolicyRenames,
   };
 }
 
@@ -295,24 +326,30 @@ export interface SecretScanInputsResult {
   inputs: SecretScanFileInput[];
   /** Added/renamed/copied binary files that could not be text-scanned. */
   unscannedBinaries: string[];
+  /** Files whose complete contents could not be inspected safely. */
+  unscannedSafetyFiles: Array<{ path: string; reason: "oversized" | "unreadable" }>;
 }
 
 /**
  * Build secret-scan inputs (TASK-1312 Producer C): per-file added diff
- * lines PLUS full contents of added/renamed/copied text files —
- * rename-only changes carry no added hunks, so content is read directly.
- * Quoted `diff --git` headers (core.quotepath) are unquoted. Oversized
- * files are skipped; binary files surface in `unscannedBinaries` so the
- * caller can emit human-review facts (round-2). Failures never break
- * sealing. Exported for tests.
+ * lines PLUS full contents of added/renamed/copied text files from the
+ * immutable sealed commit. Rename-only changes carry no added hunks, so the
+ * blob itself is required. Quoted `diff --git` headers (core.quotepath) are
+ * unquoted. Oversized or unreadable blobs surface as safety facts; binary
+ * blobs surface in `unscannedBinaries` for human review. Exported for tests.
  */
 export async function buildSecretScanInputs(
   gitDiff: string,
   nameStatus: AgentOutputSnapshotFile[],
   cwd: string,
+  sealedCommitSha: string,
 ): Promise<SecretScanInputsResult> {
+  if (!FULL_GIT_OBJECT_ID.test(sealedCommitSha)) {
+    throw new Error("Secret scan requires an immutable sealed commit identity");
+  }
   const inputs: SecretScanFileInput[] = [];
   const unscannedBinaries: string[] = [];
+  const unscannedSafetyFiles: SecretScanInputsResult["unscannedSafetyFiles"] = [];
 
   let currentFile: string | null = null;
   let added: string[] = [];
@@ -339,21 +376,38 @@ export async function buildSecretScanInputs(
     const status = file.status.charAt(0);
     if (status !== "A" && status !== "R" && status !== "C") continue;
     try {
-      const filePath = path.join(cwd, file.path);
-      const stat = await fs.stat(filePath);
-      if (!stat.isFile() || stat.size > SECRET_SCAN_MAX_FILE_BYTES) continue;
-      const buffer = await fs.readFile(filePath);
+      const object = `${sealedCommitSha}:${file.path}`;
+      const sizeResult = await runGit(["cat-file", "-s", object], cwd);
+      const rawSize = sizeResult.stdout.trim();
+      if (!/^\d+$/.test(rawSize)) throw new Error("invalid Git blob size");
+      const size = Number(rawSize);
+      if (!Number.isSafeInteger(size) || size < 0) throw new Error("invalid Git blob size");
+      if (size > SECRET_SCAN_MAX_FILE_BYTES) {
+        unscannedSafetyFiles.push({ path: file.path, reason: "oversized" });
+        continue;
+      }
+      const blobResult = await runGit(["cat-file", "blob", object], cwd);
+      const buffer = Buffer.from(blobResult.stdout, "utf8");
+      // The trusted runner decodes stdout as UTF-8. Any lossy decode changes
+      // the byte count, so classify it as binary rather than scanning a
+      // transformed representation as though it were complete evidence.
+      if (buffer.length !== size) {
+        unscannedBinaries.push(file.path);
+        continue;
+      }
       if (buffer.subarray(0, 8192).includes(0)) {
         unscannedBinaries.push(file.path);
         continue;
       }
       inputs.push({ file: file.path, content: buffer.toString("utf-8") });
     } catch {
-      // Unreadable file: skip — the scan is observational and must never
-      // break sealing.
+      // An unreadable worker-controlled file is not equivalent to a clean
+      // scan. Preserve sealing, but surface a safety-tier fact so promotion
+      // cannot proceed on incomplete evidence.
+      unscannedSafetyFiles.push({ path: file.path, reason: "unreadable" });
     }
   }
-  return { inputs, unscannedBinaries };
+  return { inputs, unscannedBinaries, unscannedSafetyFiles };
 }
 
 export function resolveEvidenceProjectRoot(projectRoot: string): string {
@@ -376,15 +430,20 @@ async function resolveDiffRef(
   const base = diffBase ?? adapter.config.git.baseBranch;
   if (diffBase) return { diffBase: base, diffRef: base };
 
-  await runGit(`fetch origin ${base}:refs/remotes/origin/${base}`, cwd, { allowFailure: true });
-  const verifyRemote = await runGit(`rev-parse --verify origin/${base}`, cwd, {
+  await runGit(["fetch", "origin", `${base}:refs/remotes/origin/${base}`], cwd, {
+    allowFailure: true,
+    ...(adapter.trustedLocalReadRemotePaths
+      ? { trustedLocalReadRemotePaths: adapter.trustedLocalReadRemotePaths }
+      : {}),
+  });
+  const verifyRemote = await runGit(["rev-parse", "--verify", `origin/${base}`], cwd, {
     allowFailure: true,
   });
   if (verifyRemote.exitCode === 0 && verifyRemote.stdout.trim()) {
     return { diffBase: base, diffRef: `origin/${base}` };
   }
 
-  const verifyLocal = await runGit(`rev-parse --verify ${base}`, cwd, { allowFailure: true });
+  const verifyLocal = await runGit(["rev-parse", "--verify", base], cwd, { allowFailure: true });
   if (verifyLocal.exitCode === 0 && verifyLocal.stdout.trim()) {
     return { diffBase: base, diffRef: base };
   }
@@ -393,29 +452,43 @@ async function resolveDiffRef(
 }
 
 async function revParse(cwd: string, ref: string): Promise<string> {
-  const result = await runGit(`rev-parse --verify ${ref}`, cwd, {
-    allowFailure: true,
-  });
-  return result.exitCode === 0 && result.stdout.trim() ? result.stdout.trim() : "unknown";
+  const result = await runGit(["rev-parse", "--verify", `${ref}^{commit}`], cwd);
+  const sha = result.stdout.trim();
+  if (!FULL_GIT_OBJECT_ID.test(sha)) {
+    throw new Error(`git rev-parse returned an invalid commit identity for ${ref}`);
+  }
+  return sha;
 }
 
 async function commitIncludedChanges(
   taskId: string,
   adapter: ProjectAdapter,
   includedFiles: string[],
+  includedToStage: string[],
 ): Promise<{ filesStaged: number; message?: string; sha?: string }> {
   const cwd = adapter.projectRoot;
-  for (const filePath of includedFiles) {
-    const add = await runGit(`add -- ${quoteGitPath(filePath)}`, cwd, {
+  if (includedFiles.length === 0) return { filesStaged: 0 };
+
+  // Only stage paths with unstaged bytes. Already-staged rename/deletion
+  // sources no longer exist in either the worktree or index, so asking `add`
+  // to match them fails. They remain in includedFiles for the commit pathset.
+  if (includedToStage.length > 0) {
+    const add = await runGit(["add", "--all", "--", ...includedToStage], cwd, {
       allowFailure: true,
     });
     if (add.exitCode !== 0) {
-      throw new Error(`git add failed for ${filePath}: ${add.stderr || add.stdout}`);
+      throw new Error(`git add failed for included output: ${add.stderr || add.stdout}`);
     }
   }
 
-  const stagedResult = await runGit("diff --cached --name-only", cwd);
-  const stagedFiles = stagedResult.stdout.split(/\r?\n/).filter(Boolean);
+  // Restrict both the inventory and commit to paths classified as task output.
+  // The worker may have pre-staged transient or denied evidence before sealing;
+  // a plain `git commit` would silently include those unrelated index entries.
+  const stagedResult = await runGit(
+    ["diff", "--cached", "--name-only", "-z", "--", ...includedFiles],
+    cwd,
+  );
+  const stagedFiles = stagedResult.stdout.split("\0").filter(Boolean);
   if (stagedFiles.length === 0) {
     return { filesStaged: 0 };
   }
@@ -426,7 +499,7 @@ async function commitIncludedChanges(
   const fullMsg = adapter.config.git.commitTrailer
     ? `${msg}\n\n${adapter.config.git.commitTrailer}`
     : msg;
-  const commit = await runGit(`commit -m "${fullMsg.replace(/"/g, '\\"')}"`, cwd, {
+  const commit = await runGit(["commit", "--only", "-m", fullMsg, "--", ...includedFiles], cwd, {
     allowFailure: true,
   });
   if (commit.exitCode !== 0) {
@@ -453,9 +526,15 @@ export async function sealAgentOutputAttempt(
 
   try {
     const headShaBefore = await revParse(cwd, "HEAD");
-    const statusBefore = (await runGit("status --short", cwd)).stdout.trimEnd();
-    const { included, excluded } = parseStatus(statusBefore);
-    const commitResult = await commitIncludedChanges(taskId, adapter, included);
+    const statusBefore = (await runGit(["status", "--short"], cwd)).stdout.trimEnd();
+    const { included, includedToStage, excluded, mixedPolicyRenames } = parseStatus(statusBefore);
+    if (mixedPolicyRenames.length > 0) {
+      const details = mixedPolicyRenames
+        .map(({ previousPath, path: destination }) => `${previousPath} -> ${destination}`)
+        .join(", ");
+      throw new Error(`Refusing to seal rename across the output inclusion boundary: ${details}`);
+    }
+    const commitResult = await commitIncludedChanges(taskId, adapter, included, includedToStage);
     if (commitResult.filesStaged > 0 && commitResult.message) {
       events.emit("auto_commit", {
         filesStaged: commitResult.filesStaged,
@@ -466,18 +545,19 @@ export async function sealAgentOutputAttempt(
     const headShaAfter = await revParse(cwd, "HEAD");
     const { diffBase, diffRef } = await resolveDiffRef(adapter, input.diffBase);
     const baseSha = await revParse(cwd, diffRef);
-    const diffResult = await runGit(`diff ${diffRef}...HEAD`, cwd, {
-      allowFailure: true,
-    });
-    const statResult = await runGit(`diff --stat ${diffRef}...HEAD`, cwd, {
-      allowFailure: true,
-    });
+    await evidenceRefsResolvedHook?.();
+    const evidenceRange = `${baseSha}...${headShaAfter}`;
+    // These three views form the complete sealed evidence used by the policy
+    // and secret scanners. A failed command (including maxBuffer truncation)
+    // is not an empty/partial diff and must abort the seal. Use immutable
+    // commit identities so a concurrent ref move cannot split the views.
+    const diffResult = await runGit(["diff", evidenceRange], cwd);
+    const statResult = await runGit(["diff", "--stat", evidenceRange], cwd);
     const nameStatusResult = await runGit(
       // Explicit rename/copy detection (round-2): rename-only changes
       // must surface as R records so the secret scan reads their content.
-      `diff --name-status --find-renames --find-copies ${diffRef}...HEAD`,
+      ["diff", "--name-status", "--find-renames", "--find-copies", evidenceRange],
       cwd,
-      { allowFailure: true },
     );
     const gitDiff = diffResult.stdout.trim();
     const diffStat = statResult.stdout.trim();
@@ -498,7 +578,7 @@ export async function sealAgentOutputAttempt(
         sandbox: adapter.config.sandbox,
         activeSpecPrefix: `${adapter.config.project.taskDir.replace(/\\/g, "/").replace(/\/+$/, "")}/${taskId}`,
       });
-      const scanInputs = await buildSecretScanInputs(gitDiff, nameStatus, cwd);
+      const scanInputs = await buildSecretScanInputs(gitDiff, nameStatus, cwd, headShaAfter);
       secretScan = scanForSecrets(scanInputs.inputs);
       // Round-2 F11: bound the carried arrays — checkpoints serialize the
       // whole snapshot, so producer blocks are capped (full detail stays
@@ -525,6 +605,17 @@ export async function sealAgentOutputAttempt(
           maskedExcerpt: "(binary file — not text-scanned)",
         });
         secretScan.humanReviewCount++;
+      }
+      for (const unscanned of scanInputs.unscannedSafetyFiles) {
+        secretScan.findings.push({
+          kind: "secret",
+          tier: "safety",
+          patternId: `${unscanned.reason}_file_unscanned`,
+          file: unscanned.path,
+          maskedExcerpt: `(${unscanned.reason} file — complete secret scan unavailable)`,
+          candidateSafetyCode: "secret_exposure",
+        });
+        secretScan.safetyCount++;
       }
     } catch {
       sealConformance = undefined;

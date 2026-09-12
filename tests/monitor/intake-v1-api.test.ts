@@ -157,16 +157,16 @@ describe("v1 intake task API", () => {
     writeCcusageCache(projectRoot);
     writeTaskFile(projectRoot, "TASK-836");
 
-    const port = 43000 + Math.floor(Math.random() * 2000);
     const server = createMonitorServer({
       projectRoot,
       taskDir: "docs/tasks",
       logDir: path.join(projectRoot, ".quack", "logs"),
-      port,
+      port: 0,
+      host: "127.0.0.1",
     });
     const started = await server.start();
     stop = started.stop;
-    baseUrl = `http://127.0.0.1:${port}`;
+    baseUrl = `http://127.0.0.1:${started.port}`;
     await pause(150);
   });
 

@@ -1,3 +1,5 @@
+import { KeyManager } from "../../src/dispatcher/key-manager";
+import { withClaudeAuthScope } from "../../src/sdk/claude-auth";
 import { analyzeIntake, _setQueryFn } from "../../src/bootstrap/intake-analyzer";
 import type { ScanResult } from "../../src/bootstrap/project-scanner";
 import type { CommandValidation } from "../../src/bootstrap/intake-types";
@@ -123,6 +125,28 @@ describe("intake-analyzer", () => {
 
   afterEach(() => {
     _setQueryFn(undefined);
+  });
+
+  it("refuses host auth conflict when unrelated active-project scope carries an explicit pool", async () => {
+    const originalEnvironment = process.env;
+    process.env = {
+      ...process.env,
+      ANTHROPIC_API_KEY_1: "fixture-project-a",
+      CLAUDE_CODE_OAUTH_TOKEN: "fixture-oauth",
+    };
+    const query = jest.fn(() => {
+      throw new Error("Conflicting host authentication must refuse before an SDK call");
+    });
+    _setQueryFn(query);
+    try {
+      const activeProjectManager = new KeyManager({ pool: ["env:ANTHROPIC_API_KEY_1"] });
+      await expect(
+        withClaudeAuthScope(activeProjectManager, () => analyzeIntake(mockScan, mockValidation)),
+      ).rejects.toThrow("Both Anthropic API keys");
+      expect(query).not.toHaveBeenCalled();
+    } finally {
+      process.env = originalEnvironment;
+    }
   });
 
   it("should analyze testing strategy", async () => {

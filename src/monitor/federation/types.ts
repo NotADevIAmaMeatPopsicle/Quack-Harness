@@ -13,6 +13,7 @@ import type { TaskService } from "../task-service.js";
 import type { PrepCache } from "../prep-cache.js";
 import type { QuackDB, NoopDB } from "../../db/index.js";
 import type { JudgmentConfig } from "../../judgment/runner/intent-judgment-config.js";
+import type { TrustedGitHubRepository } from "../../worker/trusted-executable.js";
 
 /** Subset of the closure-scoped ResolvedProject that federation helpers actually use.
  *  ResolvedProject (in server.ts) structurally satisfies this interface, so server.ts
@@ -49,9 +50,9 @@ export interface FederationProjectContext {
  *    must still see it. Treating it as "holds no worker" strands paused jobs
  *    outside recovery entirely (round-1 R1-6 caught exactly that framing error).
  *
- *  Releasing the slot on a pause is deliberately NOT done here: nothing re-binds a
- *  human-approved resume to the same jobId today, so a released job would orphan.
- *  That is TASK-1330. */
+ *  A pause remains attached until the listener durably arms the exact local pause
+ *  occurrence. The explicit release/resume handshake then re-binds the approved
+ *  decision to the same job, host, lease epoch, generation, and child session. */
 export type FederatedRuntimeStatus =
   | "assigned"
   | "queued"
@@ -79,6 +80,84 @@ export interface FederatedJobLease {
   hostId: string;
   acquiredAt: string;
   expiresAt: string;
+}
+
+export type FederatedPauseAttachmentState =
+  | "attached"
+  | "released"
+  | "resume_requested"
+  | "resume_claimed"
+  | "approved_but_not_started"
+  | "manual_recovery";
+
+/**
+ * Headnode-issued capability authorizing one exact paused dispatch to start
+ * one replacement child.  Every identity and epoch field is repeated here on
+ * purpose: neither a same-host listener nor an old lease may reuse the grant
+ * for another project, task, run, pause generation, or scheduler assignment.
+ */
+export interface FederatedResumeStartGrant {
+  token: string;
+  projectId: string;
+  jobId: string;
+  taskId: string;
+  jobType: "dispatch";
+  hostId: string;
+  originalSessionId: string;
+  generation: number;
+  releaseNonce: string;
+  claimToken: string;
+  leaseId: string;
+  issuedAt: string;
+  expiresAt: string;
+  consumedAt?: string;
+  resumedSessionId?: string;
+}
+
+/** Durable, generation-scoped ownership handshake for a human-gate pause. */
+export interface FederatedPauseState {
+  generation: number;
+  state: FederatedPauseAttachmentState;
+  gate: FederatedPendingGate["stage"];
+  sessionId: string;
+  originalHostId: string;
+  releaseNonce: string;
+  openedAt: string;
+  preparedAt: string;
+  releasedAt?: string;
+  sweepAfter?: string;
+  decision?: {
+    action: "approved" | "rejected";
+    reason?: string;
+    recordedAt: string;
+  };
+  resumeRequestedAt?: string;
+  claim?: {
+    token: string;
+    hostId: string;
+    claimedAt: string;
+    expiresAt: string;
+  };
+  startGrant?: FederatedResumeStartGrant;
+  approvedButNotStartedAt?: string;
+  resumedAt?: string;
+  recoveryReason?: string;
+}
+
+/**
+ * Immutable headnode-side publication identity for a federation auto-merge.
+ *
+ * This is persisted before the first repository mutation so a retry or monitor
+ * restart cannot silently follow a moved source branch or a changed origin.
+ */
+export interface FederatedMergeBinding {
+  version: 1;
+  repository: TrustedGitHubRepository;
+  sourceBranch: string;
+  sourceCommitSha: string;
+  targetBranch: string;
+  publicationNonce: string;
+  sealedAt: string;
 }
 
 // ─── Dispatch provenance (TASK-1323 / QPI-047) ─────────────────────
@@ -109,6 +188,12 @@ export interface JobProvenance {
 }
 
 export interface FederatedJobRecord {
+  /**
+   * Canonical registry project that owns this job. Optional only so records
+   * written before TASK-1302 remain readable during the mixed-fleet rollout.
+   * Every production creation path carries this field.
+   */
+  projectId?: string;
   jobId: string;
   taskId: string;
   jobType: "intake" | "verify" | "fix" | "dispatch";
@@ -118,6 +203,8 @@ export interface FederatedJobRecord {
   parentJobId?: string;
   priority?: number;
   priorityLabel?: string;
+  /** Operator preference retained across queued/blocked retries. */
+  preferredHostId?: string;
   hostId?: string;
   fallbackUsed?: boolean;
   retryable?: boolean;
@@ -152,7 +239,11 @@ export interface FederatedJobRecord {
    *  `status: "awaiting_approval"` and cleared when the run leaves that state,
    *  so a stale gate never outlives the pause that produced it. */
   pendingGate?: FederatedPendingGate;
-  mergeStatus?: "not_requested" | "blocked" | "merged" | "failed";
+  /** TASK-1330: attachment ownership is separate from runtime status. */
+  pause?: FederatedPauseState;
+  mergeStatus?: "not_requested" | "blocked" | "publishing" | "merged" | "failed";
+  /** Exact repository/ref identity approved for this auto-merge occurrence. */
+  mergeBinding?: FederatedMergeBinding;
   mergeCommitSha?: string;
   mergeError?: string;
   pullCommandBroadcastAt?: string;

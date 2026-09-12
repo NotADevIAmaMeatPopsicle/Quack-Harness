@@ -6,7 +6,11 @@
 import * as path from "node:path";
 import * as fsPromises from "node:fs/promises";
 
-import { ListenerRegistry } from "../../federation/listener-registry.js";
+import {
+  ListenerRegistry,
+  LISTENER_HOST_ID_PATTERN,
+  type ListenerRegistrySnapshot,
+} from "../../federation/listener-registry.js";
 import type { FederatedHost } from "../../federation/host-registry.js";
 import {
   WORKER_COMMAND_PROTOCOL_VERSION,
@@ -15,7 +19,7 @@ import {
   type WorkerCommandResult,
 } from "../../core/worker-protocol.js";
 import { listFederatedJobs } from "./store.js";
-import { holdsWorkerAttachment } from "./status.js";
+import { federatedJobHoldsWorkerAttachment } from "./status.js";
 import { federationNow } from "./lease.js";
 import type { FederatedHostEventDetails, FederationProjectContext } from "./types.js";
 
@@ -35,12 +39,10 @@ export async function applyActiveFederatedLeases(
   const now = Date.now();
   const activeCounts = new Map<string, number>();
   for (const job of await listFederatedJobs(projectRoot)) {
-    // TASK-1329: host LOAD is about attachment, not assignability. A run paused
-    // at a human gate still occupies its host (the listener holds the lease and
-    // keeps polling, `quack-listener.mjs:1264`), so counting only "active"
-    // statuses under-reports load and lets the scheduler assign into a slot that
-    // is really wedged. This is the over-assignment direction, so it fails unsafe.
-    if (!holdsWorkerAttachment(job.status) || !job.hostId) continue;
+    // Host LOAD is about durable attachment, not assignability. An attached or
+    // resume-claimed pause consumes a slot; a generation explicitly released by
+    // TASK-1330 does not. Legacy pauses have no release proof and fail closed.
+    if (!federatedJobHoldsWorkerAttachment(job) || !job.hostId) continue;
     const leaseExpiresAt = job.lease?.expiresAt;
     if (leaseExpiresAt && Date.parse(leaseExpiresAt) <= now) continue;
     activeCounts.set(job.hostId, (activeCounts.get(job.hostId) ?? 0) + 1);
@@ -53,9 +55,14 @@ export async function applyActiveFederatedLeases(
   }));
 }
 
-export async function defaultFederatedHosts(projectRoot: string): Promise<FederatedHost[]> {
+export async function defaultFederatedHosts(
+  projectRoot: string,
+  listenerSnapshot?: ListenerRegistrySnapshot,
+): Promise<FederatedHost[]> {
   const listenerRegistry = new ListenerRegistry(projectRoot);
-  const registeredListeners = await listenerRegistry.list();
+  const snapshot = listenerSnapshot ?? (await listenerRegistry.listWithDiagnostics());
+  const registeredListeners = snapshot.records;
+  const reservedHostIds = new Set(snapshot.reservedHostIds);
   const byId = new Map<string, FederatedHost>();
   for (const listener of registeredListeners) {
     byId.set(listener.id, listener);
@@ -65,7 +72,15 @@ export async function defaultFederatedHosts(projectRoot: string): Promise<Federa
     const { loadGlobalConfig: load } = await import("../../core/global-config.js");
     const config = load();
     for (const remote of config.remoteInstances ?? []) {
-      if (byId.has(remote.id)) continue;
+      // A corrupt registration is not permission to substitute a healthy-looking
+      // static remote with the same identity. Directory failures reserve all fallbacks.
+      if (
+        snapshot.unavailable ||
+        reservedHostIds.has(remote.id) ||
+        byId.has(remote.id) ||
+        !LISTENER_HOST_ID_PATTERN.test(remote.id)
+      )
+        continue;
       byId.set(remote.id, {
         id: remote.id,
         alias: remote.alias,

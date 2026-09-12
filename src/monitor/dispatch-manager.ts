@@ -1,3 +1,15 @@
+import {
+  buildClaudeChildEnvironment,
+  selectClaudeApiKey,
+  sanitizeClaudeDiagnostic,
+} from "../sdk/claude-auth.js";
+import {
+  DispatchObservationStore,
+  dispatchObservationIdentity,
+  sameDispatchObservationIdentity,
+  type DispatchObservationIdentity,
+  type DispatchTerminalObservation,
+} from "./dispatch-observation-store.js";
 // ─── Dispatch Manager ──────────────────────────────────────────────
 // Manages child processes for task dispatch. Spawns `node dist/index.js
 // run TASK-NNN` as a subprocess so the Agent SDK can create its own
@@ -5,12 +17,13 @@
 //
 // Uses git worktrees for branch isolation: each dispatched task runs in
 // its own worktree so branch switches don't affect the main working
-// directory. Falls back to shared working directory if worktrees fail.
+// directory. Legacy adapters may fall back to the shared working directory
+// only when worktree initialization is explicitly disabled.
 //
 // The dispatch writes JSONL events to .quack/logs/ — the monitor's
 // existing chokidar watcher picks them up and streams via SSE.
 
-import { spawn, execSync, execFileSync, type ChildProcess } from "node:child_process";
+import { execFileSync, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -21,7 +34,11 @@ import type {
   IsolationConfig,
 } from "../core/types.js";
 import { resolvePrepStorageDirSync } from "../core/prep-storage.js";
-import { computeAdapterBundleMetadata } from "../core/adapter-loader.js";
+import {
+  computeAdapterBundleMetadata,
+  loadAdapter,
+  TRUSTED_LOCAL_READ_REMOTES_ENV,
+} from "../core/adapter-loader.js";
 import { AdapterConfigSchema } from "../core/adapter-schema.js";
 import {
   assertBranchDeletionAllowed,
@@ -36,7 +53,9 @@ const MACHINERY_ASSET_FILES = [
   "verify.js",
 ] as const;
 import {
+  assertTrustedManagedDockerImage,
   DockerManager,
+  TRUSTED_MANAGED_DOCKER_IMAGES_ENV,
   type DockerContainer,
   type DockerStopResult,
 } from "../dispatcher/docker-manager.js";
@@ -60,6 +79,8 @@ import {
   removeWorktree as lifecycleRemoveWorktree,
   prepareWorktreeFrontendDeps,
 } from "../dispatcher/worktree-lifecycle.js";
+import { WORKTREE_INIT_FRESH_ENV } from "../dispatcher/worktree-init.js";
+import { runTrustedGitSync } from "../dispatcher/trusted-git.js";
 import { isRateLimitError, parseRetryAfter, type KeyManager } from "../dispatcher/key-manager.js";
 import {
   archivePausedRunState,
@@ -72,12 +93,110 @@ import {
   assertUncontestedClaimant,
   type DuplicateClaimantCheck,
 } from "../core/duplicate-claimants.js";
+import {
+  inspectCodexDeniedPathQuarantine,
+  inspectCodexDeniedPathQuarantineSync,
+  recoverCodexDeniedPathQuarantine,
+} from "../worker/codex-denied-path-guard.js";
+import {
+  createDecompositionDispatchAdmissionMarker,
+  ensureDecompositionDispatchAdmissionDirectory,
+  removeDecompositionDispatchAdmissionScope,
+  revokeDecompositionDispatchAdmission,
+  type CreatedDecompositionDispatchAdmission,
+} from "../preflight/decomposition-dispatch-admission.js";
+import {
+  type DecompositionDispatchAdmission,
+  withDecompositionAdmissionFence,
+} from "../preflight/decomposition-transaction-journal.js";
+import {
+  cleanupTrustedNodeLaunch,
+  confirmWindowsNodeLaunchAlreadyExited,
+  spawnTrustedNode,
+  terminateWindowsNodeJob,
+  type TrustedNodeLaunch,
+} from "./trusted-node-launch.js";
+import { resolveWindowsTaskkillPath } from "../worker/codex-process-containment.js";
+
+const CODEX_DENIED_QUARANTINE_DIRECTORY = /^\.quack-codex-denied-[A-Za-z0-9_-]+$/;
+const OPERATOR_STOP_BARRIER_VERSION = 1;
+
+interface OperatorStopBarrierRecord {
+  version: typeof OPERATOR_STOP_BARRIER_VERSION;
+  token: string;
+  taskId: string;
+  executionRoot: string;
+  pid: number;
+  createdAt: string;
+}
+
+function normalizeExecutionRoot(value: string): string {
+  const resolved = path.normalize(path.resolve(value));
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+/** Canonicalize an existing path, or its nearest existing ancestor plus suffix. */
+function canonicalizePotentialPathSync(value: string): string {
+  const absolute = path.resolve(value);
+  const suffix: string[] = [];
+  let candidate = absolute;
+  while (candidate.length > 0) {
+    try {
+      fs.lstatSync(candidate);
+      const canonical = fs.realpathSync(candidate);
+      return path.normalize(path.join(canonical, ...suffix));
+    } catch (error: unknown) {
+      const code =
+        typeof error === "object" && error !== null && "code" in error
+          ? String((error as { code?: unknown }).code)
+          : "";
+      if (code !== "ENOENT") throw error;
+      const parent = path.dirname(candidate);
+      if (pathsEqualForDispatch(parent, candidate)) throw error;
+      suffix.unshift(path.basename(candidate));
+      candidate = parent;
+    }
+  }
+  throw new Error(`Unable to canonicalize path: ${value}`);
+}
+
+function pathsEqualForDispatch(left: string, right: string): boolean {
+  return normalizeExecutionRoot(left) === normalizeExecutionRoot(right);
+}
+
+function dispatchChildEnvironment(): NodeJS.ProcessEnv {
+  return Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([name]) => name.toUpperCase() !== TRUSTED_MANAGED_DOCKER_IMAGES_ENV,
+    ),
+  );
+}
+
+class OrphanedQuarantineRefusalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "OrphanedQuarantineRefusalError";
+  }
+}
+
+class InvalidDispatchGitReferenceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidDispatchGitReferenceError";
+  }
+}
 
 export interface DispatchJob {
   taskId: string;
   sessionId: string;
   pid: number;
   startedAt: string;
+  /** Recorded only after child stdio and owned exit work have settled. */
+  completedAt?: string;
+  /** Exact trusted same-lease API-key retry, never inferred from task recency. */
+  replacementSessionId?: string;
+  /** Keeps the in-memory terminal attempt visible if durable observation fails. */
+  observationPersistenceError?: string;
   status: "running" | "completed" | "failed" | "stopped" | "awaiting_approval";
   exitCode?: number;
   output: string[];
@@ -85,6 +204,25 @@ export interface DispatchJob {
   /** QPI-043: the signal that terminated the child, when it was killed
    *  rather than exiting on its own. Absent for a normal exit. */
   killedBySignal?: string;
+  /**
+   * Set before stop() signals the child. The exit/error callbacks use this
+   * intent marker to distinguish an operator stop from an external kill.
+   */
+  operatorStopRequestedAt?: string;
+  /** True while host-side termination/recovery still blocks a replacement. */
+  operatorStopCleanupPending?: boolean;
+  /**
+   * True only after the dispatch process and its descendants are known to
+   * be dead. Orphaned denied-path state must not be restored before this.
+   */
+  operatorStopTreeTerminated?: boolean;
+  /** Detached process group owned by a worktree child on POSIX. */
+  operatorStopProcessGroupId?: number;
+  /** Actual host directory in which the mutable worker ran. */
+  executionRoot?: string;
+  /** Durable marker identity retained until cleanup is positively confirmed. */
+  operatorStopBarrierPath?: string;
+  operatorStopBarrierToken?: string;
   /**
    * TASK-1332 (QPI-045, round-2 R2-5): this run REFUSED to consume an
    * artifact whose spec contract had moved, rather than crashing. The
@@ -122,10 +260,20 @@ export interface DispatchJob {
   provenance?: JobProvenance;
 }
 
-export interface SharedCheckoutOccupant {
-  taskId: string;
-  status: DispatchJob["status"];
-}
+export type ApprovalGate = "blueprint" | "judge";
+export type DecidedApprovalState = "approved" | "rejected";
+
+export type ApprovalDecisionConflictReason =
+  | "decision_in_flight"
+  | "dispatch_running"
+  | "cleanup_live"
+  | "operator_stopped"
+  | "operator_stop_barrier"
+  | "exit_unproven"
+  | "approval_missing"
+  | "approval_not_pending"
+  | "approval_run_mismatch"
+  | "other_gate_pending";
 
 export interface SharedCheckoutShutdownSurvivor {
   taskId: string;
@@ -163,6 +311,17 @@ export interface DispatchShutdownResult {
   exited: string[];
   escalated: string[];
   timedOut: string[];
+  /**
+   * Positive proof that every timed-out non-Docker child has an exact durable
+   * ownership marker. Omission is not proof and must never authorize a hard
+   * process exit.
+   */
+  durableAccountingComplete?: boolean;
+}
+
+export interface SharedCheckoutOccupant {
+  taskId: string;
+  status: DispatchJob["status"];
 }
 
 interface DurableSharedCheckoutPause {
@@ -206,11 +365,7 @@ interface DockerPausedRunPointer {
 
 const SHARED_CHECKOUT_PAUSE_VERSION = 1;
 
-/**
- * Typed admission refusal raised when degraded isolation leaves the shared
- * checkout occupied. Callers may retry running occupants, but an approval
- * pause requires operator action and must fail promptly.
- */
+/** Typed refusal raised while degraded shared-checkout ownership is occupied. */
 export class DegradedSharedCheckoutBusyError extends Error {
   readonly occupants: SharedCheckoutOccupant[];
   readonly hasApprovalPause: boolean;
@@ -228,17 +383,50 @@ export class DegradedSharedCheckoutBusyError extends Error {
       : hasUnresolvedOccupant
         ? "Resume or explicitly override the interrupted task before reusing the shared checkout."
         : "Wait for running tasks to finish, or restart the monitor to retry worktree creation.";
-
     super(
-      `Worktree isolation is degraded (creation failed). ` +
-        `Cannot dispatch ${taskId} while the shared directory is occupied by ${occupantSummary}. ` +
-        recovery,
+      `Worktree isolation is degraded (creation failed). Cannot dispatch ${taskId} while the shared directory is occupied by ${occupantSummary}. ${recovery}`,
     );
     this.name = "DegradedSharedCheckoutBusyError";
     this.occupants = occupants;
     this.hasApprovalPause = hasApprovalPause;
     this.hasUnresolvedOccupant = hasUnresolvedOccupant;
   }
+}
+
+/**
+ * A deliberate refusal to change a human-gate decision because the live or
+ * durable dispatch lifecycle conflicts with that request. Route handlers map
+ * only this typed pre-mutation refusal to HTTP 409; malformed files and I/O
+ * failures remain server errors.
+ */
+export class ApprovalDecisionConflictError extends Error {
+  readonly code = "approval_decision_conflict";
+
+  constructor(
+    readonly reason: ApprovalDecisionConflictReason,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ApprovalDecisionConflictError";
+  }
+}
+
+interface ApprovalPauseResolution {
+  readonly taskId: string;
+  readonly gate: ApprovalGate;
+  readonly expectedState: DecidedApprovalState;
+  /** Exact exited pause to release, absent when the monitor has no live job. */
+  readonly job?: DispatchJob;
+}
+
+export interface ApprovalPauseDecisionResult<T> {
+  decision: T;
+  released: boolean;
+}
+
+export interface ApprovalPauseDecisionOptions {
+  /** Re-plan may repeat an existing rejection to regenerate preflight evidence. */
+  allowAlreadyRejected?: boolean;
 }
 
 export interface StartOptions {
@@ -263,6 +451,13 @@ export interface StartOptions {
    * (the TASK-1323 F1 lesson).
    */
   overridePausedRun?: boolean;
+  /**
+   * TASK-1333: the stale judge record and checkpoint were already moved into
+   * a recoverable archive, so an in-memory `awaiting_approval` job may be
+   * replaced without setting `resume` (which would reuse the stale worktree).
+   * Internal to the judge recycle route.
+   */
+  replaceArchivedJudgeRun?: boolean;
   /** Federated scheduler job id when a listener starts local work for a leased job. */
   federatedJobId?: string;
   /** Federated worker/listener host id for worker provenance. */
@@ -282,6 +477,8 @@ export interface StartOptions {
   provenance?: JobProvenance;
   /** Prebuilt async claimant result for the synchronous start seam. */
   duplicateClaimantCheck?: DuplicateClaimantCheck;
+  /** Exact task bytes admitted under the decomposition reservation. */
+  admittedTaskContentHash?: string;
   /** Exact monitor-owned Docker runtime archive to seed for this resume. */
   dockerResumeStateDir?: string;
 }
@@ -306,7 +503,9 @@ export type DispatchEventCallback = (
     // branch/checkpoint/pend were archived. Durable by the same
     // reasoning as dispatch_child_exit — an archive nobody can find is
     // a deletion with extra steps.
-    | "paused_run_archived",
+    | "paused_run_archived"
+    | "prep_job_completed"
+    | "prep_failed",
   taskId: string,
   payload: Record<string, unknown>,
 ) => void;
@@ -428,7 +627,28 @@ function isSafeDockerBranchName(value: string): boolean {
 
 export class DispatchManager {
   private jobs = new Map<string, DispatchJob>();
+  private observationProjectId?: string;
+  private observationStore?: DispatchObservationStore;
+  private readonly observationCandidates = new WeakSet<DispatchJob>();
+  private readonly persistedObservations = new WeakSet<DispatchJob>();
+  private readonly observationChildren = new WeakMap<DispatchJob, ChildProcess>();
+  private readonly observationExitHandlers = new WeakMap<DispatchJob, number>();
+  private readonly observationStarts = new WeakSet<DispatchJob>();
   private processes = new Map<string, ChildProcess>();
+  private nodeLaunches = new Map<string, TrustedNodeLaunch>();
+  /** Child handles remain live through `close`, after `exit` has fired. */
+  private liveProcesses = new Set<ChildProcess>();
+  /** Async exit handlers may outlive both `exit` and `close`. */
+  private pendingExitHandlers = new Set<Promise<void>>();
+  private idleWaiters = new Set<() => void>();
+  /** Blocks same-task admission until a stopped child's recovery pass finishes. */
+  private operatorStopCleanupPending = new Map<string, DispatchJob>();
+  /** Serializes a durable human-gate decision with release of its exact paused run. */
+  private approvalPauseResolutions = new Map<string, ApprovalPauseResolution>();
+  /** Deduplicates exit-handler and drain-retry recovery for the same stopped run. */
+  private operatorStopRecoveryInFlight = new Map<string, Promise<boolean>>();
+  /** Keeps an exited rate-limited run cancellable until replacement admission commits. */
+  private rateLimitRetryPending = new Set<string>();
   private dockerManager: DockerManager | null = null;
   /** Startup ownership scan shared by availability checks and first admission. */
   private dockerReconciliationPromise: Promise<void> | null = null;
@@ -438,6 +658,7 @@ export class DispatchManager {
   private onEvent?: DispatchEventCallback;
   private keyManager?: KeyManager;
   private watchdogTimer?: ReturnType<typeof setInterval>;
+  private terminalDrainStarted = false;
   private stopEscalationTimers = new Map<
     string,
     { timer: ReturnType<typeof setTimeout>; processGroupId?: number }
@@ -463,6 +684,107 @@ export class DispatchManager {
   /** Set to true when worktree creation fails — blocks parallel dispatch */
   private worktreeDegraded = false;
 
+  /** Bind only the canonical project resolved by server/registry initialization. */
+  setObservationProjectId(projectId: string): void {
+    if (
+      !projectId ||
+      projectId.length > 512 ||
+      (this.observationProjectId && this.observationProjectId !== projectId)
+    ) {
+      throw new Error("Dispatch observation project identity cannot change");
+    }
+    this.observationProjectId = projectId;
+    this.observationStore ??= new DispatchObservationStore(this.projectRoot, projectId);
+  }
+
+  private recordTerminalObservation(job: DispatchJob): void {
+    if (
+      !this.observationCandidates.has(job) ||
+      this.persistedObservations.has(job) ||
+      !["completed", "failed", "stopped"].includes(job.status) ||
+      this.observationChildren.has(job) ||
+      this.observationStarts.has(job) ||
+      (this.observationExitHandlers.get(job) ?? 0) > 0 ||
+      job.operatorStopCleanupPending === true ||
+      this.operatorStopCleanupPending.get(job.taskId) === job
+    )
+      return;
+    // The observation clock is completion, never task start or cleanup time.
+    job.completedAt ??= new Date(Math.max(Date.now(), Date.parse(job.startedAt))).toISOString();
+    const identity = this.observationProjectId
+      ? dispatchObservationIdentity(this.observationProjectId, job)
+      : undefined;
+    if (!identity || !this.observationStore) return;
+    try {
+      this.observationStore.write(identity, job, job.completedAt, job.replacementSessionId);
+      this.persistedObservations.add(job);
+      delete job.observationPersistenceError;
+    } catch (error) {
+      job.observationPersistenceError = sanitizeClaudeDiagnostic(
+        error instanceof Error ? error.message : String(error),
+      ).slice(0, 2048);
+    }
+  }
+
+  private recordAuthRetryReplacement(previous: DispatchJob, replacement: DispatchJob): void {
+    if (!this.observationProjectId) return;
+    const oldIdentity = dispatchObservationIdentity(this.observationProjectId, previous);
+    const newIdentity = dispatchObservationIdentity(this.observationProjectId, replacement);
+    if (
+      oldIdentity &&
+      newIdentity &&
+      previous.sessionId !== replacement.sessionId &&
+      sameDispatchObservationIdentity(
+        { ...oldIdentity, sessionId: newIdentity.sessionId },
+        newIdentity,
+      )
+    ) {
+      previous.replacementSessionId = replacement.sessionId;
+    }
+  }
+
+  private trackExitHandler(handler: Promise<void>, job: DispatchJob): void {
+    this.pendingExitHandlers.add(handler);
+    this.observationExitHandlers.set(job, (this.observationExitHandlers.get(job) ?? 0) + 1);
+    void handler.finally(() => {
+      this.pendingExitHandlers.delete(handler);
+      this.observationExitHandlers.set(job, (this.observationExitHandlers.get(job) ?? 1) - 1);
+      this.recordTerminalObservation(job);
+      this.notifyIdleWaiters();
+    });
+  }
+
+  private trackChildClose(child: ChildProcess, job: DispatchJob): void {
+    this.liveProcesses.add(child);
+    this.observationCandidates.add(job);
+    this.observationChildren.set(job, child);
+    child.once("close", () => {
+      this.liveProcesses.delete(child);
+      this.observationChildren.delete(job);
+      this.recordTerminalObservation(job);
+      this.notifyIdleWaiters();
+    });
+  }
+
+  private emitEventBestEffort(
+    stage: Parameters<DispatchEventCallback>[0],
+    taskId: string,
+    payload: Record<string, unknown>,
+    job?: DispatchJob,
+  ): void {
+    try {
+      this.onEvent?.(stage, taskId, payload);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      job?.output.push(`[events] ${stage} observer failed: ${detail}`);
+    }
+  }
+
+  private notifyIdleWaiters(): void {
+    if (this.hasLiveProcesses()) return;
+    for (const waiter of [...this.idleWaiters]) waiter();
+  }
+
   /** Where the durable event jsonl files live (QPI-043 exit facts). */
   private readonly logDir: string;
   /** Trusted adapter identity used to reject container-chosen event projects. */
@@ -477,6 +799,16 @@ export class DispatchManager {
     keyManager?: KeyManager,
     logDir?: string,
     private readonly claimantResolver?: (taskId: string) => Promise<DuplicateClaimantCheck>,
+    /**
+     * Operator-owned authorization for exact local bare repositories that
+     * may be used as read-only Git transports. This value must come from the
+     * runtime adapter object, never from repository-controlled adapter.json.
+     */
+    private readonly trustedLocalReadRemotePaths?: readonly string[],
+    private readonly decompositionAdmissionFence?: (
+      taskId: string,
+      operation: (admission: DecompositionDispatchAdmission) => DispatchJob,
+    ) => Promise<DispatchJob>,
   ) {
     this.logDir = logDir ?? path.join(projectRoot, ".quack", "logs");
     this.projectName = path.basename(path.resolve(projectRoot));
@@ -506,6 +838,17 @@ export class DispatchManager {
       );
     }
     this.keyManager = keyManager;
+  }
+
+  private async restartWithFreshDecompositionAdmission(
+    taskId: string,
+    operation: (admission: DecompositionDispatchAdmission) => DispatchJob,
+  ): Promise<DispatchJob> {
+    if (this.decompositionAdmissionFence) {
+      return this.decompositionAdmissionFence(taskId, operation);
+    }
+    const adapter = await loadAdapter(this.projectRoot);
+    return withDecompositionAdmissionFence(adapter, taskId, operation);
   }
 
   private sharedCheckoutPausePath(): string {
@@ -815,6 +1158,11 @@ export class DispatchManager {
     try {
       return this.withWorktreeMarkerLock(job.taskId, () => {
         const markerPath = this.worktreeSurvivorPath(job.taskId);
+        // A prior recovery attempt may have removed the exact ownership
+        // marker before a later, independent cleanup step failed. Once tree
+        // absence has been proven, an already-absent marker is an idempotent
+        // success rather than a reason to strand the task forever.
+        if (treeAbsenceConfirmed && !fs.existsSync(markerPath)) return true;
         const marker = this.parseWorktreeSurvivor(markerPath);
         if (
           !marker ||
@@ -1359,10 +1707,8 @@ export class DispatchManager {
     }
 
     try {
-      execFileSync("git", ["checkout", originalBranch], {
-        cwd: this.projectRoot,
-        stdio: "ignore",
-        timeout: 15_000,
+      runTrustedGitSync(["checkout", originalBranch], this.projectRoot, {
+        timeoutMs: 15_000,
       });
     } catch (error: unknown) {
       const detail = error instanceof Error ? error.message : String(error);
@@ -1400,12 +1746,483 @@ export class DispatchManager {
     return this.isolationConfig?.dockerCleanup !== false;
   }
 
-  private cleanupDockerForWorktree(worktreePath: string): void {
-    if (!this.shouldCleanupDockerForWorktree()) return;
-    cleanupWorktreeContainers(worktreePath, {
+  private assertValidGitBranchName(branch: string, context: string): void {
+    if (!branch || branch !== branch.trim() || branch.startsWith("-")) {
+      throw new InvalidDispatchGitReferenceError(`${context} is not a safe Git branch name`);
+    }
+    try {
+      runTrustedGitSync(["check-ref-format", "--branch", branch], this.projectRoot, {
+        timeoutMs: 10_000,
+        errorContext: `Invalid ${context}`,
+      });
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new InvalidDispatchGitReferenceError(detail);
+    }
+  }
+
+  private readWorktreeGitConfiguration(taskId: string): {
+    baseBranch: string;
+    staleBranch: string;
+    configuredProtected?: string[];
+  } {
+    if (!taskId || taskId === "." || taskId === ".." || /[\\/\0]/u.test(taskId)) {
+      throw new InvalidDispatchGitReferenceError(
+        `Task id ${JSON.stringify(taskId)} is not a safe worktree path segment`,
+      );
+    }
+    let branchPrefix = "quack/";
+    let baseBranch = "main";
+    let configuredProtected: string[] | undefined;
+    const adapterPath = path.join(this.projectRoot, ".quack", "adapter.json");
+    if (fs.existsSync(adapterPath)) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(fs.readFileSync(adapterPath, "utf-8"));
+      } catch (error: unknown) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new InvalidDispatchGitReferenceError(
+          `Cannot read adapter Git configuration: ${detail}`,
+        );
+      }
+      const git =
+        typeof parsed === "object" && parsed !== null
+          ? (parsed as { git?: unknown }).git
+          : undefined;
+      if (git !== undefined && (typeof git !== "object" || git === null || Array.isArray(git))) {
+        throw new InvalidDispatchGitReferenceError("Adapter git configuration must be an object");
+      }
+      const values = git as
+        | { baseBranch?: unknown; branchPrefix?: unknown; protectedBranches?: unknown }
+        | undefined;
+      if (values?.baseBranch !== undefined) {
+        if (typeof values.baseBranch !== "string") {
+          throw new InvalidDispatchGitReferenceError("Adapter git.baseBranch must be a string");
+        }
+        baseBranch = values.baseBranch;
+      }
+      if (values?.branchPrefix !== undefined) {
+        if (typeof values.branchPrefix !== "string") {
+          throw new InvalidDispatchGitReferenceError("Adapter git.branchPrefix must be a string");
+        }
+        branchPrefix = values.branchPrefix;
+      }
+      if (values?.protectedBranches !== undefined) {
+        if (
+          !Array.isArray(values.protectedBranches) ||
+          values.protectedBranches.some((value) => typeof value !== "string")
+        ) {
+          throw new InvalidDispatchGitReferenceError(
+            "Adapter git.protectedBranches must contain only strings",
+          );
+        }
+        configuredProtected = values.protectedBranches as string[];
+      }
+    }
+
+    const staleBranch = `${branchPrefix}${taskId}`;
+    this.assertValidGitBranchName(baseBranch, "adapter git.baseBranch");
+    this.assertValidGitBranchName(staleBranch, "task branch");
+    for (const protectedBranch of configuredProtected ?? []) {
+      this.assertValidGitBranchName(protectedBranch, "adapter git.protectedBranches entry");
+    }
+    const protectedSet = [
+      ...new Set([...(configuredProtected ?? DEFAULT_PROTECTED_BRANCHES), baseBranch]),
+    ];
+    const collision = assertBranchDeletionAllowed(staleBranch, protectedSet);
+    if (!collision.allowed) {
+      const reason =
+        `Task branch ${staleBranch} collides with a protected/base branch; ` +
+        "refusing dispatch before worktree or branch mutation";
+      this.onEvent?.("branch_guard_refusal", taskId, {
+        branch: staleBranch,
+        reason: collision.reason ?? reason,
+        site: "task_branch_admission",
+      });
+      throw new InvalidDispatchGitReferenceError(reason);
+    }
+    return { baseBranch, staleBranch, configuredProtected };
+  }
+
+  /**
+   * Worktree init defaults to auto-discovery when omitted. An explicit empty
+   * array is the only opt-out. If the adapter exists but cannot be read or its
+   * value is malformed, fail closed and assume initialization would run.
+   */
+  private worktreeInitializationActive(): boolean {
+    const adapterPath = path.join(this.projectRoot, ".quack", "adapter.json");
+    if (!fs.existsSync(adapterPath)) return false;
+    try {
+      const raw = JSON.parse(fs.readFileSync(adapterPath, "utf8")) as {
+        dispatch?: { worktreeInit?: unknown };
+      };
+      const configured = raw.dispatch?.worktreeInit;
+      return !Array.isArray(configured) || configured.length > 0;
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * Legacy dependency junctions are incompatible with initialization-owned or
+   * guard-protected node_modules trees. In those modes the worktree must own a
+   * real dependency directory instead of sharing the mutable parent copy.
+   */
+  private sharedFrontendDependenciesAllowed(): boolean {
+    if (this.worktreeInitializationActive()) return false;
+    const adapterPath = path.join(this.projectRoot, ".quack", "adapter.json");
+    if (!fs.existsSync(adapterPath)) return true;
+    try {
+      const raw = JSON.parse(fs.readFileSync(adapterPath, "utf8")) as {
+        sandbox?: { deniedPaths?: unknown; disposablePaths?: unknown };
+      };
+      if (
+        raw.sandbox &&
+        ((raw.sandbox.deniedPaths !== undefined && !Array.isArray(raw.sandbox.deniedPaths)) ||
+          (raw.sandbox.disposablePaths !== undefined &&
+            !Array.isArray(raw.sandbox.disposablePaths)))
+      ) {
+        return false;
+      }
+      const policyPaths: string[] = [];
+      for (const configuredPaths of [raw.sandbox?.deniedPaths, raw.sandbox?.disposablePaths]) {
+        if (!Array.isArray(configuredPaths)) continue;
+        for (const value of configuredPaths) {
+          if (typeof value !== "string") return false;
+          policyPaths.push(value.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, ""));
+        }
+      }
+      const dependencyRoots = ["frontend/node_modules", "frontends/_app_/node_modules"];
+      return !policyPaths.some((value) => {
+        const staticPrefix = value.split("*", 1)[0]?.replace(/\/+$/, "") ?? "";
+        // A leading wildcard may cover either legacy or multi-frontend roots;
+        // fail closed rather than manufacture an external-write alias.
+        if (!staticPrefix) return value.includes("*");
+        if (/^frontends\/[^/]+\/node_modules(?:\/|$)/u.test(staticPrefix)) return true;
+        return dependencyRoots.some(
+          (root) =>
+            root === staticPrefix ||
+            root.startsWith(`${staticPrefix}/`) ||
+            staticPrefix.startsWith(`${root}/`),
+        );
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  private cleanupDockerForWorktree(worktreePath: string): boolean {
+    if (!this.shouldCleanupDockerForWorktree()) return false;
+    return cleanupWorktreeContainers(worktreePath, {
       info: (message: string) => console.log(message),
       warn: (message: string) => console.warn(message),
     });
+  }
+
+  private operatorStopBarrierDirectory(): string {
+    return path.join(this.projectRoot, ".quack", "operator-stop-barriers");
+  }
+
+  private operatorStopFallbackBarrierDirectory(): string {
+    const canonicalProjectRoot = canonicalizePotentialPathSync(this.projectRoot);
+    const projectHash = createHash("sha256")
+      .update(normalizeExecutionRoot(canonicalProjectRoot))
+      .digest("hex")
+      .slice(0, 16);
+    const safeProjectName = path.basename(canonicalProjectRoot).replace(/[^A-Za-z0-9._-]/g, "_");
+    return path.join(
+      path.dirname(canonicalProjectRoot),
+      `.quack-operator-stop-barriers-${safeProjectName}-${projectHash}`,
+    );
+  }
+
+  private operatorStopBarrierDirectories(): string[] {
+    return [
+      this.operatorStopBarrierDirectory(),
+      this.operatorStopFallbackBarrierDirectory(),
+    ].filter(
+      (directory, index, all) =>
+        all.findIndex((candidate) => pathsEqualForDispatch(candidate, directory)) === index,
+    );
+  }
+
+  private operatorStopBarrierPath(
+    directory: string,
+    taskId: string,
+    executionRoot: string,
+  ): string {
+    const safeTaskId = taskId.replace(/[^A-Za-z0-9._-]/g, "_");
+    const rootHash = createHash("sha256")
+      .update(normalizeExecutionRoot(executionRoot))
+      .digest("hex")
+      .slice(0, 16);
+    return path.join(directory, `${safeTaskId}-${rootHash}.json`);
+  }
+
+  private prepareOperatorStopBarrierDirectory(directory: string): void {
+    if (fs.existsSync(directory)) {
+      const stat = fs.lstatSync(directory);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        throw new Error(`barrier directory is not a real directory: ${directory}`);
+      }
+    } else {
+      fs.mkdirSync(directory, { recursive: true });
+    }
+
+    const canonicalDirectory = fs.realpathSync(directory);
+    const canonicalProjectRoot = canonicalizePotentialPathSync(this.projectRoot);
+    const primaryRoot = path.join(canonicalProjectRoot, ".quack");
+    const fallbackParent = path.dirname(canonicalProjectRoot);
+    const validLocation =
+      pathsEqualForDispatch(path.dirname(canonicalDirectory), primaryRoot) ||
+      pathsEqualForDispatch(path.dirname(canonicalDirectory), fallbackParent);
+    if (!validLocation) {
+      throw new Error(`barrier directory resolves outside its approved parent: ${directory}`);
+    }
+  }
+
+  private persistOperatorStopBarrier(job: DispatchJob): boolean {
+    const requestedRoot = job.executionRoot ?? this.projectRoot;
+    const failures: string[] = [];
+    try {
+      const executionRoot = canonicalizePotentialPathSync(requestedRoot);
+      const sharedExecutionRoot = pathsEqualForDispatch(
+        executionRoot,
+        canonicalizePotentialPathSync(this.projectRoot),
+      );
+      // A shared-root worker can modify projectRoot/.quack, so a marker there
+      // is not durable against the very process it is meant to fence. For
+      // shared execution the sibling store is authoritative, not a fallback.
+      const directories = sharedExecutionRoot
+        ? [this.operatorStopFallbackBarrierDirectory()]
+        : this.operatorStopBarrierDirectories();
+      for (const [index, directory] of directories.entries()) {
+        try {
+          this.prepareOperatorStopBarrierDirectory(directory);
+          const markerPath = this.operatorStopBarrierPath(directory, job.taskId, executionRoot);
+          if (fs.existsSync(markerPath)) {
+            const existing = JSON.parse(fs.readFileSync(markerPath, "utf8")) as unknown;
+            if (
+              typeof existing !== "object" ||
+              existing === null ||
+              (existing as { version?: unknown }).version !== OPERATOR_STOP_BARRIER_VERSION ||
+              typeof (existing as { token?: unknown }).token !== "string" ||
+              (existing as { taskId?: unknown }).taskId !== job.taskId ||
+              typeof (existing as { executionRoot?: unknown }).executionRoot !== "string" ||
+              !pathsEqualForDispatch(
+                canonicalizePotentialPathSync(
+                  (existing as { executionRoot: string }).executionRoot,
+                ),
+                executionRoot,
+              ) ||
+              (existing as { pid?: unknown }).pid !== job.pid ||
+              (existing as { createdAt?: unknown }).createdAt !== job.operatorStopRequestedAt
+            ) {
+              throw new Error(
+                `existing barrier is invalid or belongs to another run: ${markerPath}`,
+              );
+            }
+            job.operatorStopBarrierPath = markerPath;
+            job.operatorStopBarrierToken = (existing as { token: string }).token;
+            return true;
+          }
+          const token = randomUUID();
+          const record: OperatorStopBarrierRecord = {
+            version: OPERATOR_STOP_BARRIER_VERSION,
+            token,
+            taskId: job.taskId,
+            executionRoot,
+            pid: job.pid,
+            createdAt: job.operatorStopRequestedAt ?? new Date().toISOString(),
+          };
+          // Exclusive creation matters more than rename atomicity here. A partial
+          // record is deliberately fail-closed on restart, while rename() could
+          // replace another monitor's valid barrier on POSIX.
+          fs.writeFileSync(markerPath, `${JSON.stringify(record, null, 2)}\n`, {
+            encoding: "utf8",
+            flag: "wx",
+          });
+          job.operatorStopBarrierPath = markerPath;
+          job.operatorStopBarrierToken = token;
+          if (sharedExecutionRoot) {
+            job.output.push(
+              `[dispatch] Shared-root stop barrier stored outside the worker-writable project at ${markerPath}.`,
+            );
+          } else if (index > 0) {
+            job.output.push(
+              `[dispatch] Primary stop-barrier storage was unavailable; using durable fallback ${markerPath}.`,
+            );
+          }
+          return true;
+        } catch (error: unknown) {
+          failures.push(`${directory}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    } catch (error: unknown) {
+      failures.push(error instanceof Error ? error.message : String(error));
+    }
+    job.output.push(
+      `[dispatch] Stop refused because no durable operator-stop recovery barrier could be written ` +
+        `(${failures.join("; ")}).`,
+    );
+    return false;
+  }
+
+  private clearOperatorStopBarrier(job: DispatchJob): boolean {
+    if (!job.operatorStopBarrierPath || !job.operatorStopBarrierToken) return true;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(job.operatorStopBarrierPath, "utf8")) as unknown;
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        (parsed as { version?: unknown }).version !== OPERATOR_STOP_BARRIER_VERSION ||
+        (parsed as { token?: unknown }).token !== job.operatorStopBarrierToken ||
+        (parsed as { taskId?: unknown }).taskId !== job.taskId ||
+        typeof (parsed as { executionRoot?: unknown }).executionRoot !== "string" ||
+        !pathsEqualForDispatch(
+          canonicalizePotentialPathSync((parsed as { executionRoot: string }).executionRoot),
+          canonicalizePotentialPathSync(job.executionRoot ?? this.projectRoot),
+        ) ||
+        (parsed as { pid?: unknown }).pid !== job.pid
+      ) {
+        throw new Error("barrier ownership or run identity changed");
+      }
+      fs.rmSync(job.operatorStopBarrierPath);
+      try {
+        fs.rmdirSync(path.dirname(job.operatorStopBarrierPath));
+      } catch {
+        // A non-empty shared barrier directory is expected when other stopped
+        // runs still need recovery. Failure to remove the empty shell is safe.
+      }
+      job.operatorStopBarrierPath = undefined;
+      job.operatorStopBarrierToken = undefined;
+      return true;
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : String(error);
+      job.output.push(
+        `[dispatch] Operator-stop barrier could not be cleared (${detail}); restart remains blocked.`,
+      );
+      return false;
+    }
+  }
+
+  private readOperatorStopBarriers(): {
+    records: Array<OperatorStopBarrierRecord & { markerPath: string }>;
+    invalid: string[];
+  } {
+    const records: Array<OperatorStopBarrierRecord & { markerPath: string }> = [];
+    const invalid: string[] = [];
+    for (const directory of this.operatorStopBarrierDirectories()) {
+      if (!fs.existsSync(directory)) continue;
+      let entries: fs.Dirent[];
+      try {
+        const stat = fs.lstatSync(directory);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) {
+          throw new Error("barrier path is not a real directory");
+        }
+        entries = fs.readdirSync(directory, { withFileTypes: true });
+      } catch (error: unknown) {
+        invalid.push(`${directory} (${error instanceof Error ? error.message : String(error)})`);
+        continue;
+      }
+      for (const entry of entries) {
+        const markerPath = path.join(directory, entry.name);
+        if (!entry.isFile() || !entry.name.endsWith(".json")) {
+          invalid.push(markerPath);
+          continue;
+        }
+        try {
+          const parsed = JSON.parse(fs.readFileSync(markerPath, "utf8")) as unknown;
+          if (
+            typeof parsed !== "object" ||
+            parsed === null ||
+            (parsed as { version?: unknown }).version !== OPERATOR_STOP_BARRIER_VERSION ||
+            typeof (parsed as { token?: unknown }).token !== "string" ||
+            typeof (parsed as { taskId?: unknown }).taskId !== "string" ||
+            typeof (parsed as { executionRoot?: unknown }).executionRoot !== "string" ||
+            typeof (parsed as { pid?: unknown }).pid !== "number" ||
+            typeof (parsed as { createdAt?: unknown }).createdAt !== "string"
+          ) {
+            throw new Error("invalid shape");
+          }
+          const record = parsed as OperatorStopBarrierRecord;
+          records.push({
+            ...record,
+            executionRoot: canonicalizePotentialPathSync(record.executionRoot),
+            markerPath,
+          });
+        } catch (error: unknown) {
+          const detail = error instanceof Error ? error.message : String(error);
+          invalid.push(`${markerPath} (${detail})`);
+        }
+      }
+    }
+    return { records, invalid };
+  }
+
+  private assertNoDurableOperatorStopBarrier(taskId: string): void {
+    const barriers = this.readOperatorStopBarriers();
+    if (barriers.invalid.length > 0) {
+      throw new Error(
+        `Cannot start ${taskId}: invalid operator-stop recovery evidence must be resolved manually: ` +
+          barriers.invalid.join("; "),
+      );
+    }
+    const sharedRoot = normalizeExecutionRoot(canonicalizePotentialPathSync(this.projectRoot));
+    const expectedWorktree = normalizeExecutionRoot(
+      canonicalizePotentialPathSync(path.join(this.managedWorktreesRoot(), taskId)),
+    );
+    const blocking = barriers.records.find((record) => {
+      const recordRoot = normalizeExecutionRoot(record.executionRoot);
+      return (
+        record.taskId === taskId || recordRoot === sharedRoot || recordRoot === expectedWorktree
+      );
+    });
+    if (blocking) {
+      throw new Error(
+        `Cannot start ${taskId}: operator-stop cleanup remains unconfirmed for ` +
+          `${blocking.taskId} at ${blocking.executionRoot}. Verify process/container absence and ` +
+          `protected-path recovery, then explicitly clear ${blocking.markerPath}.`,
+      );
+    }
+  }
+
+  private managedWorktreeRecoverySkipReasons(taskId: string, worktreePath: string): string[] {
+    const reasons: string[] = [];
+    const job = this.jobs.get(taskId);
+    if (this.operatorStopCleanupPending.has(taskId) || job?.operatorStopCleanupPending === true) {
+      reasons.push("operator_stop_cleanup_pending");
+    }
+
+    const barriers = this.readOperatorStopBarriers();
+    if (barriers.invalid.length > 0) {
+      reasons.push("invalid_operator_stop_barrier");
+    } else {
+      try {
+        const sharedRoot = normalizeExecutionRoot(canonicalizePotentialPathSync(this.projectRoot));
+        const candidateRoot = normalizeExecutionRoot(canonicalizePotentialPathSync(worktreePath));
+        if (
+          barriers.records.some((record) => {
+            const recordRoot = normalizeExecutionRoot(record.executionRoot);
+            return (
+              record.taskId === taskId || recordRoot === sharedRoot || recordRoot === candidateRoot
+            );
+          })
+        ) {
+          reasons.push("operator_stop_barrier");
+        }
+      } catch {
+        reasons.push("recovery_state_unverifiable");
+      }
+    }
+
+    try {
+      this.assertNoOrphanedQuarantineBeforeWorktreeMutation(taskId, worktreePath);
+    } catch {
+      reasons.push("denied_path_quarantine");
+    }
+
+    return [...new Set(reasons)];
   }
 
   private createJunction(targetPath: string, junctionPath: string): void {
@@ -1449,11 +2266,13 @@ export class DispatchManager {
     }
     const fullRef = `refs/heads/${branch}`;
     const git = (cwd: string, args: string[]): string =>
-      execFileSync("git", args, {
-        cwd,
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: 15_000,
+      runTrustedGitSync(args, cwd, {
+        timeoutMs: 15_000,
+        maxBuffer: 1024 * 1024,
+        trustedBoundaryRoot: this.projectRoot,
+        ...(this.trustedLocalReadRemotePaths
+          ? { trustedLocalReadRemotePaths: this.trustedLocalReadRemotePaths }
+          : {}),
       }).trim();
 
     if (options?.resume || options?.reuseWorktree) {
@@ -1589,10 +2408,8 @@ export class DispatchManager {
 
   private readRegisteredWorktreePaths(): Set<string> {
     try {
-      const output = execFileSync("git", ["worktree", "list", "--porcelain"], {
-        cwd: this.projectRoot,
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "ignore"],
+      const output = runTrustedGitSync(["worktree", "list", "--porcelain"], this.projectRoot, {
+        timeoutMs: 10_000,
       });
       const paths = output
         .split(/\r?\n/)
@@ -1670,6 +2487,9 @@ export class DispatchManager {
         if ((kind === "hermes" || kind === "claude") && branchName) {
           skipReasons.push("active_git_branch");
         }
+        for (const reason of this.managedWorktreeRecoverySkipReasons(taskId, worktreePath)) {
+          if (!skipReasons.includes(reason)) skipReasons.push(reason);
+        }
         const pruneEligible = skipReasons.length === 0;
 
         records.push({
@@ -1724,13 +2544,39 @@ export class DispatchManager {
     if (!dryRun) {
       for (const record of candidates) {
         try {
-          this.assertWorktreeHasNoLiveSurvivor(record.taskId, record.path);
-          this.cleanupDockerForWorktree(record.path);
+          const recoveryReasons = this.managedWorktreeRecoverySkipReasons(
+            record.taskId,
+            record.path,
+          );
+          if (recoveryReasons.length > 0) {
+            record.skipReasons.push(...recoveryReasons);
+            record.skipReasons = [...new Set(record.skipReasons)];
+            record.pruneEligible = false;
+            continue;
+          }
+          if (!this.cleanupDockerForWorktree(record.path)) {
+            record.skipReasons.push("docker_cleanup_unverified");
+            record.pruneEligible = false;
+            continue;
+          }
+          // Cleanup and deletion are synchronous within one monitor, but a
+          // second monitor may have written recovery evidence while Docker was
+          // being inspected. Re-read the durable fences immediately before
+          // the destructive worktree operation.
+          const postDockerRecoveryReasons = this.managedWorktreeRecoverySkipReasons(
+            record.taskId,
+            record.path,
+          );
+          if (postDockerRecoveryReasons.length > 0) {
+            record.skipReasons.push(...postDockerRecoveryReasons);
+            record.skipReasons = [...new Set(record.skipReasons)];
+            record.pruneEligible = false;
+            continue;
+          }
           this.unlinkJunctions(record.path);
           if (record.registered) {
-            execFileSync("git", ["worktree", "remove", record.path, "--force"], {
-              cwd: this.projectRoot,
-              stdio: ["ignore", "ignore", "ignore"],
+            runTrustedGitSync(["worktree", "remove", "--force", record.path], this.projectRoot, {
+              timeoutMs: 30_000,
             });
           } else if (this.isolationConfig?.method !== "docker") {
             fs.rmSync(record.path, { recursive: true, force: true });
@@ -1744,10 +2590,7 @@ export class DispatchManager {
         }
       }
       try {
-        execFileSync("git", ["worktree", "prune"], {
-          cwd: this.projectRoot,
-          stdio: ["ignore", "ignore", "ignore"],
-        });
+        runTrustedGitSync(["worktree", "prune"], this.projectRoot, { timeoutMs: 30_000 });
       } catch {
         // Best effort only.
       }
@@ -1772,6 +2615,17 @@ export class DispatchManager {
    */
   setEventCallback(cb: DispatchEventCallback): void {
     this.onEvent = cb;
+  }
+
+  /** Permanently close dispatch admission before terminal server draining. */
+  beginTerminalDrain(): void {
+    this.terminalDrainStarted = true;
+  }
+
+  private assertDispatchAdmissionOpen(): void {
+    if (this.terminalDrainStarted) {
+      throw new Error("Dispatch admission is closed because the monitor is shutting down.");
+    }
   }
 
   /**
@@ -2023,9 +2877,16 @@ export class DispatchManager {
    */
   private createWorktree(
     taskId: string,
-    ownershipId?: string,
-    linkRuntimeDirectories = true,
+    options?: {
+      preserveTaskBranch?: boolean;
+      ownershipId?: string;
+      linkRuntimeDirectories?: boolean;
+    },
   ): string | undefined {
+    const ownershipId = options?.ownershipId;
+    const linkRuntimeDirectories = options?.linkRuntimeDirectories ?? true;
+    const { baseBranch, staleBranch, configuredProtected } =
+      this.readWorktreeGitConfiguration(taskId);
     const worktreeBase = path.join(this.projectRoot, ".quack", "worktrees");
     const worktreePath = path.join(worktreeBase, taskId);
 
@@ -2035,6 +2896,12 @@ export class DispatchManager {
     this.assertWorktreeHasNoLiveSurvivor(taskId, worktreePath, ownershipId);
 
     try {
+      // This check is intentionally durable rather than relying on the
+      // in-memory stop barrier. After a monitor restart, createWorktree()
+      // would otherwise delete the exact stale worktree whose sibling still
+      // holds its denied-path originals. Fully validated quarantines for a
+      // different sibling worktree are the only candidates safe to ignore.
+      this.assertNoOrphanedQuarantineBeforeWorktreeMutation(taskId, worktreePath);
       fs.mkdirSync(worktreeBase, { recursive: true });
 
       // Clean up stale worktree from a previous failed run.
@@ -2054,9 +2921,8 @@ export class DispatchManager {
             // ignore — best effort
           }
           try {
-            execSync("git worktree prune", {
-              cwd: this.projectRoot,
-              stdio: "ignore",
+            runTrustedGitSync(["worktree", "prune"], this.projectRoot, {
+              timeoutMs: 30_000,
             });
           } catch {
             // ignore prune failures
@@ -2068,36 +2934,28 @@ export class DispatchManager {
       // When a dispatch is killed or fails, the branch retains stale commits.
       // createWorktree() is only called for fresh dispatches (not revision/resume),
       // so deleting the branch here ensures the dispatcher creates a clean one.
-      // We read the git config from adapter.json to construct the branch name
-      // and choose the canonical remote base for the worktree.
-      let branchPrefix = "quack/";
-      let baseBranch = "main";
-      let configuredProtected: string[] | undefined;
-      try {
-        const adapterPath = path.join(this.projectRoot, ".quack", "adapter.json");
-        if (fs.existsSync(adapterPath)) {
-          const adapterJson = JSON.parse(fs.readFileSync(adapterPath, "utf-8")) as {
-            git?: {
-              baseBranch?: string;
-              branchPrefix?: string;
-              protectedBranches?: string[];
-            };
-          };
-          branchPrefix = adapterJson?.git?.branchPrefix ?? "quack/";
-          baseBranch = adapterJson?.git?.baseBranch ?? "main";
-          configuredProtected = adapterJson?.git?.protectedBranches;
-        }
-      } catch {
-        // Use defaults on parse failure
-      }
-      const staleBranch = `${branchPrefix}${taskId}`;
+      // Adapter branch inputs were validated before any worktree mutation.
       // Centralized deletion guard (TASK-1312): this raw `branch -D` is one
       // of the four deletion sites and must never touch a protected branch.
       const protectedSet = [
         ...new Set([...(configuredProtected ?? DEFAULT_PROTECTED_BRANCHES), baseBranch]),
       ];
       const staleGuard = assertBranchDeletionAllowed(staleBranch, protectedSet);
-      if (!staleGuard.allowed) {
+      if (options?.preserveTaskBranch) {
+        try {
+          runTrustedGitSync(
+            ["show-ref", "--verify", "--quiet", `refs/heads/${staleBranch}`],
+            this.projectRoot,
+            {
+              timeoutMs: 10_000,
+            },
+          );
+        } catch {
+          throw new Error(
+            `Cannot resume ${taskId}: preserved branch ${staleBranch} does not exist`,
+          );
+        }
+      } else if (!staleGuard.allowed) {
         console.warn(
           `[dispatch] ${staleGuard.reason ?? "protected branch"} — skipping stale-branch cleanup`,
         );
@@ -2108,14 +2966,14 @@ export class DispatchManager {
         });
       } else {
         try {
-          execSync(`git rev-parse --verify ${staleBranch}`, {
-            cwd: this.projectRoot,
-            stdio: "pipe",
-          });
+          runTrustedGitSync(
+            ["show-ref", "--verify", "--quiet", `refs/heads/${staleBranch}`],
+            this.projectRoot,
+            { timeoutMs: 10_000 },
+          );
           // Branch exists — delete it so the dispatcher creates a fresh one
-          execSync(`git branch -D ${staleBranch}`, {
-            cwd: this.projectRoot,
-            stdio: "pipe",
+          runTrustedGitSync(["branch", "-D", "--", staleBranch], this.projectRoot, {
+            timeoutMs: 10_000,
           });
           console.log(`[dispatch] Deleted stale branch ${staleBranch} for clean re-dispatch`);
         } catch {
@@ -2123,27 +2981,45 @@ export class DispatchManager {
         }
       }
 
-      const baseRef = `origin/${baseBranch}`;
+      const baseRef = `refs/remotes/origin/${baseBranch}`;
       try {
-        execSync(`git fetch origin ${baseBranch}:refs/remotes/origin/${baseBranch}`, {
-          cwd: this.projectRoot,
-          stdio: "pipe",
-        });
-        execSync(`git rev-parse --verify ${baseRef}`, {
-          cwd: this.projectRoot,
-          stdio: "pipe",
+        runTrustedGitSync(
+          ["fetch", "origin", `refs/heads/${baseBranch}:${baseRef}`],
+          this.projectRoot,
+          {
+            timeoutMs: 60_000,
+            ...(this.trustedLocalReadRemotePaths
+              ? { trustedLocalReadRemotePaths: this.trustedLocalReadRemotePaths }
+              : {}),
+          },
+        );
+        runTrustedGitSync(["show-ref", "--verify", "--quiet", baseRef], this.projectRoot, {
+          timeoutMs: 10_000,
         });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         throw new Error(`Failed to refresh ${baseRef} before worktree creation: ${msg}`);
       }
 
-      // Create detached worktree from the freshly fetched remote base. Detached
-      // avoids conflicts with branches already checked out in the main worktree.
-      execSync(`git worktree add --detach "${worktreePath}" ${baseRef}`, {
-        cwd: this.projectRoot,
-        encoding: "utf-8",
-      });
+      // Fresh runs start detached from the remote base so the dispatcher can
+      // create a clean task branch. Resume runs must instead restore the
+      // preserved task branch before the dispatcher skips its completed branch
+      // stage; otherwise later stages review the untouched base checkout.
+      // A short, validated local branch name makes `git worktree add` attach
+      // HEAD to that branch. Passing refs/heads/<name> is interpreted as a
+      // generic commit-ish and silently creates a detached worktree.
+      const worktreeRef = options?.preserveTaskBranch ? staleBranch : baseRef;
+      runTrustedGitSync(
+        [
+          "worktree",
+          "add",
+          ...(options?.preserveTaskBranch ? [] : ["--detach"]),
+          worktreePath,
+          worktreeRef,
+        ],
+        this.projectRoot,
+        { timeoutMs: 60_000, errorContext: `Failed to create worktree for ${taskId}` },
+      );
 
       // Create junctions for gitignored .quack subdirectories so that
       // events written in the worktree reach the monitor's log watcher.
@@ -2173,13 +3049,12 @@ export class DispatchManager {
 
       this.ensureWorktreeAdapterFreshness(worktreePath);
 
-      // Symlink frontend/node_modules into the worktree so that
-      // `npm run build:frontend` succeeds without a full npm install.
-      // frontend/node_modules is gitignored and not materialized by
-      // `git worktree add` — this is the root cause of TASK-891 post-judge
-      // build failures (Pattern 44). Non-fatal: if the source doesn't exist
-      // yet (fresh clone), logs a warning and skips.
-      prepareWorktreeFrontendDeps(worktreePath, this.projectRoot, taskId);
+      // Legacy adapters that explicitly disable initialization can reuse the
+      // parent's frontend dependencies. Initialization-owned or guard-protected
+      // dependency trees must stay real and isolated inside the worktree.
+      if (this.sharedFrontendDependenciesAllowed()) {
+        prepareWorktreeFrontendDeps(worktreePath, this.projectRoot, taskId);
+      }
 
       if (this.worktreeDegraded) {
         console.log("[dispatch] Worktree isolation recovered; parallel dispatch re-enabled.");
@@ -2187,6 +3062,15 @@ export class DispatchManager {
       this.worktreeDegraded = false;
       return worktreePath;
     } catch (err) {
+      // A quarantine refusal is not a worktree-creation failure and must
+      // never enter the fallback cleanup below: that cleanup is exactly the
+      // destructive operation this preflight exists to prevent.
+      if (
+        err instanceof OrphanedQuarantineRefusalError ||
+        err instanceof InvalidDispatchGitReferenceError
+      ) {
+        throw err;
+      }
       // Worktree creation failed — set degraded flag and emit event
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[dispatch] Worktree creation failed for ${taskId}: ${msg}`);
@@ -2207,15 +3091,70 @@ export class DispatchManager {
           this.unlinkJunctions(worktreePath);
           fs.rmSync(worktreePath, { recursive: true, force: true });
         }
-        execSync("git worktree prune", {
-          cwd: this.projectRoot,
-          stdio: "ignore",
+        runTrustedGitSync(["worktree", "prune"], this.projectRoot, {
+          timeoutMs: 30_000,
         });
       } catch {
         // ignore cleanup failures
       }
 
       return undefined;
+    }
+  }
+
+  private assertNoOrphanedQuarantineBeforeWorktreeMutation(
+    taskId: string,
+    worktreePath: string,
+  ): void {
+    let canonicalWorktreePath: string;
+    try {
+      canonicalWorktreePath = canonicalizePotentialPathSync(worktreePath);
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new OrphanedQuarantineRefusalError(
+        `Cannot safely start ${taskId}: unable to canonicalize execution root ${worktreePath} (${detail}).`,
+      );
+    }
+    const worktreeParent = path.dirname(canonicalWorktreePath);
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(worktreeParent, { withFileTypes: true });
+    } catch (error: unknown) {
+      const code =
+        typeof error === "object" && error !== null && "code" in error
+          ? String((error as { code?: unknown }).code)
+          : "";
+      if (code === "ENOENT") return;
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new OrphanedQuarantineRefusalError(
+        `Cannot safely start ${taskId}: unable to inspect the worktree quarantine directory ` +
+          `${worktreeParent} (${detail}).`,
+      );
+    }
+
+    const blocking: string[] = [];
+    for (const entry of entries) {
+      if (!CODEX_DENIED_QUARANTINE_DIRECTORY.test(entry.name)) continue;
+      const quarantineRoot = path.join(worktreeParent, entry.name);
+      if (!entry.isDirectory()) {
+        blocking.push(`${quarantineRoot} (prefixed entry is not a directory)`);
+        continue;
+      }
+      const inspection = inspectCodexDeniedPathQuarantineSync(
+        canonicalWorktreePath,
+        quarantineRoot,
+      );
+      if (inspection.status !== "other_project") {
+        blocking.push(`${quarantineRoot} (${inspection.reason ?? inspection.status})`);
+      }
+    }
+
+    if (blocking.length > 0) {
+      throw new OrphanedQuarantineRefusalError(
+        `Cannot safely start ${taskId}: unresolved Codex denied-path quarantine evidence ` +
+          `must be recovered or explicitly preserved before this execution root can be reused: ` +
+          blocking.join("; "),
+      );
     }
   }
 
@@ -2226,15 +3165,20 @@ export class DispatchManager {
    * worktrees may contain hostile links and are preserved if Git cannot remove
    * them without traversing descendants.
    */
-  private removeWorktree(worktreePath: string): void {
+  private removeWorktree(worktreePath: string): boolean {
     const dockerCleanup = this.shouldCleanupDockerForWorktree();
+    if (dockerCleanup && !this.cleanupDockerForWorktree(worktreePath)) {
+      console.error(`[dispatch] Preserving ${worktreePath}: Docker cleanup could not be confirmed`);
+      return false;
+    }
     this.unlinkJunctions(worktreePath);
-    // Use worktree-lifecycle as single entry point for docker cleanup + git remove
+    // Docker absence was already proved above, before changing any worktree
+    // evidence. The lifecycle helper now performs only the Git removal.
     lifecycleRemoveWorktree(
       worktreePath,
       this.getTaskIdFromPath(worktreePath),
       this.projectRoot,
-      dockerCleanup,
+      false,
     );
     // Fallback: if git worktree remove failed, try direct filesystem removal
     if (fs.existsSync(worktreePath) && this.isolationConfig?.method !== "docker") {
@@ -2244,14 +3188,14 @@ export class DispatchManager {
         // ignore — best effort
       }
       try {
-        execSync("git worktree prune", {
-          cwd: this.projectRoot,
-          stdio: "ignore",
+        runTrustedGitSync(["worktree", "prune"], this.projectRoot, {
+          timeoutMs: 30_000,
         });
       } catch {
         // ignore prune failures
       }
     }
+    return !fs.existsSync(worktreePath);
   }
 
   /**
@@ -2862,10 +3806,8 @@ export class DispatchManager {
   private refreshMainWorkingTree(): void {
     try {
       // Pull the latest commits that were pushed from the worktree
-      execSync("git pull --ff-only", {
-        cwd: this.projectRoot,
-        stdio: "ignore",
-        timeout: 15_000,
+      runTrustedGitSync(["pull", "--ff-only"], this.projectRoot, {
+        timeoutMs: 15_000,
       });
     } catch {
       // Pull may fail if no remote configured or conflicts — that's ok,
@@ -2873,10 +3815,8 @@ export class DispatchManager {
     }
 
     try {
-      execSync("git checkout HEAD -- .", {
-        cwd: this.projectRoot,
-        stdio: "ignore",
-        timeout: 15_000,
+      runTrustedGitSync(["checkout", "HEAD", "--", "."], this.projectRoot, {
+        timeoutMs: 15_000,
       });
     } catch {
       // Best-effort — don't fail the job over a refresh failure
@@ -2886,11 +3826,9 @@ export class DispatchManager {
   private gitOutput(cwd: string | undefined, args: string[]): string | undefined {
     if (!cwd) return undefined;
     try {
-      return execFileSync("git", args, {
-        cwd,
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 10_000,
+      return runTrustedGitSync(args, cwd, {
+        timeoutMs: 10_000,
+        trustedBoundaryRoot: this.projectRoot,
       }).trim();
     } catch {
       return undefined;
@@ -2906,16 +3844,27 @@ export class DispatchManager {
   }
 
   private captureGitMetadata(job: DispatchJob, worktreePath?: string): void {
-    const branchName =
+    let branchName =
       job.branchName ??
       this.gitOutput(worktreePath, ["branch", "--show-current"]) ??
       this.inferBranchNameFromOutput(job);
+    if (branchName) {
+      try {
+        this.assertValidGitBranchName(branchName, "captured branch");
+      } catch {
+        branchName = undefined;
+      }
+    }
 
     const commitSha =
       job.commitSha ??
       this.gitOutput(worktreePath, ["rev-parse", "HEAD"]) ??
       (branchName
-        ? this.gitOutput(this.projectRoot, ["rev-parse", "--verify", branchName])
+        ? this.gitOutput(this.projectRoot, [
+            "rev-parse",
+            "--verify",
+            `refs/heads/${branchName}^{commit}`,
+          ])
         : undefined);
 
     if (branchName) job.branchName = branchName;
@@ -2934,6 +3883,320 @@ export class DispatchManager {
           : "";
       return code === "EPERM" ? true : false;
     }
+  }
+
+  /**
+   * Stop a worktree dispatch as one process tree. Windows worktree children
+   * run in a non-breakaway Job Object whose stop controller proves zero active
+   * processes. POSIX worktree children use a dedicated process group and are
+   * confirmed stopped only after that owned group no longer exists.
+   */
+  private terminateOperatorProcessTree(
+    child: ChildProcess,
+    launch?: TrustedNodeLaunch,
+  ): {
+    confirmed: boolean;
+    processGroupId?: number;
+    warning?: string;
+  } {
+    const pid = child.pid;
+    if (!pid || pid <= 0) {
+      child.kill("SIGKILL");
+      return {
+        confirmed: false,
+        warning: "child pid was unavailable; descendant termination could not be confirmed",
+      };
+    }
+
+    if (process.platform === "win32") {
+      if (!launch?.windowsJob) {
+        child.kill("SIGKILL");
+        return {
+          confirmed: false,
+          warning: "the dispatch has no Windows Job Object; descendant termination is unconfirmed",
+        };
+      }
+      const result = terminateWindowsNodeJob(launch.windowsJob);
+      if (!result.confirmed && confirmWindowsNodeLaunchAlreadyExited(launch)) {
+        return {
+          confirmed: true,
+          warning:
+            "the dispatch completed while stop was opening its Job Object; trusted exit evidence proves the wrapper and payload are absent",
+        };
+      }
+      if (!result.confirmed) child.kill("SIGKILL");
+      return result;
+    }
+
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch (err: unknown) {
+      const code =
+        typeof err === "object" && err && "code" in err
+          ? String((err as { code?: unknown }).code)
+          : "";
+      if (code === "ESRCH") return { confirmed: true, processGroupId: pid };
+      child.kill("SIGKILL");
+      const detail = err instanceof Error ? err.message : String(err);
+      return {
+        confirmed: false,
+        processGroupId: pid,
+        warning: `process-group termination failed; descendant termination is unconfirmed (${detail})`,
+      };
+    }
+
+    if (this.posixProcessGroupIsAbsent(pid)) return { confirmed: true, processGroupId: pid };
+    return {
+      confirmed: false,
+      processGroupId: pid,
+      warning: "POSIX process group termination is awaiting child close confirmation",
+    };
+  }
+
+  private posixProcessGroupIsAbsent(processGroupId: number): boolean {
+    try {
+      process.kill(-processGroupId, 0);
+      return false;
+    } catch (error: unknown) {
+      const code =
+        typeof error === "object" && error !== null && "code" in error
+          ? String((error as { code?: unknown }).code)
+          : "";
+      return code === "ESRCH";
+    }
+  }
+
+  private retryPendingOperatorStop(job: DispatchJob): boolean {
+    if (!job.operatorStopTreeTerminated) {
+      const child = this.processes.get(job.taskId);
+      if (child) {
+        const termination = this.terminateOperatorProcessTree(
+          child,
+          this.nodeLaunches.get(job.taskId),
+        );
+        job.operatorStopTreeTerminated = termination.confirmed;
+        job.operatorStopProcessGroupId = termination.processGroupId;
+        if (termination.warning) {
+          job.output.push(`[dispatch] Operator-stop termination warning: ${termination.warning}`);
+        }
+      } else if (
+        process.platform !== "win32" &&
+        job.operatorStopProcessGroupId !== undefined &&
+        this.posixProcessGroupIsAbsent(job.operatorStopProcessGroupId)
+      ) {
+        job.operatorStopTreeTerminated = true;
+      }
+    }
+
+    if (!job.operatorStopTreeTerminated) return false;
+    if (!this.processes.has(job.taskId)) {
+      const recovery = this.completeOperatorStopRecovery(job)
+        .then(() => undefined)
+        .catch((error: unknown) => {
+          const detail = error instanceof Error ? error.message : String(error);
+          this.quarantineRecoveryWarning(job, `operator-stop recovery retry failed (${detail})`);
+        });
+      this.trackExitHandler(recovery, job);
+    }
+    return true;
+  }
+
+  private quarantineRecoveryWarning(job: DispatchJob, message: string): void {
+    const line = `[quarantine] Recovery warning: ${message}; evidence preserved`;
+    job.output.push(line);
+    console.warn(`[dispatch] ${job.taskId}: ${line}`);
+  }
+
+  /**
+   * Recover only exact quarantine siblings of this exact worktree. The
+   * recovery helper independently validates the canonical root and complete
+   * manifest before changing either the worktree or the evidence directory.
+   */
+  private async recoverStoppedWorktreeQuarantines(
+    job: DispatchJob,
+    executionRoot: string,
+  ): Promise<{ safeToRestart: boolean }> {
+    let canonicalExecutionRoot: string;
+    try {
+      canonicalExecutionRoot = canonicalizePotentialPathSync(executionRoot);
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.quarantineRecoveryWarning(
+        job,
+        `could not canonicalize exact execution root ${executionRoot} (${detail})`,
+      );
+      return { safeToRestart: false };
+    }
+    const worktreeParent = path.dirname(canonicalExecutionRoot);
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(worktreeParent, { withFileTypes: true });
+    } catch (err: unknown) {
+      const detail = err instanceof Error ? err.message : String(err);
+      this.quarantineRecoveryWarning(
+        job,
+        `could not scan exact worktree parent ${worktreeParent} (${detail})`,
+      );
+      return { safeToRestart: false };
+    }
+
+    const validForProject: string[] = [];
+    let invalidForProject = false;
+    for (const entry of entries) {
+      if (!CODEX_DENIED_QUARANTINE_DIRECTORY.test(entry.name)) continue;
+      const quarantineRoot = path.join(worktreeParent, entry.name);
+      if (!entry.isDirectory()) {
+        invalidForProject = true;
+        this.quarantineRecoveryWarning(
+          job,
+          `${quarantineRoot} has the quarantine prefix but is not a directory`,
+        );
+        continue;
+      }
+
+      const inspection = await inspectCodexDeniedPathQuarantine(
+        canonicalExecutionRoot,
+        quarantineRoot,
+      );
+      if (inspection.status === "valid_for_project") {
+        validForProject.push(quarantineRoot);
+      } else if (inspection.status === "other_project") {
+        this.quarantineRecoveryWarning(
+          job,
+          `${quarantineRoot} belongs to another project${
+            inspection.projectRoot ? ` (${inspection.projectRoot})` : ""
+          }`,
+        );
+      } else {
+        invalidForProject = true;
+        this.quarantineRecoveryWarning(
+          job,
+          `${quarantineRoot} could not be safely attributed or validated (${inspection.reason ?? "unknown manifest error"})`,
+        );
+      }
+    }
+
+    if (validForProject.length > 1) {
+      this.quarantineRecoveryWarning(
+        job,
+        `multiple valid quarantines target ${canonicalExecutionRoot}: ${validForProject.join(", ")}. ` +
+          "Resolve the generations manually before retrying the task",
+      );
+      return { safeToRestart: false };
+    }
+
+    // A malformed or unattributable sibling may be a damaged generation for
+    // this exact worktree. Do not mutate the one valid generation while that
+    // ambiguity exists: doing so could restore the wrong bytes and destroy the
+    // only usable evidence for the real generation.
+    if (invalidForProject) {
+      this.quarantineRecoveryWarning(
+        job,
+        `ambiguous quarantine evidence targets ${canonicalExecutionRoot}; no generation was recovered`,
+      );
+      return { safeToRestart: false };
+    }
+
+    if (validForProject.length === 1) {
+      const quarantineRoot = validForProject[0];
+      try {
+        const result = await recoverCodexDeniedPathQuarantine(
+          canonicalExecutionRoot,
+          quarantineRoot,
+          { reclaimRecoveryLockForPid: job.pid },
+        );
+        job.output.push(
+          `[quarantine] Recovered ${quarantineRoot}; restored protected bytes` +
+            ` and removed ${result.violations.length} replacement ` +
+            `entr${result.violations.length === 1 ? "y" : "ies"}`,
+        );
+      } catch (err: unknown) {
+        const detail = err instanceof Error ? err.message : String(err);
+        this.quarantineRecoveryWarning(
+          job,
+          `${quarantineRoot} recovery failed (${detail}). ` +
+            "Inspect this path and recover it before retrying the task",
+        );
+        return { safeToRestart: false };
+      }
+    }
+
+    return { safeToRestart: true };
+  }
+
+  private completeOperatorStopRecovery(job: DispatchJob): Promise<boolean> {
+    const existing = this.operatorStopRecoveryInFlight.get(job.taskId);
+    if (existing) return existing;
+
+    const recovery = (async (): Promise<boolean> => {
+      if (this.jobs.get(job.taskId) !== job || !job.operatorStopTreeTerminated) return false;
+      if (!job.executionRoot) {
+        this.quarantineRecoveryWarning(job, "the dispatch execution root is unavailable");
+        return false;
+      }
+
+      let sharedExecutionRoot = false;
+      try {
+        sharedExecutionRoot = pathsEqualForDispatch(
+          canonicalizePotentialPathSync(job.executionRoot),
+          canonicalizePotentialPathSync(this.projectRoot),
+        );
+      } catch (error: unknown) {
+        const detail = error instanceof Error ? error.message : String(error);
+        this.quarantineRecoveryWarning(
+          job,
+          `the dispatch execution root could not be canonicalized (${detail})`,
+        );
+        return false;
+      }
+
+      if (sharedExecutionRoot) {
+        this.quarantineRecoveryWarning(
+          job,
+          "the stopped run used the shared project directory; container and protected-path state require explicit manual verification",
+        );
+        return false;
+      }
+      if (!this.cleanupDockerForWorktree(job.executionRoot)) {
+        this.quarantineRecoveryWarning(
+          job,
+          "worktree container cleanup was disabled or could not be confirmed",
+        );
+        return false;
+      }
+
+      const quarantineRecovery = await this.recoverStoppedWorktreeQuarantines(
+        job,
+        job.executionRoot,
+      );
+      if (!quarantineRecovery.safeToRestart) return false;
+      if (job.worktreePath && fs.existsSync(job.worktreePath)) {
+        this.captureGitMetadata(job, job.worktreePath);
+      }
+      if (job.worktreePath && !this.clearWorktreeSurvivor(job, true)) {
+        this.quarantineRecoveryWarning(
+          job,
+          "durable worktree ownership changed before it could be released",
+        );
+        return false;
+      }
+      if (!this.clearOperatorStopBarrier(job)) return false;
+
+      if (this.operatorStopCleanupPending.get(job.taskId) === job) {
+        this.operatorStopCleanupPending.delete(job.taskId);
+      }
+      job.operatorStopCleanupPending = false;
+      job.output.push("[dispatch] Operator-stop cleanup complete; task may be started again.");
+      return true;
+    })();
+    this.operatorStopRecoveryInFlight.set(job.taskId, recovery);
+    const clearRecovery = (): void => {
+      if (this.operatorStopRecoveryInFlight.get(job.taskId) === recovery) {
+        this.operatorStopRecoveryInFlight.delete(job.taskId);
+      }
+    };
+    void recovery.then(clearRecovery, clearRecovery);
+    return recovery;
   }
 
   private reconcileRunningJobs(): void {
@@ -3022,16 +4285,38 @@ export class DispatchManager {
     options?: StartOptions,
     claimantCheck?: DuplicateClaimantCheck,
   ): DispatchJob {
-    if (this.shutdownInProgress) {
-      throw new Error(`Cannot start ${taskId}: dispatch manager shutdown is in progress.`);
+    this.assertDispatchAdmissionOpen();
+    if (this.approvalPauseResolutions.has(taskId)) {
+      throw new Error(`Cannot start ${taskId}: an approval decision is being persisted.`);
     }
+    const sharedRoot = normalizeExecutionRoot(this.projectRoot);
+    if (this.operatorStopCleanupPending.has(taskId)) {
+      throw new Error(
+        `Task ${taskId} is still completing operator-stop cleanup; retry after cleanup finishes.`,
+      );
+    }
+    const sharedCleanup = [...this.operatorStopCleanupPending.values()].find(
+      (pendingJob) =>
+        pendingJob.executionRoot !== undefined &&
+        normalizeExecutionRoot(pendingJob.executionRoot) === sharedRoot,
+    );
+    if (sharedCleanup) {
+      throw new Error(
+        `Cannot start ${taskId}: ${sharedCleanup.taskId} still has unconfirmed cleanup in the ` +
+          "shared project directory. Resolve its preserved quarantine/process evidence first.",
+      );
+    }
+    this.assertNoDurableOperatorStopBarrier(taskId);
     // Prevent double-dispatch
     const existing = this.getActiveJob(taskId);
     let deleteAwaitingApproval = false;
     if (existing) {
       // Allow resume of tasks awaiting judge approval — the worktree has
       // agent commits that must be preserved for the post-judge session.
-      if (existing.status === "awaiting_approval" && options?.resume) {
+      if (
+        existing.status === "awaiting_approval" &&
+        (options?.resume || options?.replaceArchivedJudgeRun || options?.overridePausedRun)
+      ) {
         deleteAwaitingApproval = true;
       } else if (existing.status === "awaiting_approval") {
         // QPI-045 addendum: this covers BOTH gates (blueprint pend since
@@ -3142,9 +4427,8 @@ export class DispatchManager {
     if (recoverSharedCheckout && options?.resume !== true && options?.overridePausedRun !== true) {
       throw new DegradedSharedCheckoutBusyError(taskId, [{ taskId, status: durableSharedStatus }]);
     }
-    if (deleteAwaitingApproval) {
-      this.jobs.delete(taskId);
-    }
+
+    assertUncontestedClaimant(claimantCheck ?? options?.duplicateClaimantCheck);
 
     if (paused) {
       // Fail-closed by design: archivePausedRunState throws rather
@@ -3197,6 +4481,14 @@ export class DispatchManager {
       );
     }
 
+    // Release the in-memory guard only after the durable pause state has
+    // either been decided by a legitimate resume/recycle flow or archived by
+    // an explicit override. In particular, an archive failure must leave the
+    // awaiting_approval job visible and its worktree protected.
+    if (deleteAwaitingApproval) {
+      this.jobs.delete(taskId);
+    }
+
     // TASK-1323: no dispatch proceeds without provenance. Callers stamp
     // the real channel; this fallback only marks a path that forgot.
     const selectedDockerRuntime =
@@ -3243,7 +4535,8 @@ export class DispatchManager {
 
   /**
    * Start a task dispatch using git worktree isolation.
-   * Falls back to shared working directory if worktrees fail.
+   * Falls back to the shared working directory only for adapters that
+   * explicitly disable worktree initialization.
    */
   private startWorktree(
     taskId: string,
@@ -3297,30 +4590,38 @@ export class DispatchManager {
     recoverSharedCheckout = false,
     sharedCheckoutBaseline?: SharedCheckoutBaseline,
   ): DispatchJob {
+    this.assertDispatchAdmissionOpen();
     const sessionId = `quack-${taskId}-${randomUUID()}`;
+    // Validate the derived task branch even when an existing worktree is
+    // reused. Reuse/resume must never turn a protected branch into task state.
+    this.readWorktreeGitConfiguration(taskId);
     const expectedWorktreePath = path.join(this.projectRoot, ".quack", "worktrees", taskId);
+    // Run this before both fresh creation and reuse/resume. The latter does
+    // not call createWorktree() when the directory already exists, and a
+    // restarted monitor has no in-memory stop barrier to protect it.
+    this.assertNoOrphanedQuarantineBeforeWorktreeMutation(taskId, this.projectRoot);
+    this.assertNoOrphanedQuarantineBeforeWorktreeMutation(taskId, expectedWorktreePath);
     let worktreeOwnership = recoverSharedCheckout
       ? undefined
       : this.acquireWorktreeOwnership(taskId, sessionId, expectedWorktreePath);
     if (worktreeOwnership) this.pendingWorktreeOwnerships.set(taskId, worktreeOwnership);
+
     // Reuse existing worktree for revision or resume dispatches
     // (preserves prior branch + committed changes from stalled runs)
     let worktreePath: string | undefined;
+    let freshIsolatedWorktree = false;
     const shouldReuse = options?.reuseWorktree || options?.resume;
     if (recoverSharedCheckout) {
-      // The durable marker proves the paused run used projectRoot. Resume in
-      // that same checkout so its uncommitted work is not silently abandoned
-      // for a newly-created isolated worktree.
       worktreePath = undefined;
     } else if (shouldReuse) {
-      const existing = path.join(this.projectRoot, ".quack", "worktrees", taskId);
+      const existing = expectedWorktreePath;
       if (fs.existsSync(existing)) {
         this.assertWorktreeHasNoLiveSurvivor(taskId, existing, worktreeOwnership?.ownershipId);
         // Verify the worktree has commits from the prior run
         try {
-          const commits = execSync(`git -C "${existing}" log --oneline -10`, {
-            encoding: "utf-8",
-            timeout: 5000,
+          const commits = runTrustedGitSync(["log", "--oneline", "-10"], existing, {
+            timeoutMs: 5_000,
+            trustedBoundaryRoot: this.projectRoot,
           }).trim();
           const count = commits ? commits.split("\n").length : 0;
           console.log(
@@ -3331,10 +4632,23 @@ export class DispatchManager {
         }
         worktreePath = existing;
       } else {
-        worktreePath = this.createWorktree(taskId, worktreeOwnership?.ownershipId);
+        worktreePath = this.createWorktree(taskId, {
+          preserveTaskBranch: true,
+          ownershipId: worktreeOwnership?.ownershipId,
+        });
       }
     } else {
-      worktreePath = this.createWorktree(taskId, worktreeOwnership?.ownershipId);
+      worktreePath = this.createWorktree(taskId, {
+        ownershipId: worktreeOwnership?.ownershipId,
+      });
+      freshIsolatedWorktree = worktreePath !== undefined;
+    }
+    if (!worktreePath && this.worktreeInitializationActive()) {
+      throw new Error(
+        `Cannot dispatch ${taskId}: worktree isolation failed and dependency initialization ` +
+          "is active; refusing to run initialization in the shared project checkout. " +
+          "Repair worktree creation or explicitly set dispatch.worktreeInit to [] to opt out.",
+      );
     }
 
     // A monitor restart loses process-local jobs and the degraded flag. If
@@ -3394,14 +4708,12 @@ export class DispatchManager {
         this.gitOutput(this.projectRoot, ["rev-parse", "--is-inside-work-tree"]) === "true";
       if (isGitCheckout && (!originalBranch || originalStatus === undefined)) {
         throw new Error(
-          `Cannot dispatch ${taskId} in the shared checkout because its Git restoration baseline ` +
-            "could not be verified. Repair worktree isolation before retrying.",
+          `Cannot dispatch ${taskId} in the shared checkout because its Git restoration baseline could not be verified. Repair worktree isolation before retrying.`,
         );
       }
       if (originalStatus !== undefined && originalStatus.length > 0) {
         throw new Error(
-          `Cannot dispatch ${taskId} in the shared checkout because it was already dirty. ` +
-            "Restore a clean checkout or repair worktree isolation before retrying.",
+          `Cannot dispatch ${taskId} in the shared checkout because it was already dirty. Restore a clean checkout or repair worktree isolation before retrying.`,
         );
       }
     }
@@ -3422,7 +4734,22 @@ export class DispatchManager {
     if (options?.maxBudget) args.push("--max-budget", String(options.maxBudget));
 
     // Write judge feedback to a temp file if provided (for force-retry)
-    const childEnv: Record<string, string> = {};
+    const childEnv: Record<string, string> = {
+      [WORKTREE_INIT_FRESH_ENV]: freshIsolatedWorktree ? "1" : "0",
+    };
+    let decompositionAdmission: CreatedDecompositionDispatchAdmission | undefined;
+    if (this.trustedLocalReadRemotePaths?.length) {
+      // loadAdapter deliberately scopes operator authorization to one exact
+      // project root. A managed worktree is a distinct canonical root, so the
+      // child must receive a freshly bound envelope instead of inheriting the
+      // parent-root envelope (which correctly fails its exact-root check).
+      // The paths originated outside the repository and were already accepted
+      // by the trusted fetch that created this worktree.
+      childEnv[TRUSTED_LOCAL_READ_REMOTES_ENV] = JSON.stringify({
+        projectRoot: fs.realpathSync(workDir),
+        paths: [...this.trustedLocalReadRemotePaths],
+      });
+    }
     if (options?.judgeFeedback) {
       const feedbackDir = path.join(workDir, ".quack", "logs");
       fs.mkdirSync(feedbackDir, { recursive: true });
@@ -3439,18 +4766,9 @@ export class DispatchManager {
     if (options?.federatedLeaseId) childEnv.QUACK_FEDERATED_LEASE_ID = options.federatedLeaseId;
     if (options?.provenance) childEnv.QUACK_PROVENANCE = JSON.stringify(options.provenance);
 
-    // Select API key from key manager (if available)
-    if (this.keyManager) {
-      const selectedKey = this.keyManager.getNextKey();
-      if (!selectedKey) {
-        throw new Error("All API keys are rate-limited. Wait for cooldown to expire.");
-      }
-      const keyValue = this.keyManager.getKeyValue(selectedKey.id);
-      if (keyValue) {
-        childEnv.ANTHROPIC_API_KEY = keyValue;
-        childEnv.QUACK_SELECTED_KEY_ID = selectedKey.id; // Track which key was used
-      }
-    }
+    // The configured KeyManager is the authority for explicit API selection.
+    const selectedClaudeKey = this.keyManager ? selectClaudeApiKey(this.keyManager) : undefined;
+    if (selectedClaudeKey) childEnv.QUACK_SELECTED_KEY_ID = selectedClaudeKey.keyId;
 
     // Track which key was selected for this dispatch (for rate limit handling + per-key cost)
     const selectedKeyId = childEnv.QUACK_SELECTED_KEY_ID;
@@ -3463,6 +4781,7 @@ export class DispatchManager {
       status: "running",
       output: [],
       worktreePath,
+      executionRoot: workDir,
       keyId: selectedKeyId,
       sharedCheckoutOriginalBranch: originalBranch,
       sharedCheckoutOriginalStatus: originalStatus,
@@ -3485,47 +4804,70 @@ export class DispatchManager {
       this.persistSharedCheckoutPause(job, "running", recoverSharedCheckout);
     }
 
-    let child: ChildProcess;
+    let launch: TrustedNodeLaunch;
     try {
       // A task-level PID confirmation belongs to an older session. Clear it
       // before every new child, including isolated worktrees.
       if (process.platform === "win32") this.confirmedWindowsTreeKills.delete(taskId);
-      child = spawn("node", [this.quackBin, ...args], {
+      if (options?.admittedTaskContentHash) {
+        decompositionAdmission = createDecompositionDispatchAdmissionMarker({
+          projectRoot: workDir,
+          taskId,
+          contentHash: options.admittedTaskContentHash,
+        });
+        Object.assign(childEnv, decompositionAdmission.environment);
+      }
+      launch = spawnTrustedNode({
+        projectRoot: this.projectRoot,
+        scriptPath: this.quackBin,
+        args,
         cwd: workDir,
-        stdio: ["ignore", "pipe", "pipe"],
-        // A distinct POSIX process group lets shutdown terminate descendants,
-        // not only the Node wrapper. Windows uses taskkill /T below.
-        detached: process.platform !== "win32",
-        windowsHide: true,
-        env: {
-          ...process.env,
-          // Clear CLAUDECODE env var so the Agent SDK doesn't detect nesting
-          CLAUDECODE: undefined,
-          CLAUDE_CODE: undefined,
-          // This capability is injected only for a Docker child. Never let an
-          // inherited parent value redirect ordinary worktree control files.
-          QUACK_DOCKER_RUNTIME_LOG_DIR: undefined,
-          QUACK_DOCKER_EVENT_SESSION_ID: undefined,
-          QUACK_DOCKER_HOST_PROMOTION: undefined,
-          QUACK_DOCKER_ADMITTED_BRANCH: undefined,
-          QUACK_DOCKER_PARENT_TASK_ID: undefined,
-          QUACK_DOCKER_SHARED_BRANCH: undefined,
-          // Clear ANTHROPIC_API_KEY unless the key manager explicitly set one.
-          // When absent, the SDK CLI uses the Max subscription's OAuth auth
-          // instead of a potentially depleted API key from the parent env.
-          ...(childEnv.ANTHROPIC_API_KEY ? {} : { ANTHROPIC_API_KEY: undefined }),
-          ...childEnv,
-        },
+        env: buildClaudeChildEnvironment(
+          {
+            ...dispatchChildEnvironment(),
+            [TRUSTED_LOCAL_READ_REMOTES_ENV]: undefined,
+            // Clear CLAUDECODE env var so the Agent SDK doesn't detect nesting
+            CLAUDECODE: undefined,
+            CLAUDE_CODE: undefined,
+            // This capability is injected only for a Docker child. Never let an
+            // inherited parent value redirect ordinary worktree control files.
+            QUACK_DOCKER_RUNTIME_LOG_DIR: undefined,
+            QUACK_DOCKER_EVENT_SESSION_ID: undefined,
+            QUACK_DOCKER_HOST_PROMOTION: undefined,
+            QUACK_DOCKER_ADMITTED_BRANCH: undefined,
+            QUACK_DOCKER_PARENT_TASK_ID: undefined,
+            QUACK_DOCKER_SHARED_BRANCH: undefined,
+            ...childEnv,
+            // Host-generated identity, never inherited from the parent or task.
+            QUACK_MONITOR_EVENT_SESSION_ID: sessionId,
+          },
+          selectedClaudeKey,
+          true,
+        ),
       });
     } catch (error) {
       if (!worktreePath) {
         this.persistSharedCheckoutPause(job, "failed");
       }
+      if (decompositionAdmission) {
+        try {
+          revokeDecompositionDispatchAdmission(workDir, decompositionAdmission);
+        } catch (cleanupError) {
+          throw new AggregateError(
+            [error, cleanupError],
+            `Dispatch launch and decomposition admission revocation both failed for ${taskId}.`,
+            { cause: error },
+          );
+        }
+      }
       throw error;
     }
-    job.pid = child.pid ?? 0;
+    const child = launch.child;
+    this.trackChildClose(child, job);
+    job.pid = launch.processId;
     this.jobs.set(taskId, job);
     this.processes.set(taskId, child);
+    this.nodeLaunches.set(taskId, launch);
     if (worktreePath) {
       if (!this.updateWorktreeOwnership(job, "running", job.pid)) {
         throw new Error(
@@ -3553,17 +4895,45 @@ export class DispatchManager {
       );
     }
 
+    let admissionRevocationBarrierPersisted = false;
+    const revokeUnconsumedAdmission = (): void => {
+      if (!decompositionAdmission) return;
+      try {
+        revokeDecompositionDispatchAdmission(workDir, decompositionAdmission);
+        decompositionAdmission = undefined;
+        if (admissionRevocationBarrierPersisted && this.clearOperatorStopBarrier(job)) {
+          this.operatorStopCleanupPending.delete(taskId);
+          job.operatorStopCleanupPending = false;
+          job.operatorStopRequestedAt = undefined;
+          admissionRevocationBarrierPersisted = false;
+        }
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        job.output.push(
+          `[dispatch] Unconsumed decomposition admission could not be revoked (${detail}); ` +
+            "same-task restart remains blocked.",
+        );
+        job.operatorStopRequestedAt ??= new Date().toISOString();
+        job.operatorStopCleanupPending = true;
+        this.operatorStopCleanupPending.set(taskId, job);
+        admissionRevocationBarrierPersisted =
+          admissionRevocationBarrierPersisted || this.persistOperatorStopBarrier(job);
+      }
+    };
+
     this.captureProcessOutput(child, job);
 
     child.on("exit", (code, signal) => {
-      void (async () => {
-        let stopRequested = Boolean(job.stopRequestedAt) || this.shutdownInProgress;
+      const exitHandler = (async () => {
+        revokeUnconsumedAdmission();
+        const operatorStopRequested = Boolean(job.operatorStopRequestedAt);
+        let stopRequested = operatorStopRequested || this.shutdownInProgress;
         const lingeringTree = this.retainLingeringProcessGroup(taskId, child, job);
-        if (lingeringTree) {
-          stopRequested = true;
-        }
+        if (lingeringTree) stopRequested = true;
         this.clearStopEscalation(taskId);
-        job.exitCode = code ?? 1;
+        if (!operatorStopRequested) {
+          job.exitCode = code ?? 1;
+        }
         // QPI-043: the SIGNAL was being discarded. Node delivers
         // `(code, signal)`, and a process killed by a signal arrives as
         // `code: null, signal: "SIGKILL"`, so `code ?? 1` recorded a
@@ -3595,11 +4965,12 @@ export class DispatchManager {
             logDir: this.logDir,
             taskId,
             jobSessionId: sessionId,
+            exactSession: true,
             jobStartedAt: job.startedAt,
             exitCode: code,
             signal: signal ?? null,
             worktreePath: worktreePath ?? null,
-            isolation: worktreePath ? "worktree" : "shared-checkout",
+            operatorRequested: operatorStopRequested,
           });
           exitFactsDurable = true;
         } catch {
@@ -3613,20 +4984,61 @@ export class DispatchManager {
             signal: signal ?? null,
             killed: Boolean(signal),
             worktreePath: worktreePath ?? null,
-            isolation: worktreePath ? "worktree" : "shared-checkout",
+            operatorRequested: operatorStopRequested,
             at: new Date().toISOString(),
           });
         }
 
         if (signal) {
           job.killedBySignal = signal;
+        }
+        if (this.processes.get(taskId) === child) {
+          this.processes.delete(taskId);
+        }
+        if (this.nodeLaunches.get(taskId) === launch) {
+          this.nodeLaunches.delete(taskId);
+          cleanupTrustedNodeLaunch(launch);
+        }
+
+        // stop() records intent before sending SIGTERM. Keep that terminal
+        // state authoritative when Node delivers the later exit callback;
+        // this is an expected operator action, not a crash or an OOM signal.
+        if (operatorStopRequested) {
+          job.status = "stopped";
+          job.output.push(
+            `[dispatch] Operator-requested stop confirmed${signal ? ` (${signal})` : ""}.`,
+          );
+          if (
+            !job.operatorStopTreeTerminated &&
+            process.platform !== "win32" &&
+            job.operatorStopProcessGroupId !== undefined &&
+            this.posixProcessGroupIsAbsent(job.operatorStopProcessGroupId)
+          ) {
+            job.operatorStopTreeTerminated = true;
+          }
+          // The admission barrier below normally prevents a replacement here.
+          // Keep this identity check as defense in depth against direct state
+          // mutation or a future alternate start path.
+          if (this.jobs.get(taskId) === job) {
+            if (!job.operatorStopTreeTerminated) {
+              this.quarantineRecoveryWarning(
+                job,
+                "dispatch process-tree termination could not be confirmed",
+              );
+            } else {
+              await this.completeOperatorStopRecovery(job);
+            }
+          }
+          return;
+        }
+
+        if (signal) {
           job.output.push(
             `[dispatch] Child terminated by signal ${signal} (not a self-exit). ` +
               `If this is SIGKILL with no other output, suspect the OOM killer: ` +
               `check \`dmesg -T | grep -i "killed process"\` around ${new Date().toISOString()}.`,
           );
         }
-        this.processes.delete(taskId);
 
         // Detect a pending human gate: the subprocess exits non-zero when
         // it pauses for approval. Keep the job alive so the
@@ -3691,66 +5103,92 @@ export class DispatchManager {
 
           // Attempt re-dispatch with a different key if available
           if (this.keyManager.hasAvailableKeys()) {
-            const claimantCheck = this.claimantResolver
-              ? await this.claimantResolver(taskId)
-              : undefined;
-            // The resolver is asynchronous. Shutdown can begin while it is
-            // reading task files, after this exit handler captured its initial
-            // stopRequested value. Re-check before deleting recovery state or
-            // attempting a replacement child.
-            if (this.shutdownInProgress || job.stopRequestedAt) {
-              job.status = "stopped";
-              job.output.push(
-                "[key-rotation] Re-dispatch cancelled because shutdown is in progress; worktree preserved.",
-              );
-              this.preserveInterruptedSharedCheckout(job, "stopped");
-              return;
-            }
+            this.rateLimitRetryPending.add(taskId);
             try {
-              assertUncontestedClaimant(claimantCheck);
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              job.output.push(`[key-rotation] Re-dispatch refused: ${msg}`);
-              job.status = "failed";
-              this.jobs.set(taskId, job);
-              this.preserveInterruptedSharedCheckout(job, "failed");
-              return;
-            }
-            job.output.push(`[key-rotation] Re-dispatching ${taskId} with next available key`);
-            if (worktreePath) {
-              if (!this.clearWorktreeSurvivor(job)) {
-                job.status = "failed";
+              const claimantCheck = this.claimantResolver
+                ? await this.claimantResolver(taskId)
+                : undefined;
+              if (
+                this.shutdownInProgress ||
+                job.stopRequestedAt ||
+                job.operatorStopRequestedAt ||
+                this.jobs.get(taskId) !== job
+              ) {
+                job.status = "stopped";
                 job.output.push(
-                  "[key-rotation] Re-dispatch blocked because the prior worktree process tree is unconfirmed.",
+                  "[key-rotation] Re-dispatch cancelled because shutdown is in progress; worktree preserved.",
                 );
                 this.jobs.set(taskId, job);
                 return;
               }
-              this.removeWorktree(worktreePath);
-            }
-            try {
-              this.jobs.delete(taskId);
-              const retryOptions = {
-                ...options,
-                duplicateClaimantCheck: claimantCheck,
-              };
+              assertUncontestedClaimant(claimantCheck);
+              job.output.push(`[key-rotation] Re-dispatching ${taskId} with next available key`);
               if (worktreePath) {
-                this.start(taskId, retryOptions, claimantCheck);
-              } else {
-                // This is an internally authorized continuation of the same
-                // degraded run. Keep it in the shared checkout so partial
-                // files cannot be abandoned for a newly-created worktree.
-                this.startWorktree(taskId, retryOptions, true, {
-                  originalBranch: job.sharedCheckoutOriginalBranch,
-                  originalStatus: job.sharedCheckoutOriginalStatus,
-                });
+                if (!this.removeWorktree(worktreePath)) {
+                  job.output.push(
+                    `[worktree] Re-dispatch refused because cleanup could not be confirmed; preserved ${worktreePath}`,
+                  );
+                  job.status = "failed";
+                  this.jobs.set(taskId, job);
+                  return;
+                }
               }
+              if (
+                this.shutdownInProgress ||
+                job.stopRequestedAt ||
+                job.operatorStopRequestedAt ||
+                this.jobs.get(taskId) !== job
+              ) {
+                job.status = "stopped";
+                job.output.push(
+                  "[key-rotation] Re-dispatch cancelled because shutdown is in progress; worktree preserved.",
+                );
+                this.jobs.set(taskId, job);
+                return;
+              }
+              const replacement = await this.restartWithFreshDecompositionAdmission(
+                taskId,
+                (admission) => {
+                  if (
+                    this.shutdownInProgress ||
+                    job.stopRequestedAt ||
+                    job.operatorStopRequestedAt ||
+                    this.jobs.get(taskId) !== job ||
+                    !this.rateLimitRetryPending.has(taskId)
+                  ) {
+                    throw new Error("Rate-limit re-dispatch was cancelled before admission.");
+                  }
+                  this.rateLimitRetryPending.delete(taskId);
+                  this.jobs.delete(taskId);
+                  return this.start(
+                    taskId,
+                    {
+                      ...options,
+                      duplicateClaimantCheck: claimantCheck,
+                      admittedTaskContentHash: admission.contentHash,
+                    },
+                    claimantCheck,
+                  );
+                },
+              );
+              this.recordAuthRetryReplacement(job, replacement);
             } catch (err) {
+              if (this.shutdownInProgress || job.stopRequestedAt || job.operatorStopRequestedAt) {
+                job.status = "stopped";
+                if (!job.output.some((line) => line.includes("Re-dispatch cancelled"))) {
+                  job.output.push(
+                    "[key-rotation] Re-dispatch cancelled because shutdown is in progress; worktree preserved.",
+                  );
+                }
+                this.jobs.set(taskId, job);
+                return;
+              }
               const msg = err instanceof Error ? err.message : String(err);
               job.output.push(`[key-rotation] Re-dispatch failed: ${msg}`);
               job.status = "failed";
               this.jobs.set(taskId, job);
-              this.preserveInterruptedSharedCheckout(job, "failed");
+            } finally {
+              this.rateLimitRetryPending.delete(taskId);
             }
             return; // Skip normal cleanup — re-dispatch handles it
           } else {
@@ -3794,7 +5232,11 @@ export class DispatchManager {
             // worktree and branch so work is recoverable for manual merge
             // or /fix-task. Lost branches on auto-merge failure is a data
             // loss bug (discovered 2026-03-29).
-            this.removeWorktree(worktreePath);
+            if (!this.removeWorktree(worktreePath)) {
+              job.output.push(
+                `[worktree] Preserved ${worktreePath} because Docker cleanup could not be confirmed`,
+              );
+            }
           } else {
             this.cleanupDockerForWorktree(worktreePath);
             job.output.push(
@@ -3812,16 +5254,49 @@ export class DispatchManager {
             this.preserveInterruptedSharedCheckout(job, "failed");
           }
         }
-      })().catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err);
-        job.status = "failed";
-        job.output.push(`[exit-handler] ${message}`);
-        this.jobs.set(taskId, job);
-      });
+      })()
+        .catch((err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          if (job.operatorStopRequestedAt) {
+            job.status = "stopped";
+            job.output.push(`[exit-handler] Operator-stop cleanup warning: ${message}`);
+          } else {
+            job.status = "failed";
+            job.output.push(`[exit-handler] ${message}`);
+          }
+          if (this.jobs.get(taskId) === job) {
+            this.jobs.set(taskId, job);
+          }
+        })
+        .finally(() => {
+          // completeOperatorStopRecovery owns barrier and admission cleanup.
+        });
+      this.trackExitHandler(exitHandler, job);
     });
 
     child.on("error", (err) => {
+      revokeUnconsumedAdmission();
+      if (job.operatorStopRequestedAt) {
+        job.status = "stopped";
+        job.output.push(`[dispatch] Operator-requested stop observed child error: ${err.message}`);
+        if (this.processes.get(taskId) === child) {
+          this.processes.delete(taskId);
+        }
+        if (this.nodeLaunches.get(taskId) === launch) {
+          this.nodeLaunches.delete(taskId);
+          cleanupTrustedNodeLaunch(launch);
+        }
+        return;
+      }
+      job.status = "failed";
       job.output.push(`[error] ${err.message}`);
+      if (this.processes.get(taskId) === child) {
+        this.processes.delete(taskId);
+      }
+      if (this.nodeLaunches.get(taskId) === launch) {
+        this.nodeLaunches.delete(taskId);
+        cleanupTrustedNodeLaunch(launch);
+      }
 
       // ChildProcess can emit `error` when a signal could not be delivered,
       // not only when spawn failed. An error therefore is not proof that a
@@ -3864,16 +5339,17 @@ export class DispatchManager {
       // obtained a PID, preserve its worktree because it may contain partial
       // work even if the process disappeared before the exit event arrived.
       if (worktreePath) {
-        if (!started && !stopRequested) {
-          if (this.clearWorktreeSurvivor(job, true)) this.removeWorktree(worktreePath);
-        } else {
-          if (started) this.clearWorktreeSurvivor(job);
-          job.output.push(`[worktree] Preserved ${worktreePath} — child exit required recovery`);
+        if (!this.removeWorktree(worktreePath)) {
+          job.output.push(
+            `[worktree] Preserved ${worktreePath} because cleanup could not be confirmed`,
+          );
         }
-      } else if (!started && !stopRequested) {
-        this.preserveInterruptedSharedCheckout(job, "failed");
       }
     });
+
+    this.jobs.set(taskId, job);
+    this.processes.set(taskId, child);
+    this.nodeLaunches.set(taskId, launch);
 
     return job;
   }
@@ -3945,6 +5421,12 @@ export class DispatchManager {
   }
 
   private startDocker(taskId: string, options?: StartOptions): DispatchJob {
+    this.assertDispatchAdmissionOpen();
+    if (options?.admittedTaskContentHash) {
+      // Validate the operator-selected immutable image before publishing the
+      // one-use child capability.
+      assertTrustedManagedDockerImage(this.isolationConfig!.docker!.image);
+    }
     if (Boolean(options?.parentTaskId) !== Boolean(options?.sharedBranchName)) {
       throw new Error(
         `Docker decomposition for ${taskId} requires paired parentTaskId and sharedBranchName before admission`,
@@ -3990,7 +5472,10 @@ export class DispatchManager {
         );
         worktreePath = expectedWorktreePath;
       } else {
-        worktreePath = this.createWorktree(taskId, worktreeOwnership.ownershipId, false);
+        worktreePath = this.createWorktree(taskId, {
+          ownershipId: worktreeOwnership.ownershipId,
+          linkRuntimeDirectories: false,
+        });
       }
       if (!worktreePath) {
         throw new Error(
@@ -4015,6 +5500,26 @@ export class DispatchManager {
       this.pendingWorktreeOwnerships.delete(taskId);
       throw error;
     }
+
+    ensureDecompositionDispatchAdmissionDirectory(this.projectRoot);
+    let decompositionAdmission = options?.admittedTaskContentHash
+      ? createDecompositionDispatchAdmissionMarker({
+          projectRoot: this.projectRoot,
+          taskId,
+          contentHash: options.admittedTaskContentHash,
+          isolatedDirectory: true,
+        })
+      : undefined;
+    const settleDecompositionAdmission = (): void => {
+      if (!decompositionAdmission) return;
+      const admission = decompositionAdmission;
+      const revoked = revokeDecompositionDispatchAdmission(this.projectRoot, admission);
+      if (!revoked) {
+        removeDecompositionDispatchAdmissionScope(this.projectRoot, admission.hostDirectory);
+      }
+      decompositionAdmission = undefined;
+    };
+
     const job: DispatchJob = {
       taskId,
       sessionId,
@@ -4041,11 +5546,11 @@ export class DispatchManager {
     let createdContainer: DockerContainer | undefined;
     let runtimeBridge: DockerRuntimeBridge | undefined;
     const admittedContainer = this.serializeDockerAdmission(async () => {
-      if (this.shutdownInProgress || job.stopRequestedAt) {
+      if (this.shutdownInProgress || job.stopRequestedAt || job.operatorStopRequestedAt) {
         throw new Error(`Cannot start ${taskId}: dispatch manager shutdown is in progress.`);
       }
       await this.ensureDockerOwnershipReconciled();
-      if (this.shutdownInProgress || job.stopRequestedAt) {
+      if (this.shutdownInProgress || job.stopRequestedAt || job.operatorStopRequestedAt) {
         throw new Error(`Cannot start ${taskId}: dispatch manager shutdown is in progress.`);
       }
       return dockerMgr.createContainer(taskId, worktreePath, {
@@ -4055,8 +5560,13 @@ export class DispatchManager {
         ...(options?.parentTaskId ? { parentTaskId: options.parentTaskId } : {}),
         ...(options?.sharedBranchName ? { sharedBranchName: options.sharedBranchName } : {}),
         ...(options?.dockerResumeStateDir ? { resumeStateDir: options.dockerResumeStateDir } : {}),
+        ...(decompositionAdmission
+          ? { admissionScopeDirectory: decompositionAdmission.hostDirectory }
+          : {}),
       });
     });
+    this.observationCandidates.add(job);
+    this.observationStarts.add(job);
     const startupPromise = admittedContainer
       .then(async (containerInfo) => {
         createdContainer = containerInfo;
@@ -4090,7 +5600,7 @@ export class DispatchManager {
         // Container creation is asynchronous. A shutdown can begin after
         // startDocker() returns but before the exec child exists; never spawn a
         // late child after the shutdown snapshot has already been taken.
-        if (this.shutdownInProgress || job.stopRequestedAt) {
+        if (this.shutdownInProgress || job.stopRequestedAt || job.operatorStopRequestedAt) {
           job.status = "stopped";
           job.output.push("[dispatch] Stop requested before container agent startup.");
           const cleanup = await this.finalizeDockerContainer(job, containerInfo, {
@@ -4104,6 +5614,7 @@ export class DispatchManager {
           runtimeBridge.sealAndImport();
           runtimeBridge.emitTrustedTerminal({ outcome: "stopped" });
           this.clearWorktreeSurvivor(job, true);
+          settleDecompositionAdmission();
           return;
         }
 
@@ -4134,7 +5645,7 @@ export class DispatchManager {
         if (options?.maxTurns) agentCmd.push("--max-turns", String(options.maxTurns));
         if (options?.maxBudget) agentCmd.push("--max-budget", String(options.maxBudget));
 
-        const env: Record<string, string> = {};
+        const env: Record<string, string> = { ...decompositionAdmission?.environment };
         // Clear nesting detection vars
         env.CLAUDECODE = "";
         env.CLAUDE_CODE = "";
@@ -4148,18 +5659,8 @@ export class DispatchManager {
         if (options?.federatedLeaseId) env.QUACK_FEDERATED_LEASE_ID = options.federatedLeaseId;
         if (options?.provenance) env.QUACK_PROVENANCE = JSON.stringify(options.provenance);
 
-        // Select API key from key manager (if available)
-        if (this.keyManager) {
-          const selectedKey = this.keyManager.getNextKey();
-          if (!selectedKey) {
-            throw new Error("All API keys are rate-limited. Wait for cooldown to expire.");
-          }
-          const keyValue = this.keyManager.getKeyValue(selectedKey.id);
-          if (keyValue) {
-            env.ANTHROPIC_API_KEY = keyValue;
-            env.QUACK_SELECTED_KEY_ID = selectedKey.id;
-          }
-        }
+        const selectedClaudeKey = this.keyManager ? selectClaudeApiKey(this.keyManager) : undefined;
+        if (selectedClaudeKey) env.QUACK_SELECTED_KEY_ID = selectedClaudeKey.keyId;
 
         // Track which key was selected for this Docker dispatch
         const dockerKeyId = env.QUACK_SELECTED_KEY_ID;
@@ -4168,7 +5669,13 @@ export class DispatchManager {
         }
 
         if (process.platform === "win32") this.confirmedWindowsTreeKills.delete(taskId);
-        const child = dockerMgr.execAgent(containerInfo.containerId, agentCmd, env);
+        const child = dockerMgr.execAgent(
+          containerInfo.containerId,
+          agentCmd,
+          env,
+          selectedClaudeKey,
+        );
+        this.trackChildClose(child, job);
         job.pid = child.pid ?? 0;
 
         this.captureProcessOutput(child, job);
@@ -4185,11 +5692,14 @@ export class DispatchManager {
         };
 
         child.on("exit", (code, signal) => {
-          void (async () => {
+          const exitHandler = (async () => {
+            settleDecompositionAdmission();
             let claimantCheck: DuplicateClaimantCheck | undefined;
             let retry = false;
             let cleanup: DockerStopResult = { removed: false, retained: false };
-            const stopRequested = Boolean(job.stopRequestedAt) || this.shutdownInProgress;
+            const stopRequested =
+              Boolean(job.stopRequestedAt || job.operatorStopRequestedAt) ||
+              this.shutdownInProgress;
             try {
               this.clearStopEscalation(taskId);
               job.exitCode = code ?? 1;
@@ -4200,11 +5710,11 @@ export class DispatchManager {
                   logDir: this.logDir,
                   taskId,
                   jobSessionId: sessionId,
+                  exactSession: true,
                   jobStartedAt: job.startedAt,
                   exitCode: code,
                   signal: signal ?? null,
                   worktreePath: worktreePath ?? null,
-                  isolation: "docker",
                 });
               } catch {
                 try {
@@ -4243,10 +5753,18 @@ export class DispatchManager {
                     ? await this.claimantResolver(taskId)
                     : undefined;
                   assertUncontestedClaimant(claimantCheck);
-                  retry = !this.shutdownInProgress && !job.stopRequestedAt;
+                  retry =
+                    !this.shutdownInProgress &&
+                    !job.stopRequestedAt &&
+                    !job.operatorStopRequestedAt;
                 }
               }
-
+            } catch (error: unknown) {
+              const detail = error instanceof Error ? error.message : String(error);
+              job.status = "failed";
+              job.output.push(`[exit-handler] ${detail}`);
+              retry = false;
+            } finally {
               this.emitDockerEventSafely(
                 "container_stopped",
                 taskId,
@@ -4261,12 +5779,6 @@ export class DispatchManager {
                 },
                 job,
               );
-            } catch (error: unknown) {
-              const detail = error instanceof Error ? error.message : String(error);
-              job.status = "failed";
-              job.output.push(`[exit-handler] ${detail}`);
-              retry = false;
-            } finally {
               this.processes.delete(taskId);
               cleanup = await cleanupOnce(code !== 0, retry);
               if (cleanup.removed || cleanup.retained) {
@@ -4445,18 +5957,41 @@ export class DispatchManager {
               this.jobs.set(taskId, job);
             }
 
-            if (retry && cleanup.removed && !this.shutdownInProgress && !job.stopRequestedAt) {
+            if (
+              retry &&
+              cleanup.removed &&
+              !this.shutdownInProgress &&
+              !job.stopRequestedAt &&
+              !job.operatorStopRequestedAt
+            ) {
               try {
-                this.jobs.delete(taskId);
-                this.start(
+                const replacement = await this.restartWithFreshDecompositionAdmission(
                   taskId,
-                  {
-                    ...options,
-                    reuseWorktree: true,
-                    duplicateClaimantCheck: claimantCheck,
+                  (admission) => {
+                    if (
+                      this.shutdownInProgress ||
+                      job.stopRequestedAt ||
+                      job.operatorStopRequestedAt ||
+                      this.jobs.get(taskId) !== job
+                    ) {
+                      throw new Error(
+                        "Docker rate-limit re-dispatch was cancelled before admission.",
+                      );
+                    }
+                    this.jobs.delete(taskId);
+                    return this.start(
+                      taskId,
+                      {
+                        ...options,
+                        reuseWorktree: true,
+                        duplicateClaimantCheck: claimantCheck,
+                        admittedTaskContentHash: admission.contentHash,
+                      },
+                      claimantCheck,
+                    );
                   },
-                  claimantCheck,
                 );
+                this.recordAuthRetryReplacement(job, replacement);
               } catch (error: unknown) {
                 const detail = error instanceof Error ? error.message : String(error);
                 job.status = "failed";
@@ -4464,16 +5999,18 @@ export class DispatchManager {
                 this.jobs.set(taskId, job);
               }
             }
-          })().catch((error: unknown) => {
+          })().catch(async (error: unknown) => {
             const detail = error instanceof Error ? error.message : String(error);
             job.status = "failed";
             job.output.push(`[exit-handler] ${detail}`);
-            void cleanupOnce(true, true);
+            await cleanupOnce(true, true);
           });
+          this.trackExitHandler(exitHandler, job);
         });
 
         child.on("error", (err) => {
-          void (async () => {
+          const errorHandler = (async () => {
+            settleDecompositionAdmission();
             this.clearStopEscalation(taskId);
             job.output.push(`[error] ${err.message}`);
             this.emitDockerEventSafely(
@@ -4482,7 +6019,10 @@ export class DispatchManager {
               { containerId: containerInfo.containerId, error: err.message },
               job,
             );
-            job.status = this.shutdownInProgress || job.stopRequestedAt ? "stopped" : "failed";
+            job.status =
+              this.shutdownInProgress || job.stopRequestedAt || job.operatorStopRequestedAt
+                ? "stopped"
+                : "failed";
             const cleanup = await cleanupOnce(true, true);
             if (cleanup.removed || cleanup.retained) {
               try {
@@ -4505,13 +6045,28 @@ export class DispatchManager {
               this.processes.delete(taskId);
               this.clearWorktreeSurvivor(job, true);
             }
-          })();
+          })().catch((error: unknown) => {
+            const detail = error instanceof Error ? error.message : String(error);
+            job.status = "failed";
+            job.output.push(`[exit-handler] ${detail}`);
+          });
+          this.trackExitHandler(errorHandler, job);
         });
       })
       .catch(async (err: unknown) => {
+        try {
+          settleDecompositionAdmission();
+        } catch (cleanupError: unknown) {
+          const detail =
+            cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+          job.output.push(`[docker-admission] Admission cleanup failed: ${detail}`);
+        }
         const msg = err instanceof Error ? err.message : String(err);
         try {
-          job.status = this.shutdownInProgress || job.stopRequestedAt ? "stopped" : "failed";
+          job.status =
+            this.shutdownInProgress || job.stopRequestedAt || job.operatorStopRequestedAt
+              ? "stopped"
+              : "failed";
           job.output.push(`[docker-error] ${msg}`);
           this.emitDockerEventSafely(
             "container_error",
@@ -4554,6 +6109,8 @@ export class DispatchManager {
         if (this.pendingDockerStarts.get(taskId) === startupPromise) {
           this.pendingDockerStarts.delete(taskId);
         }
+        this.observationStarts.delete(job);
+        this.recordTerminalObservation(job);
       });
     this.pendingDockerStarts.set(taskId, startupPromise);
 
@@ -4590,16 +6147,162 @@ export class DispatchManager {
   }
 
   /**
-   * Request a process-tree stop without making the job or its checkout appear
-   * free before the child exit handler confirms termination.
+   * An approval pause is observed only after the dispatcher process exits, so
+   * its original ChildProcess handle is no longer available. Persist the same
+   * recovery barrier before changing state, clean up independently observable
+   * containers, and leave recovery blocked because detached descendants cannot
+   * be disproved from a stale pid.
+   */
+  private stopAwaitingApprovalJob(job: DispatchJob): boolean {
+    job.executionRoot ??= job.worktreePath ?? this.projectRoot;
+    job.operatorStopRequestedAt = new Date().toISOString();
+    job.operatorStopCleanupPending = true;
+    if (!this.persistOperatorStopBarrier(job)) {
+      job.operatorStopRequestedAt = undefined;
+      job.operatorStopCleanupPending = false;
+      return false;
+    }
+
+    job.status = "stopped";
+    job.operatorStopTreeTerminated = false;
+    this.operatorStopCleanupPending.set(job.taskId, job);
+    if (job.worktreePath) {
+      job.output.push(
+        `[worktree] Preserved ${job.worktreePath} — task stopped, branch retained for recovery`,
+      );
+    }
+    this.quarantineRecoveryWarning(
+      job,
+      "the approval subprocess had already exited before stop; detached descendants cannot be excluded",
+    );
+
+    let sharedExecutionRoot = true;
+    try {
+      sharedExecutionRoot = pathsEqualForDispatch(
+        canonicalizePotentialPathSync(job.executionRoot),
+        canonicalizePotentialPathSync(this.projectRoot),
+      );
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.quarantineRecoveryWarning(
+        job,
+        `the approval execution root could not be canonicalized (${detail})`,
+      );
+    }
+
+    if (sharedExecutionRoot) {
+      this.quarantineRecoveryWarning(
+        job,
+        "the paused run used the shared project directory; container and protected-path state " +
+          "require explicit manual verification",
+      );
+    } else if (!this.cleanupDockerForWorktree(job.executionRoot)) {
+      this.quarantineRecoveryWarning(
+        job,
+        "worktree container cleanup was disabled or could not be confirmed",
+      );
+    }
+
+    if (job.containerId) {
+      if (this.dockerManager) {
+        const cleanup = this.dockerManager
+          .stopContainer(job.containerId, true)
+          .then(() => {
+            job.output.push(
+              "[docker] Approval-pause container stop returned without an independently verified " +
+                "termination result; recovery remains blocked.",
+            );
+          })
+          .catch((error: unknown) => {
+            const detail = error instanceof Error ? error.message : String(error);
+            job.output.push(
+              `[docker] Approval-pause container stop failed (${detail}); recovery remains blocked.`,
+            );
+          });
+        this.trackExitHandler(cleanup, job);
+      } else {
+        this.quarantineRecoveryWarning(
+          job,
+          `container ${job.containerId} is recorded but no Docker manager is available to stop it`,
+        );
+      }
+    }
+
+    // The stop request was durably fenced, but the original subprocess handle
+    // is already gone. Without containment evidence we cannot prove that it
+    // left no detached descendants behind, so callers must not report a
+    // confirmed stop.
+    return false;
+  }
+
+  /**
+   * Stop a running dispatch and its owned process tree.
+   *
+   * Returns true only when process-tree termination is positively confirmed.
+   * A false result may still mean the stop request was accepted and durably
+   * fenced; callers must inspect the job's recovery state and must not reopen
+   * admission or report successful cleanup.
    */
   stop(taskId: string): boolean {
+    if (this.approvalPauseResolutions.has(taskId)) return false;
     const job = this.jobs.get(taskId);
+    const pendingStop = this.operatorStopCleanupPending.get(taskId);
+    if (pendingStop) return this.retryPendingOperatorStop(pendingStop);
 
-    // Handle awaiting_approval jobs (no running process to kill)
-    if (job?.status === "awaiting_approval") {
-      job.stopRequestedAt = new Date().toISOString();
+    const child = this.processes.get(taskId);
+
+    // The normal approval state has no live ChildProcess handle because it is
+    // entered from that child's exit callback. If a handle is unexpectedly
+    // still present, fall through to the ordinary process-tree stop path.
+    if (job?.status === "awaiting_approval" && !child) {
+      return this.stopAwaitingApprovalJob(job);
+    }
+
+    if (!child) {
+      if (job && this.rateLimitRetryPending.has(taskId)) {
+        job.operatorStopRequestedAt ??= new Date().toISOString();
+        job.status = "stopped";
+        job.output.push("[dispatch] Pending rate-limit re-dispatch cancelled by operator.");
+        this.rateLimitRetryPending.delete(taskId);
+        return true;
+      }
+      if (
+        job?.status === "running" &&
+        this.isolationConfig?.method === "docker" &&
+        this.dockerManager
+      ) {
+        job.operatorStopRequestedAt = new Date().toISOString();
+        job.operatorStopCleanupPending = true;
+        if (!this.persistOperatorStopBarrier(job)) {
+          job.operatorStopRequestedAt = undefined;
+          job.operatorStopCleanupPending = false;
+          return false;
+        }
+        job.status = "stopped";
+        job.output.push(
+          "[docker] Stop requested during container creation; agent launch cancelled. " +
+            "Same-task restart remains blocked until container absence can be proven.",
+        );
+        this.operatorStopCleanupPending.set(taskId, job);
+        return false;
+      }
+      return false;
+    }
+
+    // Record the operator's intent before kill(). The exit callback runs
+    // asynchronously and must see this marker before it handles SIGTERM.
+    if (job) {
+      job.operatorStopRequestedAt = new Date().toISOString();
+      job.operatorStopCleanupPending = true;
+      if (!this.persistOperatorStopBarrier(job)) {
+        job.operatorStopRequestedAt = undefined;
+        job.operatorStopCleanupPending = false;
+        return false;
+      }
       job.status = "stopped";
+
+      // Preserve worktree on manual stop — work may be partially done.
+      // The branch and commits remain available for /fix-task or manual recovery.
       if (job.worktreePath) {
         job.output.push(
           `[worktree] Preserved ${job.worktreePath} — task stopped, branch retained for recovery`,
@@ -4607,52 +6310,50 @@ export class DispatchManager {
       } else {
         this.preserveInterruptedSharedCheckout(job, "stopped");
       }
-      return true;
     }
 
-    const child = this.processes.get(taskId);
-    if (!child) {
-      // Docker container creation is asynchronous. Treat a pending create as
-      // stoppable even though no exec child exists yet; the continuation will
-      // observe stopRequestedAt, remove the late container, and never spawn.
-      if (job?.status === "running" && this.pendingDockerStarts.has(taskId)) {
-        job.stopRequestedAt = new Date().toISOString();
-        job.output.push(
-          "[dispatch] Stop requested while container creation is pending; agent startup cancelled.",
-        );
-        return true;
+    let terminationConfirmed = false;
+    if (job && !job.containerId) {
+      this.operatorStopCleanupPending.set(taskId, job);
+      job.operatorStopCleanupPending = true;
+      const termination = this.terminateOperatorProcessTree(child, this.nodeLaunches.get(taskId));
+      job.operatorStopTreeTerminated = termination.confirmed;
+      terminationConfirmed = termination.confirmed;
+      job.operatorStopProcessGroupId = termination.processGroupId;
+      if (termination.warning) {
+        job.output.push(`[dispatch] Operator-stop termination warning: ${termination.warning}`);
       }
-      return false;
-    }
-
-    if (job) {
-      job.stopRequestedAt = new Date().toISOString();
-      job.output.push("[dispatch] Stop requested; waiting for the process tree to exit.");
-      if (
-        job.worktreePath &&
-        !this.updateWorktreeOwnership(job, "stopping", child.pid ?? job.pid)
-      ) {
-        job.output.push(
-          "[dispatch] Worktree shutdown ownership could not be advanced; durable admission remains blocked.",
-        );
+    } else {
+      // Docker owns the agent descendants. Stop the exec client immediately,
+      // then request container cleanup below; admission remains fail-closed
+      // because DockerManager's current API cannot prove termination.
+      if (job) this.operatorStopCleanupPending.set(taskId, job);
+      child.kill("SIGTERM");
+      if (this.processes.get(taskId) === child) {
+        this.processes.delete(taskId);
       }
     }
-    try {
-      this.signalProcessTree(taskId, child, "SIGTERM", 1_000);
-    } catch {
-      // The escalation below confirms or force-terminates a still-live child.
-    }
-    this.scheduleForcedTreeTermination(taskId, child, 1_000);
 
-    // Preserve worktree on manual stop — work may be partially done.
-    // The branch and commits remain available for /fix-task or manual recovery.
-    if (job?.worktreePath) {
-      job.output.push(
-        `[worktree] Preserved ${job.worktreePath} — task stopped, branch retained for recovery`,
-      );
+    // Clean up Docker container if one was created
+    if (job?.containerId && this.dockerManager) {
+      const cleanup = this.dockerManager
+        .stopContainer(job.containerId, true)
+        .then(() => {
+          job.output.push(
+            "[docker] Container stop returned without an independently verified " +
+              "termination result; same-task restart remains blocked.",
+          );
+        })
+        .catch((err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          job.output.push(
+            `[docker] Container stop failed (${message}); same-task restart remains blocked.`,
+          );
+        });
+      this.trackExitHandler(cleanup, job);
     }
 
-    return true;
+    return terminationConfirmed;
   }
 
   /**
@@ -4779,7 +6480,9 @@ export class DispatchManager {
         }
         this.unconfirmedProcessGroups.delete(taskId);
         const job = this.jobs.get(taskId);
-        if (job?.stopRequestedAt && job.status === "running") job.status = "stopped";
+        if (job?.stopRequestedAt && job.status === "running") {
+          job.status = "stopped";
+        }
         return true;
       });
     } catch {
@@ -4843,7 +6546,11 @@ export class DispatchManager {
           marker.ownershipId !== ownershipId ||
           !marker.reconciliationToken ||
           marker.reconciliationToken !== reconciliationToken ||
-          marker.strategy === "docker-container"
+          marker.strategy === "docker-container" ||
+          (marker.strategy === "posix-process-group" &&
+            process.platform !== "win32" &&
+            marker.processId !== undefined &&
+            this.processGroupExists(marker.processId))
         ) {
           return false;
         }
@@ -4852,7 +6559,9 @@ export class DispatchManager {
         if (removed) {
           this.unconfirmedProcessGroups.delete(taskId);
           const job = this.jobs.get(taskId);
-          if (job?.stopRequestedAt && job.status === "running") job.status = "stopped";
+          if (job?.stopRequestedAt && job.status === "running") {
+            job.status = "stopped";
+          }
         }
         return removed;
       });
@@ -4874,10 +6583,314 @@ export class DispatchManager {
   }
 
   /**
+   * Persist a human-gate decision and release its exact in-memory pause as one
+   * fail-consistent manager operation. Blueprint and judge decision routes
+   * share this reservation, including after a monitor restart when no job is
+   * in memory, so conflicting approve/reject requests cannot both mutate one
+   * pending gate.
+   *
+   * Every fallible lifecycle check happens before `persistDecision` is called.
+   * A reservation then prevents start()/stop() from replacing or fencing the
+   * job while the durable write is in flight. Once that callback resolves, the
+   * compare-and-release path is synchronous and non-throwing. A failed write
+   * drops the reservation and leaves the awaiting job untouched.
+   *
+   * No `stop()` call, process signal, worktree cleanup, checkpoint mutation, or
+   * operator-stop barrier is performed here. `released` is false when there was
+   * no in-memory approval pause (for example after a monitor restart).
+   */
+  async resolveApprovalPauseDecision<T>(
+    taskId: string,
+    gate: ApprovalGate,
+    expectedState: DecidedApprovalState,
+    persistDecision: () => Promise<T>,
+    logDir = this.logDir,
+    options?: ApprovalPauseDecisionOptions,
+  ): Promise<ApprovalPauseDecisionResult<T>> {
+    const resolution = this.prepareApprovalPauseResolution(
+      taskId,
+      gate,
+      expectedState,
+      logDir,
+      options,
+    );
+
+    try {
+      const decision = await persistDecision();
+      const current = this.approvalPauseResolutions.get(taskId);
+      const released =
+        resolution.job !== undefined &&
+        current === resolution &&
+        resolution.taskId === taskId &&
+        resolution.gate === gate &&
+        resolution.expectedState === expectedState &&
+        this.jobs.get(taskId) === resolution.job &&
+        resolution.job.status === "awaiting_approval";
+      if (released) this.jobs.delete(taskId);
+      if (current === resolution) this.approvalPauseResolutions.delete(taskId);
+      return { decision, released };
+    } catch (error: unknown) {
+      if (this.approvalPauseResolutions.get(taskId) === resolution) {
+        this.approvalPauseResolutions.delete(taskId);
+      }
+      throw error;
+    }
+  }
+
+  private prepareApprovalPauseResolution(
+    taskId: string,
+    gate: ApprovalGate,
+    expectedState: DecidedApprovalState,
+    logDir: string,
+    options?: ApprovalPauseDecisionOptions,
+  ): ApprovalPauseResolution {
+    if (this.approvalPauseResolutions.has(taskId)) {
+      throw new ApprovalDecisionConflictError(
+        "decision_in_flight",
+        `Cannot resolve ${taskId}'s approval pause: a decision is already in flight.`,
+      );
+    }
+    const currentJob = this.jobs.get(taskId);
+    if (currentJob?.status === "running") {
+      throw new ApprovalDecisionConflictError(
+        "dispatch_running",
+        `Cannot resolve ${taskId}'s approval pause while its dispatch process is still running.`,
+      );
+    }
+    if (
+      this.processes.has(taskId) ||
+      this.nodeLaunches.has(taskId) ||
+      currentJob?.operatorStopCleanupPending === true ||
+      this.operatorStopCleanupPending.has(taskId)
+    ) {
+      throw new ApprovalDecisionConflictError(
+        "cleanup_live",
+        `Cannot resolve ${taskId}'s approval pause while dispatch process or cleanup state remains live.`,
+      );
+    }
+    if (currentJob?.status === "stopped") {
+      throw new ApprovalDecisionConflictError(
+        "operator_stopped",
+        `Cannot resolve ${taskId}'s approval pause after an operator stop; complete recovery before deciding the gate.`,
+      );
+    }
+
+    // An operator stop is durably fenced because the monitor can restart while
+    // process-tree cleanup is still unproven. Validate that same barrier here,
+    // before the approval writer runs, instead of deciding the gate and only
+    // discovering the barrier when the route attempts its replacement start.
+    try {
+      this.assertNoDurableOperatorStopBarrier(taskId);
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new ApprovalDecisionConflictError(
+        "operator_stop_barrier",
+        `Cannot resolve ${taskId}'s approval pause while durable operator-stop recovery remains blocked: ${detail}`,
+      );
+    }
+    const job = currentJob?.status === "awaiting_approval" ? currentJob : undefined;
+
+    if (
+      job &&
+      (typeof job.exitCode !== "number" ||
+        !Number.isInteger(job.exitCode) ||
+        job.exitCode === 0 ||
+        job.killedBySignal)
+    ) {
+      throw new ApprovalDecisionConflictError(
+        "exit_unproven",
+        `Cannot release ${taskId}'s approval pause because an ordinary non-zero child exit is not proven.`,
+      );
+    }
+
+    const approvalName = gate === "judge" ? `${taskId}-judge.json` : `${taskId}.json`;
+    const approvalPath = path.join(logDir, "approvals", approvalName);
+    let approval: {
+      taskId?: unknown;
+      state?: unknown;
+      createdAt?: unknown;
+    };
+    try {
+      approval = JSON.parse(fs.readFileSync(approvalPath, "utf-8")) as typeof approval;
+    } catch (error: unknown) {
+      const code =
+        typeof error === "object" && error !== null && "code" in error
+          ? String((error as { code?: unknown }).code)
+          : "";
+      if (code === "ENOENT") {
+        throw new ApprovalDecisionConflictError(
+          "approval_missing",
+          `Cannot resolve ${taskId}'s approval pause: the ${gate} approval record does not exist.`,
+        );
+      }
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Cannot resolve ${taskId}'s approval pause: the ${gate} pending record is unreadable (${detail}).`,
+      );
+    }
+
+    const createdAt =
+      typeof approval.createdAt === "string" ? new Date(approval.createdAt).getTime() : Number.NaN;
+    const startedAt = job ? new Date(job.startedAt).getTime() : undefined;
+    const repeatedReplan =
+      !job &&
+      gate === "blueprint" &&
+      expectedState === "rejected" &&
+      options?.allowAlreadyRejected === true &&
+      approval.state === "rejected";
+    if (approval.taskId !== taskId || !Number.isFinite(createdAt)) {
+      throw new Error(
+        `Cannot resolve ${taskId}'s approval pause: the ${gate} approval record is malformed.`,
+      );
+    }
+    if (approval.state !== "pending" && !repeatedReplan) {
+      throw new ApprovalDecisionConflictError(
+        "approval_not_pending",
+        `Cannot resolve ${taskId}'s approval pause: the ${gate} approval record is not pending.`,
+      );
+    }
+    if (job && (startedAt === undefined || !Number.isFinite(startedAt))) {
+      throw new Error(
+        `Cannot resolve ${taskId}'s approval pause: the in-memory dispatch start time is malformed.`,
+      );
+    }
+    if (job && createdAt < startedAt!) {
+      throw new ApprovalDecisionConflictError(
+        "approval_run_mismatch",
+        `Cannot resolve ${taskId}'s approval pause: the ${gate} pending record does not match this run.`,
+      );
+    }
+
+    // An awaiting job does not currently carry its gate as an in-memory
+    // field. Refuse to release it if the other gate still has a run-scoped
+    // pending record: the decided record above could otherwise be unrelated
+    // to the gate that actually paused this child.
+    const otherApprovalName = gate === "judge" ? `${taskId}.json` : `${taskId}-judge.json`;
+    const otherApprovalPath = path.join(logDir, "approvals", otherApprovalName);
+    if (fs.existsSync(otherApprovalPath)) {
+      let other: { state?: unknown; createdAt?: unknown };
+      try {
+        other = JSON.parse(fs.readFileSync(otherApprovalPath, "utf-8")) as typeof other;
+      } catch (error: unknown) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `Cannot release ${taskId}'s approval pause: the other gate record is unreadable (${detail}).`,
+        );
+      }
+      const otherCreatedAt =
+        typeof other.createdAt === "string" ? new Date(other.createdAt).getTime() : Number.NaN;
+      if (
+        other.state === "pending" &&
+        (!job ||
+          !Number.isFinite(otherCreatedAt) ||
+          startedAt === undefined ||
+          otherCreatedAt >= startedAt)
+      ) {
+        throw new ApprovalDecisionConflictError(
+          "other_gate_pending",
+          `Cannot release ${taskId}'s approval pause: the other human gate remains pending for this run.`,
+        );
+      }
+    }
+
+    const resolution: ApprovalPauseResolution = Object.freeze({
+      taskId,
+      gate,
+      expectedState,
+      ...(job ? { job } : {}),
+    });
+    this.approvalPauseResolutions.set(taskId, resolution);
+    return resolution;
+  }
+
+  /**
    * Get job by task ID (any status).
    */
   getJob(taskId: string): DispatchJob | undefined {
     return this.jobs.get(taskId);
+  }
+
+  /** Read-only observation; never restore historical attempts into admission state. */
+  getDispatchObservation(identity: DispatchObservationIdentity):
+    | {
+        identity: DispatchObservationIdentity;
+        job: DispatchJob | DispatchTerminalObservation["job"];
+        settled: boolean;
+        source: "memory" | "durable";
+      }
+    | undefined {
+    if (
+      !this.observationProjectId ||
+      identity.projectId !== this.observationProjectId ||
+      !this.observationStore
+    ) {
+      throw new Error("Dispatch observation project identity is unavailable");
+    }
+    const job = this.jobs.get(identity.taskId);
+    const current = job ? dispatchObservationIdentity(this.observationProjectId, job) : undefined;
+    if (job && current && sameDispatchObservationIdentity(current, identity)) {
+      if (job.observationPersistenceError)
+        throw new Error(
+          `Durable dispatch observation unavailable: ${job.observationPersistenceError}`,
+        );
+      return {
+        identity: { ...identity },
+        job: { ...job, output: [...job.output] },
+        settled: Boolean(job.completedAt),
+        source: "memory",
+      };
+    }
+    const stored = this.observationStore.read(identity);
+    return stored
+      ? { identity: stored.identity, job: stored.job, settled: true, source: "durable" }
+      : undefined;
+  }
+
+  /** Whether a dispatch child, its stdio handles, or its async exit cleanup is still live. */
+  hasLiveProcesses(): boolean {
+    return (
+      this.liveProcesses.size > 0 ||
+      this.processes.size > 0 ||
+      this.nodeLaunches.size > 0 ||
+      this.pendingExitHandlers.size > 0
+    );
+  }
+
+  /** Whether an accepted operator stop still has unproven recovery cleanup. */
+  hasPendingOperatorStopCleanup(taskId?: string): boolean {
+    if (taskId) {
+      return (
+        this.operatorStopCleanupPending.has(taskId) ||
+        this.jobs.get(taskId)?.operatorStopCleanupPending === true
+      );
+    }
+    return (
+      this.operatorStopCleanupPending.size > 0 ||
+      [...this.jobs.values()].some((job) => job.operatorStopCleanupPending === true)
+    );
+  }
+
+  /** Wait for child close and exit cleanup, returning false instead of hanging forever. */
+  waitForIdle(timeoutMs = 15_000): Promise<boolean> {
+    if (!this.hasLiveProcesses()) return Promise.resolve(true);
+
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (idle: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.idleWaiters.delete(onIdle);
+        resolve(idle);
+      };
+      const onIdle = (): void => finish(true);
+      this.idleWaiters.add(onIdle);
+      const timer = setTimeout(() => finish(false), timeoutMs);
+
+      // Avoid missing a close or handler completion between the initial check
+      // and waiter registration.
+      if (!this.hasLiveProcesses()) finish(true);
+    });
   }
 
   /**
@@ -4886,6 +6899,8 @@ export class DispatchManager {
   cleanup(maxAgeMs = 3600000): void {
     const cutoff = Date.now() - maxAgeMs;
     for (const [taskId, job] of this.jobs) {
+      // Retry a failed diagnostic write, retaining the original completion time.
+      this.recordTerminalObservation(job);
       // Don't clean up awaiting_approval jobs — worktree has agent commits
       const ownsInterruptedSharedCheckout =
         this.isolationConfig?.method !== "docker" &&
@@ -4894,8 +6909,12 @@ export class DispatchManager {
       if (
         job.status !== "running" &&
         job.status !== "awaiting_approval" &&
+        job.operatorStopCleanupPending !== true &&
+        !this.operatorStopCleanupPending.has(taskId) &&
         !ownsInterruptedSharedCheckout &&
-        new Date(job.startedAt).getTime() < cutoff
+        !job.observationPersistenceError &&
+        job.completedAt !== undefined &&
+        new Date(job.completedAt).getTime() < cutoff
       ) {
         this.jobs.delete(taskId);
       }
@@ -4916,27 +6935,16 @@ export class DispatchManager {
         if (job.status !== "running") continue;
         const elapsed = now - new Date(job.startedAt).getTime();
         if (elapsed > timeoutMs) {
-          const child = this.processes.get(taskId);
-          if (child) {
+          job.output.push(
+            `[watchdog] Stopping stuck dispatch after ${Math.round(elapsed / 60000)}min`,
+          );
+          // A watchdog stop has the same safety requirements as an operator
+          // stop: terminate the owned tree, recover only validated quarantine
+          // state, and keep same-task admission blocked until that completes.
+          if (!this.stop(taskId)) {
             job.output.push(
-              `[watchdog] Killing stuck dispatch after ${Math.round(elapsed / 60000)}min`,
+              "[watchdog] Stop requested, but durable process-tree termination remains unconfirmed.",
             );
-            // Record operator-directed termination before signaling. A root
-            // may trap SIGTERM and exit 0 while a resistant descendant stays
-            // alive; that must preserve recovery state, not look successful.
-            job.stopRequestedAt = new Date().toISOString();
-            if (job.worktreePath) {
-              this.updateWorktreeOwnership(job, "stopping", child.pid ?? job.pid);
-            }
-            try {
-              this.signalProcessTree(taskId, child, "SIGTERM", 1_000);
-            } catch {
-              // Force escalation below remains authoritative.
-            }
-            // Force-kill after 10 seconds if SIGTERM doesn't stop the full
-            // process tree. The process-group probe remains valid even if the
-            // root exits first and its normal handler removes map tracking.
-            this.scheduleForcedTreeTermination(taskId, child, 10_000);
           }
         }
       }
@@ -5130,20 +7138,40 @@ export class DispatchManager {
         `Refusing to re-signal unconfirmed process group for ${taskId}; its numeric ID may have been recycled`,
       );
     }
-    if (process.platform === "win32" && child.pid) {
+    if (process.platform === "win32") {
+      const launch = this.nodeLaunches.get(taskId);
+      if (launch?.windowsJob) {
+        const result = terminateWindowsNodeJob(launch.windowsJob);
+        if (!result.confirmed && !confirmWindowsNodeLaunchAlreadyExited(launch)) {
+          throw new Error(result.warning ?? `Windows process-tree shutdown failed for ${taskId}`);
+        }
+        if (job) this.confirmedWindowsTreeKills.set(taskId, job.sessionId);
+        return;
+      }
+      if (!child.pid) {
+        child.kill(signal);
+        return;
+      }
       if (this.attemptedWindowsTreeKills.has(child)) {
         throw new Error(
           `Refusing to retry Windows process-tree shutdown for ${taskId}; its numeric PID may have been recycled`,
         );
       }
       this.attemptedWindowsTreeKills.add(child);
-      execFileSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
+      const taskkillPath = resolveWindowsTaskkillPath(process.env, this.projectRoot);
+      const systemRoot = process.env.SYSTEMROOT ?? process.env.SystemRoot ?? process.env.WINDIR;
+      execFileSync(taskkillPath, ["/pid", String(child.pid), "/t", "/f"], {
+        cwd: path.dirname(taskkillPath),
+        env: {
+          PATH: path.dirname(taskkillPath),
+          ...(systemRoot ? { SYSTEMROOT: systemRoot, WINDIR: systemRoot } : {}),
+        },
         stdio: "ignore",
         windowsHide: true,
         timeout: Math.max(1, windowsTimeoutMs),
       });
       if (job) this.confirmedWindowsTreeKills.set(taskId, job.sessionId);
-    } else if (process.platform !== "win32" && !job?.containerId && child.pid) {
+    } else if (!job?.containerId && child.pid) {
       if (!this.isPosixRootIdentityLive(taskId, child)) {
         this.retainUnconfirmedProcessGroup(taskId, child.pid);
         throw new Error(
@@ -5163,10 +7191,9 @@ export class DispatchManager {
   }
 
   /**
-   * Stop dispatch children without deleting their worktrees. POSIX children
-   * run in their own process groups so descendants participate in the same
-   * graceful/forced shutdown. Windows uses taskkill /T /F because Node's
-   * emulated signals cannot prove that descendant processes exited.
+   * Stop dispatch children without deleting their worktrees. Every tracked
+   * process, pending Docker admission, and durable survivor participates in a
+   * bounded shutdown so fleet admission cannot reopen early.
    */
   async shutdownAll(options: DispatchShutdownOptions = {}): Promise<DispatchShutdownResult> {
     this.shutdownInProgress = true;
@@ -5200,9 +7227,20 @@ export class DispatchManager {
       ...pendingProcessGroups.map(({ taskId }) => taskId),
       ...unconfirmedProcessGroups.map(({ taskId }) => taskId),
     ]);
+    const pendingRecoveryJobs = Array.from(
+      new Map(
+        [
+          ...this.operatorStopCleanupPending.values(),
+          ...Array.from(this.jobs.values()).filter(
+            (job) => job.operatorStopCleanupPending === true,
+          ),
+        ].map((job) => [job.taskId, job] as const),
+      ).values(),
+    ).filter((job) => !trackedIds.has(job.taskId));
     const pendingWithoutChild = Array.from(this.jobs.values()).filter(
       (job) =>
         !trackedIds.has(job.taskId) &&
+        !pendingRecoveryJobs.some((pending) => pending.taskId === job.taskId) &&
         (job.status === "awaiting_approval" ||
           (job.status === "running" && !retainedProcessGroupTasks.has(job.taskId))),
     );
@@ -5214,6 +7252,7 @@ export class DispatchManager {
         ...pendingProcessGroups.map(({ taskId }) => taskId),
         ...unconfirmedProcessGroups.map(({ taskId }) => taskId),
         ...trackedDockerTasks,
+        ...pendingRecoveryJobs.map((job) => job.taskId),
       ]),
     );
     this.dockerManager?.abortPendingCommands();
@@ -5231,11 +7270,15 @@ export class DispatchManager {
     for (const entry of pendingProcessGroups) {
       this.clearStopEscalation(entry.taskId, true);
     }
+    const recoveryAttempts: Promise<boolean>[] = [];
+    for (const job of pendingRecoveryJobs) {
+      this.retryPendingOperatorStop(job);
+      const recovery = this.operatorStopRecoveryInFlight.get(job.taskId);
+      if (recovery) recoveryAttempts.push(recovery);
+    }
 
-    // Approval-paused jobs and childless jobs without retained process-group
-    // evidence can become terminal here. A childless job whose POSIX group is
-    // still pending or unconfirmed must remain running until absence or an
-    // explicit reconciliation is recorded.
+    // Approval-paused jobs have no child handle. Their durable ownership
+    // records continue protecting recoverable work across restart.
     for (const job of pendingWithoutChild) {
       if (job.status === "running" || job.status === "awaiting_approval") {
         job.stopRequestedAt = stopRequestedAt;
@@ -5295,6 +7338,7 @@ export class DispatchManager {
         // A concurrent natural exit is handled by the evidence check below.
       }
     };
+
     const settledDockerStarts = new Set<string>();
     const pendingDockerWait = (async (): Promise<string[]> => {
       if (pendingDockerStarts.length === 0) return [];
@@ -5338,10 +7382,27 @@ export class DispatchManager {
       unboundPendingProcessGroups.map(({ taskId }) => taskId),
     );
 
+    const pendingRecoveryWait = (async (): Promise<string[]> => {
+      if (recoveryAttempts.length > 0) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            Promise.allSettled(recoveryAttempts),
+            new Promise<void>((resolve) => {
+              timer = setTimeout(resolve, gracefulTimeoutMs + forceTimeoutMs);
+            }),
+          ]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      }
+      return pendingRecoveryJobs
+        .filter((job) => this.hasPendingOperatorStopCleanup(job.taskId))
+        .map((job) => job.taskId);
+    })();
+
     let remaining = tracked;
     if (process.platform === "win32") {
-      // Force the whole Windows process tree while its root PID is still
-      // available. Killing only the wrapper first can orphan its descendants.
       for (const entry of remaining) {
         escalated.push(entry.taskId);
         signalTrackedTree(entry, "SIGKILL");
@@ -5358,6 +7419,7 @@ export class DispatchManager {
     remaining = await waitForExit(remaining, forceTimeoutMs);
     const pendingDockerTimedOut = await pendingDockerWait;
     const pendingGroupTimedOut = await pendingGroupWait;
+    const pendingRecoveryTimedOut = await pendingRecoveryWait;
     let dockerCleanupTimedOut: string[] = [];
     let dockerCleanupRemoved: string[] = [];
     if (this.dockerManager) {
@@ -5384,9 +7446,7 @@ export class DispatchManager {
           cleanupOutcome.kind === "complete" ? cleanupOutcome.result.failedTaskIds : cleanupTaskIds;
         dockerCleanupRemoved =
           cleanupOutcome.kind === "complete" ? cleanupOutcome.result.removedTaskIds : [];
-        if (cleanupOutcome.kind === "timeout") {
-          this.dockerManager.abortPendingCommands();
-        }
+        if (cleanupOutcome.kind === "timeout") this.dockerManager.abortPendingCommands();
       } finally {
         if (cleanupTimer) clearTimeout(cleanupTimer);
       }
@@ -5398,6 +7458,7 @@ export class DispatchManager {
         ...pendingDockerTimedOut,
         ...pendingGroupTimedOut,
         ...this.unconfirmedProcessGroups.keys(),
+        ...pendingRecoveryTimedOut,
         ...dockerCleanupTimedOut,
       ]),
     );
@@ -5408,20 +7469,19 @@ export class DispatchManager {
     }
     for (const taskId of timedOutSet) {
       const job = this.jobs.get(taskId);
-      if (!job?.worktreePath || job.containerId) continue;
+      if (!job || job.containerId) continue;
       const processId =
         tracked.find((entry) => entry.taskId === taskId)?.child.pid ??
-        pendingProcessGroups.find((entry) => entry.taskId === taskId)?.processGroupId;
-      const retainedProcessId =
-        processId ??
+        pendingProcessGroups.find((entry) => entry.taskId === taskId)?.processGroupId ??
         unconfirmedProcessGroups.find((entry) => entry.taskId === taskId)?.processGroupId;
-      if (!retainedProcessId) continue;
+      if (!processId) continue;
       try {
-        this.persistWorktreeSurvivor(job, retainedProcessId);
+        if (job.worktreePath) this.persistWorktreeSurvivor(job, processId);
+        else this.persistSharedCheckoutPause(job, "running");
       } catch (error: unknown) {
         const detail = error instanceof Error ? error.message : String(error);
         job.output.push(
-          `[dispatch] Could not persist worktree survivor evidence (${detail}); in-process admission remains blocked.`,
+          `[dispatch] Could not persist shutdown survivor evidence (${detail}); in-process admission remains blocked.`,
         );
       }
     }
@@ -5456,7 +7516,39 @@ export class DispatchManager {
       }
     }
 
-    return { requested, exited, escalated, timedOut };
+    const worktreeSurvivors = this.readWorktreeShutdownSurvivors();
+    const sharedCheckoutSurvivor = this.readSharedCheckoutPause();
+    const durableAccountingComplete = timedOut.every((taskId) => {
+      const job = this.jobs.get(taskId);
+      // Docker and pending-create recovery has separate accounting which this
+      // result does not yet attest. Refuse to authorize a hard parent exit.
+      if (!job || job.containerId) return false;
+      if (job.worktreePath) {
+        if (!job.worktreeOwnershipId) return false;
+        return worktreeSurvivors.some(
+          (marker) =>
+            marker.taskId === job.taskId &&
+            marker.sessionId === job.sessionId &&
+            marker.ownershipId === job.worktreeOwnershipId &&
+            marker.worktreePath === job.worktreePath &&
+            marker.state === "survivor" &&
+            Number.isSafeInteger(marker.processId) &&
+            Number(marker.processId) > 0,
+        );
+      }
+      if (!job.sharedCheckoutOwnershipId) return false;
+      return Boolean(
+        sharedCheckoutSurvivor &&
+        sharedCheckoutSurvivor.taskId === job.taskId &&
+        sharedCheckoutSurvivor.sessionId === job.sessionId &&
+        sharedCheckoutSurvivor.ownershipId === job.sharedCheckoutOwnershipId &&
+        sharedCheckoutSurvivor.status === "running" &&
+        Number.isSafeInteger(sharedCheckoutSurvivor.processId) &&
+        Number(sharedCheckoutSurvivor.processId) > 0,
+      );
+    });
+
+    return { requested, exited, escalated, timedOut, durableAccountingComplete };
   }
 
   /** Check whether every tracked shutdown resource has confirmed its exit. */
@@ -5476,7 +7568,10 @@ export class DispatchManager {
       this.unreadableWorktreeSurvivorMarkers.size > 0;
     if (
       this.processes.size > 0 ||
+      this.nodeLaunches.size > 0 ||
       this.pendingDockerStarts.size > 0 ||
+      this.pendingExitHandlers.size > 0 ||
+      this.hasPendingOperatorStopCleanup() ||
       hasLiveGroup ||
       hasUnconfirmedProcessGroup ||
       hasActiveContainer ||
@@ -5496,42 +7591,32 @@ export class DispatchManager {
   }
 
   /**
-   * Legacy synchronous shutdown trigger. It force-signals complete process
-   * trees before returning, but deliberately preserves worktrees and process
-   * tracking for the normal exit handlers. Callers that can await confirmation
-   * should use shutdownAll().
+   * Stop all running processes through the same fail-closed tree/recovery
+   * barrier as an individual operator stop.
    */
-  killAll(): void {
-    this.shutdownInProgress = true;
-    for (const [taskId, child] of this.processes) {
-      const job = this.jobs.get(taskId);
-      if (job) {
-        job.stopRequestedAt = new Date().toISOString();
-        if (job.worktreePath) {
-          this.updateWorktreeOwnership(job, "stopping", child.pid ?? job.pid);
-        }
+  killAll(): boolean {
+    const activeTaskIds = new Set<string>([
+      ...this.processes.keys(),
+      ...this.operatorStopCleanupPending.keys(),
+    ]);
+    for (const [taskId, job] of this.jobs) {
+      if (
+        job.status === "running" ||
+        job.status === "awaiting_approval" ||
+        job.operatorStopCleanupPending === true
+      ) {
+        activeTaskIds.add(taskId);
       }
-      this.clearStopEscalation(taskId, true);
+    }
+    let allStopped = true;
+    for (const taskId of activeTaskIds) {
       try {
-        this.signalProcessTree(taskId, child, "SIGKILL", 1_000);
+        if (!this.stop(taskId)) allStopped = false;
       } catch {
-        // A concurrent natural exit is safe; retain tracking and the worktree
-        // until the normal child lifecycle handler records the outcome.
+        allStopped = false;
       }
     }
-    for (const job of this.jobs.values()) {
-      if (job.status === "awaiting_approval") {
-        job.stopRequestedAt = new Date().toISOString();
-        job.status = "stopped";
-        if (!job.worktreePath && this.isolationConfig?.method !== "docker") {
-          this.preserveInterruptedSharedCheckout(job, "stopped");
-        }
-      }
-    }
-    if (this.dockerManager) {
-      this.dockerManager.abortPendingCommands();
-      void this.dockerManager.cleanupAll().catch(() => undefined);
-    }
+    return allStopped;
   }
 
   /**

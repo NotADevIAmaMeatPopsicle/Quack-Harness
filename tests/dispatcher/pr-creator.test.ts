@@ -1,10 +1,7 @@
-/* eslint-disable @typescript-eslint/no-require-imports */
-import { promisify } from "node:util";
-
 import type { ProjectAdapter } from "../../src/core/adapter-loader";
 import type { AdapterConfig } from "../../src/core/types";
 
-// ─── Mock child_process.execFile ──────────────────────────────────────
+// ─── Mock the narrow trusted GitHub CLI boundary ─────────────────────
 
 type MockExecResult = {
   stdout?: string;
@@ -13,70 +10,76 @@ type MockExecResult = {
   code?: number;
 };
 
-let mockGitResults: Record<string, MockExecResult | MockExecResult[]> = {};
-let mockExecutedCommands: string[] = [];
+let mockGitResults: Record<string, MockExecResult> = {};
+let mockGitResultQueues: Record<string, MockExecResult[]> = {};
+let trustedGitHubCalls: Array<{ projectRoot: string; args: readonly string[] }> = [];
+const mockRepository = { host: "github.com", owner: "org", repo: "repo" };
+const expectedHeadOid = "a".repeat(40);
+
+function pullRequestMetadata(overrides: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    url: "https://github.com/org/repo/pull/42",
+    state: "OPEN",
+    headRefOid: expectedHeadOid,
+    headRefName: "quack/TASK-042",
+    baseRefName: "main",
+    body: "Test body",
+    headRepository: { name: "repo", nameWithOwner: "org/repo" },
+    headRepositoryOwner: { login: "org" },
+    mergeCommit: null,
+    ...overrides,
+  });
+}
 
 function findGitResult(command: string): MockExecResult | undefined {
+  for (const [pattern, queue] of Object.entries(mockGitResultQueues)) {
+    if (command.includes(pattern) && queue.length > 0) {
+      return queue.shift();
+    }
+  }
   for (const [pattern, result] of Object.entries(mockGitResults)) {
     if (command.includes(pattern)) {
-      return Array.isArray(result) ? result.shift() : result;
+      return result;
     }
   }
   return undefined;
 }
 
-jest.mock("node:child_process", () => {
-  const actual = jest.requireActual<typeof import("node:child_process")>("node:child_process");
-
-  const customPromisified = (
-    file: string,
+jest.mock("../../src/worker/trusted-executable", () => ({
+  resolveTrustedGitHubRepository: (): Promise<typeof mockRepository> =>
+    Promise.resolve(mockRepository),
+  runTrustedGitHubResult: (
+    projectRoot: string,
     args: readonly string[],
-    _options: Record<string, unknown>,
-  ): Promise<{ stdout: string; stderr: string }> => {
-    const command = [file, ...args].join(" ");
-    mockExecutedCommands.push(command);
+  ): Promise<{ exitCode: number; stdout: string; stderr: string }> => {
+    trustedGitHubCalls.push({ projectRoot, args });
+    const command = ["gh", ...args].join(" ");
     const matchedResult = findGitResult(command);
     if (!matchedResult) {
-      if (command === "git remote get-url --push --all origin") {
-        return Promise.resolve({ stdout: "git@github.com:org/repo.git\n", stderr: "" });
-      }
-      return Promise.resolve({ stdout: "", stderr: "" });
+      return Promise.resolve({ exitCode: 0, stdout: "", stderr: "" });
     }
 
     if (matchedResult.error) {
-      const err = Object.assign(new Error("Command failed"), {
-        code: matchedResult.code ?? 1,
-        killed: false,
-        signal: null,
+      return Promise.resolve({
+        exitCode: matchedResult.code ?? 1,
         stdout: matchedResult.stdout ?? "",
         stderr: matchedResult.stderr ?? "",
       });
-      return Promise.reject(err);
     }
 
     return Promise.resolve({
+      exitCode: 0,
       stdout: matchedResult.stdout ?? "",
       stderr: matchedResult.stderr ?? "",
     });
-  };
-
-  const mockExecFile = jest.fn();
-  (mockExecFile as unknown as Record<symbol, unknown>)[promisify.custom] = customPromisified;
-
-  return {
-    ...actual,
-    execFile: mockExecFile,
-  };
-});
+  },
+}));
 
 // ─── Import after mocking ────────────────────────────────────────────
 
-// eslint-disable-next-line @typescript-eslint/no-require-imports
 const { buildPrBody, createPullRequest } =
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
   require("../../src/dispatcher/pr-creator") as typeof import("../../src/dispatcher/pr-creator");
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const { parseGitHubOrigin } =
-  require("../../src/dispatcher/github-repository") as typeof import("../../src/dispatcher/github-repository");
 
 // ─── Test helpers ────────────────────────────────────────────────────
 
@@ -143,7 +146,8 @@ function makeAdapter(overrides: Partial<ProjectAdapter> = {}): ProjectAdapter {
 
 beforeEach(() => {
   mockGitResults = {};
-  mockExecutedCommands = [];
+  mockGitResultQueues = {};
+  trustedGitHubCalls = [];
 });
 
 describe("pr-creator", () => {
@@ -266,133 +270,12 @@ describe("pr-creator", () => {
   });
 
   describe("createPullRequest", () => {
-    test("hostile GH_REPO cannot redirect create or inspection from the exact origin", async () => {
-      const previous = process.env.GH_REPO;
-      process.env.GH_REPO = "attacker/redirect";
-      const headCommitSha = "a".repeat(40);
-      mockGitResults = {
-        "gh pr create": { stdout: "https://github.com/org/repo/pull/42" },
-        "gh pr view": {
-          stdout: JSON.stringify({
-            url: "https://github.com/org/repo/pull/42",
-            baseRefName: "main",
-            headRefName: "quack/TASK-042",
-            headRefOid: headCommitSha,
-            headRepository: { nameWithOwner: "org/repo" },
-          }),
-        },
-      };
-
-      try {
-        await expect(
-          createPullRequest(
-            {
-              taskId: "TASK-042",
-              title: "[TASK-042] Test Task",
-              body: "Test body",
-              baseBranch: "main",
-              headBranch: "quack/TASK-042",
-              headCommitSha,
-            },
-            makeAdapter(),
-          ),
-        ).resolves.toEqual({ success: true, prUrl: "https://github.com/org/repo/pull/42" });
-        const prCommands = mockExecutedCommands.filter((command) => command.startsWith("gh pr "));
-        expect(prCommands).not.toHaveLength(0);
-        expect(prCommands.every((command) => command.includes("--repo github.com/org/repo"))).toBe(
-          true,
-        );
-        expect(prCommands.some((command) => command.includes("attacker/redirect"))).toBe(false);
-      } finally {
-        if (previous === undefined) delete process.env.GH_REPO;
-        else process.env.GH_REPO = previous;
-      }
-    });
-
-    test("fails closed when origin changes after PR creation but before inspection", async () => {
-      const pushUrl = "git@github.com:org/repo.git";
-      const repository = parseGitHubOrigin(pushUrl)!;
-      mockGitResults = {
-        "git remote get-url --push --all origin": [
-          { stdout: `${pushUrl}\n` },
-          { stdout: "git@github.com:attacker/redirect.git\n" },
-          { stdout: "git@github.com:attacker/redirect.git\n" },
-        ],
-        "gh pr create": { stdout: "https://github.com/org/repo/pull/42" },
-      };
-
-      const result = await createPullRequest(
-        {
-          taskId: "TASK-042",
-          title: "[TASK-042] Test Task",
-          body: "Test body",
-          baseBranch: "main",
-          headBranch: "quack/TASK-042",
-          headCommitSha: "a".repeat(40),
-        },
-        makeAdapter(),
-        repository,
-      );
-
-      expect(result.success).toBe(false);
-      expect(mockExecutedCommands.some((command) => command.startsWith("gh pr create"))).toBe(true);
-      expect(mockExecutedCommands.some((command) => command.startsWith("gh pr view"))).toBe(false);
-      expect(mockExecutedCommands.some((command) => command.startsWith("gh pr list"))).toBe(false);
-    });
-
-    test("rejects multiple origin push URLs before any GitHub side effect", async () => {
-      mockGitResults = {
-        "git remote get-url --push --all origin": {
-          stdout: "git@github.com:org/repo.git\ngit@github.com:org/mirror.git\n",
-        },
-      };
-      const result = await createPullRequest(
-        {
-          taskId: "TASK-042",
-          title: "[TASK-042] Test Task",
-          body: "Test body",
-          baseBranch: "main",
-          headBranch: "quack/TASK-042",
-          headCommitSha: "a".repeat(40),
-        },
-        makeAdapter(),
-      );
-
-      expect(result.success).toBe(false);
-      expect(result.error).toContain("exactly one push URL");
-      expect(mockExecutedCommands.some((command) => command.startsWith("gh pr "))).toBe(false);
-    });
-
-    test("preserves a host-qualified GHES port from the origin push URL", () => {
-      const repository = parseGitHubOrigin("https://git.example.test:8443/org/repo.git");
-      expect(repository).toBeDefined();
-      if (!repository) throw new Error("Expected GitHub repository identity");
-      expect(repository).toMatchObject({
-        host: "git.example.test:8443",
-        nameWithOwner: "org/repo",
-        selector: "git.example.test:8443/org/repo",
-        pushUrl: "https://git.example.test:8443/org/repo.git",
-      });
-      expect(repository.pushUrlHash).toMatch(/^[a-f0-9]{64}$/u);
-    });
-
     test("should return PR URL on success", async () => {
       mockGitResults = {
-        "gh repo view": {
-          stdout: JSON.stringify({ nameWithOwner: "org/repo", url: "https://github.com/org/repo" }),
-        },
         "gh pr create": {
           stdout: "https://github.com/org/repo/pull/42",
         },
-        "gh pr view": {
-          stdout: JSON.stringify({
-            url: "https://github.com/org/repo/pull/42",
-            baseRefName: "main",
-            headRefName: "quack/TASK-042",
-            headRefOid: "a".repeat(40),
-            headRepository: { nameWithOwner: "org/repo" },
-          }),
-        },
+        "gh pr view": { stdout: pullRequestMetadata() },
       };
 
       const adapter = makeAdapter();
@@ -403,22 +286,20 @@ describe("pr-creator", () => {
           body: "Test body",
           baseBranch: "main",
           headBranch: "quack/TASK-042",
-          headCommitSha: "a".repeat(40),
+          expectedHeadOid,
         },
         adapter,
       );
 
-      expect(result).toEqual({ success: true, prUrl: "https://github.com/org/repo/pull/42" });
-      expect(mockExecutedCommands).toContain(
-        `gh pr create --title [TASK-042] Test Task --body Test body --base main --repo github.com/org/repo --head quack/TASK-042`,
-      );
+      expect(result.success).toBe(true);
+      expect(result.prUrl).toBe("https://github.com/org/repo/pull/42");
+      expect(trustedGitHubCalls).toHaveLength(2);
+      expect(trustedGitHubCalls[0]?.projectRoot).toBe("/fake/project");
+      expect(trustedGitHubCalls[0]?.args.slice(0, 2)).toEqual(["pr", "create"]);
     });
 
     test("should return error on gh failure", async () => {
       mockGitResults = {
-        "gh repo view": {
-          stdout: JSON.stringify({ nameWithOwner: "org/repo", url: "https://github.com/org/repo" }),
-        },
         "gh pr create": {
           error: true,
           stderr: "gh: Not logged in",
@@ -433,7 +314,7 @@ describe("pr-creator", () => {
           body: "Test body",
           baseBranch: "main",
           headBranch: "quack/TASK-042",
-          headCommitSha: "a".repeat(40),
+          expectedHeadOid,
         },
         adapter,
       );
@@ -442,151 +323,56 @@ describe("pr-creator", () => {
       expect(result.error).toContain("Failed to create PR");
     });
 
-    test("preserves a valid repository-bound PR URL emitted on stderr", async () => {
-      mockGitResults = {
-        "gh repo view": {
-          stdout: JSON.stringify({ nameWithOwner: "org/repo", url: "https://github.com/org/repo" }),
-        },
-        "gh pr create": {
-          stderr: "warning\nhttps://github.com/org/repo/pull/42\n",
-        },
-        "gh pr view": {
-          stdout: JSON.stringify({
-            url: "https://github.com/org/repo/pull/42",
-            baseRefName: "main",
-            headRefName: "quack/TASK-042",
-            headRefOid: "a".repeat(40),
-            headRepository: { nameWithOwner: "org/repo" },
-          }),
-        },
-      };
-
-      const result = await createPullRequest(
-        {
-          taskId: "TASK-042",
-          title: "[TASK-042] Test Task",
-          body: "Test body",
-          baseBranch: "main",
-          headBranch: "quack/TASK-042",
-          headCommitSha: "a".repeat(40),
-        },
-        makeAdapter(),
-      );
-
-      expect(result).toEqual({ success: true, prUrl: "https://github.com/org/repo/pull/42" });
-    });
-
-    test("binds and verifies an exact host-side PR before reporting success", async () => {
-      const headCommitSha = "a".repeat(40);
-      mockGitResults = {
-        "gh repo view": {
-          stdout: JSON.stringify({ nameWithOwner: "org/repo", url: "https://github.com/org/repo" }),
-        },
-        "gh pr create": { stdout: "https://github.com/org/repo/pull/42" },
-        "gh pr view": {
-          stdout: JSON.stringify({
-            url: "https://github.com/org/repo/pull/42",
-            baseRefName: "main",
-            headRefName: "quack/TASK-042",
-            headRefOid: headCommitSha,
-            headRepository: { nameWithOwner: "org/repo" },
-            headRepositoryOwner: { login: "org" },
-          }),
-        },
-      };
-
-      const result = await createPullRequest(
-        {
-          taskId: "TASK-042",
-          title: "[TASK-042] Test Task",
-          body: "Test body",
-          baseBranch: "main",
-          headBranch: "quack/TASK-042",
-          headCommitSha,
-        },
-        makeAdapter(),
-      );
-
-      expect(result).toEqual({ success: true, prUrl: "https://github.com/org/repo/pull/42" });
-      expect(mockExecutedCommands).toContain(
-        "gh pr create --title [TASK-042] Test Task --body Test body --base main --repo github.com/org/repo --head quack/TASK-042",
-      );
-      expect(mockExecutedCommands).toContain(
-        "gh pr view https://github.com/org/repo/pull/42 --repo github.com/org/repo --json url,baseRefName,headRefName,headRefOid,headRepository,headRepositoryOwner",
-      );
-    });
-
-    test("never reports success when GitHub CLI omits the PR URL", async () => {
-      mockGitResults = {
-        "gh repo view": {
-          stdout: JSON.stringify({ nameWithOwner: "org/repo", url: "https://github.com/org/repo" }),
-        },
-        "gh pr create": { stdout: "", stderr: "Pull request created" },
-      };
-
-      const result = await createPullRequest(
-        {
-          taskId: "TASK-042",
-          title: "[TASK-042] Test Task",
-          body: "Test body",
-          baseBranch: "main",
-          headBranch: "quack/TASK-042",
-          headCommitSha: "a".repeat(40),
-        },
-        makeAdapter(),
-      );
-
-      expect(result).toEqual({
-        success: false,
-        error:
-          "Failed to create PR: GitHub CLI did not return a pull request URL for the resolved repository",
-      });
-    });
-
-    test("rejects a returned PR URL from a different repository", async () => {
-      mockGitResults = {
-        "gh repo view": {
-          stdout: JSON.stringify({ nameWithOwner: "org/repo", url: "https://github.com/org/repo" }),
-        },
-        "gh pr create": { stdout: "https://github.com/other/repo/pull/42" },
-      };
-
-      const result = await createPullRequest(
-        {
-          taskId: "TASK-042",
-          title: "[TASK-042] Test Task",
-          body: "Test body",
-          baseBranch: "main",
-          headBranch: "quack/TASK-042",
-          headCommitSha: "a".repeat(40),
-        },
-        makeAdapter(),
-      );
-
-      expect(result.success).toBe(false);
-      expect(result.error).toContain("resolved repository");
-    });
-
     test("recovers the one exact existing head/base PR after an ambiguous create failure", async () => {
-      const headCommitSha = "a".repeat(40);
       mockGitResults = {
-        "gh repo view": {
-          stdout: JSON.stringify({ nameWithOwner: "org/repo", url: "https://github.com/org/repo" }),
+        "gh pr create": {
+          error: true,
+          stderr: "request completed but response was lost",
         },
+        "gh pr list": {
+          stdout: JSON.stringify([JSON.parse(pullRequestMetadata())]),
+        },
+      };
+
+      const result = await createPullRequest(
+        {
+          taskId: "TASK-042",
+          title: "[TASK-042] Test Task",
+          body: "Test body",
+          baseBranch: "main",
+          headBranch: "quack/TASK-042",
+          expectedHeadOid,
+        },
+        makeAdapter(),
+      );
+
+      expect(result).toEqual({ success: true, prUrl: "https://github.com/org/repo/pull/42" });
+    });
+
+    test("selects one marker-owned PR from bounded historical head/base results", async () => {
+      const marker = "<!-- quack-publication:123e4567-e89b-42d3-a456-426614174000 -->";
+      const onCandidate = jest.fn();
+      mockGitResults = {
         "gh pr create": {
           error: true,
           stderr: "request completed but response was lost",
         },
         "gh pr list": {
           stdout: JSON.stringify([
-            {
-              url: "https://github.com/org/repo/pull/42",
-              baseRefName: "main",
-              headRefName: "quack/TASK-042",
-              headRefOid: headCommitSha,
-              headRepository: { nameWithOwner: "org/repo" },
-              headRepositoryOwner: { login: "org" },
-            },
+            JSON.parse(pullRequestMetadata({ state: "CLOSED", body: "old publication" })),
+            JSON.parse(
+              pullRequestMetadata({
+                url: "https://github.com/org/repo/pull/41",
+                state: "MERGED",
+                body: "older publication",
+              }),
+            ),
+            JSON.parse(
+              pullRequestMetadata({
+                url: "https://github.com/org/repo/pull/43",
+                body: `Test body\n\n${marker}`,
+              }),
+            ),
           ]),
         },
       };
@@ -598,33 +384,36 @@ describe("pr-creator", () => {
           body: "Test body",
           baseBranch: "main",
           headBranch: "quack/TASK-042",
-          headCommitSha,
+          expectedHeadOid,
+          ownershipMarker: marker,
+          onCandidate,
         },
         makeAdapter(),
       );
 
-      expect(result).toEqual({ success: true, prUrl: "https://github.com/org/repo/pull/42" });
-      expect(mockExecutedCommands.find((command) => command.startsWith("gh pr list "))).toContain(
-        "--repo github.com/org/repo",
+      expect(result).toEqual({ success: true, prUrl: "https://github.com/org/repo/pull/43" });
+      expect(onCandidate).toHaveBeenNthCalledWith(1, expect.objectContaining({ state: "pending" }));
+      expect(onCandidate).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ state: "accepted" }),
       );
+      expect(trustedGitHubCalls.at(-1)?.args).toEqual(expect.arrayContaining(["--limit", "20"]));
     });
 
-    test("does not recover a same-name PR at a different head commit", async () => {
+    test("fails closed when lost-response recovery finds multiple marker-owned PRs", async () => {
+      const marker = "<!-- quack-publication:123e4567-e89b-42d3-a456-426614174000 -->";
+      const onCandidate = jest.fn();
       mockGitResults = {
-        "gh repo view": {
-          stdout: JSON.stringify({ nameWithOwner: "org/repo", url: "https://github.com/org/repo" }),
-        },
-        "gh pr create": { error: true, stderr: "request completed but response was lost" },
+        "gh pr create": { error: true, stderr: "response lost" },
         "gh pr list": {
           stdout: JSON.stringify([
-            {
-              url: "https://github.com/org/repo/pull/42",
-              baseRefName: "main",
-              headRefName: "quack/TASK-042",
-              headRefOid: "b".repeat(40),
-              headRepository: { nameWithOwner: "org/repo" },
-              headRepositoryOwner: { login: "org" },
-            },
+            JSON.parse(pullRequestMetadata({ state: "CLOSED", body: `Test body\n\n${marker}` })),
+            JSON.parse(
+              pullRequestMetadata({
+                url: "https://github.com/org/repo/pull/43",
+                body: `Test body\n\n${marker}`,
+              }),
+            ),
           ]),
         },
       };
@@ -636,13 +425,313 @@ describe("pr-creator", () => {
           body: "Test body",
           baseBranch: "main",
           headBranch: "quack/TASK-042",
-          headCommitSha: "a".repeat(40),
+          expectedHeadOid,
+          ownershipMarker: marker,
+          onCandidate,
+        },
+        makeAdapter(),
+      );
+
+      expect(result).toEqual({ success: false, error: "Failed to create PR: response lost" });
+      expect(onCandidate).not.toHaveBeenCalled();
+    });
+
+    test("fails closed when lost-response recovery finds no exact marker-owned PR", async () => {
+      const marker = "<!-- quack-publication:123e4567-e89b-42d3-a456-426614174000 -->";
+      const onCandidate = jest.fn();
+      mockGitResults = {
+        "gh pr create": { error: true, stderr: "response lost" },
+        "gh pr list": {
+          stdout: JSON.stringify([
+            JSON.parse(pullRequestMetadata({ body: "historical publication" })),
+            JSON.parse(
+              pullRequestMetadata({
+                url: "https://github.com/org/repo/pull/43",
+                body: `Test body\n\n${marker}`,
+                headRefOid: "b".repeat(40),
+              }),
+            ),
+          ]),
+        },
+      };
+
+      const result = await createPullRequest(
+        {
+          taskId: "TASK-042",
+          title: "[TASK-042] Test Task",
+          body: "Test body",
+          baseBranch: "main",
+          headBranch: "quack/TASK-042",
+          expectedHeadOid,
+          ownershipMarker: marker,
+          onCandidate,
+        },
+        makeAdapter(),
+      );
+
+      expect(result).toEqual({ success: false, error: "Failed to create PR: response lost" });
+      expect(onCandidate).not.toHaveBeenCalled();
+    });
+
+    test("rejects a created pull request whose head advanced past the expected commit", async () => {
+      mockGitResults = {
+        "gh pr create": { stdout: "https://github.com/org/repo/pull/42" },
+        "gh pr view": { stdout: pullRequestMetadata({ headRefOid: "b".repeat(40) }) },
+      };
+
+      const result = await createPullRequest(
+        {
+          taskId: "TASK-042",
+          title: "[TASK-042] Test Task",
+          body: "Test body",
+          baseBranch: "main",
+          headBranch: "quack/TASK-042",
+          expectedHeadOid,
         },
         makeAdapter(),
       );
 
       expect(result.success).toBe(false);
-      expect(result.error).toContain("Failed to create PR");
+      expect(result.error).toContain("sealed publication commit");
+    });
+
+    test("rejects a pull request whose head repository is not the pinned origin", async () => {
+      mockGitResults = {
+        "gh pr create": { stdout: "https://github.com/org/repo/pull/42" },
+        "gh pr view": {
+          stdout: pullRequestMetadata({
+            headRepository: { name: "repo", nameWithOwner: "attacker/repo" },
+            headRepositoryOwner: { login: "attacker" },
+          }),
+        },
+      };
+
+      const result = await createPullRequest(
+        {
+          taskId: "TASK-042",
+          title: "[TASK-042] Test Task",
+          body: "Test body",
+          baseBranch: "main",
+          headBranch: "quack/TASK-042",
+          expectedHeadOid,
+        },
+        makeAdapter(),
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("head repository");
+    });
+
+    test("supports a pinned GitHub Enterprise host with an explicit HTTPS port", async () => {
+      const repository = { host: "ghe.example.test:8443", owner: "org", repo: "repo" };
+      mockGitResults = {
+        "gh pr create": { stdout: "https://ghe.example.test:8443/org/repo/pull/42" },
+        "gh pr view": {
+          stdout: pullRequestMetadata({
+            url: "https://ghe.example.test:8443/org/repo/pull/42",
+          }),
+        },
+      };
+
+      await expect(
+        createPullRequest(
+          {
+            taskId: "TASK-042",
+            title: "[TASK-042] Test Task",
+            body: "Test body",
+            baseBranch: "main",
+            headBranch: "quack/TASK-042",
+            expectedHeadOid,
+            repository,
+          },
+          makeAdapter(),
+        ),
+      ).resolves.toEqual({
+        success: true,
+        prUrl: "https://ghe.example.test:8443/org/repo/pull/42",
+      });
+    });
+
+    test("durably records and safely closes a marker-owned PR that fails validation", async () => {
+      const marker = "<!-- quack-publication:123e4567-e89b-42d3-a456-426614174000 -->";
+      const onCandidate = jest.fn();
+      mockGitResults = {
+        "gh pr create": { stdout: "https://github.com/org/repo/pull/42" },
+        "gh pr close": { stdout: "closed" },
+      };
+      mockGitResultQueues = {
+        "gh pr view": [
+          {
+            stdout: pullRequestMetadata({
+              body: `Test body\n\n${marker}`,
+              headRefOid: "b".repeat(40),
+            }),
+          },
+          {
+            stdout: pullRequestMetadata({
+              body: `Test body\n\n${marker}`,
+              headRefOid: "b".repeat(40),
+              state: "CLOSED",
+            }),
+          },
+        ],
+      };
+
+      const result = await createPullRequest(
+        {
+          taskId: "TASK-042",
+          title: "[TASK-042] Test Task",
+          body: "Test body",
+          baseBranch: "main",
+          headBranch: "quack/TASK-042",
+          expectedHeadOid,
+          ownershipMarker: marker,
+          onCandidate,
+        },
+        makeAdapter(),
+      );
+
+      expect(result.success).toBe(false);
+      expect(
+        trustedGitHubCalls.some((call) => call.args.slice(0, 2).join(" ") === "pr close"),
+      ).toBe(true);
+      expect(onCandidate).toHaveBeenNthCalledWith(1, {
+        url: "https://github.com/org/repo/pull/42",
+        ownershipMarker: marker,
+        state: "pending",
+      });
+      expect(onCandidate).toHaveBeenNthCalledWith(2, {
+        url: "https://github.com/org/repo/pull/42",
+        ownershipMarker: marker,
+        state: "closed",
+      });
+    });
+
+    test("refuses to close a failed PR when its ownership marker is missing", async () => {
+      const marker = "<!-- quack-publication:123e4567-e89b-42d3-a456-426614174000 -->";
+      const onCandidate = jest.fn();
+      mockGitResults = {
+        "gh pr create": { stdout: "https://github.com/org/repo/pull/42" },
+        "gh pr view": { stdout: pullRequestMetadata({ headRefOid: "b".repeat(40) }) },
+      };
+
+      const result = await createPullRequest(
+        {
+          taskId: "TASK-042",
+          title: "[TASK-042] Test Task",
+          body: "Test body",
+          baseBranch: "main",
+          headBranch: "quack/TASK-042",
+          expectedHeadOid,
+          ownershipMarker: marker,
+          onCandidate,
+        },
+        makeAdapter(),
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("unique Quack ownership marker");
+      expect(trustedGitHubCalls.some((call) => call.args[1] === "close")).toBe(false);
+      expect(onCandidate).toHaveBeenCalledTimes(1);
+    });
+
+    test("retains a pending candidate when close readback cannot be confirmed", async () => {
+      const marker = "<!-- quack-publication:123e4567-e89b-42d3-a456-426614174000 -->";
+      const onCandidate = jest.fn();
+      mockGitResults = {
+        "gh pr create": { stdout: "https://github.com/org/repo/pull/42" },
+        "gh pr close": { stdout: "closed" },
+      };
+      mockGitResultQueues = {
+        "gh pr view": [
+          {
+            stdout: pullRequestMetadata({
+              body: `Test body\n\n${marker}`,
+              headRefOid: "b".repeat(40),
+            }),
+          },
+          { error: true, stderr: "readback unavailable" },
+        ],
+      };
+
+      const result = await createPullRequest(
+        {
+          taskId: "TASK-042",
+          title: "[TASK-042] Test Task",
+          body: "Test body",
+          baseBranch: "main",
+          headBranch: "quack/TASK-042",
+          expectedHeadOid,
+          ownershipMarker: marker,
+          onCandidate,
+        },
+        makeAdapter(),
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("readback unavailable");
+      expect(onCandidate).toHaveBeenCalledTimes(1);
+      expect(onCandidate).toHaveBeenLastCalledWith(expect.objectContaining({ state: "pending" }));
+    });
+
+    test("retains a pending candidate when the marker-owned PR cannot be closed", async () => {
+      const marker = "<!-- quack-publication:123e4567-e89b-42d3-a456-426614174000 -->";
+      const onCandidate = jest.fn();
+      mockGitResults = {
+        "gh pr create": { stdout: "https://github.com/org/repo/pull/42" },
+        "gh pr view": {
+          stdout: pullRequestMetadata({
+            body: `Test body\n\n${marker}`,
+            headRefOid: "b".repeat(40),
+          }),
+        },
+        "gh pr close": { error: true, stderr: "close denied" },
+      };
+
+      const result = await createPullRequest(
+        {
+          taskId: "TASK-042",
+          title: "[TASK-042] Test Task",
+          body: "Test body",
+          baseBranch: "main",
+          headBranch: "quack/TASK-042",
+          expectedHeadOid,
+          ownershipMarker: marker,
+          onCandidate,
+        },
+        makeAdapter(),
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("close denied");
+      expect(onCandidate).toHaveBeenCalledTimes(1);
+      expect(onCandidate).toHaveBeenLastCalledWith(expect.objectContaining({ state: "pending" }));
+    });
+
+    test("rejects an ambiguous recovered pull request from the wrong repository", async () => {
+      mockGitResults = {
+        "gh pr create": { error: true, stderr: "response lost" },
+        "gh pr list": {
+          stdout: JSON.stringify([
+            JSON.parse(pullRequestMetadata({ url: "https://github.com/attacker/repo/pull/42" })),
+          ]),
+        },
+      };
+
+      const result = await createPullRequest(
+        {
+          taskId: "TASK-042",
+          title: "[TASK-042] Test Task",
+          body: "Test body",
+          baseBranch: "main",
+          headBranch: "quack/TASK-042",
+          expectedHeadOid,
+        },
+        makeAdapter(),
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("response lost");
     });
   });
 });

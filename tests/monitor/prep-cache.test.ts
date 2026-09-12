@@ -70,7 +70,7 @@ describe("PrepCache", () => {
       fs.mkdirSync(quackDir, { recursive: true });
       fs.writeFileSync(
         path.join(quackDir, "prep"),
-        "/srv/example-service-dev/.quack/prep\n",
+        "/root/example-service-dev/.quack/prep\n",
         "utf-8",
       );
 

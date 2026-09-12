@@ -143,6 +143,105 @@ describe("QueuePersistence", () => {
       expect(task!.status).toBe("queued"); // Reset from "running" to "queued"
     });
 
+    it("preserves an awaiting-approval task as durable nonterminal work", () => {
+      persistence.append({
+        ts: "2024-01-01T00:00:00.000Z",
+        type: "task_enqueued",
+        taskId: "TASK-001",
+        priority: 0,
+        blockedBy: [],
+      });
+      persistence.append({
+        ts: "2024-01-01T00:01:00.000Z",
+        type: "task_started",
+        taskId: "TASK-001",
+      });
+      persistence.append({
+        ts: "2024-01-01T00:02:00.000Z",
+        type: "task_awaiting_approval",
+        taskId: "TASK-001",
+      });
+
+      const task = persistence.replay().get("TASK-001");
+
+      expect(task).toMatchObject({
+        status: "awaiting_approval",
+        awaitingApprovalAt: "2024-01-01T00:02:00.000Z",
+        retryCount: 0,
+      });
+      expect(task?.completedAt).toBeUndefined();
+    });
+
+    it("replays approval resume and terminal completion in order", () => {
+      persistence.append({
+        ts: "2024-01-01T00:00:00.000Z",
+        type: "task_enqueued",
+        taskId: "TASK-001",
+        priority: 0,
+        blockedBy: [],
+      });
+      persistence.append({
+        ts: "2024-01-01T00:01:00.000Z",
+        type: "task_started",
+        taskId: "TASK-001",
+      });
+      persistence.append({
+        ts: "2024-01-01T00:02:00.000Z",
+        type: "task_awaiting_approval",
+        taskId: "TASK-001",
+      });
+      persistence.append({
+        ts: "2024-01-01T00:03:00.000Z",
+        type: "task_resumed",
+        taskId: "TASK-001",
+        dispatchOptions: { resume: true },
+      });
+      persistence.append({
+        ts: "2024-01-01T00:04:00.000Z",
+        type: "task_completed",
+        taskId: "TASK-001",
+        outcome: "approved",
+      });
+
+      expect(persistence.replay().get("TASK-001")).toMatchObject({
+        status: "completed",
+        outcome: "approved",
+        awaitingApprovalAt: "2024-01-01T00:02:00.000Z",
+        dispatchOptions: { resume: true },
+      });
+    });
+
+    it("retains resume intent when a resumed dispatch is interrupted", () => {
+      persistence.append({
+        ts: "2024-01-01T00:00:00.000Z",
+        type: "task_enqueued",
+        taskId: "TASK-001",
+        priority: 0,
+        blockedBy: [],
+      });
+      persistence.append({
+        ts: "2024-01-01T00:01:00.000Z",
+        type: "task_started",
+        taskId: "TASK-001",
+      });
+      persistence.append({
+        ts: "2024-01-01T00:02:00.000Z",
+        type: "task_awaiting_approval",
+        taskId: "TASK-001",
+      });
+      persistence.append({
+        ts: "2024-01-01T00:03:00.000Z",
+        type: "task_resumed",
+        taskId: "TASK-001",
+        dispatchOptions: { resume: true },
+      });
+
+      expect(persistence.replay().get("TASK-001")).toMatchObject({
+        status: "queued",
+        dispatchOptions: { resume: true },
+      });
+    });
+
     it("preserves completed and failed tasks on recovery", () => {
       persistence.append({
         ts: "2024-01-01T00:00:00.000Z",

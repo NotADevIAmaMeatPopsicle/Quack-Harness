@@ -28,18 +28,6 @@ function makeTempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "quack-v1-reviews-"));
 }
 
-function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const probe = http.createServer();
-    probe.once("error", reject);
-    probe.listen(0, "127.0.0.1", () => {
-      const address = probe.address();
-      const assignedPort = typeof address === "object" && address !== null ? address.port : 0;
-      probe.close(() => resolve(assignedPort));
-    });
-  });
-}
-
 function writeTaskFile(
   projectRoot: string,
   taskId: string,
@@ -152,15 +140,15 @@ describe("v1 reviews API", () => {
     fs.mkdirSync(path.join(projectRoot, ".quack", "logs"), { recursive: true });
     writeTaskFile(projectRoot, "TASK-920", "COMPLETE", true);
     writeTaskFile(projectRoot, "TASK-921", "IMPLEMENTED IN FRONTEND SLICE", true);
-    port = await freePort();
-
     const server = createMonitorServer({
       projectRoot,
       taskDir: "docs/tasks",
       logDir: path.join(projectRoot, ".quack", "logs"),
-      port,
+      port: 0,
+      host: "127.0.0.1",
     });
     const started = await server.start();
+    port = started.port;
     stop = started.stop;
   });
 
@@ -173,7 +161,7 @@ describe("v1 reviews API", () => {
   });
 
   it("accepts changelog_only review when required artifacts are present", async () => {
-    const resp = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const resp = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-920",
       verdict: "VERIFIED",
       docsImpact: "changelog_only",
@@ -231,7 +219,7 @@ describe("v1 reviews API", () => {
   });
 
   it("blocks feature_page_update when wiki artifacts are incomplete", async () => {
-    const resp = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const resp = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-920",
       verdict: "VERIFIED",
       docsImpact: "feature_page_update",
@@ -251,7 +239,7 @@ describe("v1 reviews API", () => {
   });
 
   it("flags non-canonical task status values as an advisory without blocking (TASK-1300)", async () => {
-    const resp = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const resp = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-921",
       verdict: "VERIFIED",
       docsImpact: "changelog_only",
@@ -277,7 +265,7 @@ describe("v1 reviews API", () => {
   });
 
   it("blocks /api/tasks/:id/verified when linked review is not merge-ready", async () => {
-    const reviewResp = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const reviewResp = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-920",
       verdict: "VERIFIED",
       docsImpact: "feature_page_update",
@@ -293,10 +281,11 @@ describe("v1 reviews API", () => {
     expect(reviewResp.status).toBe(422);
     const reviewBody = JSON.parse(reviewResp.body) as { reviewId: string };
 
-    const verifyResp = await httpPost(`http://localhost:${port}/api/tasks/TASK-920/verified`, {
+    const verifyResp = await httpPost(`http://127.0.0.1:${port}/api/tasks/TASK-920/verified`, {
       verdict: "VERIFIED",
       reviewId: reviewBody.reviewId,
       requireReview: true,
+      commit: "abc1234",
     });
 
     expect(verifyResp.status).toBe(409);
@@ -305,9 +294,10 @@ describe("v1 reviews API", () => {
   });
 
   it("requires review linkage for /verify-task method on VERIFIED verdict", async () => {
-    const verifyResp = await httpPost(`http://localhost:${port}/api/tasks/TASK-920/verified`, {
+    const verifyResp = await httpPost(`http://127.0.0.1:${port}/api/tasks/TASK-920/verified`, {
       verdict: "VERIFIED",
       method: "/verify-task",
+      commit: "abc1234",
     });
 
     expect(verifyResp.status).toBe(409);
@@ -316,7 +306,7 @@ describe("v1 reviews API", () => {
   });
 
   it("returns persisted verification fields on first-time POST", async () => {
-    const verifyResp = await httpPost(`http://localhost:${port}/api/tasks/TASK-920/verified`, {
+    const verifyResp = await httpPost(`http://127.0.0.1:${port}/api/tasks/TASK-920/verified`, {
       verdict: "SOFT-VERIFIED",
       verified: "2026-05-12",
       commit: "abc1111",
@@ -353,7 +343,7 @@ describe("v1 reviews API", () => {
   });
 
   it("upgrades an existing row from SOFT-VERIFIED to VERIFIED via repeat POST", async () => {
-    const firstResp = await httpPost(`http://localhost:${port}/api/tasks/TASK-920/verified`, {
+    const firstResp = await httpPost(`http://127.0.0.1:${port}/api/tasks/TASK-920/verified`, {
       verdict: "SOFT-VERIFIED",
       verified: "2026-05-12",
       commit: "abc1111",
@@ -363,7 +353,7 @@ describe("v1 reviews API", () => {
     });
     expect(firstResp.status).toBe(200);
 
-    const secondResp = await httpPost(`http://localhost:${port}/api/tasks/TASK-920/verified`, {
+    const secondResp = await httpPost(`http://127.0.0.1:${port}/api/tasks/TASK-920/verified`, {
       verdict: "VERIFIED",
       verified: "2026-05-13",
       commit: "abc2222",
@@ -393,7 +383,7 @@ describe("v1 reviews API", () => {
   });
 
   it("updates an existing row from VERIFIED to FAILED when the later write is newer", async () => {
-    const firstResp = await httpPost(`http://localhost:${port}/api/tasks/TASK-920/verified`, {
+    const firstResp = await httpPost(`http://127.0.0.1:${port}/api/tasks/TASK-920/verified`, {
       verdict: "VERIFIED",
       verified: "2026-05-12",
       commit: "abc1111",
@@ -403,7 +393,7 @@ describe("v1 reviews API", () => {
     });
     expect(firstResp.status).toBe(200);
 
-    const secondResp = await httpPost(`http://localhost:${port}/api/tasks/TASK-920/verified`, {
+    const secondResp = await httpPost(`http://127.0.0.1:${port}/api/tasks/TASK-920/verified`, {
       verdict: "FAILED",
       verified: "2026-05-13",
       commit: "abc3333",
@@ -437,7 +427,7 @@ describe("v1 reviews API", () => {
     // Precedence is write-recency (updated_at), not verified-date order
     // (QPI-022). The stale path is reachable only with explicit write
     // cursors, exactly how federation-sync replays peer rows.
-    const firstResp = await httpPost(`http://localhost:${port}/api/tasks/TASK-920/verified`, {
+    const firstResp = await httpPost(`http://127.0.0.1:${port}/api/tasks/TASK-920/verified`, {
       verdict: "VERIFIED",
       verified: "2026-05-13",
       updated_at: "2026-05-13T10:00:00.000Z",
@@ -448,7 +438,7 @@ describe("v1 reviews API", () => {
     });
     expect(firstResp.status).toBe(200);
 
-    const staleResp = await httpPost(`http://localhost:${port}/api/tasks/TASK-920/verified`, {
+    const staleResp = await httpPost(`http://127.0.0.1:${port}/api/tasks/TASK-920/verified`, {
       verdict: "FAILED",
       verified: "2026-05-12",
       updated_at: "2026-05-12T10:00:00.000Z",
@@ -483,7 +473,7 @@ describe("v1 reviews API", () => {
   });
 
   it("rejects a malformed updated_at cursor", async () => {
-    const resp = await httpPost(`http://localhost:${port}/api/tasks/TASK-920/verified`, {
+    const resp = await httpPost(`http://127.0.0.1:${port}/api/tasks/TASK-920/verified`, {
       verdict: "VERIFIED",
       commit: "abc9999",
       method: "api",
@@ -497,7 +487,7 @@ describe("v1 reviews API", () => {
   });
 
   it("rejects a calendar-rollover updated_at cursor (2026-02-30 parses as Mar 2)", async () => {
-    const resp = await httpPost(`http://localhost:${port}/api/tasks/TASK-920/verified`, {
+    const resp = await httpPost(`http://127.0.0.1:${port}/api/tasks/TASK-920/verified`, {
       verdict: "VERIFIED",
       commit: "abc9999",
       method: "api",
@@ -511,7 +501,7 @@ describe("v1 reviews API", () => {
   });
 
   it("rejects a future updated_at cursor (poisoned-row guard)", async () => {
-    const resp = await httpPost(`http://localhost:${port}/api/tasks/TASK-920/verified`, {
+    const resp = await httpPost(`http://127.0.0.1:${port}/api/tasks/TASK-920/verified`, {
       verdict: "FAILED",
       commit: "abc0001",
       method: "api",
@@ -525,7 +515,7 @@ describe("v1 reviews API", () => {
   });
 
   it("fetches persisted review bundle by id", async () => {
-    const createResp = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const createResp = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-920",
       verdict: "VERIFIED",
       docsImpact: "changelog_only",
@@ -541,7 +531,7 @@ describe("v1 reviews API", () => {
     expect(createResp.status).toBe(201);
     const createBody = JSON.parse(createResp.body) as { reviewId: string };
 
-    const getResp = await httpGet(`http://localhost:${port}/v1/reviews/${createBody.reviewId}`);
+    const getResp = await httpGet(`http://127.0.0.1:${port}/v1/reviews/${createBody.reviewId}`);
     expect(getResp.status).toBe(200);
     const getBody = JSON.parse(getResp.body) as { review: { taskId: string; reviewId: string } };
     expect(getBody.review.taskId).toBe("TASK-920");
@@ -549,7 +539,7 @@ describe("v1 reviews API", () => {
   });
 
   it("lists persisted review bundles", async () => {
-    const createResp = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const createResp = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-920",
       verdict: "VERIFIED",
       docsImpact: "changelog_only",
@@ -566,7 +556,7 @@ describe("v1 reviews API", () => {
     expect(createResp.status).toBe(201);
     const createBody = JSON.parse(createResp.body) as { reviewId: string };
 
-    const listResp = await httpGet(`http://localhost:${port}/v1/reviews`);
+    const listResp = await httpGet(`http://127.0.0.1:${port}/v1/reviews`);
     expect(listResp.status).toBe(200);
     const listBody = JSON.parse(listResp.body) as {
       reviews: Array<{
@@ -587,7 +577,7 @@ describe("v1 reviews API", () => {
   });
 
   it("returns support-content records for downstream consumers", async () => {
-    const createResp = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const createResp = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-920",
       verdict: "VERIFIED",
       docsImpact: "support_bundle",
@@ -624,7 +614,7 @@ describe("v1 reviews API", () => {
     expect(createResp.status).toBe(201);
 
     const getResp = await httpGet(
-      `http://localhost:${port}/v1/support-content?taskId=TASK-920&limit=10`,
+      `http://127.0.0.1:${port}/v1/support-content?taskId=TASK-920&limit=10`,
     );
     expect(getResp.status).toBe(200);
     const body = JSON.parse(getResp.body) as {
@@ -637,7 +627,7 @@ describe("v1 reviews API", () => {
   });
 
   it("accepts docs_change_event and persists job event log", async () => {
-    const resp = await httpPost(`http://localhost:${port}/v1/jobs/JOB-1/events`, {
+    const resp = await httpPost(`http://127.0.0.1:${port}/v1/jobs/JOB-1/events`, {
       eventType: "docs_change_event",
       taskId: "TASK-920",
       payload: {
@@ -698,15 +688,15 @@ describe("v1 reviews ledger bridge (TASK-1203)", () => {
     projectRoot = makeTempDir();
     fs.mkdirSync(path.join(projectRoot, ".quack", "logs"), { recursive: true });
     writeTaskFile(projectRoot, "TASK-930", "COMPLETE", true);
-    port = await freePort();
-
     const server = createMonitorServer({
       projectRoot,
       taskDir: "docs/tasks",
       logDir: path.join(projectRoot, ".quack", "logs"),
-      port,
+      port: 0,
+      host: "127.0.0.1",
     });
     const started = await server.start();
+    port = started.port;
     stop = started.stop;
   });
 
@@ -719,7 +709,7 @@ describe("v1 reviews ledger bridge (TASK-1203)", () => {
   });
 
   it("writes a VERIFIED ledger row (method v1-review) and advances task_status", async () => {
-    const resp = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const resp = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-930",
       verdict: "VERIFIED",
       docsImpact: "changelog_only",
@@ -755,7 +745,7 @@ describe("v1 reviews ledger bridge (TASK-1203)", () => {
     const projectionPath = path.join(projectRoot, ".quack", "verified.json");
     const projectionBytes = fs.readFileSync(projectionPath);
 
-    const resp = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const resp = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-930",
       verdict: "VERIFIED",
       docsImpact: "changelog_only",
@@ -780,8 +770,8 @@ describe("v1 reviews ledger bridge (TASK-1203)", () => {
     expect(fs.readFileSync(projectionPath)).toEqual(projectionBytes);
   });
 
-  it("records commit 'unknown' when commitSha is omitted", async () => {
-    const resp = await httpPost(`http://localhost:${port}/v1/reviews`, {
+  it("preserves the review and reports ledger.error when positive commitSha is omitted", async () => {
+    const resp = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-930",
       verdict: "VERIFIED",
       docsImpact: "changelog_only",
@@ -789,11 +779,26 @@ describe("v1 reviews ledger bridge (TASK-1203)", () => {
     });
 
     expect(resp.status).toBe(201);
-    expect(readVerifiedProjection(projectRoot)["TASK-930"]).toMatchObject({ commit: "unknown" });
+    const body = JSON.parse(resp.body) as {
+      reviewPath: string;
+      ledger: { applied: boolean; error: string };
+    };
+    expect(fs.existsSync(body.reviewPath)).toBe(true);
+    expect(body.ledger.applied).toBe(false);
+    expect(body.ledger.error).toContain("Positive verification requires");
+    expect(readProjectionSafe(projectRoot)["TASK-930"]).toBeUndefined();
+    const db = new QuackDB(path.join(projectRoot, ".quack", "quack.db"));
+    try {
+      expect(db.getVerified("TASK-930")).toBeUndefined();
+      expect(db.getVerifiedHistory("TASK-930")).toEqual([]);
+      expect(db.getStatus("TASK-930")).toBeUndefined();
+    } finally {
+      db.close();
+    }
   });
 
   it("a duplicate review does not churn the existing VERIFIED row", async () => {
-    const first = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const first = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-930",
       verdict: "VERIFIED",
       docsImpact: "changelog_only",
@@ -802,7 +807,7 @@ describe("v1 reviews ledger bridge (TASK-1203)", () => {
     });
     expect(first.status).toBe(201);
 
-    const second = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const second = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-930",
       verdict: "VERIFIED",
       docsImpact: "changelog_only",
@@ -821,7 +826,7 @@ describe("v1 reviews ledger bridge (TASK-1203)", () => {
   });
 
   it("a PARTIAL verdict writes nothing", async () => {
-    const resp = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const resp = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-930",
       verdict: "PARTIAL",
       docsImpact: "none",
@@ -842,7 +847,7 @@ describe("v1 reviews ledger bridge (TASK-1203)", () => {
   // The 422 is unchanged; what changed is that the fact of verification is
   // now recorded behind it.
   it("a DOCS-blocked review still 422s but DOES write the verified row", async () => {
-    const resp = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const resp = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-930",
       verdict: "VERIFIED",
       docsImpact: "feature_page_update",
@@ -864,7 +869,7 @@ describe("v1 reviews ledger bridge (TASK-1203)", () => {
 
   it("TASK-1328: the row carries NO docs-debt breadcrumb", async () => {
     writeTaskFile(projectRoot, "TASK-931", "COMPLETE", true);
-    await httpPost(`http://localhost:${port}/v1/reviews`, {
+    await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-931",
       verdict: "VERIFIED",
       docsImpact: "feature_page_update",
@@ -893,7 +898,7 @@ describe("v1 reviews ledger bridge (TASK-1203)", () => {
     writeTaskFile(projectRoot, "TASK-934", "COMPLETE", true);
 
     // Docs debt: the work is done, the paperwork is late.
-    const docsBlocked = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const docsBlocked = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-934",
       verdict: "VERIFIED",
       docsImpact: "feature_page_update",
@@ -902,7 +907,7 @@ describe("v1 reviews ledger bridge (TASK-1203)", () => {
     });
 
     // Integrity: the gate REFUTED the claim (an open P1 finding).
-    const integrityBlocked = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const integrityBlocked = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-932",
       verdict: "VERIFIED",
       docsImpact: "none",
@@ -922,7 +927,7 @@ describe("v1 reviews ledger bridge (TASK-1203)", () => {
 
   it("TASK-1328: 422-with-debt then 201 once the docs land, on the SAME task", async () => {
     writeTaskFile(projectRoot, "TASK-933", "COMPLETE", true);
-    const first = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const first = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-933",
       verdict: "VERIFIED",
       docsImpact: "feature_page_update",
@@ -933,7 +938,7 @@ describe("v1 reviews ledger bridge (TASK-1203)", () => {
     expect(readProjectionSafe(projectRoot)["TASK-933"]).toBeDefined();
 
     // Docs land; the same task is re-reviewed with the full artifact set.
-    const second = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const second = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-933",
       verdict: "VERIFIED",
       docsImpact: "feature_page_update",
@@ -954,7 +959,7 @@ describe("v1 reviews ledger bridge (TASK-1203)", () => {
   });
 
   it("an unknown taskId persists the review but never reaches the ledger", async () => {
-    const resp = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const resp = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-999",
       verdict: "VERIFIED",
       docsImpact: "none",
@@ -981,7 +986,7 @@ describe("v1 reviews ledger bridge (TASK-1203)", () => {
         {
           taskId: "TASK-930",
           verdict: "SOFT-VERIFIED",
-          commitSha: "mergeabc123",
+          commitSha: "ae09eabc123",
           method: "on-merge",
           criteriaChecked: 0,
           criteriaPassed: 0,
@@ -991,7 +996,7 @@ describe("v1 reviews ledger bridge (TASK-1203)", () => {
       db.close();
     }
 
-    const resp = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const resp = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-930",
       verdict: "VERIFIED",
       docsImpact: "changelog_only",
@@ -1026,7 +1031,7 @@ describe("v1 reviews ledger bridge real downstream state (TASK-1338-F)", () => {
   let stop: (() => Promise<void>) | null = null;
 
   async function readQueueItem(taskId: string): Promise<QueueApiItem | undefined> {
-    const response = await httpGet(`http://localhost:${port}/api/queue`);
+    const response = await httpGet(`http://127.0.0.1:${port}/api/queue`);
     expect(response.status).toBe(200);
     const body = JSON.parse(response.body) as { items: QueueApiItem[] };
     return body.items.find((item) => item.taskId === taskId);
@@ -1127,14 +1132,15 @@ describe("v1 reviews ledger bridge real downstream state (TASK-1338-F)", () => {
       maxConcurrentJobs: 1,
     });
 
-    port = await freePort();
     const server = createMonitorServer({
       projectRoot,
       taskDir: "docs/tasks",
       logDir,
-      port,
+      port: 0,
+      host: "127.0.0.1",
     });
     const started = await server.start();
+    port = started.port;
     stop = started.stop;
 
     await waitForQueueItem(
@@ -1182,11 +1188,11 @@ describe("v1 reviews ledger bridge real downstream state (TASK-1338-F)", () => {
     beforeDb.close();
     expect(statusBefore).toBeDefined();
 
-    const response = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const response = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-930",
       verdict: "VERIFIED",
       docsImpact: "changelog_only",
-      commitSha: "contested1234",
+      commitSha: "c07e57ed1234",
       wikiArtifacts: [changelogArtifact("TASK-930")],
     });
 
@@ -1222,11 +1228,11 @@ describe("v1 reviews ledger bridge real downstream state (TASK-1338-F)", () => {
     const { notifySpy, releaseSpy, tickSpy } = instrumentCallbackOrder(order);
     const queueLogPath = path.join(logDir, "dispatch-queue.jsonl");
 
-    const response = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const response = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-930",
       verdict: "VERIFIED",
       docsImpact: "changelog_only",
-      commitSha: "clean1234",
+      commitSha: "c1ea01234",
       wikiArtifacts: [changelogArtifact("TASK-930")],
     });
 
@@ -1283,15 +1289,15 @@ describe("recording backfill endpoint (TASK-1204)", () => {
     projectRoot = makeTempDir();
     fs.mkdirSync(path.join(projectRoot, ".quack", "logs"), { recursive: true });
     writeTaskFile(projectRoot, "TASK-950", "COMPLETE", true);
-    port = await freePort();
-
     const server = createMonitorServer({
       projectRoot,
       taskDir: "docs/tasks",
       logDir: path.join(projectRoot, ".quack", "logs"),
-      port,
+      port: 0,
+      host: "127.0.0.1",
     });
     const started = await server.start();
+    port = started.port;
     stop = started.stop;
   });
 
@@ -1304,18 +1310,18 @@ describe("recording backfill endpoint (TASK-1204)", () => {
   });
 
   it("rejects a request without a valid since date", async () => {
-    const missing = await httpPost(`http://localhost:${port}/api/recording/backfill`, {});
+    const missing = await httpPost(`http://127.0.0.1:${port}/api/recording/backfill`, {});
     expect(missing.status).toBe(400);
     expect(JSON.parse(missing.body)).toMatchObject({ error: "invalid_backfill_request" });
 
-    const malformed = await httpPost(`http://localhost:${port}/api/recording/backfill`, {
+    const malformed = await httpPost(`http://127.0.0.1:${port}/api/recording/backfill`, {
       since: "last tuesday",
     });
     expect(malformed.status).toBe(400);
   });
 
   it("refuses to scan a project without an adapter git.baseBranch", async () => {
-    const resp = await httpPost(`http://localhost:${port}/api/recording/backfill`, {
+    const resp = await httpPost(`http://127.0.0.1:${port}/api/recording/backfill`, {
       since: "2026-05-01",
     });
 
@@ -1383,7 +1389,7 @@ describe("v1 reviews ledger bridge failure isolation (TASK-1203)", () => {
     const record = jest.fn().mockRejectedValue(new Error("db locked"));
     const boot = await bootRouteApp({ record });
     try {
-      const resp = await httpPost(`http://localhost:${boot.port}/v1/reviews`, payload);
+      const resp = await httpPost(`http://127.0.0.1:${boot.port}/v1/reviews`, payload);
       expect(resp.status).toBe(201);
       const body = JSON.parse(resp.body) as {
         ledger?: { applied: boolean; error?: string };
@@ -1403,7 +1409,7 @@ describe("v1 reviews ledger bridge failure isolation (TASK-1203)", () => {
     const onLedgerApplied = jest.fn().mockRejectedValue(new Error("release blew up"));
     const boot = await bootRouteApp({ onLedgerApplied });
     try {
-      const resp = await httpPost(`http://localhost:${boot.port}/v1/reviews`, payload);
+      const resp = await httpPost(`http://127.0.0.1:${boot.port}/v1/reviews`, payload);
       expect(resp.status).toBe(201);
       const body = JSON.parse(resp.body) as { ledger?: { applied: boolean } };
       expect(body.ledger).toEqual({ applied: true });
@@ -1435,7 +1441,7 @@ describe("v1 reviews ledger bridge failure isolation (TASK-1203)", () => {
     const boot = await bootRouteApp({ record, onLedgerApplied });
     try {
       let settled = false;
-      const responsePromise = httpPost(`http://localhost:${boot.port}/v1/reviews`, payload).then(
+      const responsePromise = httpPost(`http://127.0.0.1:${boot.port}/v1/reviews`, payload).then(
         (response) => {
           settled = true;
           order.push("response");
@@ -1466,7 +1472,7 @@ describe("v1 reviews ledger bridge failure isolation (TASK-1203)", () => {
     const onLedgerApplied = jest.fn();
     const boot = await bootRouteApp({ record, onLedgerApplied });
     try {
-      const resp = await httpPost(`http://localhost:${boot.port}/v1/reviews`, payload);
+      const resp = await httpPost(`http://127.0.0.1:${boot.port}/v1/reviews`, payload);
       expect(resp.status).toBe(201);
       const body = JSON.parse(resp.body) as {
         ledger?: { applied: boolean; skippedReason?: string };
@@ -1514,15 +1520,15 @@ describe("advisory status gating feeds the ledger bridge (TASK-1300)", () => {
     fs.mkdirSync(path.join(projectRoot, ".quack", "logs"), { recursive: true });
     writePlainStatusTaskFile(projectRoot, "TASK-931");
     writeTaskFile(projectRoot, "TASK-932", "VERIFIED", false);
-    port = await freePort();
-
     const server = createMonitorServer({
       projectRoot,
       taskDir: "docs/tasks",
       logDir: path.join(projectRoot, ".quack", "logs"),
-      port,
+      port: 0,
+      host: "127.0.0.1",
     });
     const started = await server.start();
+    port = started.port;
     stop = started.stop;
   });
 
@@ -1535,7 +1541,7 @@ describe("advisory status gating feeds the ledger bridge (TASK-1300)", () => {
   });
 
   it("a VERIFIED review of a plain-Status spec is mergeReady and reaches the ledger (was a false 422)", async () => {
-    const resp = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const resp = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-931",
       verdict: "VERIFIED",
       docsImpact: "changelog_only",
@@ -1560,7 +1566,7 @@ describe("advisory status gating feeds the ledger bridge (TASK-1300)", () => {
   });
 
   it("a checklist-mismatch VERIFIED claim still 422s and skips the bridge", async () => {
-    const resp = await httpPost(`http://localhost:${port}/v1/reviews`, {
+    const resp = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-932",
       verdict: "VERIFIED",
       docsImpact: "changelog_only",

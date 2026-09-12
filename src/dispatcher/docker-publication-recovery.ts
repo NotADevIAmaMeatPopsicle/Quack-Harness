@@ -27,6 +27,12 @@ export interface DockerPublicationRequirements {
 export interface DockerPublicationProgress {
   promotedAt?: string;
   pushedAt?: string;
+  pullRequestCandidate?: {
+    url: string;
+    ownershipMarker: string;
+    state: "pending" | "accepted" | "closed";
+    recordedAt: string;
+  };
   pullRequestAt?: string;
   prUrl?: string;
   preparedMerge?: {
@@ -244,6 +250,7 @@ function validateProgress(value: unknown): value is DockerPublicationProgress {
       [
         "promotedAt",
         "pushedAt",
+        "pullRequestCandidate",
         "pullRequestAt",
         "prUrl",
         "preparedMerge",
@@ -275,6 +282,8 @@ function validateProgress(value: unknown): value is DockerPublicationProgress {
     }
   }
   return (
+    (value.pullRequestCandidate === undefined ||
+      validatePullRequestCandidate(value.pullRequestCandidate)) &&
     (value.prUrl === undefined ||
       (typeof value.prUrl === "string" && /^https?:\/\//i.test(value.prUrl))) &&
     (value.preparedMerge === undefined || validatePreparedMerge(value.preparedMerge)) &&
@@ -283,6 +292,38 @@ function validateProgress(value: unknown): value is DockerPublicationProgress {
     (value.cleanupOutcome === undefined ||
       (typeof value.cleanupOutcome === "string" && value.cleanupOutcome.length <= 1_000))
   );
+}
+
+function validatePullRequestCandidate(
+  value: unknown,
+): value is NonNullable<DockerPublicationProgress["pullRequestCandidate"]> {
+  if (
+    !isRecord(value) ||
+    Object.keys(value).length !== 4 ||
+    !Object.keys(value).every((key) =>
+      ["url", "ownershipMarker", "state", "recordedAt"].includes(key),
+    ) ||
+    typeof value.url !== "string" ||
+    typeof value.ownershipMarker !== "string" ||
+    !["pending", "accepted", "closed"].includes(String(value.state)) ||
+    typeof value.recordedAt !== "string" ||
+    !Number.isFinite(Date.parse(value.recordedAt))
+  ) {
+    return false;
+  }
+  try {
+    const url = new URL(value.url);
+    return (
+      url.protocol === "https:" &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash &&
+      /^\/[^/]+\/[^/]+\/pull\/[1-9][0-9]*\/?$/u.test(url.pathname)
+    );
+  } catch {
+    return false;
+  }
 }
 
 function validatePreparedMerge(
@@ -407,6 +448,22 @@ function readDockerPublicationArtifact(
     [journal.requirements.status, "statusAt"],
     [journal.requirements.cleanup, "cleanupAt"],
   ];
+  const expectedOwnershipMarker = `<!-- quack-publication:${journal.publicationId} -->`;
+  const candidate = journal.progress.pullRequestCandidate;
+  const candidateMatchesRepository = (() => {
+    if (!candidate || !journal.repository?.github) return candidate === undefined;
+    try {
+      const parsed = new URL(candidate.url);
+      return (
+        parsed.host.toLowerCase() === journal.repository.github.host.toLowerCase() &&
+        parsed.pathname
+          .toLowerCase()
+          .startsWith(`/${journal.repository.github.nameWithOwner.toLowerCase()}/pull/`)
+      );
+    } catch {
+      return false;
+    }
+  })();
   if (
     journal.publicationId !== journal.worktreeOwnershipId ||
     Boolean(journal.repository) !== requiresRemote ||
@@ -416,6 +473,16 @@ function readDockerPublicationArtifact(
       ? journal.previousDigest !== undefined
       : journal.previousDigest === undefined) ||
     journal.gitState.authoritativeRef !== `refs/heads/${journal.branch}` ||
+    Boolean(journal.progress.pullRequestAt) !== Boolean(journal.progress.prUrl) ||
+    (journal.progress.prUrl !== undefined && !journal.requirements.pullRequest) ||
+    (candidate !== undefined &&
+      (!journal.requirements.pullRequest ||
+        candidate.ownershipMarker !== expectedOwnershipMarker ||
+        !candidateMatchesRepository ||
+        (journal.requirements.push && journal.progress.pushedAt === undefined))) ||
+    (journal.progress.prUrl !== undefined &&
+      candidate !== undefined &&
+      (candidate.state !== "accepted" || candidate.url !== journal.progress.prUrl)) ||
     (journal.state === "complete" &&
       requiredProgress.some(
         ([required, key]) => required && journal.progress[key] === undefined,

@@ -12,6 +12,8 @@ import { assembleContext } from "../dispatcher/context-assembler.js";
 import { runReadinessGate } from "../gate/gate.js";
 import { validateTaskSchema } from "../gate/schema-validator.js";
 import type { DispatchResult, GateResult, TaskContext } from "../core/types.js";
+import { withDecompositionAdmissionFence } from "../preflight/decomposition-transaction-journal.js";
+import { consumeDecompositionDispatchAdmission } from "../preflight/decomposition-dispatch-admission.js";
 
 import * as fs from "node:fs/promises";
 
@@ -340,6 +342,17 @@ export async function runCommand(
     console.log(`\nDispatching ${taskId}...\n`);
 
     const adapter = await loadAdapter(projectPath);
+    // Monitor-spawned children receive the exact spec hash captured while the
+    // writable owner held the decomposition reservation. Docker mounts are
+    // intentionally read-only, so they validate that snapshot without trying
+    // to create a lock inside /workspace. Standalone CLI runs capture the same
+    // snapshot locally before the dispatcher reads the task.
+    let admittedTaskContentHash = await consumeDecompositionDispatchAdmission(adapter, taskId);
+    const managedDecompositionAdmission = admittedTaskContentHash !== undefined;
+    if (!admittedTaskContentHash) {
+      const admission = await withDecompositionAdmissionFence(adapter, taskId, (value) => value);
+      admittedTaskContentHash = admission.contentHash;
+    }
 
     // Apply CLI overrides to adapter config (capped to adapter limits)
     if (options.model) adapter.config.agent.model = options.model;
@@ -401,6 +414,8 @@ export async function runCommand(
       retryFeedback,
       forceClean: options.forceClean,
       overridePausedRun: options.overridePausedRun,
+      admittedTaskContentHash,
+      managedDecompositionAdmission,
     });
 
     // QPI-043: the final result must be written SYNCHRONOUSLY. On POSIX,

@@ -266,6 +266,44 @@ it("never enters dispatch resolution before initial enrichment settles", async (
   }
 });
 
+it("does not resume an in-flight readiness pass after abort", async () => {
+  const fixture = createSingleClaimantFixture("quack-aborted-readiness-");
+  let releaseReadiness = (): void => undefined;
+  try {
+    const taskService = new TaskService(fixture.root, "docs/tasks");
+    const dispatchManager = manager();
+    const queue = queueFor(fixture.root, dispatchManager, taskService);
+    queue.enqueue("TASK-100");
+    await settleQueueItem(queue, "TASK-100");
+
+    const originalListTasks = taskService.listTasks.bind(taskService);
+    let readinessStarted = (): void => undefined;
+    const readinessEntered = new Promise<void>((resolve) => {
+      readinessStarted = resolve;
+    });
+    const readinessGate = new Promise<void>((resolve) => {
+      releaseReadiness = resolve;
+    });
+    jest.spyOn(taskService, "listTasks").mockImplementationOnce(async (...args) => {
+      readinessStarted();
+      await readinessGate;
+      return originalListTasks(...args);
+    });
+
+    const start = queue.start();
+    await readinessEntered;
+    queue.abort();
+    releaseReadiness();
+    await start;
+
+    expect(queue.isRunning()).toBe(false);
+    expect(dispatchManager.start).not.toHaveBeenCalled();
+  } finally {
+    releaseReadiness();
+    removeFixture(fixture.root);
+  }
+});
+
 function lateDependencyFixture(
   dependencyKind: "exact" | "fallback",
   duplicateKind: DuplicateFixtureKind,

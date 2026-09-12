@@ -1,3 +1,7 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { declaredTaskIdFromSpec } from "../core/task-spec-declaration.js";
+
 // ─── Residual ledger reconcile (TASK-1303) ──────────────────────────
 // List-based closure of the recall gap the commit-shape backfill
 // (TASK-1204) cannot see. Evidence-proportional by contract:
@@ -91,6 +95,36 @@ export const RESIDUAL_WRITE_GUARD: ResidualRecordOptions = {
   skipIfExistingVerdict: ["VERIFIED", "REJECTED"],
 };
 
+/** Identity of partial residual evidence, including the two historical task families. */
+export function canonicalIdFromSpecContent(content: string): string | undefined {
+  return declaredTaskIdFromSpec(content, { allowLegacyIds: true });
+}
+
+/** The driver and tests share the same partial-spec evidence inventory. */
+export function loadResidualSpecInventory(taskDir: string): {
+  taskIds: Set<string>;
+  doneIds: string[];
+} {
+  const taskIds = new Set<string>();
+  const doneIds = new Set<string>();
+  const statusPattern =
+    /^[\t ]*(?:-[\t ]*)?(?:\*\*Status:\*\*|Status:)[\t ]*(COMPLETE|VERIFIED)[\t ]*$/im;
+  for (const name of fs.readdirSync(taskDir).sort()) {
+    if (!/\.md$/i.test(name)) continue;
+    try {
+      const content = fs.readFileSync(path.join(taskDir, name), "utf-8");
+      const taskId = canonicalIdFromSpecContent(content);
+      if (!taskId) continue;
+      taskIds.add(taskId);
+      if (statusPattern.test(content)) doneIds.add(taskId);
+    } catch {
+      // An unreadable document supplies no residual spec evidence.
+    }
+  }
+  return { taskIds, doneIds: [...doneIds].sort() };
+}
+
+// Compatibility-only filename utility; active residual evidence reads declarations.
 // Canonical task id from a spec filename: TASK- plus segments that are
 // all caps/digits (949, 949-C, BS-01, SAURUS-REM-001); the slug starts
 // at the first segment containing lowercase. Round-2 fix: a lazy-regex

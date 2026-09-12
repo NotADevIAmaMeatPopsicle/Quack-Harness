@@ -261,7 +261,9 @@ function updateOrAddPattern(
  * Try to load and parse a task spec file for a given taskId.
  * Returns parsed task data or null if the task file cannot be found/parsed.
  */
-export function summarizeResolvedTaskSpec(resolved: ResolvedTaskFile): {
+export function summarizeResolvedTaskSpec(
+  resolved: ResolvedTaskFile,
+): {
   tags: string[];
   targetFiles: string[];
   filesToModify: number;

@@ -1,3 +1,4 @@
+import type { PrepJob } from "./prep-worker.js";
 // ─── Event Types ───────────────────────────────────────────────────
 // Defines the QuackEvent schema used for all pipeline event logging.
 // Events are written as JSONL lines to .quack/logs/ and streamed
@@ -12,6 +13,7 @@ import type {
   WorkflowState,
 } from "../workflow/workflow-state-types.js";
 import type { ExecutionMode } from "../core/types.js";
+import type { BriefFidelityViolation } from "../blueprint/blueprint-types.js";
 import type { LoopReviewGateFacts } from "../review/loop-gate.js";
 import type { ReviewerRunnerKind, ReviewKind, ReviewRunResult } from "../review/reviewer-types.js";
 import type {
@@ -41,6 +43,7 @@ export type EventStage =
   | "blueprint_start"
   | "blueprint_warning"
   | "blueprint_fallback"
+  | "blueprint_fidelity_failed"
   | "blueprint_generated"
   | "blueprint_structured_omitted"
   | "blueprint_pending_approval"
@@ -64,6 +67,8 @@ export type EventStage =
   | "prep_depth_start"
   | "prep_depth_done"
   | "prep_complete"
+  | "prep_job_completed"
+  | "prep_failed"
   | "preflight_start"
   | "preflight_gate"
   | "preflight_spec_review"
@@ -94,6 +99,11 @@ export type EventStage =
   | "branch_cleaned"
   | "branch_deleted"
   | "branch_target_resolved"
+  | "worktree_init_start"
+  | "worktree_init_step_complete"
+  | "worktree_init_step_failed"
+  | "worktree_init_complete"
+  | "worktree_init_failed"
   | "agent_turn"
   | "agent_tool_use"
   | "agent_complete"
@@ -160,6 +170,8 @@ export type EventStage =
   | "dispatch_queue_task_enqueued"
   | "dispatch_queue_task_ready"
   | "dispatch_queue_task_started"
+  | "dispatch_queue_task_awaiting_approval"
+  | "dispatch_queue_task_resumed"
   | "dispatch_queue_task_completed"
   | "dispatch_queue_task_failed"
   | "dispatch_queue_task_blocked"
@@ -167,6 +179,7 @@ export type EventStage =
   | "dispatch_queue_task_refused"
   | "follow_up_tasks_created"
   | "follow_up_tasks_refused"
+  | "follow_up_child_creation_refused"
   | "docs_change_event"
   | "revision_start"
   | "revision_complete"
@@ -362,6 +375,22 @@ export interface BlueprintGeneratedPayload {
   antiPatterns: number;
 }
 
+/**
+ * A freshly synthesized Brief was the empty agent/provider fallback shape.
+ * This is terminal for the dispatch attempt: there is no substantive
+ * artifact to checkpoint, review, or approve. The operator can repair the
+ * provider/runtime and retry (or explicitly re-plan an existing approval).
+ */
+export interface BlueprintFidelityFailedPayload {
+  taskId: string;
+  reason: "empty_brief";
+  message: string;
+  retryable: true;
+  recovery: "replan_or_retry";
+  producerProvenancePresent: boolean;
+  violations: BriefFidelityViolation[];
+}
+
 export interface BlueprintPendingApprovalPayload {
   taskId: string;
   autoApproveAttempted: boolean;
@@ -445,6 +474,43 @@ export interface BranchDeletedPayload {
   /** true if this was a dry-run (no actual deletion) */
   dryRun: boolean;
   timestamp: string;
+}
+
+export type WorktreeInitPhase = "initial" | "post_worker_refresh";
+export type WorktreeInitMode = "auto" | "explicit" | "disabled";
+
+export interface WorktreeInitStartPayload {
+  worktreePath: string;
+  mode: WorktreeInitMode;
+  phase: WorktreeInitPhase;
+  stepCount: number;
+}
+
+export interface WorktreeInitStepCompletePayload {
+  step: string;
+  durationMs: number;
+  phase: WorktreeInitPhase;
+}
+
+export interface WorktreeInitStepFailedPayload extends WorktreeInitStepCompletePayload {
+  stderr: string;
+  exitCode?: number;
+  timedOut?: boolean;
+  descendantsContained?: boolean;
+}
+
+export interface WorktreeInitCompletePayload {
+  success: boolean;
+  stepsRun: number;
+  errorCount: number;
+  mode: WorktreeInitMode;
+  phase: WorktreeInitPhase;
+}
+
+export interface WorktreeInitFailedPayload {
+  taskId: string;
+  stepsRun: number;
+  errors: Array<{ step: string; message: string; exitCode?: number }>;
 }
 
 export interface AgentTurnPayload {
@@ -607,6 +673,8 @@ export interface SessionErrorPayload {
   hostId?: string;
   hostAlias?: string;
   hostEndpoint?: string;
+  runner?: "claude-sdk" | "codex-cli";
+  sessionId?: string;
 }
 
 export interface PrepSchemaDonePayload {
@@ -1084,6 +1152,8 @@ export interface LifecycleFixStartPayload {
   projectId?: string;
   attempt: number;
   issues: string[];
+  runner?: "claude-sdk" | "codex-cli";
+  sessionId?: string;
 }
 
 export interface LifecycleFixCompletePayload {
@@ -1093,6 +1163,9 @@ export interface LifecycleFixCompletePayload {
   attempt: number;
   fixed?: boolean;
   exhausted?: boolean;
+  runner?: "claude-sdk" | "codex-cli";
+  sessionId?: string;
+  outcome?: "success" | "failure";
 }
 
 export interface LifecycleFixExhaustedPayload {
@@ -1251,8 +1324,8 @@ export interface DispatchChildExitPayload {
   signal: string | null;
   killed: boolean;
   worktreePath: string | null;
-  /** Explicitly distinguishes a shared fallback from Docker's null worktree. */
-  isolation?: "worktree" | "shared-checkout" | "docker";
+  /** Distinguishes an expected stop() signal from an external kill/OOM. */
+  operatorRequested: boolean;
   at: string;
   /** Which session file received the durable write (see child-exit-log.ts). */
   sessionResolution?: "child-session" | "latest-task-session" | "job-fallback";
@@ -1282,6 +1355,7 @@ export type EventPayload =
   | SafetyFactPayload
   | SealConformancePayload
   | BlueprintGeneratedPayload
+  | BlueprintFidelityFailedPayload
   | BlueprintPendingApprovalPayload
   | BlueprintApprovedPayload
   | BlueprintRejectedPayload
@@ -1292,6 +1366,7 @@ export type EventPayload =
   | PrepDepthStartPayload
   | PrepDepthDonePayload
   | PrepCompletePayload
+  | PrepJob
   | PreflightStartPayload
   | PreflightGatePayload
   | PreflightSpecReviewPayload
@@ -1311,6 +1386,11 @@ export type EventPayload =
   | BranchReusedPayload
   | BranchCleanedPayload
   | BranchDeletedPayload
+  | WorktreeInitStartPayload
+  | WorktreeInitStepCompletePayload
+  | WorktreeInitStepFailedPayload
+  | WorktreeInitCompletePayload
+  | WorktreeInitFailedPayload
   | AgentTurnPayload
   | AgentToolUsePayload
   | AgentCompletePayload

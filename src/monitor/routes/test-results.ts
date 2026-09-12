@@ -4,16 +4,14 @@
 import type { Express, Request, Response } from "express";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { spawn } from "node:child_process";
 import type {
   RetentionConfig,
   TestDashboardData,
-  TestFailure,
   TestRunResult,
   TestSuiteResult,
 } from "../../core/types.js";
-import { saveBaseline } from "../../testing/baseline-manager.js";
-import type { TieredTestResult } from "../../testing/types.js";
+import { computeAdapterBundleMetadata, loadAdapter } from "../../core/adapter-loader.js";
+import type { TestRunner } from "../server.js";
 
 export interface ProjectContext {
   projectRoot?: string;
@@ -147,6 +145,7 @@ export function pruneTestArtifacts(
 export function registerTestResultsRoutes(
   app: Express,
   resolveProject: (req: Request) => ProjectContext,
+  options?: { getTestRunner?: (projectRoot: string) => TestRunner },
 ): void {
   /**
    * GET /api/tasks/:id/test-results
@@ -217,7 +216,7 @@ export function registerTestResultsRoutes(
    * Trigger a Tier 3 full-suite test run. Runs asynchronously via child process.
    * Saves result as new baseline if test count improves or stays stable.
    */
-  app.post("/api/test/full-suite", (req: Request, res: Response) => {
+  app.post("/api/test/full-suite", async (req: Request, res: Response) => {
     try {
       const { projectRoot } = resolveProject(req);
       if (!projectRoot) {
@@ -225,113 +224,54 @@ export function registerTestResultsRoutes(
         return;
       }
 
-      // Load adapter to check tiered testing config
-      const adapterPath = path.join(projectRoot, ".quack", "adapter.json");
-      if (!fs.existsSync(adapterPath)) {
-        res.status(400).json({ error: "No adapter.json found — tiered testing not configured" });
-        return;
-      }
-
-      const adapter = JSON.parse(fs.readFileSync(adapterPath, "utf-8")) as Record<string, unknown>;
-      const verification = adapter.verification as Record<string, unknown> | undefined;
-      const tieredConfig = verification?.tieredTesting as
-        | { enabled?: boolean; dockerCommand?: string; outputDir?: string }
-        | undefined;
+      const adapter = await loadAdapter(projectRoot);
+      const tieredConfig = adapter.config.verification.tieredTesting;
 
       if (!tieredConfig?.enabled) {
         res.status(400).json({ error: "Tiered testing is not enabled in adapter.json" });
         return;
       }
 
-      // Run Tier 3 asynchronously via child process
-      const outputDir = tieredConfig.outputDir ?? ".quack/test-results";
-      const fullOutputDir = path.join(projectRoot, outputDir);
-      fs.mkdirSync(fullOutputDir, { recursive: true });
-      const jsonOutputFile = path.join(fullOutputDir, "tier3-latest.json");
-
-      const dockerCmd = tieredConfig.dockerCommand;
-      const command = dockerCmd
-        ? `${dockerCmd} npx jest --json --outputFile="${jsonOutputFile}" --forceExit`
-        : `npx jest --json --outputFile="${jsonOutputFile}" --forceExit`;
-
-      const child = spawn(command, [], {
-        cwd: projectRoot,
-        shell: true,
-        stdio: "ignore",
-        detached: false,
-      });
-
-      // Track completion and save baseline if results are clean or improving
-      child.on("close", () => {
-        try {
-          if (fs.existsSync(jsonOutputFile)) {
-            const raw = fs.readFileSync(jsonOutputFile, "utf-8");
-            const json = JSON.parse(raw) as {
-              success?: boolean;
-              testResults?: Array<{
-                name?: string;
-                assertionResults?: Array<{
-                  ancestorTitles?: string[];
-                  title?: string;
-                  fullName?: string;
-                  status?: string;
-                  failureMessages?: string[];
-                }>;
-              }>;
-            };
-
-            const failures: TestFailure[] = [];
-            let totalPassed = 0;
-            let totalFailed = 0;
-            let totalSkipped = 0;
-
-            for (const suite of json.testResults ?? []) {
-              const suitePath = suite.name ?? "";
-              for (const test of suite.assertionResults ?? []) {
-                if (test.status === "passed") {
-                  totalPassed++;
-                } else if (test.status === "failed") {
-                  totalFailed++;
-                  failures.push({
-                    suitePath,
-                    ancestorTitles: test.ancestorTitles ?? [],
-                    testName: test.title ?? "",
-                    fullName: test.fullName ?? "",
-                    message: (test.failureMessages ?? []).join("\n"),
-                    stack: (test.failureMessages ?? []).join("\n"),
-                  });
-                } else {
-                  totalSkipped++;
-                }
-              }
-            }
-
-            const tier3Result: TieredTestResult = {
-              tier: 3,
-              ran: totalPassed + totalFailed + totalSkipped,
-              passed: totalPassed,
-              failed: totalFailed,
-              skipped: totalSkipped,
-              files: [],
-              durationMs: 0,
-              exitCode: json.success ? 0 : 1,
-              failures,
-            };
-
-            saveBaseline(projectRoot, tier3Result, outputDir);
-          }
-        } catch {
-          // Best-effort baseline save — don't crash if parsing fails
-        }
-      });
-
-      child.unref();
+      const fullSuite = adapter.config.verification.commands.find(
+        (command) => command.name === "full-suite",
+      );
+      if (!fullSuite) {
+        res.status(409).json({
+          error:
+            "Tier 3 requires a named 'full-suite' verification command so it can run through the configured execution boundary.",
+          code: "FULL_SUITE_COMMAND_REQUIRED",
+        });
+        return;
+      }
+      const runner = options?.getTestRunner?.(projectRoot);
+      if (!runner) {
+        res.status(503).json({ error: "Bounded test runner is not available" });
+        return;
+      }
+      if (runner.isRunning()) {
+        res.status(409).json({ error: "A command is already running" });
+        return;
+      }
+      const bundle = computeAdapterBundleMetadata(adapter.config);
+      const runnerOptions = {
+        timeoutMs: fullSuite.timeout,
+        force: true,
+        baseBranch: adapter.config.git.baseBranch,
+        adapterFreshness: {
+          status: "fresh" as const,
+          localHash: bundle.sharedHash,
+          authoritativeHash: bundle.sharedHash,
+        },
+      };
+      const hostExecution = adapter.config.verification.hostExecution ?? "direct";
+      const started = runner.startAdapterVerification(adapter, fullSuite.name, runnerOptions);
 
       res.json({
         status: "started",
-        message: "Tier 3 full-suite test run started",
-        outputFile: jsonOutputFile,
-        pid: child.pid,
+        message: "Tier 3 full-suite verification started through the configured execution boundary",
+        command: fullSuite.name,
+        hostExecution,
+        ...started,
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);

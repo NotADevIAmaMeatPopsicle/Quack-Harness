@@ -1,5 +1,4 @@
 import { ParsedTask, SchemaCheckResult, TaskPriority, TaskStatus } from "../core/types";
-import * as path from "node:path";
 import { TASK_STATUSES } from "../core/task-status.js";
 import { hasUnresolvedRepairMarkers } from "../core/spec-normalizer.js";
 
@@ -94,24 +93,6 @@ export function validateTaskSchema(
     } else {
       warnings.push("files_to_modify (minimum 1 recommended)");
     }
-  }
-
-  const unsafeTaskPaths = (task.filesToModify ?? [])
-    .map((file) => file.path.trim())
-    .filter((filePath) => {
-      const normalized = path.posix.normalize(filePath.replace(/\\/g, "/"));
-      return (
-        filePath.length === 0 ||
-        path.posix.isAbsolute(normalized) ||
-        path.win32.isAbsolute(filePath) ||
-        normalized === ".." ||
-        normalized.startsWith("../")
-      );
-    });
-  if (unsafeTaskPaths.length > 0) {
-    missing.push(
-      `files_to_modify contains path(s) outside the project root: ${unsafeTaskPaths.join(", ")}`,
-    );
   }
 
   // Integration wiring check

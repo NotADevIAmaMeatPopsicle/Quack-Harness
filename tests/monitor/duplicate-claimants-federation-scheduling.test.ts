@@ -7,12 +7,21 @@ import {
   buildFederationClaimantIndex,
   evaluateFederatedSchedulingGate,
   recoverStaleFederatedLeases,
+  isRecoverableFederatedSchedulingBlock,
+  recheckRecoverableFederatedBlocks,
   releaseFederatedDependencyBlocks,
   runSwarmSchedulerTick,
 } from "../../src/monitor/federation/scheduling";
 import { queueFederatedJobRecord } from "../../src/monitor/federation/jobs";
-import { loadFederatedJob, saveFederatedJob } from "../../src/monitor/federation/store";
-import type { FederationProjectContext } from "../../src/monitor/federation/types";
+import {
+  loadFederatedJob,
+  saveFederatedJob,
+  updateFederatedJob,
+} from "../../src/monitor/federation/store";
+import type {
+  FederatedJobRecord,
+  FederationProjectContext,
+} from "../../src/monitor/federation/types";
 import { ListenerRegistry } from "../../src/federation/listener-registry";
 import type { EventWriter } from "../../src/monitor/event-emitter";
 
@@ -38,7 +47,11 @@ function spec(id: string, blockedBy: string[] = []): string {
   ].join("\n");
 }
 
-function fixture(): { root: string; taskDir: string; context: FederationProjectContext } {
+function fixture(dependencyStatus = "COMPLETE"): {
+  root: string;
+  taskDir: string;
+  context: FederationProjectContext;
+} {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "quack-1338f-scheduler-"));
   const taskDir = path.join(root, "docs", "tasks");
   fs.mkdirSync(taskDir, { recursive: true });
@@ -53,7 +66,7 @@ function fixture(): { root: string; taskDir: string; context: FederationProjectC
     reader: {},
     db: {
       getStatus: (id: string) =>
-        id.toUpperCase() === "TASK-100" ? { status: "COMPLETE" } : undefined,
+        id.toUpperCase() === "TASK-100" ? { status: dependencyStatus } : undefined,
     },
   } as unknown as FederationProjectContext;
   return { root, taskDir, context };
@@ -203,6 +216,242 @@ describe("TASK-1338-F federation scheduler strict index", () => {
       ]);
     },
   );
+
+  function legacyPendingDependencyBlock(
+    change: Partial<FederatedJobRecord> = {},
+  ): FederatedJobRecord {
+    return {
+      ...queueFederatedJobRecord({
+        taskId: "TASK-200",
+        jobType: "verify",
+        requiredCapabilities: ["verify"],
+        provenance,
+      }),
+      status: "blocked",
+      blockReasonCode: "pending_manual_handoff",
+      error: "blocked_by_unresolved:TASK-100",
+      nextAction: "wait_for_dependencies",
+      decision: { dependencyBlockers: ["TASK-100"] },
+      ...change,
+    };
+  }
+
+  it("releases the historical dependency tuple only through current-authority completion replay", async () => {
+    const f = fixture();
+    roots.push(f.root);
+    const blocked = legacyPendingDependencyBlock();
+    await saveFederatedJob(f.root, blocked);
+    const before = await loadFederatedJob(f.root, blocked.jobId);
+    expect(before?.retryable).toBeUndefined();
+    expect(isRecoverableFederatedSchedulingBlock(blocked)).toBe(false);
+    expect(await recheckRecoverableFederatedBlocks(f.context)).toEqual([]);
+    expect(await loadFederatedJob(f.root, blocked.jobId)).toEqual(before);
+
+    const released = await releaseFederatedDependencyBlocks(f.context, "TASK-100");
+    expect(released).toHaveLength(1);
+    expect(await loadFederatedJob(f.root, blocked.jobId)).toMatchObject({
+      jobId: blocked.jobId,
+      status: "queued",
+      nextAction: "schedule_after_dependency_verified",
+      decision: { unblockedBy: "TASK-100" },
+    });
+    expect(await releaseFederatedDependencyBlocks(f.context, "TASK-100")).toEqual([]);
+  });
+
+  it.each<Partial<FederatedJobRecord>>([
+    { retryable: false },
+    { nextAction: "manual_handoff" },
+    { error: "operator_uncertainty" },
+    { error: undefined },
+    { nextAction: undefined },
+    { hostId: "already-attached" },
+    { remoteSessionId: "previous-session" },
+    { assignedAt: "2026-09-11T00:00:00.000Z" },
+    { pendingGate: { stage: "judge" } },
+    { projectId: "different-project" },
+    { decision: {}, error: "blocked_by_unresolved:" },
+  ])("preserves a refused historical dependency tuple byte-for-byte: %j", async (change) => {
+    const f = fixture();
+    roots.push(f.root);
+    const blocked = legacyPendingDependencyBlock(change);
+    await saveFederatedJob(f.root, blocked);
+    const jobPath = path.join(f.root, ".quack", "federation", "jobs", blocked.jobId + ".json");
+    const before = fs.readFileSync(jobPath);
+    expect(await releaseFederatedDependencyBlocks(f.context, "TASK-100")).toEqual([]);
+    expect(fs.readFileSync(jobPath)).toEqual(before);
+  });
+
+  it("keeps current DB state ahead of completion replay for the historical tuple", async () => {
+    const f = fixture("IN_PROGRESS");
+    roots.push(f.root);
+    fs.writeFileSync(
+      path.join(f.taskDir, "TASK-100-a.md"),
+      spec("TASK-100").replace("- **Status:** READY", "- **Status:** COMPLETE"),
+    );
+    const blocked = legacyPendingDependencyBlock();
+    await saveFederatedJob(f.root, blocked);
+    expect(await releaseFederatedDependencyBlocks(f.context, "TASK-100")).toEqual([]);
+    expect(await loadFederatedJob(f.root, blocked.jobId)).toMatchObject({
+      status: "blocked",
+      error: "blocked_by_unresolved:TASK-100",
+      nextAction: "wait_for_dependencies",
+    });
+  });
+
+  it("retains a strict claimant refusal and retries the historical tuple after repair", async () => {
+    const f = fixture();
+    roots.push(f.root);
+    const blocked = legacyPendingDependencyBlock();
+    await saveFederatedJob(f.root, blocked);
+    const contest = addContest(f, "cross-population", "after-canonical");
+    expect(await releaseFederatedDependencyBlocks(f.context, "TASK-100")).toEqual([]);
+    expect(await loadFederatedJob(f.root, blocked.jobId)).toMatchObject({
+      status: "blocked",
+      nextAction: "resolve_duplicate_claimants",
+      decision: { dependencyBlockers: ["TASK-100"] },
+    });
+    expect((await loadFederatedJob(f.root, blocked.jobId))?.error).toContain(
+      "duplicate_claimants:TASK-100",
+    );
+    fs.rmSync(contest.duplicatePath);
+    expect(await releaseFederatedDependencyBlocks(f.context, "TASK-100")).toHaveLength(1);
+    expect(await loadFederatedJob(f.root, blocked.jobId)).toMatchObject({
+      status: "queued",
+    });
+  });
+
+  it("does not overwrite a cancellation that wins after dependency discovery", async () => {
+    const f = fixture();
+    roots.push(f.root);
+    const blocked = {
+      ...queueFederatedJobRecord({
+        taskId: "TASK-200",
+        jobType: "verify",
+        requiredCapabilities: ["verify"],
+        provenance,
+      }),
+      status: "blocked" as const,
+      error: "blocked_by_unresolved:TASK-100",
+      decision: { dependencyBlockers: ["TASK-100"] },
+    };
+    await saveFederatedJob(f.root, blocked);
+    const claimantIndex = await buildFederationClaimantIndex(f.context);
+    let releaseDiscovery!: () => void;
+    let continueRelease!: () => void;
+    const discovered = new Promise<void>((resolve) => {
+      releaseDiscovery = resolve;
+    });
+    const mayContinue = new Promise<void>((resolve) => {
+      continueRelease = resolve;
+    });
+
+    const releasePromise = releaseFederatedDependencyBlocks(f.context, "TASK-100", claimantIndex, {
+      afterCandidateDiscoveredForTest: async () => {
+        releaseDiscovery();
+        await mayContinue;
+      },
+    });
+    await discovered;
+    await expect(
+      updateFederatedJob(f.root, blocked.jobId, (current) => ({
+        ...current,
+        status: "canceled",
+        error: "operator_canceled",
+        nextAction: "none",
+        updatedAt: "2026-09-10T00:00:01.000Z",
+      })),
+    ).resolves.toMatchObject({ changed: true, record: { status: "canceled" } });
+    continueRelease();
+
+    await expect(releasePromise).resolves.toEqual([]);
+    await expect(loadFederatedJob(f.root, blocked.jobId)).resolves.toMatchObject({
+      status: "canceled",
+      error: "operator_canceled",
+      nextAction: "none",
+    });
+  });
+
+  it.each([
+    { nextAction: "manual_handoff", error: "operator_uncertainty" },
+    { hostId: "already-attached" },
+    { remoteSessionId: "previous-session" },
+    { projectId: "different-project" },
+  ])(
+    "does not release a legacy dependency block with manual or active identity: %j",
+    async (change) => {
+      const f = fixture();
+      roots.push(f.root);
+      const blocked = {
+        ...queueFederatedJobRecord({
+          taskId: "TASK-200",
+          jobType: "verify",
+          requiredCapabilities: ["verify"],
+          provenance,
+        }),
+        status: "blocked" as const,
+        error: "blocked_by_unresolved:TASK-100",
+        decision: { dependencyBlockers: ["TASK-100"] },
+        ...change,
+      };
+      await saveFederatedJob(f.root, blocked);
+      const before = await loadFederatedJob(f.root, blocked.jobId);
+      expect(await releaseFederatedDependencyBlocks(f.context, "TASK-100")).toEqual([]);
+      expect(await loadFederatedJob(f.root, blocked.jobId)).toEqual(before);
+    },
+  );
+
+  it("rereads declarations after completion discovery instead of using a stale clean index", async () => {
+    const f = fixture();
+    roots.push(f.root);
+    const blocked = {
+      ...queueFederatedJobRecord({
+        taskId: "TASK-200",
+        jobType: "verify",
+        requiredCapabilities: ["verify"],
+        provenance,
+      }),
+      status: "blocked" as const,
+      decision: { dependencyBlockers: ["TASK-100"] },
+    };
+    await saveFederatedJob(f.root, blocked);
+    const index = await buildFederationClaimantIndex(f.context);
+    expect(
+      await releaseFederatedDependencyBlocks(f.context, "TASK-100", index, {
+        afterCandidateDiscoveredForTest: () => {
+          fs.writeFileSync(path.join(f.taskDir, "TASK-999-contest.md"), spec("TASK-100"));
+        },
+      }),
+    ).toEqual([]);
+    expect((await loadFederatedJob(f.root, blocked.jobId))?.error).toContain(
+      "duplicate_claimants:TASK-100",
+    );
+  });
+
+  it("keeps canonical DB status ahead of a completed spec and completion notification", async () => {
+    const f = fixture("IN_PROGRESS");
+    roots.push(f.root);
+    fs.writeFileSync(
+      path.join(f.taskDir, "TASK-100-a.md"),
+      spec("TASK-100").replace("- **Status:** READY", "- **Status:** COMPLETE"),
+    );
+    const blocked = {
+      ...queueFederatedJobRecord({
+        taskId: "TASK-200",
+        jobType: "verify",
+        requiredCapabilities: ["verify"],
+        provenance,
+      }),
+      status: "blocked" as const,
+      decision: { dependencyBlockers: ["TASK-100"] },
+    };
+    await saveFederatedJob(f.root, blocked);
+    expect(await releaseFederatedDependencyBlocks(f.context, "TASK-100")).toEqual([]);
+    expect(await loadFederatedJob(f.root, blocked.jobId)).toMatchObject({
+      status: "blocked",
+      error: "blocked_by_unresolved:TASK-100",
+      nextAction: "wait_for_dependencies",
+    });
+  });
 
   it("reports an unavailable tick with zero admissions and no reconciliation", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "quack-1338f-tick-unavailable-"));

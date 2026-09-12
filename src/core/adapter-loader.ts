@@ -23,12 +23,78 @@ export interface ProjectAdapter {
   adrDocs: Record<string, string>;
   /** Stable shared adapter policy metadata for worker/headnode comparison */
   adapterBundle: AdapterBundleMetadata;
+  /**
+   * Exact local bare repositories authorized by the operator process for
+   * read-only Git transport. This is never sourced from adapter.json.
+   */
+  trustedLocalReadRemotePaths?: string[];
+}
+
+export const TRUSTED_LOCAL_READ_REMOTES_ENV = "QUACK_TRUSTED_LOCAL_READ_REMOTES";
+
+function pathsIdentifySameLocation(left: string, right: string): boolean {
+  const normalizedLeft = path.normalize(left);
+  const normalizedRight = path.normalize(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
+async function loadOperatorTrustedLocalReadRemotePaths(
+  projectRoot: string,
+): Promise<string[] | undefined> {
+  const raw = process.env[TRUSTED_LOCAL_READ_REMOTES_ENV]?.trim();
+  if (!raw) return undefined;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`${TRUSTED_LOCAL_READ_REMOTES_ENV} must contain valid JSON`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`${TRUSTED_LOCAL_READ_REMOTES_ENV} must be a JSON object`);
+  }
+  const manifest = parsed as Record<string, unknown>;
+  if (typeof manifest.projectRoot !== "string" || !path.isAbsolute(manifest.projectRoot)) {
+    throw new Error(`${TRUSTED_LOCAL_READ_REMOTES_ENV}.projectRoot must be an absolute path`);
+  }
+  if (
+    !Array.isArray(manifest.paths) ||
+    manifest.paths.length === 0 ||
+    manifest.paths.some((candidate) => typeof candidate !== "string" || !path.isAbsolute(candidate))
+  ) {
+    throw new Error(
+      `${TRUSTED_LOCAL_READ_REMOTES_ENV}.paths must be a non-empty array of absolute paths`,
+    );
+  }
+
+  let configuredProjectRoot: string;
+  let canonicalProjectRoot: string;
+  try {
+    [configuredProjectRoot, canonicalProjectRoot] = await Promise.all([
+      fs.realpath(path.resolve(manifest.projectRoot)),
+      fs.realpath(projectRoot),
+    ]);
+  } catch (error: unknown) {
+    throw new Error(
+      `Unable to resolve ${TRUSTED_LOCAL_READ_REMOTES_ENV} project boundary: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+  if (!pathsIdentifySameLocation(configuredProjectRoot, canonicalProjectRoot)) return undefined;
+
+  return [...new Set((manifest.paths as string[]).map((candidate) => path.resolve(candidate)))];
 }
 
 const MACHINE_LOCAL_ADAPTER_FIELDS = [
   "project.root",
   "logging.dir",
   "agent.apiKeys",
+  "agent.codex.codexHome",
+  "evaluationProviders.*.codex.codexHome",
+  "judgment.runner.codex.codexHome",
   "workerOverlay",
 ];
 
@@ -81,6 +147,28 @@ export function normalizeAdapterBundleConfig(config: AdapterConfig): AdapterConf
   normalized.project.root = "<machine-local:project.root>";
   normalized.logging.dir = "<machine-local:logging.dir>";
   delete normalized.agent.apiKeys;
+  if (normalized.agent.codex) {
+    delete normalized.agent.codex.codexHome;
+  }
+  if (normalized.evaluationProviders) {
+    const providerKeys = [
+      "readinessDepth",
+      "specReview",
+      "blueprint",
+      "taskDecomposition",
+      "childSpecMaterialization",
+      "judge",
+      "semanticPostJudge",
+      "lifecycleVerify",
+    ] as const;
+    for (const key of providerKeys) {
+      const provider = normalized.evaluationProviders[key];
+      if (provider?.codex) delete provider.codex.codexHome;
+    }
+  }
+  if (normalized.judgment?.runner.provider === "codex-cli" && normalized.judgment.runner.codex) {
+    delete normalized.judgment.runner.codex.codexHome;
+  }
   delete normalized.workerOverlay;
   return normalized;
 }
@@ -228,6 +316,7 @@ export async function loadAdapter(projectRoot: string): Promise<ProjectAdapter> 
   }
 
   const config: AdapterConfig = result.data;
+  const trustedLocalReadRemotePaths = await loadOperatorTrustedLocalReadRemotePaths(absoluteRoot);
 
   // 4. Read companion files
   const conventionsDoc = await readFileOrDefault(path.join(quackDir, "conventions.md"), "");
@@ -251,5 +340,6 @@ export async function loadAdapter(projectRoot: string): Promise<ProjectAdapter> 
     conventionCheckScripts,
     adrDocs,
     adapterBundle: computeAdapterBundleMetadata(config),
+    ...(trustedLocalReadRemotePaths ? { trustedLocalReadRemotePaths } : {}),
   };
 }

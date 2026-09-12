@@ -1,3 +1,4 @@
+import { withClaudeApiKeysScope } from "../sdk/claude-auth.js";
 import { GateResult, ParsedTask } from "../core/types.js";
 import { ProjectAdapter } from "../core/adapter-loader.js";
 import { validateTaskSchema } from "./schema-validator.js";
@@ -44,7 +45,18 @@ type ReadinessGateOptions = {
  * emitted events always match the RETURNED outcome. Off mode reproduces
  * the pre-1315 event content and order exactly.
  */
-export async function runReadinessGate(
+export function runReadinessGate(
+  task: ParsedTask,
+  adapter: ProjectAdapter,
+  options?: ReadinessGateOptions,
+  events?: IEventWriter,
+): Promise<GateResult> {
+  return withClaudeApiKeysScope(adapter.config.agent.apiKeys, () =>
+    runReadinessGateWithAuth(task, adapter, options, events),
+  );
+}
+
+async function runReadinessGateWithAuth(
   task: ParsedTask,
   adapter: ProjectAdapter,
   options?: ReadinessGateOptions,
@@ -290,8 +302,12 @@ export async function runReadinessGate(
   const gateModel = resolveModel(adapter.config.modelRouting, adapter.config.agent, {
     stage: "gate",
   });
+  const depthEvaluator = adapter.config.evaluationProviders?.readinessDepth;
   let depthResult = await evaluateTaskDepth(task, adapter.conventionsDoc, {
-    model: gateModel,
+    model: depthEvaluator?.model ?? gateModel,
+    evaluator: depthEvaluator,
+    projectRoot: adapter.projectRoot,
+    apiKeys: adapter.config.agent.apiKeys,
   });
 
   if (collisionDeficiencies.length > 0) {

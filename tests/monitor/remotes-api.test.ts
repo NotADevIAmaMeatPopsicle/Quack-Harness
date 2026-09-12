@@ -159,10 +159,10 @@ describe("POST /api/remotes", () => {
   it("creates a remote and persists to config", async () => {
     const res = await httpRequest("POST", `${baseUrl}/api/remotes`, {
       alias: "test_remote",
-      host: "192.0.2.100",
+      host: "192.168.1.100",
       localPort: 4000,
       remotePort: 4000,
-      sshTarget: "user@192.0.2.100",
+      sshTarget: "user@192.168.1.100",
       sshKeyPath: "~/.ssh/test_key",
       enabled: true,
     });
@@ -201,10 +201,10 @@ describe("PUT /api/remotes/:id", () => {
     // Create first
     await httpRequest("POST", `${baseUrl}/api/remotes`, {
       alias: "original",
-      host: "198.51.100.1",
+      host: "10.0.0.1",
       localPort: 5000,
       remotePort: 5000,
-      sshTarget: "admin@198.51.100.1",
+      sshTarget: "admin@10.0.0.1",
       sshKeyPath: "~/.ssh/key",
       enabled: true,
     });
@@ -212,13 +212,13 @@ describe("PUT /api/remotes/:id", () => {
     // Update
     const res = await httpRequest("PUT", `${baseUrl}/api/remotes/original`, {
       alias: "updated_name",
-      host: "198.51.100.2",
+      host: "10.0.0.2",
     });
 
     expect(res.status).toBe(200);
     const body = JSON.parse(res.body);
     expect(body.remote.alias).toBe("updated_name");
-    expect(body.remote.host).toBe("198.51.100.2");
+    expect(body.remote.host).toBe("10.0.0.2");
     expect(body.remote.localPort).toBe(5000); // unchanged
   });
 

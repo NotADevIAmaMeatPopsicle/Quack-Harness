@@ -94,6 +94,7 @@ describe("TASK-1339-B: import pipeline consumes PlannerResult.filePaths", () => 
       data: { specPath: "generated/specs/TASK-210-descriptive-import.md" },
     });
     expect(mockPostLifecycleComment.mock.calls[0][1].data?.specPath).not.toContain("\\");
+    expect(mockPostLifecycleComment.mock.calls[0][3]).toBe(projectRoot);
   });
 
   // Mutation-bite record (2026-08-17): a temporary canonical resolver selected the

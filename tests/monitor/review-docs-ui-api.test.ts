@@ -191,16 +191,16 @@ describe("review/docs UI summary API", () => {
     writeCcusageCache(projectRoot);
     writeTaskFile(projectRoot, "TASK-839");
 
-    const port = 48000 + Math.floor(Math.random() * 1000);
     const server = createMonitorServer({
       projectRoot,
       taskDir: "docs/tasks",
       logDir: path.join(projectRoot, ".quack", "logs"),
-      port,
+      port: 0,
+      host: "127.0.0.1",
     });
     const started = await server.start();
     stop = started.stop;
-    baseUrl = `http://127.0.0.1:${port}`;
+    baseUrl = `http://127.0.0.1:${started.port}`;
     await pause(150);
   });
 
@@ -217,6 +217,8 @@ describe("review/docs UI summary API", () => {
     const reviewResp = await httpPost(`${baseUrl}/v1/reviews`, {
       taskId: "TASK-839",
       verdict: "VERIFIED",
+      // Implementation evidence is separate from the wiki artifact commit below.
+      commitSha: "c0de123",
       docsImpact: "feature_page_update",
       wikiArtifacts: [
         {
@@ -228,6 +230,10 @@ describe("review/docs UI summary API", () => {
       ],
     });
     expect(reviewResp.status).toBe(422);
+    const reviewBody = JSON.parse(reviewResp.body) as {
+      ledger: { applied: boolean; error?: string };
+    };
+    expect(reviewBody.ledger).toEqual({ applied: true });
 
     const summaryResp = await httpGet(`${baseUrl}/v1/tasks/TASK-839/review-docs-summary`);
     expect(summaryResp.status).toBe(200);

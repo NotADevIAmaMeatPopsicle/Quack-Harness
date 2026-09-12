@@ -16,6 +16,7 @@ import type {
   EffectiveSpecRow,
   QueueItemRow,
   VerifiedHistoryRow,
+  QuackDbHealth,
 } from "./types.js";
 
 // Lazy-load better-sqlite3 to avoid crashing at module import time
@@ -634,6 +635,20 @@ export class QuackDB {
       throw new Error("QuackDB is closed");
     }
     return this.db;
+  }
+
+  getHealth(): QuackDbHealth {
+    if (this.closed) return { mode: "sqlite", available: false, reason: "QuackDB is closed" };
+    try {
+      this.db.prepare("SELECT task_id FROM verified LIMIT 1").get();
+      return { mode: "sqlite", available: true };
+    } catch (error: unknown) {
+      return {
+        mode: "sqlite",
+        available: false,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
   }
 
   close(): void {

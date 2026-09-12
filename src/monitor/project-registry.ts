@@ -19,6 +19,7 @@ import { QuackDB, NoopDB } from "../db/index.js";
 import { ReadinessService } from "./readiness-service.js";
 import type { ProjectAdapter } from "../core/adapter-loader.js";
 import type { DispatchEventCallback } from "./dispatch-manager.js";
+import { withDecompositionAdmissionFence } from "../preflight/decomposition-transaction-journal.js";
 
 export interface ProjectDbState {
   dbPath: string;
@@ -64,7 +65,7 @@ export interface ProjectContext {
   /** API key manager (if configured) */
   keyManager: KeyManager | null;
   /** Cleanup function to stop the chokidar event watcher */
-  stopWatcher?: () => void;
+  stopWatcher?: () => Promise<void>;
   /** Task file watcher (auto-discovery + repair + preflight) */
   taskWatcher?: { close: () => Promise<void> } | null;
   /** SQLite database for runtime state (NoopDB if native module unavailable) */
@@ -72,6 +73,8 @@ export interface ProjectContext {
   /** Health metadata for the runtime DB backing this project. */
   dbState?: ProjectDbState;
 }
+
+export type ProjectEventWatcherTeardownState = "not-attempted" | "closed" | "failed";
 
 /**
  * Registry managing multiple project contexts.
@@ -261,6 +264,7 @@ export function buildProjectContext(
   // Initialize KeyManager if apiKeys config is present
   const keyManager = adapter.config.agent.apiKeys
     ? new KeyManager({
+        pool: adapter.config.agent.apiKeys.pool,
         strategy: adapter.config.agent.apiKeys.strategy,
         cooldownMs: adapter.config.agent.apiKeys.cooldownMs,
       })
@@ -278,14 +282,33 @@ export function buildProjectContext(
       taskId,
       claimants: await listDuplicateClaimants(taskService.getTaskDirectory(), taskId),
     }),
+    adapter.trustedLocalReadRemotePaths,
+    (taskId, dispatch) => withDecompositionAdmissionFence(adapter, taskId, dispatch, db),
   );
+
+  dispatchManager.setObservationProjectId(projectId);
 
   if (eventCallback) {
     dispatchManager.setEventCallback(eventCallback);
   }
 
   const prepCache = new PrepCache(adapter.projectRoot);
-  const prepWorker = new PrepWorker(adapter.projectRoot, quackBin);
+  const prepWorker = new PrepWorker(
+    adapter.projectRoot,
+    quackBin,
+    {},
+    {
+      keyManager: keyManager ?? undefined,
+      logDir,
+      projectId,
+      onTerminal: (job) =>
+        eventCallback?.(
+          job.status === "completed" ? "prep_job_completed" : "prep_failed",
+          job.taskId,
+          { ...job },
+        ),
+    },
+  );
   const readiness = new ReadinessService({
     projectRoot: adapter.projectRoot,
     taskService,
@@ -339,6 +362,7 @@ export function buildProjectContext(
           // Event callback handled at server level
         },
         db,
+        (taskId, dispatch) => withDecompositionAdmissionFence(adapter, taskId, dispatch, db),
       )
     : null;
 
@@ -367,18 +391,123 @@ export function buildProjectContext(
 /**
  * Tear down a ProjectContext, stopping all running services.
  */
-export function teardownProjectContext(context: ProjectContext): void {
-  // Stop file watcher
-  context.stopWatcher?.();
-  // Stop task watcher
-  void context.taskWatcher?.close();
-  // Stop progress detector
-  context.progressDetector.stopChecking();
-  // Stop dispatch queue (if running)
-  context.dispatchQueue?.stop();
-  // Stop prep scheduler (if running)
-  context.prepScheduler?.stop();
-  // Close SQLite database
-  context.db.close();
-  // Note: DispatchManager, FleetController, etc. are stateless and don't need explicit cleanup
+export async function teardownProjectContext(
+  context: ProjectContext,
+  options: { eventWatcherState?: ProjectEventWatcherTeardownState } = {},
+): Promise<void> {
+  const failures: Error[] = [];
+  const asyncCleanups: Array<{ label: string; promise: Promise<void> }> = [];
+  let dispatchTerminationConfirmed = true;
+  let prepTerminationConfirmed = true;
+
+  const recordFailure = (label: string, reason: unknown): void => {
+    const cause = reason instanceof Error ? reason : new Error(String(reason));
+    failures.push(new Error(`${label}: ${cause.message}`, { cause }));
+  };
+  const runSyncCleanup = (label: string, cleanup: () => void): void => {
+    try {
+      cleanup();
+    } catch (error: unknown) {
+      recordFailure(label, error);
+    }
+  };
+  const queueAsyncCleanup = (label: string, cleanup: () => Promise<void>): void => {
+    try {
+      asyncCleanups.push({ label, promise: cleanup() });
+    } catch (error: unknown) {
+      recordFailure(label, error);
+    }
+  };
+
+  // Close dispatch/prep admission before the first await so no new child can
+  // appear while dynamic project unregistration is tearing the context down.
+  runSyncCleanup("dispatch admission drain", () => context.dispatchManager?.beginTerminalDrain());
+  runSyncCleanup("prep admission drain", () => context.prepWorker?.beginTerminalDrain());
+  runSyncCleanup("dispatch process termination", () => {
+    if (context.dispatchManager && !context.dispatchManager.killAll()) {
+      dispatchTerminationConfirmed = false;
+      throw new Error("one or more dispatch process trees could not be confirmed stopped");
+    }
+  });
+  if (context.dispatchManager && dispatchTerminationConfirmed) {
+    queueAsyncCleanup("dispatch process close", async () => {
+      if (!(await context.dispatchManager!.waitForIdle())) {
+        dispatchTerminationConfirmed = false;
+        throw new Error("timed out waiting for dispatch child handles or exit cleanup to finish");
+      }
+      if (context.dispatchManager!.hasPendingOperatorStopCleanup()) {
+        dispatchTerminationConfirmed = false;
+        throw new Error("operator-stop recovery cleanup remains unconfirmed");
+      }
+    });
+  }
+  runSyncCleanup("prep process termination", () => {
+    if (context.prepWorker && !context.prepWorker.killAll()) {
+      prepTerminationConfirmed = false;
+      throw new Error("one or more prep process trees could not be confirmed stopped");
+    }
+  });
+  if (context.prepWorker && prepTerminationConfirmed) {
+    queueAsyncCleanup("prep process close", async () => {
+      if (!(await context.prepWorker!.waitForIdle())) {
+        prepTerminationConfirmed = false;
+        throw new Error("timed out waiting for prep child handles to close");
+      }
+    });
+  }
+
+  const eventWatcherState = options.eventWatcherState ?? "not-attempted";
+  const stopWatcher = context.stopWatcher;
+  if (eventWatcherState === "failed") {
+    // The server already attempted this watcher during the current shutdown
+    // pass. Do not invoke it twice in one pass, but retain it and fail teardown
+    // so the project database stays open and a later stop can retry safely.
+    recordFailure("event watcher close", "the earlier shutdown-phase attempt failed");
+  } else if (eventWatcherState === "not-attempted" && stopWatcher) {
+    queueAsyncCleanup("event watcher close", async () => {
+      await stopWatcher();
+      if (context.stopWatcher === stopWatcher) context.stopWatcher = undefined;
+    });
+  }
+
+  const taskWatcher = context.taskWatcher;
+  if (taskWatcher) {
+    queueAsyncCleanup("task watcher close", async () => {
+      await taskWatcher.close();
+      if (context.taskWatcher === taskWatcher) context.taskWatcher = null;
+    });
+  }
+
+  runSyncCleanup("progress detector stop", () => context.progressDetector.stopChecking());
+  runSyncCleanup("dispatch queue stop", () => context.dispatchQueue?.stop());
+  runSyncCleanup("prep scheduler stop", () => context.prepScheduler?.stop());
+
+  // Wait until all file-system handles have had a chance to close. Preserve
+  // every rejection instead of treating Promise.allSettled as success.
+  const watcherResults = await Promise.allSettled(
+    asyncCleanups.map(async ({ label, promise }) => {
+      try {
+        await promise;
+      } catch (error: unknown) {
+        recordFailure(label, error);
+      }
+    }),
+  );
+  // The wrapper promises above are expected to fulfill, but retain a defensive
+  // check so a future refactor cannot silently discard a cleanup rejection.
+  watcherResults.forEach((result, index) => {
+    if (result.status === "rejected") {
+      recordFailure(asyncCleanups[index]?.label ?? "asynchronous cleanup", result.reason);
+    }
+  });
+
+  // A child with unconfirmed termination may still be using the project DB.
+  // Keep it open and keep the registry entry so the caller can retry safely.
+  if (dispatchTerminationConfirmed && prepTerminationConfirmed && failures.length === 0) {
+    runSyncCleanup("database close", () => context.db.close());
+  }
+
+  if (failures.length > 0) {
+    throw new AggregateError(failures, `Failed to fully tear down project ${context.id}`);
+  }
 }

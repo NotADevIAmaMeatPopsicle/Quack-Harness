@@ -91,6 +91,20 @@ describe("blueprint-prompt", () => {
       expect(prompt).toContain('action is "Modify"');
     });
 
+    it("should fence typed directives to existing repo-local exports", () => {
+      const prompt = buildBlueprintPrompt(mockTask, "");
+
+      expect(prompt).toContain("Emit only repo-local export directives");
+      expect(prompt).toContain("external package imports");
+      expect(prompt).toContain("dependencies that are not installed yet");
+      expect(prompt).toMatch(/symbols or files that will be created by\s+this task/);
+      expect(prompt).toContain("npm script names");
+      expect(prompt).toContain("package.json keys");
+      expect(prompt).toContain("configuration or object keys");
+      expect(prompt).toContain("environment variables");
+      expect(prompt).toMatch(/An empty\s+directive array is correct/);
+    });
+
     it("should handle task with no files to modify", () => {
       const taskNoFiles: ParsedTask = {
         ...mockTask,
@@ -263,6 +277,13 @@ describe("blueprint-prompt", () => {
             fileGlob: "tests/*.test.ts",
             expectedMatches: 3,
           },
+          {
+            criterion: "No ambient randomness",
+            checkType: "grep_count",
+            pattern: "Math\\.random",
+            fileGlob: "src/*.ts",
+            expectedMatches: 0,
+          },
         ],
       };
 
@@ -270,6 +291,9 @@ describe("blueprint-prompt", () => {
 
       expect(formatted).toContain(
         "| Three tests added | grep_count | `it\\(` | tests/*.test.ts | 3+ |",
+      );
+      expect(formatted).toContain(
+        "| No ambient randomness | grep_count | `Math\\.random` | src/*.ts | exactly 0 |",
       );
     });
   });

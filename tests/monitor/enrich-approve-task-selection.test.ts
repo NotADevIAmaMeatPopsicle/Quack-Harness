@@ -76,7 +76,7 @@ async function postJson(
     const encoded = JSON.stringify(body);
     const req = http.request(
       {
-        hostname: "localhost",
+        hostname: "127.0.0.1",
         port,
         path: pathname,
         method: "POST",
@@ -156,7 +156,8 @@ describe.each([["child-first"], ["parent-first"]])(
     async function startServer(): Promise<number> {
       const server = createMonitorServer({
         logDir: path.join(root, ".quack", "logs"),
-        port: 30000 + Math.floor(Math.random() * 10000),
+        port: 0,
+        host: "127.0.0.1",
         projectRoot: root,
         taskDir: "docs/tasks",
         adapterPath,

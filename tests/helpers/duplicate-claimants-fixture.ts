@@ -31,7 +31,7 @@ export function taskSpec(
     "- **Tags:** fixture, duplicate-claimants",
     "",
     "## Problem Statement",
-    `${id} exercises a destructive writer against real task files.`,
+    `${id} exercises a destructive writer against real task files while preserving identity, scope, and transaction safety across every finalization step.`,
     "",
     "## Current State",
     "The task has not been changed by the writer.",
@@ -52,6 +52,12 @@ export function taskSpec(
     "## Testing Requirements",
     "- [ ] Exercise real files in both creation orders",
     options.extra ?? "",
+    "",
+    "## Anti-Patterns",
+    "- Do not mutate a task when its declared identity is ambiguous",
+    "",
+    "## Context References",
+    "- Parent task identity contract",
     "",
   ].join("\n");
 }

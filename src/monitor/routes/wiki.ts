@@ -2,11 +2,19 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
-import { spawn } from "node:child_process";
 import type { Express, Request, Response } from "express";
 import { z } from "zod";
 
+import {
+  persistentOriginRepositoryBinding,
+  resolveBoundOriginRepository,
+  resolveOriginRepository,
+} from "../../dispatcher/github-repository.js";
 import { validationDetails } from "../../intake/task-intake.js";
+import {
+  runTrustedGitResult,
+  type TrustedGitExecutionOptions,
+} from "../../worker/trusted-executable.js";
 
 type WikiRootSource = "configured" | "env" | "detected" | "missing";
 
@@ -197,7 +205,7 @@ const gitPullSchema = z.object({
 });
 
 const gitPushSchema = z.object({
-  remote: z.string().trim().min(1).optional(),
+  remote: z.literal("origin").optional(),
   branch: z.string().trim().min(1).optional(),
   setUpstream: z.boolean().optional(),
 });
@@ -609,9 +617,11 @@ function parseBranchHeader(header: string): {
   const bracketStart = raw.indexOf(" [");
   const head = bracketStart >= 0 ? raw.slice(0, bracketStart) : raw;
   const bracket = bracketStart >= 0 ? raw.slice(bracketStart + 2, -1) : "";
-  const branchMatch = head.match(/^([^.\s]+)(?:\.\.\.([^\s]+))?/);
-  const branch = branchMatch?.[1] ?? null;
-  const upstream = branchMatch?.[2] ?? null;
+  const upstreamSeparator = head.indexOf("...");
+  const branchToken = upstreamSeparator >= 0 ? head.slice(0, upstreamSeparator) : head;
+  const upstreamToken = upstreamSeparator >= 0 ? head.slice(upstreamSeparator + 3) : "";
+  const branch = branchToken.length > 0 && !/\s/u.test(branchToken) ? branchToken : null;
+  const upstream = upstreamToken.length > 0 && !/\s/u.test(upstreamToken) ? upstreamToken : null;
   let ahead = 0;
   let behind = 0;
   const aheadMatch = bracket.match(/ahead\s+(\d+)/);
@@ -621,36 +631,111 @@ function parseBranchHeader(header: string): {
   return { branch, upstream, ahead, behind };
 }
 
+const GIT_OBJECT_ID_PATTERN = /^[0-9a-f]{40,64}$/iu;
+
+interface WikiPublicationIdentity {
+  branch: string;
+  branchRef: string;
+  headSha: string;
+}
+
+function isConservativeWikiBranch(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value.length <= 200 &&
+    /^[A-Za-z0-9][A-Za-z0-9._/-]*$/u.test(value) &&
+    value !== "@" &&
+    !value.endsWith("/") &&
+    !value.endsWith(".") &&
+    !value.includes("..") &&
+    !value.includes("//") &&
+    !value.includes("@{") &&
+    value.split("/").every((segment) => !segment.startsWith(".") && !segment.endsWith(".lock"))
+  );
+}
+
+function exactRemoteBranchOid(stdout: string, branch: string): string | undefined {
+  const expectedRef = `refs/heads/${branch}`;
+  const matches = stdout
+    .split(/\r?\n/u)
+    .map((line) => line.trim().split(/\s+/u))
+    .filter(([oid, ref]) => GIT_OBJECT_ID_PATTERN.test(oid ?? "") && ref === expectedRef);
+  return matches.length === 1 ? matches[0]?.[0]?.toLowerCase() : undefined;
+}
+
+async function captureWikiPublicationIdentity(root: string): Promise<WikiPublicationIdentity> {
+  const inside = await runGit(root, ["rev-parse", "--is-inside-work-tree"]);
+  if (inside.exitCode !== 0 || inside.stdout !== "true") {
+    throw new WikiRouteError(409, "Wiki publication requires a Git working tree.");
+  }
+
+  const branchRefBefore = await runGit(root, ["symbolic-ref", "--quiet", "HEAD"]);
+  if (branchRefBefore.exitCode !== 0 || !branchRefBefore.stdout.startsWith("refs/heads/")) {
+    throw new WikiRouteError(409, "Wiki repo does not have an active branch to push.");
+  }
+  const branchRef = branchRefBefore.stdout;
+  const branch = branchRef.slice("refs/heads/".length);
+  if (!isConservativeWikiBranch(branch) || branchRef !== `refs/heads/${branch}`) {
+    throw new WikiRouteError(400, "Wiki push branch must be the current safe branch.");
+  }
+
+  const headBefore = await runGit(root, ["rev-parse", "--verify", "HEAD^{commit}"]);
+  const branchHead = await runGit(root, ["rev-parse", "--verify", `${branchRef}^{commit}`]);
+  const branchRefAfter = await runGit(root, ["symbolic-ref", "--quiet", "HEAD"]);
+  const headAfter = await runGit(root, ["rev-parse", "--verify", "HEAD^{commit}"]);
+  const headSha = headBefore.stdout.toLowerCase();
+  if (
+    headBefore.exitCode !== 0 ||
+    branchHead.exitCode !== 0 ||
+    branchRefAfter.exitCode !== 0 ||
+    headAfter.exitCode !== 0 ||
+    !GIT_OBJECT_ID_PATTERN.test(headSha) ||
+    branchHead.stdout.toLowerCase() !== headSha ||
+    branchRefAfter.stdout !== branchRef ||
+    headAfter.stdout.toLowerCase() !== headSha
+  ) {
+    throw new WikiRouteError(
+      409,
+      "Wiki branch or HEAD changed while its publication identity was captured.",
+    );
+  }
+  return { branch, branchRef, headSha };
+}
+
+function sameWikiPublicationIdentity(
+  left: WikiPublicationIdentity,
+  right: WikiPublicationIdentity,
+): boolean {
+  return (
+    left.branch === right.branch &&
+    left.branchRef === right.branchRef &&
+    left.headSha === right.headSha
+  );
+}
+
 async function runGit(
   root: string,
   args: string[],
+  options: Partial<TrustedGitExecutionOptions> = {},
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  return new Promise((resolve, reject) => {
-    const child = spawn("git", ["-C", root, ...args], {
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-      env: {
-        ...process.env,
-        GIT_TERMINAL_PROMPT: "0",
-      },
+  try {
+    const result = await runTrustedGitResult(root, args, {
+      timeoutMs: 30_000,
+      maxBuffer: 10 * 1024 * 1024,
+      ...options,
     });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk: Buffer | string) => {
-      stdout += String(chunk);
-    });
-    child.stderr.on("data", (chunk: Buffer | string) => {
-      stderr += String(chunk);
-    });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      resolve({
-        stdout: stdout.trim(),
-        stderr: stderr.trim(),
-        exitCode: code ?? 0,
-      });
-    });
-  });
+    return {
+      stdout: result.stdout.trim(),
+      stderr: result.stderr.trim(),
+      exitCode: result.exitCode,
+    };
+  } catch (error: unknown) {
+    return {
+      stdout: "",
+      stderr: error instanceof Error ? error.message : String(error),
+      exitCode: 1,
+    };
+  }
 }
 
 async function readGitStatus(root: string): Promise<WikiGitStatus> {
@@ -1006,22 +1091,73 @@ async function pullWikiChanges(
   };
 }
 
-async function pushWikiChanges(
+export async function pushWikiChanges(
   root: string,
   input: z.infer<typeof gitPushSchema>,
 ): Promise<WikiGitActionResponse> {
-  const git = await readGitStatus(root);
-  const branch = input.branch ?? git.branch;
-  if (!branch) {
-    throw new WikiRouteError(409, "Wiki repo does not have an active branch to push.");
+  const publicationIdentity = await captureWikiPublicationIdentity(root);
+  const branch = input.branch ?? publicationIdentity.branch;
+  if (!isConservativeWikiBranch(branch) || branch !== publicationIdentity.branch) {
+    throw new WikiRouteError(400, "Wiki push branch must be the current safe branch.");
+  }
+  if (input.setUpstream === true) {
+    throw new WikiRouteError(
+      400,
+      "Wiki push does not change upstream configuration; configure origin before publishing.",
+    );
+  }
+  const headSha = publicationIdentity.headSha;
+
+  let origin;
+  try {
+    const captured = await resolveOriginRepository(root);
+    if (!captured.github) {
+      throw new Error("Wiki publication requires a GitHub network origin");
+    }
+    origin = await resolveBoundOriginRepository(root, persistentOriginRepositoryBinding(captured));
+    if (!origin.github) {
+      throw new Error("Wiki publication requires a GitHub network origin");
+    }
+  } catch (error: unknown) {
+    throw new WikiRouteError(
+      409,
+      `Failed to bind wiki publication origin: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
 
-  const args = ["push"];
-  if (input.setUpstream === true) args.push("--set-upstream");
-  args.push(input.remote ?? "origin", branch);
-  const push = await runGit(root, args);
+  const verifiedIdentity = await captureWikiPublicationIdentity(root);
+  if (!sameWikiPublicationIdentity(publicationIdentity, verifiedIdentity)) {
+    throw new WikiRouteError(409, "Wiki branch or HEAD changed before publication.");
+  }
+
+  const [owner, repo] = origin.github.nameWithOwner.split("/");
+  if (!owner || !repo) {
+    throw new WikiRouteError(409, "Wiki publication origin has an invalid repository identity.");
+  }
+  const expectedRepository = { host: origin.github.host, owner, repo };
+  const push = await runGit(root, ["push", origin.pushUrl, `${headSha}:refs/heads/${branch}`], {
+    expectedRepository,
+  });
   if (push.exitCode !== 0) {
     throw new WikiRouteError(409, push.stderr || push.stdout || "Failed to push wiki changes.");
+  }
+  const readback = await runGit(
+    root,
+    ["ls-remote", "--heads", origin.pushUrl, `refs/heads/${branch}`],
+    { expectedRepository },
+  );
+  if (readback.exitCode !== 0) {
+    throw new WikiRouteError(
+      409,
+      readback.stderr || readback.stdout || "Failed to verify pushed wiki changes.",
+    );
+  }
+  const remoteHead = exactRemoteBranchOid(readback.stdout, branch);
+  if (remoteHead !== headSha) {
+    throw new WikiRouteError(
+      409,
+      `Wiki push readback mismatch: expected ${headSha}, received ${remoteHead ?? "no exact remote ref"}.`,
+    );
   }
   return {
     ok: true,

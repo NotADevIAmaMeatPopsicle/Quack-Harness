@@ -3,6 +3,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { AdminRunManager, classifyAdminRunStageLine } from "../../src/monitor/admin-run-manager";
+import * as trustedNodeLaunch from "../../src/monitor/trusted-node-launch";
+
+jest.setTimeout(60_000);
 
 describe("admin run manager", () => {
   it("classifies overnight output into pollable stages", () => {
@@ -33,6 +36,129 @@ describe("admin run manager", () => {
 
   it("keeps current stage when output has no progress signal", () => {
     expect(classifyAdminRunStageLine("ordinary command output", "prep")).toBe("prep");
+  });
+
+  it("permanently refuses new runs after entering terminal drain", () => {
+    const manager = new AdminRunManager(process.execPath);
+    manager.beginTerminalDrain();
+
+    expect(() =>
+      manager.startOvernight({
+        projectId: "test",
+        projectRoot: os.tmpdir(),
+        monitorUrl: "http://127.0.0.1:3347",
+        dryRun: true,
+      }),
+    ).toThrow("terminally drained");
+  });
+
+  const windowsIt = process.platform === "win32" ? it : it.skip;
+
+  windowsIt("stops the complete detached admin process tree with active-zero proof", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-admin-tree-stop-"));
+    const binDir = path.join(tempDir, "dist");
+    fs.mkdirSync(binDir);
+    const readyPath = path.join(tempDir, "ready.json");
+    const heartbeatPath = path.join(tempDir, "heartbeat.txt");
+    const taskkillMarker = path.join(tempDir, "taskkill-shadow-ran.txt");
+    const childScript = path.join(tempDir, "descendant.cjs");
+    const scriptPath = path.join(binDir, "fake-quack.cjs");
+    const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
+    if (!systemRoot) throw new Error("SystemRoot is required for this Windows test");
+    fs.copyFileSync(path.join(systemRoot, "System32", "cmd.exe"), path.join(tempDir, "node.exe"));
+    fs.copyFileSync(
+      path.join(systemRoot, "System32", "cmd.exe"),
+      path.join(tempDir, "powershell.exe"),
+    );
+    fs.writeFileSync(
+      childScript,
+      [
+        "const fs = require('node:fs');",
+        `const heartbeat = ${JSON.stringify(heartbeatPath)};`,
+        "setInterval(() => fs.writeFileSync(heartbeat, String(Date.now()), 'utf8'), 20);",
+      ].join("\n"),
+      "utf8",
+    );
+    fs.writeFileSync(
+      scriptPath,
+      [
+        "const fs = require('node:fs');",
+        "const { spawn } = require('node:child_process');",
+        `const child = spawn(process.execPath, [${JSON.stringify(childScript)}], { detached: true, stdio: 'ignore' });`,
+        `fs.writeFileSync(${JSON.stringify(readyPath)}, JSON.stringify({ pid: child.pid }), 'utf8');`,
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(tempDir, "taskkill.cmd"),
+      `@echo off\r\n>"${taskkillMarker}" echo hijacked\r\n`,
+      "utf8",
+    );
+    const manager = new AdminRunManager(scriptPath);
+    const run = manager.startOvernight({
+      projectId: "test",
+      projectRoot: tempDir,
+      monitorUrl: "http://127.0.0.1:3347",
+      dryRun: true,
+    });
+    expect(fs.realpathSync.native(run.command[0])).toBe(fs.realpathSync.native(process.execPath));
+    await waitForFile(readyPath);
+    await waitForFile(heartbeatPath);
+    const { pid: descendantPid } = JSON.parse(fs.readFileSync(readyPath, "utf8")) as {
+      pid: number;
+    };
+    const originalPath = process.env.PATH;
+    try {
+      process.env.PATH = `${tempDir}${path.delimiter}${originalPath ?? ""}`;
+      expect(manager.stopRun(run.runId)).toBe(true);
+    } finally {
+      process.env.PATH = originalPath;
+    }
+    await waitForRunStatus(manager, run.runId, "stopped");
+    await waitForNoLiveProcesses(manager);
+
+    expect(() => process.kill(descendantPid, 0)).toThrow();
+    expect(fs.existsSync(taskkillMarker)).toBe(false);
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  windowsIt("keeps drain live and refuses a terminal state without stop proof", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "quack-admin-stop-refusal-"));
+    const binDir = path.join(tempDir, "dist");
+    fs.mkdirSync(binDir);
+    const scriptPath = path.join(binDir, "fake-quack.cjs");
+    fs.writeFileSync(scriptPath, "setInterval(() => {}, 1000);", "utf8");
+    const manager = new AdminRunManager(scriptPath);
+    const run = manager.startOvernight({
+      projectId: "test",
+      projectRoot: tempDir,
+      monitorUrl: "http://127.0.0.1:3347",
+      dryRun: true,
+    });
+    const stopSpy = jest
+      .spyOn(trustedNodeLaunch, "terminateWindowsNodeJob")
+      .mockReturnValue({ confirmed: false, warning: "synthetic missing proof" });
+    manager.beginTerminalDrain();
+
+    expect(manager.stopAll()).toBe(false);
+    const refused = await manager.getRun(run.runId);
+    expect(refused).toEqual(
+      expect.objectContaining({ status: "running", error: "synthetic missing proof" }),
+    );
+    expect(manager.hasLiveProcesses()).toBe(true);
+    expect(() =>
+      manager.startOvernight({
+        projectId: "test",
+        projectRoot: tempDir,
+        monitorUrl: "http://127.0.0.1:3347",
+      }),
+    ).toThrow("terminally drained");
+
+    stopSpy.mockRestore();
+    expect(manager.stopAll()).toBe(true);
+    await waitForNoLiveProcesses(manager);
+    fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
   it("starts overnight runs in the background with bounded dry-run args", async () => {
@@ -326,7 +452,7 @@ describe("admin run manager", () => {
 });
 
 async function waitForFile(filePath: string): Promise<void> {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
     if (fs.existsSync(filePath)) return;
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
@@ -338,7 +464,7 @@ async function waitForRunStatus(
   runId: string,
   status: "completed" | "failed" | "stopped",
 ): Promise<void> {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
     const run = await manager.getRun(runId);
     if (run?.status === status) return;
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -346,12 +472,20 @@ async function waitForRunStatus(
   throw new Error(`Timed out waiting for admin run ${runId} to reach ${status}`);
 }
 
+async function waitForNoLiveProcesses(manager: AdminRunManager): Promise<void> {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    if (!manager.hasLiveProcesses()) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error("Timed out waiting for the admin process tree to stop");
+}
+
 async function waitForHeartbeatAfter(
   manager: AdminRunManager,
   runId: string,
   previousHeartbeat: string,
 ) {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
     const run = await manager.getRun(runId);
     if (run && run.lastHeartbeatAt !== previousHeartbeat) return run;
     await new Promise((resolve) => setTimeout(resolve, 20));

@@ -57,11 +57,12 @@ describe("JUDGE_SYSTEM_PROMPT (static, cacheable)", () => {
   });
 
   it("should NOT include per-task data", () => {
-    // System prompt must be static — no task spec, diff, or verification results
-    expect(JUDGE_SYSTEM_PROMPT).not.toContain("Original Task Specification");
-    expect(JUDGE_SYSTEM_PROMPT).not.toContain("Git Diff");
-    expect(JUDGE_SYSTEM_PROMPT).not.toContain("Verification Results");
-    expect(JUDGE_SYSTEM_PROMPT).not.toContain("Extracted Success Criteria");
+    // System prompt may explain how to interpret these inputs, but it must not
+    // contain the dynamic sections into which per-task payloads are rendered.
+    expect(JUDGE_SYSTEM_PROMPT).not.toContain("## Original Task Specification");
+    expect(JUDGE_SYSTEM_PROMPT).not.toContain("## Git Diff");
+    expect(JUDGE_SYSTEM_PROMPT).not.toContain("## Verification Results");
+    expect(JUDGE_SYSTEM_PROMPT).not.toContain("## Extracted Success Criteria");
   });
 });
 
