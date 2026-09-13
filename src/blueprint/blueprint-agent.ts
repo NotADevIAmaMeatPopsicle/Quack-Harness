@@ -15,6 +15,15 @@ import { stampBriefFidelity } from "./fidelity.js";
 import { getSdkPermissionOptions } from "../sdk/permission-mode.js";
 import { runCodexStructuredEvaluation } from "../llm/codex-structured-evaluator.js";
 import type { ModelProvenance } from "../review/reviewer-types.js";
+import { QuackRuntimeError } from "../core/runtime-errors.js";
+import {
+  blueprintFailure,
+  blueprintFailureFromError,
+  codexBlueprintFailure,
+  BLUEPRINT_FAILURE_ERRORS_LIMIT,
+  BLUEPRINT_FAILURE_ERROR_LIMIT,
+  type BlueprintGenerationFailure,
+} from "./generation-failure.js";
 
 /**
  * Minimal SDK result message shape used for type narrowing.
@@ -224,124 +233,125 @@ export async function generateBlueprint(
         }
       : { runner: "claude-sdk", provider: "anthropic", model };
 
-  if (evaluator?.runner === "codex-cli") {
-    const result = await runCodexStructuredEvaluation(
-      {
-        projectRoot: adapter.projectRoot,
-        model,
-        prompt: `${prompt}\n\nUse read-only shell commands to inspect the repository. Return only the JSON object required above.`,
-        outputSchema: BLUEPRINT_RESPONSE_SCHEMA,
-        parse: extractBlueprintJson,
-      },
-      evaluator,
-    );
-    if (result.status === "completed") {
-      return stampBriefFidelity(
-        stampBriefProvenance(result.value, adapter.projectRoot, producerProvenance),
-        adapter.projectRoot,
-        task.mandatedChecks,
-      );
-    }
-    console.warn(
-      `Codex blueprint evaluation failed (${result.errorKind}: ${result.message}). Falling back to minimal blueprint.`,
-    );
-    return stampBriefFidelity(
-      createMinimalBlueprint(task.id),
+  const failed = (failure: BlueprintGenerationFailure): Blueprint =>
+    stampBriefFidelity(
+      { ...createMinimalBlueprint(task.id), generationFailure: failure },
       adapter.projectRoot,
       task.mandatedChecks,
     );
-  }
-
-  const queryFn = await getQueryFn();
-
-  const messages: Array<{ type: string; subtype?: string; [key: string]: unknown }> = [];
-
-  const queryResult = queryFn({
-    prompt,
-    options: {
-      allowedTools: ["Read", "Glob", "Grep"],
-      disallowedTools: ["Edit", "Write", "Bash", "WebSearch", "WebFetch"],
-      ...getSdkPermissionOptions(),
-      env: getClaudeSdkEnvironment(adapter.config.agent.apiKeys),
-      model,
-      maxTurns,
-      cwd: adapter.projectRoot,
-    },
-  });
-
-  // Blueprint agent uses read-only tools and can take longer (maxTurns up to 25).
-  // 10 minutes for Opus on large-context projects (e.g. example-service with
-  // 574-line conventions doc). 5 minutes was insufficient — Pattern 21 in retrospectives.
-  const BLUEPRINT_TIMEOUT_MS = 600_000;
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    const timer = setTimeout(
-      () =>
-        reject(new Error(`Blueprint generation timed out after ${BLUEPRINT_TIMEOUT_MS / 1000}s`)),
-      BLUEPRINT_TIMEOUT_MS,
-    );
-    timer.unref();
-  });
-
-  const iterateGenerator = async (): Promise<Blueprint> => {
-    for await (const message of queryResult) {
-      messages.push({ ...message } as { type: string; subtype?: string; [key: string]: unknown });
-
-      if (message.type === "result") {
-        if (message.subtype === "success") {
-          const resultText = (message as SDKSuccessResult).result;
-
-          // Extract and validate the Blueprint JSON from the agent's response
-          const blueprint = extractBlueprintJson(resultText);
-          if (blueprint) {
-            // TASK-1306: stamp brief provenance in code — only on a REAL
-            // parse (the minimal fallback is not a brief).
-            return stampBriefProvenance(blueprint, adapter.projectRoot, producerProvenance);
-          }
-
-          console.warn(
-            `Failed to extract blueprint JSON from agent response (${resultText.length} chars, starts with: "${resultText.slice(0, 60)}..."). Falling back to minimal blueprint.`,
-          );
-          return createMinimalBlueprint(task.id);
-        }
-
-        // Handle SDK error results explicitly
-        const errMsg = message as unknown as {
-          subtype: string;
-          errors?: string[];
-          total_cost_usd?: number;
-          num_turns?: number;
-          stop_reason?: string | null;
-        };
-        console.warn(
-          `Blueprint agent SDK error: ${errMsg.subtype}. Falling back to minimal blueprint.`,
+  let timeoutTimer: NodeJS.Timeout | undefined;
+  try {
+    if (evaluator?.runner === "codex-cli") {
+      const result = await runCodexStructuredEvaluation(
+        {
+          projectRoot: adapter.projectRoot,
+          model,
+          prompt: `${prompt}\n\nUse read-only shell commands to inspect the repository. Return only the JSON object required above.`,
+          outputSchema: BLUEPRINT_RESPONSE_SCHEMA,
+          parse: extractBlueprintJson,
+        },
+        evaluator,
+      );
+      if (result.status === "completed") {
+        return stampBriefFidelity(
+          stampBriefProvenance(result.value, adapter.projectRoot, producerProvenance),
+          adapter.projectRoot,
+          task.mandatedChecks,
         );
-        return createMinimalBlueprint(task.id);
       }
+      return failed(codexBlueprintFailure(result.errorKind, result.message, result.exitCode));
     }
 
-    // No result received — fall back to minimal blueprint instead of throwing
-    console.warn(`Blueprint agent returned no success result. Falling back to minimal blueprint.`);
-    return createMinimalBlueprint(task.id);
-  };
+    // Setup belongs inside the same diagnostic boundary as iteration.
+    const queryFn = await getQueryFn();
+    const queryResult = queryFn({
+      prompt,
+      options: {
+        allowedTools: ["Read", "Glob", "Grep"],
+        disallowedTools: ["Edit", "Write", "Bash", "WebSearch", "WebFetch"],
+        ...getSdkPermissionOptions(),
+        env: getClaudeSdkEnvironment(adapter.config.agent.apiKeys),
+        model,
+        maxTurns,
+        cwd: adapter.projectRoot,
+      },
+    });
+    const BLUEPRINT_TIMEOUT_MS = 600_000;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutTimer = setTimeout(() => {
+        const error = new QuackRuntimeError(
+          `Blueprint generation timed out after ${BLUEPRINT_TIMEOUT_MS / 1000}s`,
+          { kind: "runtime_unavailable", stage: "preflight.blueprint", retryable: true },
+        );
+        error.name = "TimeoutError";
+        reject(error);
+      }, BLUEPRINT_TIMEOUT_MS);
+      timeoutTimer.unref();
+    });
 
-  try {
-    // TASK-1324: EVERY fresh synthesis leaves through this seam with a
-    // pipeline-stamped fidelity result — the success path and all four
-    // fallback classes inside iterateGenerator (the empty stub audits as
-    // fidelity: failed instead of laundering into a clean cache entry).
+    const iterateGenerator = async (): Promise<Blueprint> => {
+      for await (const message of queryResult) {
+        if (message.type !== "result") continue;
+        if (message.subtype === "success") {
+          const resultText = (message as SDKSuccessResult).result;
+          const blueprint =
+            typeof resultText === "string" ? extractBlueprintJson(resultText) : null;
+          if (blueprint)
+            return stampBriefProvenance(blueprint, adapter.projectRoot, producerProvenance);
+          return failed(
+            blueprintFailure({
+              source: "claude-sdk",
+              code: "parse_failed",
+              kind: "validation_failed",
+              retryable: true,
+              message:
+                "Blueprint provider returned a final result without a valid blueprint JSON object.",
+            }),
+          );
+        }
+        const errorResult = message as SDKMessage & { errors?: unknown };
+        const errors = Array.isArray(errorResult.errors)
+          ? errorResult.errors
+              .filter((value): value is string => typeof value === "string")
+              .slice(0, BLUEPRINT_FAILURE_ERRORS_LIMIT)
+              .map((value) => value.slice(0, BLUEPRINT_FAILURE_ERROR_LIMIT))
+          : [];
+        return failed(
+          blueprintFailure({
+            source: "claude-sdk",
+            code: "sdk_error",
+            sdkSubtype: message.subtype ?? "unknown_result",
+            sdkErrors: errors,
+            kind: "runtime_unavailable",
+            retryable: true,
+            message: `Blueprint SDK ${message.subtype ?? "unknown_result"}: ${errors.join("; ") || "No additional provider diagnostics."}`,
+          }),
+        );
+      }
+      return failed(
+        blueprintFailure({
+          source: "claude-sdk",
+          code: "no_final_result",
+          kind: "runtime_unavailable",
+          retryable: true,
+          message: "Blueprint provider ended without a final result.",
+        }),
+      );
+    };
     return stampBriefFidelity(
       await Promise.race([iterateGenerator(), timeoutPromise]),
       adapter.projectRoot,
       task.mandatedChecks,
     );
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn(`Blueprint generation failed: ${msg}. Falling back to minimal blueprint.`);
-    return stampBriefFidelity(
-      createMinimalBlueprint(task.id),
-      adapter.projectRoot,
-      task.mandatedChecks,
+  } catch (error) {
+    return failed(
+      blueprintFailureFromError(
+        error,
+        producerProvenance.runner === "codex-cli" ? "codex-cli" : "claude-sdk",
+      ),
     );
+  } finally {
+    if (timeoutTimer) clearTimeout(timeoutTimer);
   }
 }
 
@@ -599,6 +609,9 @@ export function stampBriefProvenance(
     generatedAt: now,
     ...(producerProvenance ? { producerProvenance } : {}),
   };
+
+  // A successful provider result cannot inject pipeline failure evidence.
+  delete stamped.generationFailure;
 
   try {
     const gitOut = (args: string[]): string =>

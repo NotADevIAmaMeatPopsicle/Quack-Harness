@@ -198,6 +198,7 @@ const EXCLUDED_EXACT_PATHS = new Set([
   ".quack",
   ".quack/",
   ".quack/prep",
+  ".quack/preflight-jobs",
   ".quack/runtime-prep",
   ".quack/logs",
   ".quack/workflows",
@@ -219,6 +220,7 @@ const EXCLUDED_EXACT_PATHS = new Set([
 
 const EXCLUDED_PREFIXES = [
   ".quack/prep/",
+  ".quack/preflight-jobs/",
   ".quack/runtime-prep/",
   ".quack/logs/",
   ".quack/workflows/",

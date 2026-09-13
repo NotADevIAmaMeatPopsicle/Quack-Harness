@@ -4,6 +4,7 @@
 // implementation details before dispatch, reducing agent exploration time.
 
 import type { ModelProvenance } from "../review/reviewer-types.js";
+import type { BlueprintGenerationFailure } from "./generation-failure.js";
 
 /**
  * Analysis of a single file that will be created, modified, or deleted.
@@ -224,6 +225,8 @@ export interface Blueprint {
    *  and the generation path OVERWRITES it unconditionally after
    *  synthesis — the stampBriefProvenance pattern. */
   fidelity?: BriefFidelityResult;
+  /** Original failed generation cause, stamped only by the pipeline. */
+  generationFailure?: BlueprintGenerationFailure;
 }
 
 /**

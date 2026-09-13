@@ -544,6 +544,12 @@ quack preflight <taskId> [flags]
 | `--json` | boolean | false | Output machine-readable JSON instead of human-readable text |
 | `--force` | boolean | false | Skip cache and re-run even if a cached result exists |
 
+`--mode <auto|deterministic>` defaults to `auto`. The readiness judgment policy
+(`off`, `shadow`, `enforce`) is a separate adapter setting. Direct CLI `--json`
+continues to output a plain report and waits for stdout to flush before exit.
+Monitor-owned invocations use internal identity flags and a bounded job envelope;
+operators should use the monitor API for durable background attempts.
+
 ### Output (human-readable)
 
 ```

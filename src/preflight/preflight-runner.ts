@@ -15,7 +15,16 @@ import { DEFAULT_COMPLEXITY_THRESHOLDS } from "./preflight-types.js";
 import { evaluateComplexity } from "./complexity-evaluator.js";
 import { runReadinessGate } from "../gate/gate.js";
 import { validateTaskSchema } from "../gate/schema-validator.js";
+import { computeSchemaPolicyHash } from "../gate/schema-policy.js";
 import { generateBlueprint } from "../blueprint/blueprint-agent.js";
+import {
+  fidelityBlueprintFailure,
+  blueprintFailureFromError,
+  blueprintFailureGuidance,
+  BLUEPRINT_FAILURE_MESSAGE_LIMIT,
+  type BlueprintGenerationFailure,
+} from "../blueprint/generation-failure.js";
+import type { BriefFidelityResult } from "../blueprint/blueprint-types.js";
 import { formatBlueprintForPrompt } from "../blueprint/blueprint-prompt.js";
 import { assembleContext } from "../dispatcher/context-assembler.js";
 import { PrepCache, computeContentHash } from "../monitor/prep-cache.js";
@@ -34,7 +43,11 @@ import {
   DecompositionFinalizeError,
   finalizeDecompositionTransaction,
 } from "./decomposition-finalizer.js";
-import { toRuntimeDiagnostics, type RuntimeDiagnostics } from "../core/runtime-errors.js";
+import {
+  QuackRuntimeError,
+  toRuntimeDiagnostics,
+  type RuntimeDiagnostics,
+} from "../core/runtime-errors.js";
 import { ReadinessService } from "../monitor/readiness-service.js";
 import { listDuplicateClaimants, resolveParsedTaskFile } from "../core/task-file-resolver.js";
 
@@ -104,11 +117,22 @@ export async function runPreflight(
 
   // TASK-1315: gate authority is mode-scoped; a flip invalidates.
   const readinessJudgmentMode = adapter.config.judgment?.stages.readiness.mode ?? "off";
+  const requiredSections = [...(adapter.config.gate?.requiredSections ?? [])];
+  const schemaPolicyHash = computeSchemaPolicyHash(requiredSections);
+  const gateAdapter: ProjectAdapter = {
+    ...adapter,
+    config: { ...adapter.config, gate: { requiredSections } },
+  };
 
   // Check cache (unless force)
   if (!options?.force) {
     const cache = new PrepCache(adapter.projectRoot);
-    const cached = await cache.readPreflight(task.id, contentHash, readinessJudgmentMode);
+    const cached = await cache.readPreflight(
+      task.id,
+      contentHash,
+      readinessJudgmentMode,
+      schemaPolicyHash,
+    );
     if (cached) {
       events?.emit("preflight_complete", {
         taskId: task.id,
@@ -216,6 +240,8 @@ export async function runPreflight(
   let gateScore = 5;
   let gateDimensions: Record<string, number> = {};
   let gateAdvisories: string[] = [];
+  let gateReason: string | undefined;
+  let gateSchemaErrors: string[] | undefined;
   let gateActiveOutcome: "pass" | "enriched" | "rejected" | undefined;
   let gateOrchestration: NonNullable<PreflightResult["gate"]["orchestration"]> | undefined;
 
@@ -223,10 +249,12 @@ export async function runPreflight(
     await runStage("gate", "Evaluating readiness gate.", async () => {
       events?.emit("preflight_gate", { taskId: task.id });
       if (executionMode === "deterministic") {
-        const deterministicGate = runDeterministicGate(task);
+        const deterministicGate = runDeterministicGate(task, requiredSections);
         gateReady = deterministicGate.ready;
         gateScore = deterministicGate.score;
         gateDimensions = deterministicGate.dimensions;
+        gateReason = deterministicGate.reason;
+        gateSchemaErrors = deterministicGate.schemaErrors;
         degradedChecksRun.add("gate.schema");
         degradedChecksSkipped.add("gate.depth");
         return;
@@ -235,7 +263,7 @@ export async function runPreflight(
       try {
         const gateResult: GateResult = await runReadinessGate(
           task,
-          adapter,
+          gateAdapter,
           { skipEnrichment: true },
           events,
         );
@@ -258,6 +286,7 @@ export async function runPreflight(
 
         if (gateResult.outcome === "rejected") {
           gateReady = false;
+          gateReason = gateResult.reason;
           if ("details" in gateResult && gateResult.details) {
             if ("overallScore" in gateResult.details) {
               gateScore = gateResult.details.overallScore;
@@ -267,6 +296,7 @@ export async function runPreflight(
               );
             } else {
               gateScore = 0;
+              gateSchemaErrors = [...gateResult.details.missing];
             }
           }
         } else if (gateResult.outcome === "pass" || gateResult.outcome === "enriched") {
@@ -277,10 +307,12 @@ export async function runPreflight(
       } catch (err: unknown) {
         fallbackDiagnostics = toRuntimeDiagnostics(err, "preflight.gate");
         executionMode = "deterministic";
-        const deterministicGate = runDeterministicGate(task);
+        const deterministicGate = runDeterministicGate(task, requiredSections);
         gateReady = deterministicGate.ready;
         gateScore = deterministicGate.score;
         gateDimensions = deterministicGate.dimensions;
+        gateReason = deterministicGate.reason;
+        gateSchemaErrors = deterministicGate.schemaErrors;
         degradedChecksRun.add("gate.schema");
         degradedChecksSkipped.add("gate.depth");
 
@@ -293,7 +325,8 @@ export async function runPreflight(
         events?.emit("preflight_degraded", {
           taskId: task.id,
           mode: executionMode,
-          reason: "runtime_unavailable",
+          reason: fallbackDiagnostics.kind,
+          retryable: fallbackDiagnostics.retryable,
         });
       }
     });
@@ -334,6 +367,8 @@ export async function runPreflight(
 
   // Step 2: Generate blueprint
   let blueprint: Awaited<ReturnType<typeof generateBlueprint>> | undefined;
+  let generationFailure: BlueprintGenerationFailure | undefined;
+  let attemptedFidelity: BriefFidelityResult | undefined;
   let blueprintMarkdown = buildDeterministicBlueprint(task);
   let blueprintSummary: {
     fileAnalyses: number;
@@ -364,16 +399,13 @@ export async function runPreflight(
 
     try {
       blueprint = await generateBlueprint(task, adapter);
-      if (blueprint.fidelity?.status === "failed") {
-        const details = blueprint.fidelity.violations
-          .map((violation) => `${violation.kind}: ${violation.detail}`)
-          .join("; ");
-        throw new Error(
-          `Generated blueprint failed deterministic fidelity validation${
-            details ? `: ${details}` : ""
-          }`,
-        );
+      attemptedFidelity = blueprint.fidelity;
+      generationFailure = blueprint.generationFailure;
+      if (!generationFailure && blueprint.fidelity?.status === "failed") {
+        generationFailure = fidelityBlueprintFailure(blueprint.fidelity);
       }
+      if (generationFailure)
+        throw new QuackRuntimeError(generationFailure.message, generationFailure);
       blueprintMarkdown = formatBlueprintForPrompt(blueprint);
       blueprintSummary = {
         fileAnalyses: blueprint.fileAnalyses.length,
@@ -383,7 +415,8 @@ export async function runPreflight(
       };
       degradedChecksRun.add("blueprint.llm");
     } catch (err: unknown) {
-      fallbackDiagnostics ??= toRuntimeDiagnostics(err, "preflight.blueprint");
+      generationFailure ??= blueprintFailureFromError(err, "pipeline");
+      fallbackDiagnostics ??= generationFailure;
       executionMode = "deterministic";
       blueprint = undefined;
       blueprintMarkdown = buildDeterministicBlueprint(task);
@@ -405,7 +438,8 @@ export async function runPreflight(
       events?.emit("preflight_degraded", {
         taskId: task.id,
         mode: executionMode,
-        reason: "runtime_unavailable",
+        reason: fallbackDiagnostics.kind,
+        retryable: fallbackDiagnostics.retryable,
       });
     }
   });
@@ -586,6 +620,7 @@ export async function runPreflight(
               decomposed: true,
               subtaskIds,
               subtaskFiles,
+              committedSha: finalized.commit.sha,
               recoveryPending: finalized.commit.recoveryPending,
               statusProjectionId: finalized.commit.statusProjectionId,
             };
@@ -759,14 +794,24 @@ export async function runPreflight(
   }
 
   // Build result
-  const result: PreflightResult = {
+  if (fallbackDiagnostics?.message) {
+    fallbackDiagnostics = {
+      ...fallbackDiagnostics,
+      message: fallbackDiagnostics.message.slice(0, BLUEPRINT_FAILURE_MESSAGE_LIMIT),
+    };
+  }
+  let result: PreflightResult = {
     taskId: task.id,
     timestamp: new Date().toISOString(),
     contentHash: resultContentHash,
+    inputContentHash: contentHash,
+    schemaPolicyHash,
     gate: {
       ready: gateReady,
       score: gateScore,
       dimensions: gateDimensions,
+      ...(gateReason ? { reason: gateReason } : {}),
+      ...(gateSchemaErrors ? { schemaErrors: gateSchemaErrors } : {}),
       ...(gateAdvisories.length > 0 ? { advisories: gateAdvisories } : {}),
       readinessJudgmentMode,
       ...(options?.skipGate ? { gateSkipped: true } : {}),
@@ -780,10 +825,12 @@ export async function runPreflight(
       antiPatterns: blueprintSummary.antiPatterns,
       formattedMarkdown: blueprintMarkdown,
       ...(structuredForStore ? { structured: structuredForStore } : {}),
+      ...(blueprint?.generatedAt ? { generatedAt: blueprint.generatedAt } : {}),
       // TASK-1324 round-2 F1: the verdict persists even when the
       // structured object is dropped for size — the cached path must
       // never read an audited brief as unchecked.
-      ...(blueprint?.fidelity ? { fidelity: blueprint.fidelity } : {}),
+      ...(attemptedFidelity ? { fidelity: attemptedFidelity } : {}),
+      ...(generationFailure ? { generationFailure } : {}),
     },
     contextEstimate,
     complexity,
@@ -792,7 +839,9 @@ export async function runPreflight(
     mode: executionMode,
     degraded: fallbackDiagnostics
       ? {
-          reason: "Runtime-dependent stages unavailable; deterministic fallback executed",
+          reason: generationFailure
+            ? blueprintFailureGuidance(generationFailure)
+            : `${fallbackDiagnostics.message ?? fallbackDiagnostics.stderrTail ?? fallbackDiagnostics.kind}; deterministic fallback executed`,
           diagnostics: fallbackDiagnostics,
           checksRun: Array.from(degradedChecksRun),
           checksSkipped: Array.from(degradedChecksSkipped),
@@ -808,13 +857,13 @@ export async function runPreflight(
     if (decompositionCommitCompleted) {
       try {
         const cache = new PrepCache(adapter.projectRoot);
-        await cache.writePreflight(result);
+        result = await cache.writePreflight(result);
       } catch {
         // The committed parent+children remain authoritative.
       }
     } else {
       const cache = new PrepCache(adapter.projectRoot);
-      await cache.writePreflight(result);
+      result = await cache.writePreflight(result);
     }
 
     if (decompositionCommitCompleted) {
@@ -853,7 +902,7 @@ export async function runPreflight(
       events?.emit("preflight_complete", {
         taskId: task.id,
         cached: false,
-        recommendDecomposition: complexity.recommendDecomposition,
+        recommendDecomposition: result.complexity.recommendDecomposition,
         mode: executionMode,
         degraded: Boolean(fallbackDiagnostics),
       });
@@ -864,7 +913,7 @@ export async function runPreflight(
     events?.emit("preflight_complete", {
       taskId: task.id,
       cached: false,
-      recommendDecomposition: complexity.recommendDecomposition,
+      recommendDecomposition: result.complexity.recommendDecomposition,
       mode: executionMode,
       degraded: Boolean(fallbackDiagnostics),
     });
@@ -873,17 +922,24 @@ export async function runPreflight(
   return result;
 }
 
-function runDeterministicGate(task: ParsedTask): {
+function runDeterministicGate(
+  task: ParsedTask,
+  requiredSections: string[],
+): {
   ready: boolean;
   score: number;
   dimensions: Record<string, number>;
+  reason?: string;
+  schemaErrors?: string[];
 } {
-  const schema = validateTaskSchema(task);
+  const schema = validateTaskSchema(task, requiredSections);
   if (!schema.valid) {
     return {
       ready: false,
       score: 0,
       dimensions: {},
+      reason: "Schema validation failed",
+      schemaErrors: [...schema.missing],
     };
   }
   return {

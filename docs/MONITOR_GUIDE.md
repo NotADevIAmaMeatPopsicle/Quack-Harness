@@ -69,6 +69,21 @@ curl http://localhost:3333/api/health
 
 The dashboard receives live updates through server-sent events. Event names and payloads are documented in [SSE_EVENTS_REFERENCE.md](SSE_EVENTS_REFERENCE.md).
 
+## Prep and preflight progress
+
+Both dashboards show durable preflight attempts separately from cached results.
+Use **Run fresh preflight** to rerun checks without reusing the cached report;
+this may use model credits and preserves existing approvals. The dashboard
+reports when a request joins an already running attempt. Replanning a blueprint
+is a separate action that requires fresh approval of the replacement.
+
+Readiness labels distinguish current passing prep, rejection, invalid stored
+prep, stale history and missing prep. Score tooltips identify the source. A
+prep badge does not summarize every scheduler prerequisite. Interrupted or
+damaged attempts retain their evidence and recovery action after reload.
+Keep `.quack/preflight-jobs/` ignored and preserve its files for recovery;
+stopping a monitor does not certify an unknown former process as stopped.
+
 ## Screenshots
 
 Public screenshots must use fixture data, consistent viewport sizes, and application-only captures. The release gallery is stored in `docs/assets/screenshots/` after metadata inspection.

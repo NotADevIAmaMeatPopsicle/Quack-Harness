@@ -1,3 +1,4 @@
+import { DEFAULT_SCHEMA_POLICY_HASH } from "../../src/gate/schema-policy";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -76,6 +77,7 @@ describe("recoverable federation prerequisites", () => {
     const prep = {
       taskId: "TASK-001",
       preparedAt: new Date().toISOString(),
+      schemaPolicyHash: DEFAULT_SCHEMA_POLICY_HASH,
       schemaValid: true,
       schemaErrors: [],
       depthScore: 4.9,

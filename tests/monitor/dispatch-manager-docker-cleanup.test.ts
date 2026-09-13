@@ -256,4 +256,34 @@ describe("DispatchManager docker cleanup integration", () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  test("a native child error preserves the monitor and worktree when unlink fails", () => {
+    const taskId = "TASK-UNLINK-ERROR";
+    const worktree = path.join(projectRoot, ".quack", "worktrees", taskId);
+    const shared = path.join(projectRoot, ".quack", "logs");
+    fs.mkdirSync(path.join(worktree, ".quack"), { recursive: true });
+    fs.writeFileSync(path.join(shared, "sentinel.txt"), "keep");
+    fs.symlinkSync(shared, path.join(worktree, ".quack", "logs"), "junction");
+    const fakeChild = new FakeChild();
+    Object.defineProperty(fakeChild, "pid", { value: undefined });
+    mockSpawn.mockReturnValue(fakeChild as unknown as ReturnType<typeof spawn>);
+    const mgr = new DispatchManager(projectRoot, "/fake/bin.js", { method: "worktree", dockerCleanup: false });
+    (mgr as unknown as { createWorktree: () => string }).createWorktree = () => worktree;
+    const nativeFs = jest.requireActual<typeof import("node:fs")>("node:fs");
+    const unlink = jest.spyOn(nativeFs, "unlinkSync");
+    try {
+      const job = mgr.start(taskId, { skipGate: true });
+      unlink.mockImplementationOnce(() => { throw new Error("fixture unlink denied"); });
+      expect(() => fakeChild.emit("error", new Error("fixture spawn error"))).not.toThrow();
+      expect(job.status).toBe("failed");
+      expect(job.output.some((line) => line.includes("cleanup could not be confirmed"))).toBe(true);
+      expect(mockRemoveWorktree).not.toHaveBeenCalled();
+      expect(fs.existsSync(worktree)).toBe(true);
+      expect(fs.readFileSync(path.join(shared, "sentinel.txt"), "utf8")).toBe("keep");
+      fakeChild.emit("close", 1, null);
+    } finally {
+      unlink.mockRestore();
+      mgr.killAll();
+    }
+  });
 });

@@ -1,3 +1,4 @@
+import { computeSchemaPolicyHash, DEFAULT_SCHEMA_POLICY_HASH } from "../../src/gate/schema-policy";
 // ─── TASK-1324 S3: enforcement wiring pins ─────────────────────────
 // A fidelity-failed brief must be structurally un-approvable and unable
 // to destroy a good cached brief: the auto-approve predicate (both
@@ -163,6 +164,45 @@ describe("TASK-1324 S3: monotonic cache guard", () => {
     expect(stored?.timestamp).toBe("2026-08-10T02:00:00.000Z");
   });
 
+  it.each([false, true])(
+    "recognizes size-omitted failure evidence and refuses malformed prior content (malformed=%s)",
+    async (malformed) => {
+      const prior = preflightResult({
+        contentHash: "hash-1",
+        timestamp: "2026-08-10T01:00:00.000Z",
+        structured: goodBrief,
+      });
+      if (malformed) prior.blueprint.structured = { ...goodBrief, fileAnalyses: [{}] } as Blueprint;
+      await cache.writePreflight(prior);
+      const fresh = preflightResult({
+        contentHash: "hash-1",
+        timestamp: "2026-08-10T02:00:00.000Z",
+      });
+      fresh.blueprint.fidelity = fidelity("failed");
+      const effective = await cache.writePreflight(fresh);
+      expect(Boolean(effective.blueprint.structuredPreserved)).toBe(!malformed);
+      expect(effective.blueprint.generationFailure?.code).toBe("fidelity_failed");
+      expect(effective.mode).toBe("deterministic");
+      expect(resolveCachedBlueprint(effective)).toBeNull();
+      expect(await cache.readPreflight("TASK-999", "hash-1")).toEqual(effective);
+    },
+  );
+
+  it("does not treat malformed typed directives as usable prior content", async () => {
+    const prior = preflightResult({
+      contentHash: "hash-1",
+      timestamp: "2026-08-10T01:00:00.000Z",
+      structured: brief({ importsToUse: "invalid" as unknown as Blueprint["importsToUse"] }),
+    });
+    await cache.writePreflight(prior);
+    const fresh = preflightResult({
+      contentHash: "hash-1",
+      timestamp: "2026-08-10T02:00:00.000Z",
+      structured: failedBrief,
+    });
+    expect((await cache.writePreflight(fresh)).blueprint.structuredPreserved).toBeUndefined();
+  });
+
   it("stands aside when the contentHash changed (the spec moved; the old brief is obsolete)", async () => {
     await cache.writePreflight(
       preflightResult({
@@ -203,6 +243,7 @@ describe("TASK-1324 S3: monotonic cache guard", () => {
       timestamp: "2026-08-10T01:00:00.000Z",
       structured: goodBrief,
     });
+    good.schemaPolicyHash = DEFAULT_SCHEMA_POLICY_HASH;
     (good.complexity as unknown as { recommendDecomposition: boolean }).recommendDecomposition =
       false;
     await cache.writePreflight(good);
@@ -212,11 +253,14 @@ describe("TASK-1324 S3: monotonic cache guard", () => {
       timestamp: "2026-08-10T02:00:00.000Z",
       structured: failedBrief,
     });
+    fresh.schemaPolicyHash = computeSchemaPolicyHash(["filesToModify"]);
     (fresh.complexity as unknown as { recommendDecomposition: boolean }).recommendDecomposition =
       true;
     await cache.writePreflight(fresh);
 
     const stored = await cache.readPreflight("TASK-999", "hash-1");
+    expect(stored?.schemaPolicyHash).toBe(fresh.schemaPolicyHash);
+    expect(stored?.schemaPolicyHash).not.toBe(good.schemaPolicyHash);
     // Everything derived from the preserved synthesis travels with it.
     expect(
       (stored?.complexity as unknown as { recommendDecomposition: boolean }).recommendDecomposition,

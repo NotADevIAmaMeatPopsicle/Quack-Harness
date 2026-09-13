@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 // ─── Blueprint Approval Gate ───────────────────────────────────────
 // Approval state machine and auto-approve evaluator for blueprint review.
 // Pauses dispatch between blueprint generation and agent execution to allow
@@ -275,6 +276,29 @@ export async function updateApprovalState(
   rejectionReason?: string,
   decision?: ApprovalDecisionOptions,
 ): Promise<{ override?: AdvisoryOverride; unexplained: boolean }> {
+  const written = await updateApprovalStateWithReceipt(
+    taskId,
+    state,
+    logDir,
+    approvedBy,
+    rejectionReason,
+    decision,
+  );
+  return {
+    ...(written.override ? { override: written.override } : {}),
+    unexplained: written.unexplained,
+  };
+}
+
+/** Same decision writer, with the digest of the exact bytes it wrote. */
+export async function updateApprovalStateWithReceipt(
+  taskId: string,
+  state: ApprovalState,
+  logDir: string,
+  approvedBy?: string,
+  rejectionReason?: string,
+  decision?: ApprovalDecisionOptions,
+): Promise<{ override?: AdvisoryOverride; unexplained: boolean; recordDigest: string }> {
   const approval = await loadApproval(taskId, logDir);
   if (!approval) {
     throw new Error(`No pending approval found for task ${taskId}`);
@@ -315,9 +339,11 @@ export async function updateApprovalState(
   if (resolved.override) approval.override = resolved.override;
 
   const approvalPath = path.join(logDir, "approvals", `${taskId}.json`);
-  await fs.writeFile(approvalPath, JSON.stringify(approval, null, 2), "utf-8");
+  const content = JSON.stringify(approval, null, 2);
+  await fs.writeFile(approvalPath, content, "utf-8");
 
   return {
+    recordDigest: createHash("sha256").update(content).digest("hex"),
     ...(resolved.override ? { override: resolved.override } : {}),
     unexplained: resolved.unexplained,
   };

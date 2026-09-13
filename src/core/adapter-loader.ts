@@ -202,12 +202,19 @@ export function applyAdapterWorkerOverlay(config: AdapterConfig): AdapterConfig 
     }
   }
 
+  return applyDockerRuntimeLogOverride(effective);
+}
+
+function applyDockerRuntimeLogOverride(
+  config: AdapterConfig,
+  requireBinding = false,
+): AdapterConfig {
   // The monitor injects this only into the Docker agent process. It keeps
   // container-writable output inside the disposable task worktree instead of
   // mounting the authoritative host log/control tree read-write.
   const dockerRuntimeLogDir = process.env.QUACK_DOCKER_RUNTIME_LOG_DIR;
-  if (dockerRuntimeLogDir) {
-    const normalized = dockerRuntimeLogDir.replace(/\\/g, "/");
+  if (dockerRuntimeLogDir || requireBinding) {
+    const normalized = (dockerRuntimeLogDir ?? "").replace(/\\/g, "/");
     if (
       !/^\/workspace\/\.quack\/docker-runtime\/[A-Za-z0-9._-]+-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
         normalized,
@@ -215,9 +222,11 @@ export function applyAdapterWorkerOverlay(config: AdapterConfig): AdapterConfig 
     ) {
       throw new Error("Invalid QUACK_DOCKER_RUNTIME_LOG_DIR isolation boundary");
     }
+    const effective = cloneConfig(config);
     effective.logging.dir = normalized;
+    return effective;
   }
-  return effective;
+  return config;
 }
 
 // ─── Helper: discover scripts in a directory ────────────────────────
@@ -315,7 +324,14 @@ export async function loadAdapter(projectRoot: string): Promise<ProjectAdapter> 
     throw new Error(`Invalid adapter config in ${adapterJsonPath}:\n${issues}`);
   }
 
-  const config: AdapterConfig = result.data;
+  // This binding belongs to the managed container process. Host-side loads
+  // must not redirect every project's control files because of a leaked value.
+  // Applying the Docker-only part also leaves dormant workerOverlay fields
+  // unchanged rather than silently changing root/task authority here.
+  const config: AdapterConfig =
+    process.env.QUACK_DOCKER_HOST_PROMOTION === "1"
+      ? applyDockerRuntimeLogOverride(result.data, true)
+      : result.data;
   const trustedLocalReadRemotePaths = await loadOperatorTrustedLocalReadRemotePaths(absoluteRoot);
 
   // 4. Read companion files

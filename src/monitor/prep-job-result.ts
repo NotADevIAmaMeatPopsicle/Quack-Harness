@@ -6,6 +6,7 @@ export interface PrepGateResult {
   deficiencies: string[];
   outcome: "pass" | "enriched" | "rejected";
   contentHash?: string;
+  schemaPolicyHash?: string;
 }
 
 /** A computed rejection is a valid result; a parseable error object is not. */
@@ -31,7 +32,9 @@ export function parsePrepGateResult(value: unknown): PrepGateResult {
     typeof record.outcome !== "string" ||
     !["pass", "enriched", "rejected"].includes(record.outcome) ||
     (record.contentHash !== undefined &&
-      (typeof record.contentHash !== "string" || !/^[a-f0-9]{64}$/i.test(record.contentHash)))
+      (typeof record.contentHash !== "string" || !/^[a-f0-9]{64}$/i.test(record.contentHash))) ||
+    (record.schemaPolicyHash !== undefined &&
+      (typeof record.schemaPolicyHash !== "string" || !/^[a-f0-9]{64}$/.test(record.schemaPolicyHash)))
   ) {
     throw new Error("Prep output does not match the gate-result contract");
   }
@@ -51,5 +54,6 @@ export function parsePrepGateResult(value: unknown): PrepGateResult {
     deficiencies: record.deficiencies,
     outcome: record.outcome as PrepGateResult["outcome"],
     ...(record.contentHash === undefined ? {} : { contentHash: record.contentHash }),
+    ...(record.schemaPolicyHash === undefined ? {} : { schemaPolicyHash: record.schemaPolicyHash }),
   };
 }

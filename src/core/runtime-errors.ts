@@ -9,6 +9,8 @@ export interface RuntimeDiagnostics {
   stage: string;
   exitCode?: number;
   stderrTail?: string;
+  /** Bounded operator-facing cause when supplied by the producer. */
+  message?: string;
   retryable: boolean;
 }
 

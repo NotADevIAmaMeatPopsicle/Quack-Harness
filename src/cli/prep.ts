@@ -8,6 +8,7 @@ import * as path from "node:path";
 import { loadAdapter } from "../core/adapter-loader.js";
 import { resolveTaskFile } from "../core/task-file-resolver.js";
 import { validateTaskSchema } from "../gate/schema-validator.js";
+import { computeSchemaPolicyHash } from "../gate/schema-policy.js";
 import { evaluateTaskDepth } from "../gate/depth-evaluator.js";
 import { PrepCache, computeContentHash } from "../monitor/prep-cache.js";
 import { ReadinessService } from "../monitor/readiness-service.js";
@@ -22,6 +23,8 @@ export async function prepCommand(taskId: string, options: PrepOptions): Promise
   try {
     // Load adapter
     const adapter = await loadAdapter(projectRoot);
+    const requiredSections = [...(adapter.config.gate?.requiredSections ?? [])];
+    const schemaPolicyHash = computeSchemaPolicyHash(requiredSections);
 
     // Find and parse task file
     const taskDir = path.resolve(adapter.projectRoot, adapter.config.project.taskDir);
@@ -34,7 +37,7 @@ export async function prepCommand(taskId: string, options: PrepOptions): Promise
     const contentHash = computeContentHash(content);
 
     // Schema validation (fast, deterministic)
-    const schemaResult = validateTaskSchema(task);
+    const schemaResult = validateTaskSchema(task, requiredSections);
 
     let depthScore = 0;
     let depthReady = false;
@@ -44,6 +47,7 @@ export async function prepCommand(taskId: string, options: PrepOptions): Promise
     if (!schemaResult.valid) {
       // Schema failed — mark as rejected
       outcome = "rejected";
+      deficiencies = [...schemaResult.missing];
     } else {
       // Depth evaluation (slow, LLM-based)
       const depthEvaluator = adapter.config.evaluationProviders?.readinessDepth;
@@ -71,6 +75,7 @@ export async function prepCommand(taskId: string, options: PrepOptions): Promise
       deficiencies,
       outcome,
       contentHash,
+      schemaPolicyHash,
     });
 
     const readiness = new ReadinessService({
@@ -87,6 +92,7 @@ export async function prepCommand(taskId: string, options: PrepOptions): Promise
         deficiencies,
         outcome,
         contentHash,
+        schemaPolicyHash,
       });
     } finally {
       readiness.close();
@@ -101,6 +107,7 @@ export async function prepCommand(taskId: string, options: PrepOptions): Promise
       deficiencies,
       outcome,
       contentHash,
+      schemaPolicyHash,
     };
 
     console.log(JSON.stringify(result));

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { Command } from "commander";
+import { Command, Option } from "commander";
 import packageJson from "../package.json";
 
 import { runCommand } from "./cli/run.js";
@@ -11,7 +11,7 @@ import { initCommand } from "./cli/init.js";
 import { statusCommand } from "./cli/status.js";
 import { monitorCommand } from "./cli/monitor.js";
 import { prepCommand } from "./cli/prep.js";
-import { preflightCommand } from "./cli/preflight.js";
+import { preflightCommand, type PreflightCommandOptions } from "./cli/preflight.js";
 import { planCommand } from "./cli/plan.js";
 import { queueCommand } from "./cli/queue.js";
 import { decomposeCommand } from "./cli/decompose.js";
@@ -281,7 +281,13 @@ program
   .option("--project <path>", "Path to project root (default: cwd)")
   .option("--json", "Output machine-readable JSON")
   .option("--force", "Skip cache and re-run")
-  .action((taskId: string, options: { project?: string; json?: boolean; force?: boolean }) => {
+  .addOption(new Option("--mode <mode>", "Pipeline mode").choices(["auto", "deterministic"]))
+  .addOption(new Option("--job-id <id>").hideHelp())
+  .addOption(new Option("--project-id <id>").hideHelp())
+  .addOption(new Option("--expected-content-hash <hash>").hideHelp())
+  .addOption(new Option("--expected-schema-policy-hash <hash>").hideHelp())
+  .addOption(new Option("--expected-readiness-mode <mode>").choices(["off", "shadow", "enforce"]).hideHelp())
+  .action((taskId: string, options: PreflightCommandOptions) => {
     void preflightCommand(taskId, options);
   });
 

@@ -1,3 +1,4 @@
+import { DEFAULT_SCHEMA_POLICY_HASH } from "../../src/gate/schema-policy";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -207,9 +208,18 @@ function removeTempDir(dir: string): void {
   });
 }
 
-function initializeDispatchGitFixture(projectRoot: string): string {
+function initializeDispatchGitFixture(projectRoot: string, logDir: string): string {
   // Local read grants may never point inside the mutable project boundary.
   // Keep the test remote as a sibling, matching the isolated demo topology.
+  // Native worktree launch validates the adapter and configured event directory.
+  // The fixture must describe the monitor's actual (external) temporary log path.
+  const adapter = JSON.parse(fs.readFileSync(
+    path.resolve(__dirname, "../fixtures/adapters/gate-required-sections/.quack/adapter.json"), "utf8",
+  )) as { gate?: unknown; logging: { dir: string } };
+  delete adapter.gate;
+  adapter.logging.dir = logDir;
+  fs.mkdirSync(path.join(projectRoot, ".quack"), { recursive: true });
+  fs.writeFileSync(path.join(projectRoot, ".quack", "adapter.json"), JSON.stringify(adapter));
   const originRoot = `${projectRoot}-origin.git`;
   fs.mkdirSync(originRoot, { recursive: true });
   fs.writeFileSync(path.join(projectRoot, ".gitignore"), ".quack/\n", "utf-8");
@@ -1030,7 +1040,7 @@ describe("Monitor Server", () => {
         ].join("\n"),
         "utf-8",
       );
-      originRoot = initializeDispatchGitFixture(projectRoot);
+      originRoot = initializeDispatchGitFixture(projectRoot, logDir);
       process.env.QUACK_TRUSTED_LOCAL_READ_REMOTES = JSON.stringify({
         projectRoot,
         paths: [originRoot],
@@ -1260,7 +1270,7 @@ describe("Monitor Server", () => {
         skipGate: true,
       });
 
-      expect(status).toBe(200);
+      expect(`${status} ${body}`).toMatch(/^200 /);
       const data = JSON.parse(body) as {
         ok: boolean;
         taskId: string;
@@ -1367,14 +1377,31 @@ describe("Monitor Server", () => {
       stopServer = started.stop;
       const baseUrl = `http://127.0.0.1:${started.port}`;
 
-      // Start the task
-      await httpPost(`${baseUrl}/api/tasks/TASK-001/start`, { skipGate: true });
-
-      // Stop it
-      const { status, body } = await httpPost(`${baseUrl}/api/tasks/TASK-001/stop`);
-      expect(status).toBe(200);
-      const data = JSON.parse(body) as { ok: boolean };
-      expect(data.ok).toBe(true);
+      const start = await httpPost(`${baseUrl}/api/tasks/TASK-001/start`, { skipGate: true });
+      expect(`${start.status} ${start.body}`).toMatch(/^200 /);
+      // Observe the real manager; do not replace its process-tree stop behavior.
+      const stopSpy = jest.spyOn(DispatchManager.prototype, "stop");
+      try {
+        const response = await httpPost(`${baseUrl}/api/tasks/TASK-001/stop`);
+        if (response.status === 409) {
+          // POSIX SIGKILL can return before Node reaps the owned process group.
+          // The API deliberately reports pending confirmation until child close.
+          expect(JSON.parse(response.body)).toMatchObject({
+            code: "DISPATCH_STOP_UNCONFIRMED", terminationConfirmed: false, cleanupPending: true,
+          });
+        } else {
+          expect(`${response.status} ${response.body}`).toMatch(/^200 /);
+          expect(JSON.parse(response.body)).toMatchObject({ ok: true });
+        }
+        const manager = stopSpy.mock.contexts[0] as DispatchManager;
+        expect(await manager.waitForIdle(5_000)).toBe(true);
+        expect(manager.getJob("TASK-001")).toMatchObject({
+          status: "stopped", operatorStopTreeTerminated: true,
+        });
+        expect(manager.hasPendingOperatorStopCleanup("TASK-001")).toBe(false);
+      } finally {
+        stopSpy.mockRestore();
+      }
     });
 
     it("returns 404 when stopping non-running task", async () => {
@@ -2521,6 +2548,7 @@ describe("Monitor Server", () => {
               taskId: "TASK-010",
               timestamp: "2026-02-24T12:00:00.000Z",
               contentHash: parentHash,
+              schemaPolicyHash: DEFAULT_SCHEMA_POLICY_HASH,
               gate: {
                 ready: true,
                 score: 4.8,

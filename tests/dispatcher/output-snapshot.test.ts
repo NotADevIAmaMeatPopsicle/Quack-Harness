@@ -130,6 +130,8 @@ describe("sealAgentOutputAttempt", () => {
     await fs.writeFile(path.join(tmpDir, "src", "feature.ts"), "export const value = 2;\n");
     await fs.writeFile(path.join(tmpDir, "PROGRESS.md"), "temporary\n");
     await fs.mkdir(path.join(tmpDir, ".quack", "runtime-prep"), { recursive: true });
+    await fs.mkdir(path.join(tmpDir, ".quack", "preflight-jobs", "TASK-861"), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, ".quack", "preflight-jobs", "TASK-861", "state.json"), "{}\n");
     await fs.mkdir(path.join(tmpDir, ".quack", "analytics"), { recursive: true });
     await fs.mkdir(path.join(tmpDir, ".quack", "federation", "jobs"), { recursive: true });
     await fs.mkdir(path.join(tmpDir, ".quack", "reviews"), { recursive: true });
@@ -167,6 +169,7 @@ describe("sealAgentOutputAttempt", () => {
     expect(snapshot.changedFiles).toContain("src/feature.ts");
     expect(snapshot.excludedFiles).toContain("PROGRESS.md");
     expect(snapshot.excludedFiles).toContain(".quack/prep");
+    expect(snapshot.excludedFiles).toContain(".quack/preflight-jobs/");
     expect(snapshot.excludedFiles).toContain(".quack/analytics/");
     expect(snapshot.excludedFiles).toContain(".quack/federation/");
     expect(snapshot.excludedFiles).toContain(".quack/reviews/");

@@ -6,7 +6,7 @@ import { resolveFederatedTaskEventDetails, sessionTitleForFederatedTask } from "
 import { defaultFederatedHosts, federatedHostEventDetailsFromHost } from "./host.js";
 import { federatedDependencyBlockers, federatedSessionId, sortFederatedQueue } from "./jobs.js";
 import { createFederatedLease, federationNow, leaseExpired } from "./lease.js";
-import { ReadinessService } from "../readiness-service.js";
+import { ReadinessService, selectReadinessDiagnosticPrep } from "../readiness-service.js";
 import { federatedJobHoldsWorkerAttachment, holdsWorkerAttachment } from "./status.js";
 import { releasedPauseNeedsRecovery } from "./pause-resume.js";
 import {
@@ -317,9 +317,11 @@ export async function evaluateFederatedSchedulingGate(
       taskService: p.taskService,
       prepCache: p.prepCache,
       db: p.db,
+      schemaPolicyHash: p.schemaPolicyHash,
+      readinessJudgmentMode: p.judgmentConfig?.stages.readiness.mode,
     });
     const state = await readiness.resolveCurrent(record.taskId);
-    const preflight = state?.preflight ?? null;
+    const preflight = state?.admissionPreflight ?? null;
     // QPI-051 (live on the 2026-08-10 1282 wave): the deterministic prep
     // is the ADMISSION authority. A preflight's embedded gate block can
     // misrepresent — score 0 assembled under readiness-shadow
@@ -330,11 +332,16 @@ export async function evaluateFederatedSchedulingGate(
     // against a 4.9 prep). A CURRENT passing prep therefore admits even
     // when the preflight gate section reads failed; a passing preflight
     // still admits on its own (the designed rescue for stale prep).
-    const currentPrep = state?.prep ?? null;
+    const currentPrep = state?.admissionPrep ?? null;
+    // A genuine but policy-stale record is still useful for invalid-contract
+    // diagnostics. Snapshot display columns never count as prep evidence.
+    // An unproven legacy blob may explain an invalid contract without gaining
+    // admission authority. Do not validate unrelated snapshot display columns.
+    const diagnosticPrep = selectReadinessDiagnosticPrep(state);
     let prepContractValid = true;
-    if (currentPrep) {
+    if (diagnosticPrep) {
       try {
-        parsePrepGateResult(currentPrep);
+        parsePrepGateResult(diagnosticPrep);
       } catch {
         prepContractValid = false;
       }
@@ -347,13 +354,10 @@ export async function evaluateFederatedSchedulingGate(
       currentPrep.depthReady &&
       currentPrep.depthScore >= 4.7 &&
       currentPrep.outcome !== "rejected";
+    const preflightPasses = preflight !== null && preflight.gate.gateSkipped !== true &&
+      preflight.gate.ready && preflight.gate.score >= 4.7;
+    if (prepPasses || preflightPasses) return { ok: true };
     if (preflight && preflight.gate.gateSkipped !== true) {
-      if (preflight.gate.ready && preflight.gate.score >= 4.7) {
-        return { ok: true };
-      }
-      if (prepPasses) {
-        return { ok: true };
-      }
       return {
         ok: false,
         blockReasonCode: "pending_manual_handoff",
@@ -365,7 +369,7 @@ export async function evaluateFederatedSchedulingGate(
     // gateSkipped preflights carry no admission verdict — fall through
     // to the prep-side evaluation exactly like an absent preflight.
 
-    const prep = state?.prep ?? null;
+    const prep = currentPrep;
     if (!prepContractValid)
       return {
         ok: false,
@@ -374,6 +378,32 @@ export async function evaluateFederatedSchedulingGate(
         nextAction: "reprep",
         retryable: true,
       };
+    if (
+      prep &&
+      (!prep.schemaValid ||
+        !prep.depthReady ||
+        prep.depthScore < 4.7 ||
+        prep.outcome === "rejected")
+    ) {
+      return {
+        ok: false,
+        blockReasonCode: "pending_manual_handoff",
+        error: `preflight_gate_failed:${prep.depthScore.toFixed(1)}`,
+        nextAction: prep.recommendDecomposition ? "decompose" : "enrich_and_reprep",
+        retryable: true,
+      };
+    }
+    // Current passing evidence from either source rescues the other above.
+    // Otherwise stale evidence is recoverable, not missing or a low score.
+    if (state?.staleReasons.some((reason) => reason === "schema_policy_stale" || reason === "readiness_mode_stale")) {
+      return {
+        ok: false,
+        blockReasonCode: "pending_manual_handoff",
+        error: "preflight_gate_stale",
+        nextAction: "reprep",
+        retryable: true,
+      };
+    }
     if (state?.hasStalePrep) {
       return {
         ok: false,
@@ -389,21 +419,6 @@ export async function evaluateFederatedSchedulingGate(
         blockReasonCode: "pending_manual_handoff",
         error: "preflight_gate_missing",
         nextAction: "prep_or_preflight",
-        retryable: true,
-      };
-    }
-    if (
-      prep &&
-      (!prep.schemaValid ||
-        !prep.depthReady ||
-        prep.depthScore < 4.7 ||
-        prep.outcome === "rejected")
-    ) {
-      return {
-        ok: false,
-        blockReasonCode: "pending_manual_handoff",
-        error: `preflight_gate_failed:${prep.depthScore.toFixed(1)}`,
-        nextAction: prep.recommendDecomposition ? "decompose" : "enrich_and_reprep",
         retryable: true,
       };
     }

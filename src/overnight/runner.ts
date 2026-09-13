@@ -15,6 +15,7 @@ import {
 import { isTerminalTaskStatus } from "../monitor/task-projection.js";
 import type { QuackEvent } from "../monitor/event-types.js";
 import { loadAdapter } from "../core/adapter-loader.js";
+import { computeSchemaPolicyHash } from "../gate/schema-policy.js";
 import {
   applyResolvedStatusHygiene,
   buildStructuralBacklogHygieneReport,
@@ -1213,6 +1214,8 @@ async function runPrepEvaluation(
   stageReporter?: PreflightStageReporter,
 ): Promise<OvernightPrepResult> {
   const adapter = await loadAdapter(projectRoot);
+  const requiredSections = [...(adapter.config.gate?.requiredSections ?? [])];
+  const schemaPolicyHash = computeSchemaPolicyHash(requiredSections);
   const taskDir = path.resolve(adapter.projectRoot, adapter.config.project.taskDir);
   const resolved = await resolveTaskFile(taskDir, taskId);
   if (!resolved) {
@@ -1221,9 +1224,10 @@ async function runPrepEvaluation(
 
   const { content, filePath } = resolved;
   const parsed = resolved.task ?? parseTaskFile(content, filePath);
-  const schema = validateTaskSchema(parsed);
+  const schema = validateTaskSchema(parsed, requiredSections);
   if (!schema.valid) {
     const result: OvernightPrepResult = {
+      schemaPolicyHash,
       schemaValid: false,
       schemaErrors: schema.missing,
       depthScore: 0,
@@ -1255,6 +1259,7 @@ async function runPrepEvaluation(
   }
 
   const result: OvernightPrepResult = {
+    schemaPolicyHash,
     schemaValid: true,
     schemaErrors: [],
     depthScore: depth.overallScore,
@@ -1289,6 +1294,7 @@ async function writePrepCache(
     recommendDecomposition: result.recommendDecomposition,
     decompositionReason: result.decompositionReason,
     contentHash,
+    schemaPolicyHash: result.schemaPolicyHash,
   });
 
   const readiness = new ReadinessService({
@@ -1307,6 +1313,7 @@ async function writePrepCache(
       recommendDecomposition: result.recommendDecomposition,
       decompositionReason: result.decompositionReason,
       contentHash,
+      schemaPolicyHash: result.schemaPolicyHash,
     });
   } finally {
     readiness.close();

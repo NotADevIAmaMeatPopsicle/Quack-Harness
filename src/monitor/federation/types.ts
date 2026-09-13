@@ -29,6 +29,7 @@ export interface FederationProjectContext {
   prepCache: PrepCache | null;
   db: QuackDB | NoopDB;
   judgmentConfig?: JudgmentConfig;
+  schemaPolicyHash?: string;
 }
 
 /** All federation runtime statuses. Loose synonyms (`complete`, `started`, `verify`)

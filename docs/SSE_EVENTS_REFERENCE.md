@@ -65,9 +65,18 @@ These are examples of declared stages, not an exhaustive inventory.
 - `prep_job_completed`
 - `prep_failed`
 - `preflight_complete`
+- `preflight_job_started`
+- `preflight_job_completed`
+- `preflight_job_failed`
 - `blueprint_start`
 - `blueprint_generated`
 - `blueprint_pending_approval`
+
+Durable preflight-job events include attempt and task/project identity.
+`preflight_job_started` follows persistence of the reservation; completion and
+failure events follow terminal persistence. Pipeline `preflight_complete`
+alone does not establish that the owned child has closed. After disconnect or
+reload, read the project-scoped attempt status API to recover the current state.
 
 ### Execution and verification
 

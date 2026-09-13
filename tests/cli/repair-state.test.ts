@@ -113,6 +113,20 @@ describe("repairProjectState", () => {
     expect(result.ghostPrep.ghosts).toEqual([]);
   });
 
+  it("names refusal to implicitly replace corrupt authority configuration", async () => {
+    fs.mkdirSync(path.join(projectRoot, ".quack/federation"), { recursive: true });
+    const file = path.join(projectRoot, ".quack/federation/peer.json");
+    const raw = '{"serviceToken":"fixture-secret",';
+    fs.writeFileSync(file, raw);
+    const result = repairProjectState({ project: projectRoot, writePeerConfig: true,
+      peerUrl: "http://headnode.test:3333", peerProjectId: "fixture", pullPeer: false });
+    await expect(result).rejects.toMatchObject({
+      name: "FederationPeerConfigWriteError", code: "existing_peer_config_unreadable",
+    });
+    await result.catch((error: Error) => expect(error.message).not.toContain("fixture-secret"));
+    expect(fs.readFileSync(file, "utf8")).toBe(raw);
+  });
+
   it("QPI-048 leg (h): the sweep detects ghosts through the full repair flow", async () => {
     const taskDir = path.join(projectRoot, "docs", "tasks");
     fs.mkdirSync(taskDir, { recursive: true });

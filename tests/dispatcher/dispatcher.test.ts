@@ -1,3 +1,4 @@
+import { DEFAULT_SCHEMA_POLICY_HASH } from "../../src/gate/schema-policy";
 /* eslint-disable @typescript-eslint/no-unsafe-return */
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
@@ -4173,6 +4174,7 @@ describe("dispatchTask", () => {
         taskId: "TASK-042",
         timestamp: new Date().toISOString(),
         contentHash,
+        schemaPolicyHash: DEFAULT_SCHEMA_POLICY_HASH,
         gate: { ready: true, score: 5, dimensions: {} },
         blueprint: {
           fileAnalyses: 2,
@@ -4533,6 +4535,7 @@ describe("dispatchTask", () => {
           taskId: "TASK-042",
           timestamp: new Date().toISOString(),
           contentHash,
+          schemaPolicyHash: DEFAULT_SCHEMA_POLICY_HASH,
           gate: { ready: true, score: 4.9, dimensions: {} },
           blueprint: {
             fileAnalyses: 0,
@@ -4589,6 +4592,7 @@ describe("dispatchTask", () => {
           taskId: "TASK-042",
           timestamp: new Date().toISOString(),
           contentHash,
+          schemaPolicyHash: DEFAULT_SCHEMA_POLICY_HASH,
           gate: {
             ready: false,
             score: 4.6,
@@ -4642,6 +4646,7 @@ describe("dispatchTask", () => {
           taskId: "TASK-042",
           timestamp: new Date().toISOString(),
           contentHash,
+          schemaPolicyHash: DEFAULT_SCHEMA_POLICY_HASH,
           gate: {
             ready: true,
             score: 5,
@@ -4696,6 +4701,7 @@ describe("dispatchTask", () => {
         taskId: "TASK-042",
         timestamp: new Date().toISOString(),
         contentHash,
+        schemaPolicyHash: DEFAULT_SCHEMA_POLICY_HASH,
         gate: {
           ready: true,
           score: 4.8,

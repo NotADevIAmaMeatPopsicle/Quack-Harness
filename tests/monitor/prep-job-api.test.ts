@@ -149,6 +149,36 @@ describe("operator prep and authentication diagnostics", () => {
     );
   });
 
+  it("rejects an explicit unknown project even in legacy single-project mode before child start", async () => {
+    const spawn = jest.spyOn(trustedNode, "spawnTrustedNode").mockImplementation(() => { throw new Error("unexpected child"); });
+    const port = await start();
+    for (const [route, method] of [["prep", "POST"], ["prep/job", "GET"], ["prep", "GET"]]) {
+      expect(await request(port, `/api/tasks/TASK-001/${route}?project=unknown`, method)).toMatchObject({ status: 404, body: { code: "PROJECT_NOT_FOUND" } });
+    }
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("supports the runbook's explicitly scoped cache/start/job sequence", async () => {
+    jest.spyOn(trustedNode, "spawnTrustedNode").mockImplementation(() => ({
+      child: child as unknown as ChildProcess, executablePath: process.execPath, processId: child.pid,
+    }));
+    const port = await start();
+    const projects = (await request(port, "/api/projects")).body as unknown as Array<{ id: string }>;
+    const scope = `?project=${encodeURIComponent(projects[0].id)}`;
+    try {
+      expect((await request(port, `/api/tasks/TASK-001/prep${scope}`)).status).toBe(404);
+      const started = await request(port, `/api/tasks/TASK-001/prep${scope}`, "POST");
+      expect(started.status).toBe(200); expect(started.body.jobId).toEqual(expect.any(String));
+      expect((await request(port, `/api/tasks/TASK-001/prep/job${scope}`)).body.job).toMatchObject({ jobId: started.body.jobId, status: "running" });
+      child.stdout.emit("data", Buffer.from(JSON.stringify({ schemaValid: true, schemaErrors: [], depthScore: 4.9,
+        depthReady: true, deficiencies: [], outcome: "pass" })));
+      child.exitCode = 0; child.emit("exit", 0, null); child.emit("close", 0, null);
+      expect((await request(port, `/api/tasks/TASK-001/prep/job${scope}`)).body.job).toMatchObject({ jobId: started.body.jobId, status: "completed", result: { depthScore: 4.9 } });
+    } finally {
+      if (child.exitCode === null) { child.exitCode = 1; child.emit("exit", 1, null); child.emit("close", 1, null); }
+    }
+  });
+
   it("reports auth conflict in health without deleting parent credentials or probing on GET", async () => {
     Object.assign(process.env, {
       ANTHROPIC_API_KEY: "fixture-api",

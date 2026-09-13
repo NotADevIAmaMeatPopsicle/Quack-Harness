@@ -1,3 +1,7 @@
+import { computeSchemaPolicyHash, DEFAULT_SCHEMA_POLICY_HASH } from "../../src/gate/schema-policy";
+import { PrepCache, computeContentHash } from "../../src/monitor/prep-cache";
+import { ReadinessService } from "../../src/monitor/readiness-service";
+import type { PreflightResult } from "../../src/preflight/preflight-types";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -207,3 +211,76 @@ describe.each([
     });
   },
 );
+
+function passingPreflight(taskId: string, contentHash: string, schemaPolicyHash: string): PreflightResult {
+  return {
+    taskId, contentHash, schemaPolicyHash, timestamp: new Date().toISOString(),
+    gate: { ready: true, score: 5, dimensions: {} },
+    blueprint: { fileAnalyses: 0, codeExamples: 0, verificationPatterns: 0, antiPatterns: 0, formattedMarkdown: "fixture" },
+    complexity: { filesToModify: 0, successCriteria: 1, estimatedContextTokens: 0, independentFeatures: 1, featureClusters: [], recommendDecomposition: false, reason: "fixture" },
+    contextEstimate: { taskSpec: 0, blueprint: 0, repoMap: 0, relevantFiles: 0, relatedPatterns: 0, existingTests: 0, conventions: 0, claudeMd: 0, total: 0, withinBudget: true },
+  };
+}
+
+describe.each(["legacy", "registered"] as const)("%s monitor policy wiring", (mode) => {
+  it.each([false, true])("only current-policy evidence suppresses watcher work (current=%s)", async (current) => {
+    const projectRoot = createProject(true, "Policy fixture");
+    const adapterPath = path.join(projectRoot, ".quack", "adapter.json");
+    const raw = JSON.parse(fs.readFileSync(adapterPath, "utf8")) as Record<string, unknown>;
+    raw.gate = { requiredSections: ["filesToModify"] };
+    raw.judgment = { stages: { readiness: { mode: "shadow" } } };
+    fs.writeFileSync(adapterPath, JSON.stringify(raw));
+    const policy = computeSchemaPolicyHash(["filesToModify"]);
+    const taskId = "TASK-5300";
+    const taskPath = writeReadyTask(projectRoot, taskId);
+    fs.appendFileSync(taskPath, "\n\n## Files to Modify\n| File | Action | Notes |\n| --- | --- | --- |\n| src/example.ts | Modify | fixture |\n");
+    const content = fs.readFileSync(taskPath, "utf8");
+    const hash = computeContentHash(content);
+    const stamp = current ? policy : DEFAULT_SCHEMA_POLICY_HASH;
+    const preflight = passingPreflight(taskId, hash, stamp);
+    preflight.gate.readinessJudgmentMode = "shadow";
+    await new PrepCache(projectRoot).writePreflight(preflight);
+    const writer = new ReadinessService({ projectRoot });
+    writer.persistPreflightResult(taskId, content, preflight);
+    writer.persistPrepResult(taskId, content, { taskId, contentHash: hash, schemaPolicyHash: stamp, preparedAt: preflight.timestamp, schemaValid: true, schemaErrors: [], depthScore: 5, depthReady: true, outcome: "pass", deficiencies: [] });
+    writer.close();
+    let server: MonitorServer | null = null;
+    const capturedWatchers: TaskWatcher[] = [];
+    jest.spyOn(TaskWatcher.prototype, "start").mockImplementation(function (this: TaskWatcher) {
+      capturedWatchers.push(this); return Promise.resolve();
+    });
+    const prepStart = jest.spyOn(PrepWorker.prototype, "start").mockImplementation((id) => fakePrepJob(id));
+    try {
+      const adapter = await loadAdapter(projectRoot);
+      server = createMonitorServer(mode === "registered"
+        ? { port: 0, host: "127.0.0.1", projectAdapters: [adapter] }
+        : { port: 0, host: "127.0.0.1", projectRoot, taskDir: "docs/tasks", adapterPath, logDir: path.join(projectRoot, ".quack/logs") });
+      const runtime = await server.start();
+      await capturedWatchers[0].processFile(taskPath);
+      expect(prepStart).toHaveBeenCalledTimes(current ? 0 : 1);
+      const origin = `http://127.0.0.1:${runtime.port}`;
+      const prep = await (await fetch(`${origin}/api/tasks/${taskId}/prep`)).json();
+      expect(prep).toMatchObject({ evidenceSource: "prep_record", stale: !current, schemaPolicyHash: stamp });
+      const displayed = await (await fetch(`${origin}/api/tasks/${taskId}/preflight`)).json();
+      expect(displayed).toMatchObject({ stale: !current, schemaPolicyHash: stamp });
+      if (!current) expect(displayed).toMatchObject({ staleReasons: expect.arrayContaining(["schema_policy_stale"]) as unknown });
+    } finally {
+      await stopServer(server);
+      jest.restoreAllMocks();
+      fs.rmSync(projectRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+    }
+  });
+});
+
+it("legacy malformed gate policy fails startup instead of silently using empty policy", () => {
+  const projectRoot = createProject(false, "Invalid policy");
+  const adapterPath = path.join(projectRoot, ".quack", "adapter.json");
+  const raw = JSON.parse(fs.readFileSync(adapterPath, "utf8")) as Record<string, unknown>;
+  raw.gate = { requiredSections: ["misspelledSection"] };
+  fs.writeFileSync(adapterPath, JSON.stringify(raw));
+  try {
+    expect(() => createMonitorServer({ port: 0, projectRoot, taskDir: "docs/tasks", adapterPath, logDir: path.join(projectRoot, ".quack/logs") })).toThrow(/requiredSections/);
+  } finally {
+    fs.rmSync(projectRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+  }
+});

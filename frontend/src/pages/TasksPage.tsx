@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import {
   listTasks,
+  listProjects,
   prepTask,
   startTask,
   stopTask,
@@ -26,6 +27,9 @@ const STATUS_FILTER_OPTIONS = [
 
 export function TasksPage() {
   const queryClient = useQueryClient();
+  const projects = useQuery({ queryKey: ["projects"], queryFn: listProjects });
+  const projectId = projects.data?.activeProjectId ??
+    (projects.data?.projects.length === 1 ? projects.data.projects[0].id : undefined);
   const [page, setPage] = useState(1);
   const [perPage, setPerPage] = useState(50);
   const [status, setStatus] = useState("");
@@ -90,13 +94,13 @@ export function TasksPage() {
   });
 
   const prep = useMutation({
-    mutationFn: (taskId: string) => prepTask(taskId),
-    onSuccess: (_, taskId) => {
-      toast.success(`Prep started for ${taskId}`);
+    mutationFn: (scope: { taskId: string; projectId: string }) => prepTask(scope.taskId, scope.projectId),
+    onSuccess: (_, scope) => {
+      toast.success(`Prep started for ${scope.taskId}`);
       invalidate();
     },
-    onError: (err, taskId) => {
-      toast.error(`Prep failed for ${taskId}`, err instanceof Error ? err.message : String(err));
+    onError: (err, scope) => {
+      toast.error(`Prep failed for ${scope.taskId}`, err instanceof Error ? err.message : String(err));
     },
   });
 
@@ -194,15 +198,16 @@ export function TasksPage() {
                   <TaskRow
                     key={task.id}
                     task={task}
+                    prepDisabled={!projectId}
                     busy={
                       (start.isPending && start.variables === task.id)
                       || (stop.isPending && stop.variables === task.id)
-                      || (prep.isPending && prep.variables === task.id)
+                      || (prep.isPending && prep.variables?.taskId === task.id)
                       || (setStatusM.isPending && setStatusM.variables?.taskId === task.id)
                     }
                     onStart={() => confirmStartTask(task.id)}
                     onStop={() => confirmStopTask(task.id)}
-                    onPrep={() => prep.mutate(task.id)}
+                    onPrep={() => { if (projectId) prep.mutate({ taskId: task.id, projectId }); }}
                     onStatusChange={(newStatus) => setStatusM.mutate({ taskId: task.id, newStatus })}
                   />
                 ))}
@@ -265,10 +270,11 @@ function SortableTh({
 }
 
 function TaskRow({
-  task, busy, onStart, onStop, onPrep, onStatusChange,
+  task, busy, prepDisabled, onStart, onStop, onPrep, onStatusChange,
 }: {
   task: TaskSummary;
   busy: boolean;
+  prepDisabled: boolean;
   onStart: () => void;
   onStop: () => void;
   onPrep: () => void;
@@ -311,7 +317,7 @@ function TaskRow({
               Stop
             </button>
           )}
-          <button type="button" className="btn btn-sm" onClick={onPrep} disabled={busy}>
+          <button type="button" className="btn btn-sm" onClick={onPrep} disabled={busy || prepDisabled}>
             Prep
           </button>
         </div>

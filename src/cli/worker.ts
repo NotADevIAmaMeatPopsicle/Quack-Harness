@@ -861,8 +861,8 @@ function writeProjectEnvStubFiles(
   return written;
 }
 
-async function writePrimaryProjectPeerConfigs(
-  manifest: WorkerEnrollmentManifest,
+export async function writePrimaryProjectPeerConfigs(
+  manifest: Pick<WorkerEnrollmentManifest, "projects" | "controlPlane">,
   projectPaths: Record<string, string>,
 ): Promise<string[]> {
   const written: string[] = [];

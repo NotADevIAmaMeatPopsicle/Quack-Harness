@@ -1,3 +1,4 @@
+import { parseFullPreflightResult } from "../../src/monitor/preflight-job-result";
 import { execFileSync } from "node:child_process";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
@@ -587,6 +588,7 @@ describe("auto-decomposition write safety", () => {
     mockDecomposeTask.mockResolvedValue(topology);
 
     const result = await runPreflight(task, adapter, { force: true });
+    expect(parseFullPreflightResult(result)).toEqual(result);
 
     expect(result.decomposition?.refused).toMatchObject({
       errorType: "coverage_gap",
@@ -904,6 +906,10 @@ describe("auto-decomposition write safety", () => {
       subtaskIds: ["TASK-006-A", "TASK-006-B"],
     });
     const parentAfter = await fs.readFile(parentPath, "utf-8");
+    expect(result.inputContentHash).toBe(computeDecompositionParentHash(task.rawContent));
+    expect(result.contentHash).toBe(computeDecompositionParentHash(parentAfter));
+    expect(result.contentHash).not.toBe(result.inputContentHash);
+    expect(result.decomposition?.committedSha).toBe(git(root, ["rev-parse", "--short=7", "HEAD"]));
     expect(parentAfter).toContain("**Status:** DECOMPOSED");
     expect(parentAfter).toContain("**Blocks:** [TASK-006-A, TASK-006-B]");
     expect(parentAfter).toContain("## Decomposition Summary");

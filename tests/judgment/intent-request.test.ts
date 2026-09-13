@@ -110,6 +110,51 @@ describe("extractIntentSections", () => {
 });
 
 describe("buildReadinessIntentRequest", () => {
+  it.each(["pass", "enriched"] as const)("owns its four evidence arrays for %s", (outcome) => {
+    const task = makeTask(RAW);
+    const advisories = ["ADVISORY: original"];
+    const result: GateResult = outcome === "pass"
+      ? { outcome, task, advisories }
+      : { outcome, task: { original: task, enriched: task, diff: "", approved: true }, advisories };
+    const evidence: ReadinessGateEvidence = {
+      ...EVIDENCE,
+      schemaWarnings: ["schema warning"],
+      collisionDeficiencies: ["collision warning"],
+      depthResult: { ...EVIDENCE.depthResult!, deficiencies: ["depth warning"] },
+    };
+    const legacy = projectReadinessDecision(result);
+    const request = buildReadinessIntentRequest(task, result, legacy, evidence)!;
+    const pairs: Array<[string[], string[]]> = [
+      [evidence.depthResult!.deficiencies, request.stageContext.depthDeficiencies as string[]],
+      [evidence.collisionDeficiencies, request.stageContext.collisionDeficiencies as string[]],
+      [evidence.schemaWarnings, request.stageContext.schemaWarnings as string[]],
+      [advisories, request.stageContext.advisories as string[]],
+    ];
+    for (const [input, captured] of pairs) {
+      const original = [...input];
+      input.push("later caller edit");
+      expect(captured).toEqual(original);
+      captured.push("later request edit");
+      expect(input).toEqual([...original, "later caller edit"]);
+    }
+  });
+
+  it("retains rejected advisory filtering and the original signal objects", () => {
+    const evidence: ReadinessGateEvidence = {
+      ...EVIDENCE,
+      depthResult: {
+        ...EVIDENCE.depthResult!,
+        deficiencies: ["hard failure", "ADVISORY: retained"],
+      },
+    };
+    const legacy = projectReadinessDecision(REJECTED);
+    const request = buildReadinessIntentRequest(makeTask(RAW), REJECTED, legacy, evidence)!;
+    evidence.depthResult!.deficiencies.push("ADVISORY: later");
+    expect(request.stageContext.advisories).toEqual(["ADVISORY: retained"]);
+    expect(request.signals.length).toBeGreaterThan(0);
+    request.signals.forEach((signal, index) => expect(signal.signal).toBe(legacy.signals[index]));
+  });
+
   it("carries the task substance plus the gate evidence in stageContext", () => {
     const task = makeTask(RAW);
     const legacy = projectReadinessDecision(REJECTED);
@@ -175,6 +220,20 @@ const ELIGIBLE_FACTS: LoopReviewGateFacts = {
 };
 
 describe("buildLoopIntentRequest", () => {
+  it("owns the missing-anchor array in both directions", () => {
+    const missing = ["src/original.ts:1"];
+    const review: ReviewRunResult = {
+      ...CLEAN_REVIEW,
+      anchorsAudit: { total: 1, missing },
+    };
+    const legacy = projectLoopReviewDecision("loop_diff", review, ELIGIBLE_FACTS);
+    const request = buildLoopIntentRequest("loop_diff", "TASK-042", RAW, review, ELIGIBLE_FACTS, legacy)!;
+    missing.push("src/later.ts:2");
+    expect(request.stageContext.anchorsMissing).toEqual(["src/original.ts:1"]);
+    (request.stageContext.anchorsMissing as string[]).push("src/request.ts:3");
+    expect(missing).toEqual(["src/original.ts:1", "src/later.ts:2"]);
+  });
+
   it("carries the spec's substance, the review evidence, and the gate's own conclusion", () => {
     const legacy = projectLoopReviewDecision("loop_diff", CLEAN_REVIEW, ELIGIBLE_FACTS);
     const request = buildLoopIntentRequest(

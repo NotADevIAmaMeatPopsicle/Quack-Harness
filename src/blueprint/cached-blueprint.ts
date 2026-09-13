@@ -36,6 +36,9 @@ export function resolveCachedBlueprint(
   if (!cached || typeof markdown !== "string" || markdown.length === 0) {
     return null;
   }
+  // Retention is diagnostic evidence. A failed attempt must generate a fresh
+  // blueprint before dispatch, even when its report displays an older good one.
+  if (cached.blueprint.generationFailure || cached.blueprint.structuredPreserved) return null;
 
   // TASK-1324 round-2 F1: the verdict persisted BESIDE structured (it
   // survives the 256KB size-drop). Reattached to whatever object this

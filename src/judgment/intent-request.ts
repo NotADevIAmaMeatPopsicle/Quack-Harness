@@ -100,16 +100,16 @@ export function buildReadinessIntentRequest(
       outcome: legacyResult.outcome,
       reason: legacyResult.outcome === "rejected" ? legacyResult.reason : undefined,
       depthOverallScore: evidence.depthResult?.overallScore,
-      depthDeficiencies: evidence.depthResult?.deficiencies ?? [],
+      depthDeficiencies: [...(evidence.depthResult?.deficiencies ?? [])],
       advisorySuggestedMinScore: evidence.advisorySuggestedMinScore,
-      collisionDeficiencies: evidence.collisionDeficiencies,
-      schemaWarnings: evidence.schemaWarnings,
+      collisionDeficiencies: [...evidence.collisionDeficiencies],
+      schemaWarnings: [...evidence.schemaWarnings],
       advisories:
         legacyResult.outcome === "rejected"
           ? (evidence.depthResult?.deficiencies ?? []).filter((deficiency) =>
               deficiency.startsWith("ADVISORY:"),
             )
-          : (legacyResult.advisories ?? []),
+          : [...(legacyResult.advisories ?? [])],
     },
     signals: assignIntentSignalRefs(legacyDecision.signals),
     contextMetadata: {
@@ -177,7 +177,7 @@ export function buildLoopIntentRequest(
             review.findings.map((finding) => `${finding.severity}: ${finding.summary}`),
             20,
           ),
-          anchorsMissing: review.anchorsAudit?.missing ?? [],
+          anchorsMissing: [...(review.anchorsAudit?.missing ?? [])],
           treeDirtyAfterReview: review.treeDirtyAfterReview === true,
         }
       : {

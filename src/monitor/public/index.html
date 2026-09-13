@@ -1215,10 +1215,6 @@
         background: rgba(139, 148, 158, 0.15);
         color: var(--text-muted);
       }
-      .task-prep-badge.schema-ok {
-        background: rgba(210, 153, 34, 0.15);
-        color: var(--yellow);
-      }
       .task-prep-badge.ready {
         background: rgba(63, 185, 80, 0.15);
         color: var(--green);
@@ -1227,9 +1223,27 @@
         background: rgba(248, 81, 73, 0.15);
         color: var(--red);
       }
+      .task-prep-badge.invalid {
+        background: rgba(248, 81, 73, 0.15);
+        color: var(--red);
+      }
       .task-prep-badge.stale {
         background: rgba(210, 153, 34, 0.2);
         color: var(--yellow);
+      }
+      .task-prep-badge.prep-needed {
+        background: rgba(210, 153, 34, 0.15);
+        color: var(--yellow);
+      }
+      .task-prep-badge.unconfirmed,
+      .task-prep-badge.unavailable,
+      .task-prep-badge.missing {
+        background: rgba(210, 153, 34, 0.2);
+        color: var(--yellow);
+      }
+      .task-prep-badge.failed {
+        background: rgba(248, 81, 73, 0.15);
+        color: var(--red);
       }
       .task-prep-badge.prepping {
         background: rgba(88, 166, 255, 0.15);
@@ -5452,6 +5466,8 @@
       </div>
     </div>
 
+    <script src="/legacy/preflight-jobs.js"></script>
+    <script src="/legacy/prep-jobs.js"></script>
     <script>
       // ─── API Base URL ──────────────────────────────────────────────
       // When serving the dashboard separately from the backend, set this
@@ -6165,6 +6181,9 @@
       }
 
       async function reloadAllData() {
+        fullPreflightJobs.sync();
+        prepJobs.sync();
+        preflightTaskData = {};
         // Clear current state
         sessions = [];
         activeSessions.clear();
@@ -6213,6 +6232,7 @@
         });
 
         es.addEventListener("quack-event", (e) => {
+          if (currentEventSource !== es) return;
           const event = JSON.parse(e.data);
           // Filter events by active project — applies in both single and multi-project modes
           // so that stale or misrouted events are always discarded consistently
@@ -6368,6 +6388,7 @@
       }
 
       function handleEvent(event) {
+        prepJobs.event(event);
         // Handle task freshness events (TASK-096)
         if (event.stage === "tasks_stale") {
           freshnessIsStale = true;
@@ -6479,38 +6500,11 @@
 
         // Handle blueprint approval events
         if (event.sessionId === "approval" && event.stage) {
-          if (event.stage === "blueprint_replan_complete") {
-            const panel = document.getElementById(`blueprint-approval-panel-${event.taskId}`);
-            if (panel) {
-              panel.innerHTML = `
-              <div class="preflight-panel" style="border-color:var(--green)">
-                <div class="preflight-header" style="background:var(--green);color:white">
-                  <span style="font-weight:600">✓ Re-plan complete</span>
-                </div>
-                <div class="preflight-body">
-                  <p style="margin:0;font-size:13px;color:var(--text-muted)">
-                    New blueprint generated. Run dispatch to continue.
-                  </p>
-                </div>
-              </div>
-            `;
-            }
-          } else if (event.stage === "blueprint_replan_failed") {
-            const panel = document.getElementById(`blueprint-approval-panel-${event.taskId}`);
-            if (panel) {
-              panel.innerHTML = `
-              <div class="preflight-panel" style="border-color:var(--red)">
-                <div class="preflight-header" style="background:var(--red);color:white">
-                  <span style="font-weight:600">✗ Re-plan failed</span>
-                </div>
-                <div class="preflight-body">
-                  <p style="margin:0;font-size:13px;color:var(--text-muted)">
-                    ${event.payload?.error || "Preflight generation failed. Try again."}
-                  </p>
-                </div>
-              </div>
-            `;
-            }
+          if (
+            event.stage === "blueprint_replan_complete" ||
+            event.stage === "blueprint_replan_failed"
+          ) {
+            fullPreflightJobs.event(event);
           }
           return;
         }
@@ -6595,74 +6589,8 @@
         refreshHistory();
       }
 
-      // Map of stage names to human-readable descriptions
-      const PREFLIGHT_STAGE_LABELS = {
-        preflight_start: "Starting pre-flight...",
-        preflight_gate: "Running gate check...",
-        preflight_blueprint: "Generating blueprint...",
-        preflight_analysis: "Analyzing complexity...",
-        preflight_complete: "Pre-flight complete",
-      };
-
-      // Track the current pre-flight stage per task
-      if (!window._preflightStage) window._preflightStage = {};
-
       function handlePreflightEvent(event) {
-        const taskId = event.payload?.taskId;
-        if (!taskId) return;
-
-        const stage = event.stage;
-
-        if (stage === "preflight_start") {
-          window._preflightRunning[taskId] = true;
-          window._preflightStage[taskId] = stage;
-          updatePreflightStageIndicator(taskId, stage);
-        } else if (
-          stage === "preflight_gate" ||
-          stage === "preflight_blueprint" ||
-          stage === "preflight_analysis"
-        ) {
-          window._preflightStage[taskId] = stage;
-          updatePreflightStageIndicator(taskId, stage);
-        } else if (stage === "preflight_complete") {
-          window._preflightRunning[taskId] = false;
-          window._preflightStage[taskId] = null;
-          // Reload preflight result
-          fetch(`${API_BASE}/api/tasks/${taskId}/preflight`)
-            .then((r) => {
-              if (r.ok) return r.json();
-              throw new Error("no preflight");
-            })
-            .then((result) => {
-              preflightTaskData[taskId] = result;
-              renderTasks(); // Update row button state
-              const btn = document.getElementById(`preflight-btn-${taskId}`);
-              if (btn) {
-                btn.textContent = "Re-Run Pre-Flight";
-              }
-              // Auto-render if task detail is already expanded
-              if (expandedTaskId === taskId) {
-                renderPreflightPanel(taskId, result);
-              }
-            })
-            .catch(() => {});
-        }
-      }
-
-      function updatePreflightStageIndicator(taskId, stage) {
-        const label = PREFLIGHT_STAGE_LABELS[stage] || "Running...";
-        // Update the row button if visible
-        const rowBtn = document.querySelector(`[data-preflight-task="${taskId}"]`);
-        if (rowBtn) {
-          rowBtn.textContent = label;
-          rowBtn.title = label;
-        }
-        // Update the detail panel button if visible
-        const detailBtn = document.getElementById(`preflight-btn-${taskId}`);
-        if (detailBtn && window._preflightRunning[taskId]) {
-          detailBtn.textContent = label;
-          detailBtn.disabled = true;
-        }
+        fullPreflightJobs.event(event);
       }
 
       function handleAutoPrepEvent(event) {
@@ -7118,8 +7046,7 @@
         const hostBadge = `<span style="display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--text-muted);margin-left:8px"><span class="${hostDisplay.className}" style="width:6px;height:6px"></span>${esc(hostDisplay.label)}</span>`;
 
         // Gate score for active session
-        const aScore =
-          taskGateScores.get(s.taskId) ?? preflightTaskData[s.taskId]?.gate?.score ?? null;
+        const aScore = taskGateScores.get(s.taskId) ?? currentPreflightScore(s.taskId);
         const aScoreHtml =
           aScore != null
             ? `<span class="gate-score ${aScore >= 4.7 ? "high" : aScore >= 4.0 ? "mid" : "low"}" style="margin-left:6px;font-size:12px">${aScore.toFixed(1)}</span>`
@@ -7697,10 +7624,7 @@
                     : Math.floor(timeAgoMs / 86400000) + "d ago";
             // Gate score — prefer inline from API, fall back to cached prep data
             const hScore =
-              s.gateScore ??
-              taskGateScores.get(s.taskId) ??
-              preflightTaskData[s.taskId]?.gate?.score ??
-              null;
+              s.gateScore ?? taskGateScores.get(s.taskId) ?? currentPreflightScore(s.taskId);
             const hScoreHtml =
               hScore != null
                 ? `<span class="gate-score ${hScore >= 4.7 ? "high" : hScore >= 4.0 ? "mid" : "low"}" style="margin-left:6px">${hScore.toFixed(1)}</span>`
@@ -7746,8 +7670,7 @@
             const badgeClass = s.outcome === "rejected" ? "rejected" : "failed";
             const label = s.outcome || s.status;
             const cost = s.totalCostUsd != null ? `$${s.totalCostUsd.toFixed(2)}` : "";
-            const eScore =
-              taskGateScores.get(s.taskId) ?? preflightTaskData[s.taskId]?.gate?.score ?? null;
+            const eScore = taskGateScores.get(s.taskId) ?? currentPreflightScore(s.taskId);
             const eScoreHtml =
               eScore != null
                 ? `<span class="gate-score ${eScore >= 4.7 ? "high" : eScore >= 4.0 ? "mid" : "low"}" style="margin-left:4px">${eScore.toFixed(1)}</span>`
@@ -10021,7 +9944,7 @@
           console.error("Refresh failed:", err);
         }
       }
-      const taskPrepStatus = new Map(); // taskId -> 'unprepared' | 'schema-ok' | 'ready' | 'not-ready' | 'stale' | 'prepping'
+      const taskPrepStatus = new Map(); // taskId -> 'unprepared' | 'prep-needed' | 'invalid' | 'ready' | 'not-ready' | 'stale' | 'prepping'
       const taskGateScores = new Map(); // taskId -> number (depth score from prep)
       const queueItems = new Map(); // taskId -> QueueItem { status, ... }
       const workflowSummaryCache = new Map(); // taskId -> /v1/tasks/:id/review-docs-summary payload
@@ -10197,6 +10120,7 @@
 
           // Load cached preflight results for row buttons
           await loadPreflightCache();
+          await fullPreflightJobs.load();
 
           const workflowCandidates = allTasks
             .filter((t) => {
@@ -10223,30 +10147,83 @@
         }
       }
 
+      function currentPreflightScore(taskId) {
+        if (["starting", "running", "unconfirmed"].includes(prepJobs.state(taskId)?.status))
+          return null;
+        if (preflightTaskData[taskId]?.stale) return null;
+        const gate = preflightTaskData[taskId]?.gate;
+        return gate?.gateSkipped === true ? null : (gate?.score ?? null);
+      }
+
+      function isCurrentPrepRecord(prep) {
+        return prep?.evidenceSource === "prep_record" && !prep.stale;
+      }
+
+      function prepDisplayStatus(prep) {
+        if (!prep) return "unprepared";
+        if (prep.stale) return "stale";
+        if (!isCurrentPrepRecord(prep)) return "prep-needed";
+        if (!QuackPrepJobs.validResult(prep)) return "invalid";
+        return QuackPrepJobs.passes(prep) ? "ready" : "not-ready";
+      }
+
+      function prepBadgeHtml(status) {
+        const label = {
+          "prep-needed": "Prep needed",
+          ready: "Ready",
+          "not-ready": "Not Ready",
+          invalid: "Invalid prep",
+          stale: "Stale",
+          prepping: "Prepping...",
+          unconfirmed: "Status unconfirmed",
+          unavailable: "Attempt unavailable",
+          missing: "No attempt recorded",
+          failed: "Prep failed",
+        }[status];
+        if (!label) return '<span style="color:var(--text-muted)">—</span>';
+        const guidance =
+          status === "invalid"
+            ? "Stored prep result is invalid. Run prep again."
+            : status === "not-ready"
+              ? "Prep did not meet readiness requirements. The score may come from a separate preflight."
+              : "";
+        return `<span class="task-prep-badge ${esc(status)}" title="${esc(guidance)}">${esc(label)}</span>`;
+      }
+
+      function currentGateScoreTitle(taskId) {
+        return currentPreflightScore(taskId) != null
+          ? "Current preflight score"
+          : "Current prep score";
+      }
+
+      function rememberPrepScore(taskId, prep) {
+        taskGateScores.delete(taskId);
+        if (isCurrentPrepRecord(prep) && QuackPrepJobs.validResult(prep)) {
+          taskGateScores.set(taskId, prep.depthScore);
+        }
+      }
+
       async function loadPrepStatus() {
+        const scope = prepJobs.sync();
         allTasks.forEach((task) => taskPrepStatus.set(task.id, "unprepared"));
+        taskGateScores.clear();
         try {
-          const res = await fetch(`${API_BASE}/api/tasks/prep-cache`);
+          const res = await fetch(
+            `${scope.apiBase}/api/tasks/prep-cache${scope.projectId ? `?project=${encodeURIComponent(scope.projectId)}` : ""}`,
+          );
           if (!res.ok) return;
           const data = await res.json();
+          if (scope.generation !== prepJobs.sync().generation) return;
           const results = data.results || {};
           for (const task of allTasks) {
             const prep = results[task.id];
+            if (prepJobs.state(task.id)) {
+              prepJobs.readiness(task.id, prep);
+              continue;
+            }
             if (!prep) continue;
-            let status = "unprepared";
-            if (prep.stale) {
-              status = "stale";
-            } else if (prep.schemaValid && prep.depthReady) {
-              status = "ready";
-            } else if (prep.schemaValid && !prep.depthReady) {
-              status = "not-ready";
-            } else if (prep.schemaValid) {
-              status = "schema-ok";
-            }
-            taskPrepStatus.set(task.id, status);
-            if (typeof prep.depthScore === "number") {
-              taskGateScores.set(task.id, prep.depthScore);
-            }
+            taskPrepStatus.set(task.id, prepDisplayStatus(prep));
+            rememberPrepScore(task.id, prep);
           }
         } catch {
           /* ignore */
@@ -10254,11 +10231,16 @@
       }
 
       async function loadPreflightCache() {
+        const scope = fullPreflightJobs.sync();
+        if (!scope.projectId) return;
         try {
-          const res = await fetch(`${API_BASE}/api/tasks/preflight-cache`);
+          const res = await fetch(
+            `${scope.apiBase}/api/tasks/preflight-cache?project=${encodeURIComponent(scope.projectId)}`,
+          );
           if (!res.ok) return;
           const data = await res.json();
-          preflightTaskData = data.results || {};
+          if (scope.generation === fullPreflightJobs.sync().generation)
+            preflightTaskData = data.results || {};
         } catch {
           /* ignore */
         }
@@ -10392,7 +10374,7 @@
       function taskSortValue(task, key) {
         if (key === "status") return task.effectiveStatus || task.status;
         if (key === "score")
-          return preflightTaskData[task.id]?.gate?.score ?? taskGateScores.get(task.id) ?? -1;
+          return currentPreflightScore(task.id) ?? taskGateScores.get(task.id) ?? -1;
         if (key === "deps") return (task.blockedBy?.length || 0) + (task.blocks?.length || 0);
         return task[key] ?? "";
       }
@@ -10565,28 +10547,13 @@
           const isExpanded = expandedTaskId === t.id;
 
           // Get prep status from cache (fetched separately)
-          const prepStatus = taskPrepStatus.get(t.id) || "unprepared";
-          const prepLabel =
-            prepStatus === "unprepared"
-              ? "—"
-              : prepStatus === "schema-ok"
-                ? "Schema OK"
-                : prepStatus === "ready"
-                  ? "Ready"
-                  : prepStatus === "not-ready"
-                    ? "Not Ready"
-                    : prepStatus === "stale"
-                      ? "Stale"
-                      : prepStatus === "prepping"
-                        ? "Prepping..."
-                        : "—";
+          const prepStatus = prepAttemptStatus(t.id) || taskPrepStatus.get(t.id) || "unprepared";
 
           // Get gate score — prefer preflight data, fall back to prep depthScore
-          const cachedPf = preflightTaskData[t.id];
-          const gateScore = cachedPf?.gate?.score ?? taskGateScores.get(t.id) ?? null;
+          const gateScore = currentPreflightScore(t.id) ?? taskGateScores.get(t.id) ?? null;
           const scoreHtml =
             gateScore != null
-              ? `<span class="gate-score ${gateScore >= 4.7 ? "high" : gateScore >= 4.0 ? "mid" : "low"}">${gateScore.toFixed(1)}</span>`
+              ? `<span title="${currentGateScoreTitle(t.id)}" class="gate-score ${gateScore >= 4.7 ? "high" : gateScore >= 4.0 ? "mid" : "low"}">${gateScore.toFixed(1)}</span>`
               : '<span style="color:var(--text-muted)">—</span>';
 
           // Get queue status for this task
@@ -10616,22 +10583,12 @@
               : `<span class="task-deps-badge" style="background:rgba(88,166,255,0.15);color:var(--blue);margin-left:6px">#${ghIssue.issueNumber}</span>`
             : "";
 
-          // Pre-Flight button for task card row
-          const hasCachedPreflight = !!preflightTaskData[t.id];
-          const preflightRunning = !!window._preflightRunning && window._preflightRunning[t.id];
-          const preflightStage = window._preflightStage && window._preflightStage[t.id];
-          const stageLabel =
-            preflightStage && PREFLIGHT_STAGE_LABELS[preflightStage]
-              ? PREFLIGHT_STAGE_LABELS[preflightStage]
-              : "Running...";
-          let preflightBtnHtml = "";
-          if (preflightRunning) {
-            preflightBtnHtml = `<span class="preflight-row-btn running" data-preflight-task="${esc(t.id)}" title="${esc(stageLabel)}">${esc(stageLabel)}</span>`;
-          } else if (hasCachedPreflight) {
-            preflightBtnHtml = `<span class="preflight-row-btn cached" onclick="event.stopPropagation();runPreflightFromRow('${esc(t.id)}')" title="Pre-flight complete — click to re-run">Pre-Flight ✓</span>`;
-          } else {
-            preflightBtnHtml = `<span class="preflight-row-btn" onclick="event.stopPropagation();runPreflightFromRow('${esc(t.id)}')" title="Run pre-flight check">Pre-Flight</span>`;
-          }
+          // Latest durable attempt takes precedence over paid cache contents.
+          const preflightState = fullPreflightJobs.state(t.id);
+          const preflightLabel = fullPreflightJobs.label(preflightState);
+          const preflightBusy =
+            preflightState.pending || fullPreflightJobs.active(preflightState.job);
+          const preflightBtnHtml = `<button class="preflight-row-btn${preflightBusy ? " running" : ""}" data-preflight-task="${esc(t.id)}" onclick="event.stopPropagation();runPreflightFromRow('${esc(t.id)}')" title="${esc(preflightLabel)}" ${preflightBusy ? "disabled" : ""}>${esc(preflightLabel)}</button>`;
 
           let html = `
           <tr class="${isExpanded ? "expanded" : ""} ${isSubtaskRow ? "subtask-row subtask-of-" + esc(getParentTaskId(t.id) || "") : ""}" onclick="toggleTaskDetail('${t.id}')" ${isSubtaskRow && window._subtaskCollapsed[getParentTaskId(t.id)] ? 'style="display:none"' : ""}>
@@ -10640,7 +10597,7 @@
             <td class="task-title-cell">${isSubtaskRow ? '<span style="color:var(--text-muted);margin-right:4px">↳</span>' : ""}${esc(t.title)}${ghIssueBadge}</td>
             <td><span class="task-priority-badge ${priorityClass}">${esc(t.priority)}</span></td>
             <td><span class="task-status-badge ${statusClass}" onclick="event.stopPropagation()" ondblclick="event.stopPropagation();editTaskStatus('${esc(t.id)}','${esc(displayStatus)}',this)" title="Double-click to edit">${esc(displayStatus)}</span>${t.needsVerification ? '<span class="task-verify-badge" title="Approved but not yet verified">Verify</span>' : ""}</td>
-            <td>${prepStatus !== "unprepared" ? `<span class="task-prep-badge ${prepStatus}">${prepLabel}</span>` : '<span style="color:var(--text-muted)">—</span>'}${preflightBtnHtml}</td>
+            <td><span class="prep-badge-slot">${prepBadgeHtml(prepStatus)}</span>${preflightBtnHtml}</td>
             <td class="workflow-row-cell">${workflowCellHtml}</td>
             <td class="gate-score-cell">${scoreHtml}</td>
             <td class="queue-status-cell">${qBadgeHtml}</td>
@@ -10732,6 +10689,8 @@
       }
 
       async function loadTaskDetail(taskId, isRefresh) {
+        const preflightContext = fullPreflightJobs.sync();
+        const preflightScope = preflightContext.generation;
         const detailContent = document.getElementById(`detail-content-${taskId}`);
         if (!detailContent) return;
 
@@ -10756,12 +10715,20 @@
 
           const workflowSummary = await loadWorkflowSummary(taskId);
 
+          await fullPreflightJobs.refresh(taskId);
+          if (fullPreflightJobs.sync().generation !== preflightScope) return;
+
           // Check for preflight result
           try {
-            const preflightRes = await fetch(`${API_BASE}/api/tasks/${taskId}/preflight`);
-            if (preflightRes.ok) {
-              const preflight = await preflightRes.json();
-              preflightTaskData[taskId] = preflight;
+            if (preflightContext.projectId) {
+              const preflightRes = await fetch(
+                `${preflightContext.apiBase}/api/tasks/${taskId}/preflight?project=${encodeURIComponent(preflightContext.projectId)}`,
+              );
+              if (preflightRes.ok) {
+                const preflight = await preflightRes.json();
+                if (fullPreflightJobs.sync().generation === preflightScope)
+                  preflightTaskData[taskId] = preflight;
+              }
             }
           } catch {
             /* ignore preflight fetch errors */
@@ -10779,7 +10746,10 @@
             /* ignore progress fetch errors */
           }
 
+          if (fullPreflightJobs.sync().generation !== preflightScope) return;
           renderTaskDetail(task, runs, detailContent, workflowSummary);
+          await prepJobs.recover(taskId);
+          updatePrepAttemptView(taskId);
         } catch (err) {
           // On refresh, silently keep the existing content instead of showing an error
           if (!isRefresh) {
@@ -11171,16 +11141,8 @@
           updateContainerInfoPanel(task.id);
         }
 
-        // Show preflight button and render cached result if exists
-        const preflightBtn = document.getElementById(`preflight-btn-${task.id}`);
-        if (preflightBtn) {
-          preflightBtn.style.display = "";
-          const cachedPreflight = preflightTaskData[task.id];
-          if (cachedPreflight) {
-            preflightBtn.textContent = "Re-Run Pre-Flight";
-            renderPreflightPanel(task.id, cachedPreflight);
-          }
-        }
+        updateFullPreflightView(task.id);
+        updatePrepAttemptView(task.id);
 
         // Check for pending blueprint approval
         fetch(API_BASE + "/api/tasks/" + encodeURIComponent(task.id) + "/blueprint")
@@ -11616,8 +11578,7 @@
             }
 
             // Gate score for queue item — prefer preflight, fall back to prep
-            const qPf = preflightTaskData[item.taskId];
-            const qScore = qPf?.gate?.score ?? taskGateScores.get(item.taskId);
+            const qScore = currentPreflightScore(item.taskId) ?? taskGateScores.get(item.taskId);
             const qScoreHtml =
               qScore != null
                 ? `<span class="gate-score ${qScore >= 4.7 ? "high" : qScore >= 4.0 ? "mid" : "low"}" style="margin-left:6px">${qScore.toFixed(1)}</span>`
@@ -12023,243 +11984,188 @@
 
       function updatePrepBadgeInRow(taskId, status) {
         // Update the prep badge in the task list row without full re-render
-        const prepLabel =
-          status === "unprepared"
-            ? "—"
-            : status === "schema-ok"
-              ? "Schema OK"
-              : status === "ready"
-                ? "Ready"
-                : status === "not-ready"
-                  ? "Not Ready"
-                  : status === "stale"
-                    ? "Stale"
-                    : status === "prepping"
-                      ? "Prepping..."
-                      : "—";
         taskPrepStatus.set(taskId, status);
         // Find the row for this task and update just the prep cell
-        const rows = document.querySelectorAll("#taskTableBody tr");
+        const rows = document.querySelectorAll("#tasksBody .task-table tbody tr");
         for (const row of rows) {
-          if (row.onclick && row.onclick.toString().includes(taskId)) {
-            const cells = row.querySelectorAll("td");
-            if (cells.length >= 5) {
-              if (status !== "unprepared") {
-                cells[4].innerHTML = `<span class="task-prep-badge ${status}">${prepLabel}</span>`;
-              } else {
-                cells[4].innerHTML = '<span style="color:var(--text-muted)">—</span>';
-              }
+          if (row.querySelector(".task-select-cb")?.dataset.taskId === taskId) {
+            const slot = row.querySelector(".prep-badge-slot");
+            if (slot) {
+              slot.innerHTML = prepBadgeHtml(status);
+            }
+            const scoreCell = row.querySelector(".gate-score-cell");
+            const score = currentPreflightScore(taskId) ?? taskGateScores.get(taskId);
+            if (scoreCell) {
+              scoreCell.innerHTML =
+                score == null
+                  ? '<span style="color:var(--text-muted)">—</span>'
+                  : `<span title="${currentGateScoreTitle(taskId)}" class="gate-score ${score >= 4.7 ? "high" : score >= 4.0 ? "mid" : "low"}">${score.toFixed(1)}</span>`;
             }
             break;
           }
         }
       }
 
-      function updatePrepStatusPanel(taskId, state, data) {
+      const prepJobs = QuackPrepJobs.create({
+        getScope: () => ({ apiBase: API_BASE, projectId: activeProjectId }),
+        onChange: (taskId) => updatePrepAttemptView(taskId),
+      });
+
+      function prepAttemptStatus(taskId) {
+        const state = prepJobs.state(taskId);
+        if (!state) return null;
+        if (state.status === "starting" || state.status === "running") return "prepping";
+        if (state.status === "completed" && state.readiness)
+          return QuackPrepJobs.passes(state.result) ? "ready" : "not-ready";
+        if (state.status === "completed") return "prep-needed";
+        if (state.status === "failed") return "failed";
+        return state.status;
+      }
+
+      function updatePrepAttemptView(taskId) {
+        const state = prepJobs.state(taskId);
+        if (!state) return;
+        taskGateScores.delete(taskId);
+        if (state.readiness) taskGateScores.set(taskId, state.readiness.depthScore);
+        updatePrepBadgeInRow(taskId, prepAttemptStatus(taskId));
         const panel = document.getElementById(`prep-status-${taskId}`);
         const content = document.getElementById(`prep-status-content-${taskId}`);
         const btn = document.getElementById(`prep-btn-${taskId}`);
+        const busy = state.status === "starting" || state.status === "running";
+        const terminal = state.status === "completed" || state.status === "failed";
+        const newAttemptAllowed =
+          terminal || state.status === "missing" || state.status === "unavailable";
+        if (btn) {
+          btn.disabled = busy;
+          btn.textContent = busy
+            ? "Prepping..."
+            : terminal
+              ? "Re-Prep"
+              : newAttemptAllowed
+                ? "Start new prep"
+                : "Check status";
+          btn.onclick = () => (newAttemptAllowed ? prepTask(taskId) : checkPrepStatus(taskId));
+        }
         if (!panel || !content) return;
-
         panel.style.display = "block";
-
-        if (state === "prepping") {
-          content.innerHTML = `<div class="prep-status-box prepping">
-          <span class="prep-spinner"></span> Running gate checks...
-          <div style="color:var(--text-muted);font-size:11px;margin-top:4px">
-            Schema validation + LLM depth evaluation (typically 15-30s)
-          </div>
-        </div>`;
-          if (btn) {
-            btn.disabled = true;
-            btn.textContent = "Prepping...";
-          }
-        } else if (state === "pass") {
-          const d = data || {};
-          content.innerHTML = `<div class="prep-status-box pass">
-          <strong>Gate passed</strong>
-          <div class="prep-detail-row"><span>Schema:</span> <span>${d.schemaValid ? "Valid" : "Invalid"}</span></div>
-          <div class="prep-detail-row"><span>Depth score:</span> <span>${d.depthScore != null ? d.depthScore + "/5" : "—"}</span></div>
-          <div class="prep-detail-row"><span>Ready:</span> <span>${d.depthReady ? "Yes" : "No"}</span></div>
-          ${d.deficiencies && d.deficiencies.length > 0 ? `<div style="margin-top:4px;font-size:12px"><strong>Deficiencies:</strong><ul style="margin:4px 0;padding-left:20px">${d.deficiencies.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></div>` : ""}
-        </div>`;
-          if (btn) {
-            btn.disabled = false;
-            btn.textContent = "Re-Prep";
-          }
-        } else if (state === "fail") {
-          const d = data || {};
-          content.innerHTML = `<div class="prep-status-box fail">
-          <strong>Gate check ${d.schemaValid === false ? "failed (schema invalid)" : "did not pass"}</strong>
-          ${d.schemaErrors && d.schemaErrors.length > 0 ? `<div style="margin-top:4px"><strong>Schema errors:</strong><ul style="margin:4px 0;padding-left:20px">${d.schemaErrors.map((e) => `<li>${esc(e)}</li>`).join("")}</ul></div>` : ""}
-          <div class="prep-detail-row"><span>Depth score:</span> <span>${d.depthScore != null ? d.depthScore + "/5" : "—"}</span></div>
-          ${d.deficiencies && d.deficiencies.length > 0 ? `<div style="margin-top:4px"><strong>Deficiencies:</strong><ul style="margin:4px 0;padding-left:20px">${d.deficiencies.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></div>` : ""}
-        </div>`;
-          if (btn) {
-            btn.disabled = false;
-            btn.textContent = "Re-Prep";
-          }
-        } else if (state === "error") {
-          content.innerHTML = `<div class="prep-status-box fail">
-          <strong>Prep failed</strong>
-          <div style="margin-top:4px">${esc(data?.error || "Unknown error")}</div>
-        </div>`;
-          if (btn) {
-            btn.disabled = false;
-            btn.textContent = "Retry Prep";
-          }
-        }
+        const result = state.result;
+        const label = busy
+          ? "Running gate checks..."
+          : state.status === "failed"
+            ? "Prep failed"
+            : state.status === "completed"
+              ? QuackPrepJobs.passes(result)
+                ? "Gate passed for this attempt"
+                : "Gate check did not pass for this attempt"
+              : state.status === "unavailable"
+                ? "Attempt unavailable"
+                : state.status === "missing"
+                  ? "No attempt recorded"
+                  : "Status unconfirmed";
+        content.innerHTML = `<div class="prep-status-box ${busy ? "prepping" : state.readiness && QuackPrepJobs.passes(result) ? "pass" : ""}">
+        <strong>${esc(label)}</strong>
+        ${state.jobId ? `<div>Attempt ${esc(state.jobId)}</div>` : ""}
+        ${state.actionError ? `<p>${esc(state.actionError)}</p>` : ""}
+        ${state.message ? `<p>${esc(state.message)}</p>` : ""}
+        ${result ? `<div>Terminal depth score: ${esc(result.depthScore)}/5</div><ul>${[...result.schemaErrors, ...result.deficiencies].map((item) => `<li>${esc(item)}</li>`).join("")}</ul>` : ""}
+        ${!terminal ? `<button class="fleet-btn" onclick="checkPrepStatus('${esc(taskId)}')">Check status</button>` : ""}
+      </div>`;
       }
-
       async function prepTask(taskId) {
-        try {
-          // Show immediate feedback
-          updatePrepBadgeInRow(taskId, "prepping");
-          updatePrepStatusPanel(taskId, "prepping");
-
-          const res = await fetch(`${API_BASE}/api/tasks/${taskId}/prep`, {
-            method: "POST",
-          });
-
-          if (!res.ok) {
-            const err = await res.json();
-            updatePrepBadgeInRow(taskId, "unprepared");
-            updatePrepStatusPanel(taskId, "error", { error: err.error });
-            return;
-          }
-
-          // Poll for result (prep runs in background)
-          let attempts = 0;
-          const maxAttempts = 90; // 90 seconds max
-          const checkResult = async () => {
-            attempts++;
-            try {
-              const prepRes = await fetch(`${API_BASE}/api/tasks/${taskId}/prep`);
-              if (prepRes.ok) {
-                const prep = await prepRes.json();
-                let status = "unprepared";
-                let state = "fail";
-                if (prep.stale) {
-                  status = "stale";
-                  state = "fail";
-                } else if (prep.schemaValid && prep.depthReady) {
-                  status = "ready";
-                  state = "pass";
-                } else if (prep.schemaValid && !prep.depthReady) {
-                  status = "not-ready";
-                  state = "fail";
-                } else if (prep.schemaValid) {
-                  status = "schema-ok";
-                  state = "fail";
-                }
-                updatePrepBadgeInRow(taskId, status);
-                updatePrepStatusPanel(taskId, state, prep);
-                return;
-              }
-            } catch {
-              /* ignore fetch errors during polling */
-            }
-            if (attempts < maxAttempts) {
-              setTimeout(checkResult, 1000);
-            } else {
-              updatePrepBadgeInRow(taskId, "unprepared");
-              updatePrepStatusPanel(taskId, "error", { error: "Prep timed out after 90 seconds" });
-            }
-          };
-          setTimeout(checkResult, 2000); // first poll after 2s (give child process time to start)
-        } catch (err) {
-          updatePrepBadgeInRow(taskId, "unprepared");
-          updatePrepStatusPanel(taskId, "error", { error: err.message });
-        }
+        await prepJobs.start(taskId);
+      }
+      async function checkPrepStatus(taskId) {
+        await prepJobs.refresh(taskId);
       }
 
       // ─── Pre-Flight ───────────────────────────────────────────────────
       let preflightTaskData = {}; // Map<taskId, PreflightResult>
       let decomposeTaskId = null;
       let decomposePlan = null;
-      if (!window._preflightRunning) window._preflightRunning = {};
-      if (!window._preflightStage) window._preflightStage = {};
 
-      // Called from the task card row Pre-Flight button
-      async function runPreflightFromRow(taskId) {
-        window._preflightRunning[taskId] = true;
-        renderTasks(); // Re-render to show running state
-        try {
-          const res = await fetch(`${API_BASE}/api/tasks/${taskId}/preflight`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ force: true }),
-          });
+      const fullPreflightJobs = QuackPreflightJobs.create({
+        getScope: () => ({ apiBase: API_BASE, projectId: activeProjectId }),
+        onChange: (taskId) => updateFullPreflightView(taskId),
+      });
 
-          if (!res.ok) {
-            const err = await res.json();
-            alert(`Pre-flight failed: ${err.error}`);
-            return;
-          }
-
-          const result = await res.json();
-          if (result.result) {
-            preflightTaskData[taskId] = result.result;
-            // If the detail view is expanded for this task, update it too
-            const panel = document.getElementById(`preflight-panel-${taskId}`);
-            if (panel) renderPreflightPanel(taskId, result.result);
-            const detailBtn = document.getElementById(`preflight-btn-${taskId}`);
-            if (detailBtn) {
-              detailBtn.textContent = "Re-Run Pre-Flight";
-            }
-          }
-        } catch (err) {
-          console.error("Pre-flight error:", err);
-          alert(`Pre-flight failed: ${err.message}`);
-        } finally {
-          window._preflightRunning[taskId] = false;
-          renderTasks(); // Re-render to show updated state
+      function updateFullPreflightView(taskId) {
+        const state = fullPreflightJobs.state(taskId);
+        const job = state.job;
+        const busy = state.pending || fullPreflightJobs.active(job);
+        const label = fullPreflightJobs.label(state);
+        const row = document.querySelector(`[data-preflight-task="${CSS.escape(taskId)}"]`);
+        if (row) {
+          row.textContent = label;
+          row.title = label;
+          row.disabled = busy;
+          row.classList.toggle("running", Boolean(busy));
         }
+        const btn = document.getElementById(`preflight-btn-${taskId}`);
+        if (btn) {
+          btn.style.display = "";
+          btn.disabled = Boolean(busy || job?.status === "recovery_required");
+          btn.textContent = busy ? label : job ? "Run preflight again" : "Pre-Flight";
+        }
+        const panel = document.getElementById(`preflight-panel-${taskId}`);
+        if (!panel) return;
+        panel.style.display = "";
+        const isCompleted = job?.status === "completed";
+        const result = isCompleted && !job.reportSummary ? job.result : null;
+        if (result) renderPreflightPanel(taskId, result);
+        else if (preflightTaskData[taskId]) {
+          renderPreflightPanel(taskId, preflightTaskData[taskId]);
+          panel.innerHTML = `<section aria-label="Cached preflight report"><p style="color:var(--text-muted)">Cached report. This is separate from the current attempt's result.</p>${panel.innerHTML}</section>`;
+        } else panel.innerHTML = "";
+        const status = document.createElement("div");
+        status.className = "preflight-panel";
+        status.setAttribute("aria-label", "Full preflight status");
+        // All server-supplied text is escaped; attempt reports never come from the old cache.
+        status.innerHTML = `<div class="preflight-body" style="font-family:inherit;font-size:13px;line-height:1.5">
+        <strong role="status">${esc(label)}</strong>
+        ${state.error ? `<p style="color:var(--red)">${esc(state.error)}. The last known attempt is retained; check status to reconnect.</p>` : ""}
+        ${state.actionError ? `<p style="color:var(--red)">${esc(state.actionError)}</p>` : ""}
+        ${state.notice ? `<p role="status">${esc(state.notice)}</p>` : ""}
+        ${job?.error ? `<p style="color:var(--red)">${esc(job.error)}</p>` : ""}
+        ${job?.claimants?.length ? `<p>Conflicting task files: ${esc(job.claimants.join(", "))}</p>` : ""}
+        ${job?.result?.degraded ? `<p>Limited checks: ${esc(job.result.degraded.reason || "Model-dependent checks were skipped.")}</p>` : ""}
+        ${job?.replan && isCompleted ? "<p>A replacement must pass blueprint checks and receive fresh approval before dispatch.</p>" : ""}
+        ${job ? `<p style="font-family:monospace;font-size:11px">Attempt ${esc(job.jobId)}</p>` : "<p>No full-preflight attempt yet.</p>"}
+        ${job?.eventError ? "<p>Some progress events could not be saved. This status comes from the durable attempt record.</p>" : ""}
+        <button class="fleet-btn" onclick="checkFullPreflight('${esc(taskId)}')">Check status</button>
+        <button class="fleet-btn" ${!activeProjectId || busy || job?.status === "recovery_required" ? "disabled" : ""} onclick="runFreshPreflight('${esc(taskId)}')">Run fresh preflight</button>
+        <p style="color:var(--text-muted)">Rerun checks without reusing the cached report. May use model credits.</p>
+        ${job?.status === "failed" ? `<button class="fleet-btn" onclick="runPreflight('${esc(taskId)}')">Retry preflight</button>` : ""}
+        ${job?.replan ? `<p>An incomplete replacement keeps the old brief blocked until a successful, explicitly requested replan.</p><button class="fleet-btn" ${busy ? "disabled" : ""} onclick="replanBlueprint('${esc(taskId)}')">Replan blueprint</button>` : ""}
+        ${job?.status === "recovery_required" ? `<button class="fleet-btn" ${state.pending ? "disabled" : ""} onclick="reconcileFullPreflight('${esc(taskId)}')">Reconcile interrupted run</button>` : ""}
+      </div>`;
+        panel.prepend(status);
       }
 
-      async function runPreflight(taskId) {
-        try {
-          const btn = document.getElementById(`preflight-btn-${taskId}`);
-          const panel = document.getElementById(`preflight-panel-${taskId}`);
-          if (btn) {
-            btn.disabled = true;
-            btn.textContent = "Running Pre-Flight...";
-          }
-
-          const res = await fetch(`${API_BASE}/api/tasks/${taskId}/preflight`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ force: true }),
-          });
-
-          if (!res.ok) {
-            const err = await res.json();
-            alert(`Pre-flight failed: ${err.error}`);
-            if (btn) {
-              btn.disabled = false;
-              btn.textContent = "Pre-Flight";
-            }
-            return;
-          }
-
-          const result = await res.json();
-          if (result.result) {
-            preflightTaskData[taskId] = result.result;
-            renderPreflightPanel(taskId, result.result);
-          }
-
-          if (btn) {
-            btn.disabled = false;
-            btn.textContent = "Re-Run Pre-Flight";
-          }
-        } catch (err) {
-          console.error("Pre-flight error:", err);
-          const btn = document.getElementById(`preflight-btn-${taskId}`);
-          if (btn) {
-            btn.disabled = false;
-            btn.textContent = "Pre-Flight";
-          }
+      async function checkFullPreflight(taskId) {
+        await fullPreflightJobs.refresh(taskId);
+      }
+      async function reconcileFullPreflight(taskId) {
+        await fullPreflightJobs.reconcile(
+          taskId,
+          confirm(
+            "Confirm that the original preflight process and all of its child processes have stopped before releasing this attempt for retry.",
+          ),
+        );
+      }
+      async function runPreflightFromRow(taskId) {
+        const state = fullPreflightJobs.state(taskId);
+        if (state.error || state.job?.status === "recovery_required") {
+          await fullPreflightJobs.refresh(taskId);
+          if (expandedTaskId !== taskId) await toggleTaskDetail(taskId);
+          return;
         }
+        await fullPreflightJobs.start(taskId);
+      }
+      async function runPreflight(taskId) {
+        await fullPreflightJobs.start(taskId);
+      }
+      async function runFreshPreflight(taskId) {
+        await fullPreflightJobs.fresh(taskId);
       }
 
       function renderPreflightPanel(taskId, result) {
@@ -12286,15 +12192,18 @@
 
         const dims = gate.dimensions || {};
         const dimNames = Object.keys(dims);
-        const dimHtml =
-          dimNames.length > 0
-            ? dimNames
-                .map(
-                  (k) =>
-                    `<div style="font-size:11px;color:var(--text-muted)">${k}: ${dims[k]}/5</div>`,
-                )
-                .join("")
-            : '<div style="font-size:11px;color:var(--text-muted)">No dimensions</div>';
+        const dimHtml = result.stale
+          ? '<div style="font-size:11px;color:var(--yellow)">Cached gate is stale; run prep or preflight again</div>'
+          : gate.gateSkipped === true
+            ? '<div style="font-size:11px;color:var(--text-muted)">Gate skipped; no depth evaluation</div>'
+            : dimNames.length > 0
+              ? dimNames
+                  .map(
+                    (k) =>
+                      `<div style="font-size:11px;color:var(--text-muted)">${k}: ${dims[k]}/5</div>`,
+                  )
+                  .join("")
+              : '<div style="font-size:11px;color:var(--text-muted)">No dimensions</div>';
 
         const legendItems = [
           { label: "Task Spec", value: context.taskSpec || 0, color: "#3fb950" },
@@ -12347,13 +12256,13 @@
               <div class="preflight-stat-grid">
                 <div class="preflight-stat-card">
                   <div class="preflight-stat-label">Status</div>
-                  <div class="preflight-stat-value" style="color:${gate.ready ? "var(--green)" : "var(--red)"}">
-                    ${gate.ready ? "READY" : "NOT READY"}
+                  <div class="preflight-stat-value" style="color:${result.stale || gate.gateSkipped ? "var(--text-muted)" : gate.ready ? "var(--green)" : "var(--red)"}">
+                    ${result.stale ? "STALE" : gate.gateSkipped ? "SKIPPED" : gate.ready ? "READY" : "NOT READY"}
                   </div>
                 </div>
                 <div class="preflight-stat-card">
                   <div class="preflight-stat-label">Score</div>
-                  <div class="preflight-stat-value">${gate.score || 0}/5</div>
+                  <div class="preflight-stat-value">${result.stale || gate.gateSkipped ? "—" : (gate.score || 0) + "/5"}</div>
                 </div>
                 <div class="preflight-stat-card" style="grid-column:span 2">
                   <div class="preflight-stat-label">Dimensions</div>
@@ -12670,38 +12579,16 @@ ${advisories}
       async function replanBlueprint(taskId) {
         if (
           !confirm(
-            "Re-plan will invalidate the current blueprint and trigger a new preflight run. Continue?",
+            "Generate a replacement blueprint? The current brief will be rejected, and the replacement will require fresh approval.",
           )
         )
           return;
-        try {
-          const res = await fetch(`${API_BASE}/api/tasks/${taskId}/blueprint/replan`, {
-            method: "POST",
-          });
-          if (!res.ok) {
-            const err = await res.json();
-            alert(`Re-plan failed: ${err.error}`);
-            return;
-          }
-          const panel = document.getElementById(`blueprint-approval-panel-${taskId}`);
-          if (panel) {
-            panel.innerHTML = `
-            <div class="preflight-panel" style="border-color:var(--yellow)">
-              <div class="preflight-header" style="background:var(--yellow);color:#000">
-                <span style="font-weight:600">⟳ Re-planning in progress...</span>
-              </div>
-              <div class="preflight-body">
-                <p style="margin:0;font-size:13px;color:var(--text-muted)">
-                  New blueprint generation triggered. Listen for SSE events for completion status.
-                </p>
-              </div>
-            </div>
-          `;
-          }
-        } catch (err) {
-          console.error("Re-plan error:", err);
-          alert("Failed to re-plan blueprint");
+        await fullPreflightJobs.start(taskId, true);
+        if (fullPreflightJobs.state(taskId).job?.replan) {
+          const approvalPanel = document.getElementById(`blueprint-approval-panel-${taskId}`);
+          if (approvalPanel) approvalPanel.innerHTML = "";
         }
+        updateFullPreflightView(taskId);
       }
 
       function renderJudgeApprovalPanel(taskId, approval) {

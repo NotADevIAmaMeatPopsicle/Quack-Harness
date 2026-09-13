@@ -22,6 +22,7 @@ export type OvernightFailureClass =
   | "unknown";
 
 export interface OvernightPrepResult {
+  schemaPolicyHash?: string;
   schemaValid: boolean;
   schemaErrors: string[];
   depthScore: number;

@@ -20,7 +20,10 @@ or:
 X-Quack-Service-Token: <SERVICE_TOKEN>
 ```
 
-Queue and job reads require an authenticated dashboard principal or a token with `federation:read` or `federation:write` whenever access controls are configured.
+Queue reads require an authenticated dashboard principal or a token with
+`federation:read` or `federation:write` whenever access controls are configured.
+The legacy single-job GET retains its monitor access policy; it does not itself
+enforce a service-token scope. A token sent to it is not proof of peer identity.
 
 The monitor binds to loopback by default. If you deliberately bind it to another interface, place it behind TLS and network access controls and configure authentication before use.
 
@@ -92,7 +95,7 @@ Survivor reconciliation is deliberately explicit. Read the current record, indep
 | ------ | ---------------------------------------- | ------------------ | ------------------------------------ |
 | `GET`  | `/v1/federation/queue`                   | `federation:read`  | Queue, host, and merge-lane state    |
 | `POST` | `/v1/federation/queue`                   | `federation:write` | Enqueue a federated job              |
-| `GET`  | `/v1/federation/jobs/:jobId`             | `federation:read`  | Read one federated job               |
+| `GET`  | `/v1/federation/jobs/:jobId`             | Monitor access policy | Read one federated job           |
 | `POST` | `/v1/federation/jobs/:jobId/events`      | `federation:write` | Report worker progress or completion |
 | `POST` | `/v1/federation/jobs/:jobId/lease/renew` | `federation:write` | Renew a worker lease                 |
 | `POST` | `/v1/federation/jobs/:jobId/cancel`      | `federation:write` | Cancel a job                         |
@@ -106,6 +109,25 @@ curl -s http://127.0.0.1:3333/v1/federation/queue \
 ```
 
 ## Workers and listeners
+
+Remote workers can opt into fresh headnode start verification using local
+`.quack/federation/peer.json`: set the trusted `url`, `remoteProjectId`, a
+`serviceToken` (or supported environment-token binding), and
+`startAuthority: { "hostId": "worker-host" }`. The host ID must match the worker.
+Ordinary synchronization configuration alone does not enable this mode.
+Start and revision verify the assignment and lease again immediately before
+mutation. Unavailable authority, mismatched or expired leases refuse with
+`federated_claim_unverified`; the worker never falls back to a local job copy.
+Requests reject redirects, have a five-second total timeout and a 1 MiB response
+limit. Preserve this local authority configuration during worker repair.
+
+Federation job IDs use portable filename stems: an ASCII letter, digit or
+underscore first, then letters, digits, dot, underscore or hyphen, at most 96
+characters. Windows device names, including dotted variants, are rejected.
+Malformed job IDs return HTTP 400 with `INVALID_FEDERATED_JOB_ID` before lookup.
+New queue and legacy-job task IDs have a 64-character limit under the same
+character policy. Nonportable historical IDs are refused without automatic
+renaming; valid legacy records remain readable without newer optional fields.
 
 Worker enrollment routes create short-lived bootstrap material. Listener routes register worker capabilities, accept heartbeats, and deliver commands. Use narrowly scoped service tokens and never place bootstrap secrets in source control or logs.
 
@@ -199,6 +221,34 @@ The gate field is `depthScore`. The broader preflight result uses a separate
 `gate.score` field. A missing or outdated prep result returns `404`; an outdated
 result includes `stale: true` and `currentSpecHash`. The response also includes
 the latest observed `job` when available, independently of readiness cache state.
+
+### Durable full-preflight attempts
+
+`POST /api/tasks/:id/preflight?project=<PROJECT_ID>` promptly returns HTTP 202
+with `job`, `jobId` and `statusUrl`. Equivalent concurrent requests share one
+attempt. Use `{ "force": true }` to request fresh checks; this may use model
+credits. Inspect the returned attempt because an existing compatible run may
+be reused. Ordinary forced preflight preserves blueprint approval records.
+
+Read the exact attempt with `GET /api/tasks/:id/preflight/jobs/:jobId`, its latest
+observation with `GET /api/tasks/:id/preflight/jobs/latest`, or project attempts
+with `GET /api/preflight/jobs`. Include the project on every request. Cached
+`GET /api/tasks/:id/preflight` is separate from current attempt status.
+Terminal attempt state is recorded after child close. `recovery_required`
+retains uncertain process ownership; use the attempt's `/reconcile` POST only
+after independently confirming the original process tree has stopped.
+
+`POST /api/tasks/:id/blueprint/replan` reserves or joins a forced replacement
+attempt and returns the same asynchronous receipt. It rejects the selected
+brief and keeps it blocked while replacement is pending or unsuccessful. Paid
+caches remain intact; a successful replacement requires fresh approval.
+An incompatible live preflight returns 409 without changing approval authority.
+
+Prep and preflight evidence also carry schema-policy identity. Old or unstamped
+results remain diagnostic history rather than current admission authority.
+Readiness summaries and scheduler diagnostics use the same qualified sources.
+Failed blueprint generation can preserve a usable previous brief with its
+original provenance and bounded failure diagnostics.
 
 ### GET /api/tasks/:id/dispatch/observation
 

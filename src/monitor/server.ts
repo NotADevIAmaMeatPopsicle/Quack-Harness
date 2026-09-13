@@ -1,3 +1,4 @@
+import { computeSchemaPolicyHash, DEFAULT_SCHEMA_POLICY_HASH } from "../gate/schema-policy.js";
 import { recheckRecoverableFederatedBlocks } from "./federation/scheduling.js";
 import {
   buildClaudeChildEnvironment,
@@ -50,7 +51,6 @@ import {
   DuplicateClaimantAdmissionError,
   duplicateClaimantRefusal,
   duplicateClaimantRefusalForIndex,
-  formatDuplicateClaimantsMessage,
   type DuplicateClaimantIndex,
 } from "../core/duplicate-claimants.js";
 import { persistClaimantDiagnostic } from "./claimant-diagnostic.js";
@@ -69,6 +69,9 @@ import {
   setVerificationPeerSyncHandler,
 } from "./verification-store.js";
 import { PrepWorker } from "./prep-worker.js";
+import { PreflightWorker, type PreflightWorkerOptions } from "./preflight-worker.js";
+import { PreflightJobConflict, PreflightStorageError, type PreflightJob, type PreflightInputIdentity } from "./preflight-job-store.js";
+import { preflightJobIdSchema } from "./preflight-job-result.js";
 import { PrepScheduler } from "./prep-scheduler.js";
 import { AdminRunManager } from "./admin-run-manager.js";
 import { getSdkPermissionOptions } from "../sdk/permission-mode.js";
@@ -86,6 +89,7 @@ import type {
 import {
   AdapterConfigSchema,
   AdapterGitConfigSchema,
+  GateConfigSchema,
   RecordingConfigSchema,
   SmartTestingConfigSchema,
   VerificationCommandSchema,
@@ -154,7 +158,7 @@ import {
   withCanonicalTaskSpecMutationFence,
 } from "../preflight/canonical-task-spec-mutation.js";
 import { hasPendingCanonicalTaskMutationJournals } from "../preflight/canonical-task-mutation-journal.js";
-import { ReadinessService } from "./readiness-service.js";
+import { ReadinessService, toOperatorPrepResult, toOperatorPreflightResult } from "./readiness-service.js";
 import { evaluateEnrichmentCandidate } from "./enrichment-candidate-gate.js";
 import { inspectGeneratedProjectionHygiene } from "./projection-hygiene.js";
 import { registerTemplateRoutes } from "./routes/templates.js";
@@ -221,11 +225,12 @@ import {
 import {
   loadFederationPeerConfig,
   loadFederatedJob,
-  leaseExpired,
   pullVerifiedFromPeer,
   pushVerificationToPeer,
   startPeriodicVerifiedSync,
 } from "./federation/index.js";
+import { resolveFederatedStartClaim } from "./federation/start-claim.js";
+import { isSafeFederatedJobId, invalidFederatedJobIdResponse } from "./federation/job-id.js";
 import { ResearchStore } from "../research/research-store.js";
 import {
   registerAuthRoutes,
@@ -307,6 +312,8 @@ const federatedResumeStartBodySchema = z
   .strict();
 
 export interface MonitorServerOptions {
+  /** Native child seam for full-preflight lifecycle verification. */
+  preflightWorkerRuntime?: PreflightWorkerOptions["runtime"];
   /** @deprecated Use projectAdapters instead */
   logDir?: string;
   port?: number;
@@ -2159,6 +2166,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
   let stuckDetectionConfig: StuckDetectionConfig | undefined;
   let queueConfig: DispatchQueueConfig | undefined;
   let legacyJudgmentConfig: JudgmentConfig | undefined;
+  let legacySchemaPolicyHash = DEFAULT_SCHEMA_POLICY_HASH;
   let apiKeysConfig:
     | { pool: string[]; strategy: "round-robin" | "least-used" | "least-cost"; cooldownMs: number }
     | undefined;
@@ -2253,6 +2261,10 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
   // must fail startup instead of silently degrading to off.
   if (adapterPath && fs.existsSync(adapterPath)) {
     const raw = JSON.parse(fs.readFileSync(adapterPath, "utf-8")) as Record<string, unknown>;
+    // Gate policy controls admission. Validate outside the best-effort catch
+    // so malformed configured policy cannot silently become defaults.
+    const gatePolicy = GateConfigSchema.parse(raw.gate === undefined ? {} : raw.gate);
+    legacySchemaPolicyHash = computeSchemaPolicyHash(gatePolicy.requiredSections);
     if (raw.judgment !== undefined) {
       legacyJudgmentConfig = JudgmentConfigSchema.parse(raw.judgment);
     }
@@ -2366,6 +2378,12 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       )
     : null;
 
+  const preflightWorker = projectRoot ? new PreflightWorker(projectRoot, quackBin, {
+    projectId: legacyProjectId, logDir: logDir || undefined, keyManager: legacyKeyManager,
+    runtime: options.preflightWorkerRuntime,
+    // EventReader forwards the durable lifecycle log; do not broadcast it twice.
+  }) : null;
+
   // Now create DispatchManager with KeyManager (if available)
   dispatchManager = projectRoot
     ? // QPI-043: pass the resolved log dir so the durable child-exit write
@@ -2424,6 +2442,8 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
                 taskService,
                 prepCache,
                 db: legacyDb,
+                schemaPolicyHash: legacySchemaPolicyHash,
+                readinessJudgmentMode: legacyJudgmentConfig?.stages.readiness.mode,
               });
               return readiness.isPrepCurrent(taskId);
             },
@@ -2674,6 +2694,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     dispatchManager: DispatchManager | null;
     prepCache: PrepCache | null;
     prepWorker: PrepWorker | null;
+    preflightWorker?: PreflightWorker | null;
     prepScheduler: PrepScheduler | null;
     fleetController: FleetController | null;
     costVelocityTracker: CostVelocityTracker;
@@ -2682,6 +2703,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     keyManager: KeyManager | null;
     db: QuackDB | NoopDB;
     judgmentConfig?: JudgmentConfig;
+    schemaPolicyHash: string;
   }
 
   async function dispatchWithDecompositionFence<T>(
@@ -2803,6 +2825,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       dispatchManager: ctx.dispatchManager,
       prepCache: ctx.prepCache,
       prepWorker: ctx.prepWorker,
+      preflightWorker: ctx.preflightWorker,
       prepScheduler: ctx.prepScheduler,
       fleetController: ctx.fleetController,
       costVelocityTracker: ctx.costVelocityTracker,
@@ -2811,6 +2834,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       keyManager: ctx.keyManager,
       db: ctx.db,
       judgmentConfig: ctx.adapter.config.judgment,
+      schemaPolicyHash: computeSchemaPolicyHash(ctx.adapter.config.gate?.requiredSections),
     };
   }
 
@@ -2824,6 +2848,8 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       taskService: project.taskService,
       prepCache: project.prepCache,
       db: project.db,
+      schemaPolicyHash: project.schemaPolicyHash,
+      readinessJudgmentMode: project.judgmentConfig?.stages.readiness.mode,
     });
   }
 
@@ -3028,18 +3054,21 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     }
   }
 
+  const federatedClaimError = "Federated assignment could not be verified: the claim is invalid or its configured authority is unavailable.";
+  const federatedClaimHint = "Check the assigned task/host/lease, peer.json startAuthority, token environment and headnode availability. Authority reads have a five-second timeout; monitor logs record a safe refusal reason.";
+
   class FederatedStartClaimError extends Error {
     readonly code = "federated_claim_unverified";
 
     constructor() {
-      super("The federated job lease no longer authorizes this task start.");
+      super(federatedClaimError);
       this.name = "FederatedStartClaimError";
     }
   }
 
   function respondIfFederatedStartClaimInvalid(res: Response, err: unknown): boolean {
     if (!(err instanceof FederatedStartClaimError)) return false;
-    res.status(409).json({ ok: false, code: err.code, error: err.message });
+    res.status(409).json({ ok: false, code: err.code, error: err.message, hint: federatedClaimHint });
     return true;
   }
 
@@ -3072,6 +3101,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       dispatchManager,
       prepCache,
       prepWorker,
+      preflightWorker,
       prepScheduler,
       fleetController,
       costVelocityTracker,
@@ -3080,6 +3110,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       keyManager: legacyKeyManager ?? null,
       db: legacyDb,
       judgmentConfig: legacyJudgmentConfig,
+      schemaPolicyHash: legacySchemaPolicyHash,
     };
   }
 
@@ -3143,6 +3174,10 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       for (const project of resolveProjects()) {
         project.dispatchManager?.beginTerminalDrain();
         project.prepWorker?.beginTerminalDrain();
+        project.preflightWorker?.beginTerminalDrain();
+        if (project.preflightWorker) void project.preflightWorker.shutdownAll().catch((error: unknown) => {
+          drain.lastError = describeDrainError(error);
+        });
         project.dispatchQueue?.stop();
         project.prepScheduler?.stop();
         project.prepWorker?.killAll();
@@ -3219,6 +3254,21 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         taskId: job.taskId,
       })),
     );
+    const preflightSnapshots = resolveProjects().map((project) => ({
+      projectId: project.projectId,
+      snapshot: project.preflightWorker?.getStatusSnapshot(),
+    }));
+    const activePreflightJobs = preflightSnapshots.flatMap(({ projectId, snapshot }) =>
+      (snapshot?.jobs ?? []).filter((job) => job.status !== "completed" && job.status !== "failed").map((job) => ({
+        projectId, taskId: job.taskId, jobId: job.jobId, status: job.status,
+      })));
+    const livePreflightProcesses = resolveProjects()
+      .filter((project) => project.preflightWorker?.hasLiveProcesses())
+      .map((project) => ({ projectId: project.projectId }));
+    const preflightStorageIssues = preflightSnapshots.flatMap(({ projectId, snapshot }) =>
+      (snapshot?.storageIssues ?? []).map((issue) => ({ projectId, ...issue })));
+    const unconfirmedPreflightShutdowns = preflightSnapshots.flatMap(({ projectId, snapshot }) =>
+      snapshot?.shutdownUnconfirmed ? [{ projectId, taskIds: snapshot.unconfirmedShutdownTasks }] : []);
     const liveDispatchProcesses = resolveProjects()
       .filter((project) => project.dispatchManager?.hasLiveProcesses())
       .map((project) => ({ projectId: project.projectId }));
@@ -3241,13 +3291,14 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       .filter(([, runner]) => runner.isRunning())
       .map(([root]) => root);
     const testRunActive = activeTestProjects.length > 0;
-    const safeToTerminate = Boolean(
+    const ownedWorkStopped = Boolean(
       monitorDrain?.dispatchStopConfirmed &&
       monitorDrain.quiesceComplete &&
       !monitorDrain.lastError &&
       unsafeDispatchJobs.length === 0 &&
       liveDispatchProcesses.length === 0 &&
       activePrepJobs.length === 0 &&
+      !activePreflightJobs.some((job) => job.status !== "recovery_required") && livePreflightProcesses.length === 0 &&
       livePrepProcesses.length === 0 &&
       activeAdminRuns === 0 &&
       !adminProcessActive &&
@@ -3256,12 +3307,17 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     return {
       active: Boolean(monitorDrain),
       acceptingWork: !monitorDrain,
-      safeToTerminate,
+      safeToTerminate: ownedWorkStopped && preflightStorageIssues.length === 0 && activePreflightJobs.length === 0 && unconfirmedPreflightShutdowns.length === 0,
+      ownedWorkStopped,
       state: monitorDrain,
       unsafeDispatchJobs,
       liveDispatchProcesses,
       activePrepJobs,
       livePrepProcesses,
+      activePreflightJobs,
+      livePreflightProcesses,
+      preflightStorageIssues,
+      unconfirmedPreflightShutdowns,
       activeAdminRuns,
       adminProcessActive,
       testRunActive,
@@ -3269,10 +3325,10 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     };
   }
 
-  async function waitForMonitorDrainSafety(timeoutMs = 15_000): Promise<Record<string, unknown>> {
+  async function waitForOwnedMonitorWorkToStop(timeoutMs = 15_000): Promise<Record<string, unknown>> {
     const deadline = Date.now() + timeoutMs;
     let snapshot = await monitorDrainSnapshot();
-    while (snapshot.safeToTerminate !== true && Date.now() < deadline) {
+    while (snapshot.ownedWorkStopped !== true && Date.now() < deadline) {
       await new Promise<void>((resolveWait) => setTimeout(resolveWait, 50));
       if (monitorDrain) {
         try {
@@ -3347,6 +3403,9 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     req: Request,
     jobId: string,
   ): Promise<WriteScopeResult & { compatibilityFallback?: boolean }> {
+    if (!isSafeFederatedJobId(jobId)) {
+      return { ok: false, status: 400, body: invalidFederatedJobIdResponse() };
+    }
     const explicitOrSingle = resolveProjectForWrite(req);
     if (
       explicitOrSingle.ok ||
@@ -5417,7 +5476,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       const entries = await Promise.all(
         tasks.map(async (task) => {
           const result = await readiness.resolveCurrent(task.id);
-          return [task.id, result?.prep ?? null] as const;
+          return [task.id, toOperatorPrepResult(result)] as const;
         }),
       );
       res.json({
@@ -5442,7 +5501,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       const entries = await Promise.all(
         tasks.map(async (task) => {
           const result = await readiness.resolveCurrent(task.id);
-          return [task.id, result?.preflight ?? null] as const;
+          return [task.id, toOperatorPreflightResult(result)] as const;
         }),
       );
       res.json({
@@ -6488,8 +6547,17 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
   // â”€â”€â”€ Prep endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+  // Prep job identity and its readiness read must resolve the same explicit project.
+  function resolvePrepProject(req: Request, res: Response): ResolvedProject | undefined {
+    // Common API middleware already rejects unknown/conflicting explicit IDs.
+    const scoped = resolveProjectForWrite(req);
+    if (!scoped.ok) { res.status(scoped.status).json(scoped.body); return; }
+    return scoped.project;
+  }
+
   app.post("/api/tasks/:id/prep", async (req: Request, res: Response) => {
-    const p = resolveProject(req);
+    const p = resolvePrepProject(req, res);
+    if (!p) return;
     if (!p.prepCache || !p.prepWorker || !p.taskService) {
       res.status(500).json({ error: "Prep not available (no project root)" });
       return;
@@ -6531,7 +6599,8 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
   });
 
   app.get("/api/tasks/:id/prep/job", (req: Request, res: Response) => {
-    const p = resolveProject(req);
+    const p = resolvePrepProject(req, res);
+    if (!p) return;
     if (!p.prepWorker) {
       res.status(404).json({ error: "Prep not available" });
       return;
@@ -6539,17 +6608,18 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     try {
       const job = p.prepWorker.getJob(req.params.id as string);
       if (!job) {
-        res.status(404).json({ error: "No prep attempt recorded" });
+        res.status(404).json({ error: "No prep attempt recorded", code: "PREP_ATTEMPT_NOT_FOUND" });
         return;
       }
       res.json({ job });
     } catch {
-      res.status(503).json({ error: "Stored prep diagnostics are unavailable or malformed" });
+      res.status(503).json({ error: "Stored prep diagnostics are unavailable or malformed", code: "PREP_DIAGNOSTICS_UNAVAILABLE" });
     }
   });
 
   app.get("/api/tasks/:id/prep", async (req: Request, res: Response) => {
-    const p = resolveProject(req);
+    const p = resolvePrepProject(req, res);
+    if (!p) return;
     const readiness = createReadinessService(p);
     if (!readiness || !p.taskService) {
       res.status(404).json({ error: "Prep not available" });
@@ -6578,7 +6648,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         return;
       }
 
-      res.json(state.prep);
+      res.json(toOperatorPrepResult(state));
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ error: `Failed to read prep result: ${msg}` });
@@ -6821,165 +6891,53 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
   });
 
   app.post("/api/tasks/:id/blueprint/replan", async (req: Request, res: Response) => {
-    const p = resolveProject(req);
-    if (!p.projectRoot || !p.prepCache) {
-      res.status(500).json({ error: "Project not configured" });
-      return;
-    }
-
+    const p = resolveFullPreflightProject(req, res);
+    if (!p) return;
     const taskId = req.params.id as string;
-    const { updateApprovalState } = await import("../dispatcher/blueprint-approval.js");
-
+    const { updateApprovalStateWithReceipt } = await import("../dispatcher/blueprint-approval.js");
     try {
-      const logDirPath = resolveTaskRuntimeLogDir(
-        p.projectRoot,
-        p.dispatchManager,
-        taskId,
-        p.logDir,
-      );
-      const persistReplan = () =>
-        updateApprovalState(taskId, "rejected", logDirPath, undefined, "Requested re-plan");
-      let managerPauseReleased = false;
-      if (p.dispatchManager) {
-        const resolution = await p.dispatchManager.resolveApprovalPauseDecision(
-          taskId,
-          "blueprint",
-          "rejected",
-          persistReplan,
-          logDirPath,
-          { allowAlreadyRejected: true },
-        );
-        managerPauseReleased = resolution.released;
-      } else {
-        await persistReplan();
-      }
-
-      // Federation must see the rejection before successful preflight removes
-      // the old approval record. Otherwise listener reconciliation can lose
-      // the only durable decision for the paused generation.
-      const deferredResume = recordLocalFederatedResumeDecision(logDirPath, taskId, "blueprint", {
-        action: "rejected",
-        reason: "Requested re-plan",
-      });
-      p.dispatchQueue?.settleApprovalRejection(
-        taskId,
-        "Blueprint re-plan requested; run dispatch after preflight completes",
-        "blueprint_replan_requested",
-        managerPauseReleased,
-      );
-
-      // Invalidate preflight cache to force new blueprint generation
-      await p.prepCache.invalidate(taskId);
-      await p.prepCache.invalidatePreflight(taskId);
-
-      // Emit SSE event
-      sse.broadcast({
-        sessionId: "approval",
-        taskId,
-        project: currentProjectId(),
-        timestamp: new Date().toISOString(),
-        stage: "blueprint_rejected",
-        payload: { taskId, rejectionReason: "Re-plan requested" } as never,
-      });
-
-      // Automatically trigger new preflight run if task service is available
-      if (p.taskService) {
-        try {
-          const { loadAdapter } = await import("../core/adapter-loader.js");
-          const { resolveTaskFile } = await import("../core/task-file-resolver.js");
-          const { runPreflight } = await import("../preflight/preflight-runner.js");
-          const adapter = await loadAdapter(p.projectRoot);
-          const taskDir = path.resolve(adapter.projectRoot, adapter.config.project.taskDir);
-          const resolved = await resolveTaskFile(taskDir, taskId);
-          if (resolved?.task) {
-            const parsedTask = resolved.task;
-
-            const { createNoOpWriter } = await import("./event-emitter.js");
-            let eventWriter = createNoOpWriter();
-            if (p.logDir) {
-              const { EventWriter } = await import("./event-emitter.js");
-              eventWriter = new EventWriter({
-                sessionId: "preflight-replan",
-                taskId,
-                project: p.projectId,
-                logDir: p.logDir,
-              });
-            }
-            const originalEmit = eventWriter.emit.bind(eventWriter);
-            eventWriter.emit = (stage, payload) => {
-              originalEmit(stage, payload);
-              sse.broadcast({
-                sessionId: "preflight-replan",
-                taskId,
-                project: p.projectId,
-                timestamp: new Date().toISOString(),
-                stage: stage as never,
-                payload: payload as never,
-              });
-            };
-
-            // Run preflight asynchronously, then emit SSE events on completion or failure.
-            runPreflight(parsedTask, adapter, { force: true, events: eventWriter })
-              .then(async () => {
-                // Clear the rejected approval after a successful preflight.
-                try {
-                  const approvalPath = path.join(logDirPath, "approvals", `${taskId}.json`);
-                  await fsPromises.unlink(approvalPath);
-                } catch {
-                  // ok if already gone
-                }
-
-                sse.broadcast({
-                  sessionId: "approval",
-                  taskId,
-                  project: currentProjectId(),
-                  timestamp: new Date().toISOString(),
-                  stage: "blueprint_replan_complete" as never,
-                  payload: { taskId } as never,
-                });
-              })
-              .catch((err: unknown) => {
-                const errMsg = err instanceof Error ? err.message : String(err);
-                console.error(`Re-plan preflight failed for ${taskId}: ${errMsg}`);
-                sse.broadcast({
-                  sessionId: "approval",
-                  taskId,
-                  project: currentProjectId(),
-                  timestamp: new Date().toISOString(),
-                  stage: "blueprint_replan_failed" as never,
-                  payload: { taskId, error: errMsg } as never,
-                });
-              });
-          }
-        } catch (err: unknown) {
-          // Non-fatal: replan state update succeeded, just auto-preflight setup failed
-          const errMsg = err instanceof Error ? err.message : String(err);
-          console.error(`Auto-preflight after replan failed for ${taskId}: ${errMsg}`);
-          sse.broadcast({
-            sessionId: "approval",
-            taskId,
-            project: currentProjectId(),
-            timestamp: new Date().toISOString(),
-            stage: "blueprint_replan_failed" as never,
-            payload: { taskId, error: errMsg } as never,
-          });
+      const input = await fullPreflightInput(p, taskId, "auto", res);
+      if (!input) return;
+      const logDirPath = resolveTaskRuntimeLogDir(p.projectRoot!, p.dispatchManager, taskId, p.logDir);
+      let approvalContent: string;
+      try { approvalContent = await fsPromises.readFile(path.join(logDirPath, "approvals", `${taskId}.json`), "utf8"); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          throw new ApprovalDecisionConflictError("approval_missing", `No blueprint approval exists for ${taskId}`);
         }
+        throw error;
       }
-
-      res.status(deferredResume ? 202 : 200).json({
-        ok: true,
-        ...(deferredResume ? { deferred: true, resume: deferredResume } : {}),
-        message:
-          "Blueprint rejected, new preflight triggered. Listen for blueprint_replan_complete/blueprint_replan_failed SSE events for status.",
+      const reserveReplan = () => p.preflightWorker!.start(taskId, input, {
+        force: true, replan: { approvalDigest: computeContentHash(approvalContent), approvalLogDir: logDirPath, prepared: false },
+        prepareReplan: async () => {
+          const written = await updateApprovalStateWithReceipt(taskId, "rejected", logDirPath, undefined, "Requested re-plan");
+          return { approvalDigest: written.recordDigest, approvalLogDir: logDirPath };
+        },
       });
-    } catch (err: unknown) {
-      if (respondIfApprovalDecisionConflict(res, err)) return;
-      const msg = err instanceof Error ? err.message : String(err);
-      res.status(500).json({ error: `Failed to replan blueprint: ${msg}` });
+      let managerPauseReleased = false;
+      let reserved;
+      if (p.dispatchManager) {
+        const resolution = await p.dispatchManager.resolveApprovalPauseDecision(taskId, "blueprint", "rejected",
+          reserveReplan, logDirPath, { allowAlreadyRejected: true });
+        reserved = resolution.decision;
+        managerPauseReleased = resolution.released;
+      } else reserved = await reserveReplan();
+
+      const deferredResume = recordLocalFederatedResumeDecision(logDirPath, taskId, "blueprint", {
+        action: "rejected", reason: "Requested re-plan",
+      });
+      p.dispatchQueue?.settleApprovalRejection(taskId,
+        "Blueprint re-plan requested; run dispatch after preflight completes", "blueprint_replan_requested", managerPauseReleased);
+      sse.broadcast({ sessionId: "approval", taskId, project: p.projectId, timestamp: new Date().toISOString(),
+        stage: "blueprint_rejected", payload: { taskId, jobId: reserved.job.jobId, rejectionReason: "Re-plan requested" } });
+      res.status(202).json({ ...preflightJobResponse(reserved.job), created: reserved.created,
+        ...(deferredResume ? { deferred: true, resume: deferredResume } : {}),
+        message: "Blueprint replan accepted. Follow the preflight job for completion." });
+    } catch (error) {
+      if (respondIfApprovalDecisionConflict(res, error)) return;
+      preflightRequestFailure(res, error);
     }
   });
-
-  // â”€â”€â”€ Judge review endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   app.get("/api/tasks/:id/judge-review", async (req: Request, res: Response) => {
     const p = resolveProject(req);
@@ -7941,80 +7899,130 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
 
   // â”€â”€â”€ Pre-flight endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-  app.post("/api/tasks/:id/preflight", async (req: Request, res: Response) => {
-    const p = resolveProject(req);
-    if (!p.projectRoot || !p.taskService) {
-      res.status(500).json({ error: "Preflight not available (no project root)" });
+  function resolveFullPreflightProject(req: Request, res: Response): ResolvedProject | undefined {
+    const requested = resolveProjectIdFromRequest(req);
+    if (requested.conflict) {
+      res.status(400).json({ code: "PROJECT_SCOPE_CONFLICT", error: "Project identifiers disagree" });
       return;
     }
-
-    const taskId = req.params.id as string;
-
-    try {
-      const task = await p.taskService.getTask(taskId);
-      if (!task) {
-        res.status(404).json({ error: `Task ${taskId} not found` });
-        return;
-      }
-
-      // Run preflight in the request handler (it's I/O-bound, not blocking)
-      const { loadAdapter } = await import("../core/adapter-loader.js");
-      const { runPreflight } = await import("../preflight/preflight-runner.js");
-
-      const adapter = await loadAdapter(p.projectRoot);
-
-      const force = (req.body as Record<string, unknown> | undefined)?.force === true;
-
-      // Create event writer for SSE broadcasts (if logDir exists)
-      const { createNoOpWriter } = await import("./event-emitter.js");
-      let eventWriter = createNoOpWriter();
-      if (p.logDir) {
-        const { EventWriter } = await import("./event-emitter.js");
-        eventWriter = new EventWriter({
-          sessionId: "preflight",
-          taskId,
-          project: p.projectId,
-          logDir: p.logDir,
-        });
-      }
-
-      // Wrap emitter to also broadcast via SSE
-      const originalEmit = eventWriter.emit.bind(eventWriter);
-      eventWriter.emit = (stage, payload) => {
-        originalEmit(stage, payload);
-        sse.broadcast({
-          sessionId: "preflight",
-          taskId,
-          project: p.projectId,
-          timestamp: new Date().toISOString(),
-          stage: stage as never,
-          payload: payload as never,
-        });
-      };
-
-      const result = await runPreflight(task, adapter, { force, events: eventWriter });
-
-      const preflightRefusal = result.decomposition?.refused;
-      if (preflightRefusal?.errorType === "duplicate_claimants") {
-        const claimants = preflightRefusal.claimants;
-        res.status(409).json({
-          ok: false,
-          error: "duplicate_claimants",
-          taskId,
-          claimants,
-          message: formatDuplicateClaimantsMessage(taskId, claimants),
-        });
-        return;
-      }
-
-      // Note: preflight_complete is already broadcast by the wrapped eventWriter
-      // (runPreflight emits all 5 stages: start, gate, blueprint, analysis, complete)
-
-      res.json({ ok: true, taskId, result });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      res.status(500).json({ error: `Failed to run preflight: ${msg}` });
+    const scoped = resolveProjectForWrite(req);
+    if (!scoped.ok) { res.status(scoped.status).json(scoped.body); return; }
+    const p = scoped.project;
+    if (requested.projectId && requested.projectId !== p.projectId) {
+      res.status(404).json({ code: "UNKNOWN_PROJECT", error: "Unknown project id" }); return;
     }
+    if (!p.projectRoot || !p.preflightWorker) {
+      res.status(503).json({ error: "Full preflight is not configured", code: "PREFLIGHT_UNAVAILABLE" }); return;
+    }
+    return p;
+  }
+
+  async function fullPreflightInput(p: ResolvedProject, taskId: string, mode: "auto" | "deterministic",
+    res: Response): Promise<PreflightInputIdentity | undefined> {
+    const { loadAdapter } = await import("../core/adapter-loader.js");
+    const { resolveTaskFile, listDuplicateClaimants } = await import("../core/task-file-resolver.js");
+    const adapter = await loadAdapter(p.projectRoot!);
+    const directory = path.resolve(adapter.projectRoot, adapter.config.project.taskDir);
+    const claimants = await listDuplicateClaimants(directory, taskId);
+    if (claimants.length > 1) {
+      rejectDuplicateClaimantCheck({ taskId, claimants }, res); return;
+    }
+    const resolved = await resolveTaskFile(directory, taskId);
+    if (!resolved?.task) { res.status(404).json({ error: `Task ${taskId} not found` }); return; }
+    return { contentHash: computeContentHash(resolved.task.rawContent),
+      schemaPolicyHash: computeSchemaPolicyHash(adapter.config.gate?.requiredSections),
+      readinessJudgmentMode: adapter.config.judgment?.stages.readiness.mode ?? "off", requestedMode: mode };
+  }
+
+  function preflightJobResponse(job: PreflightJob): Record<string, unknown> {
+    return { ok: true, taskId: job.taskId, jobId: job.jobId, status: job.status, job,
+      statusUrl: `/api/tasks/${encodeURIComponent(job.taskId)}/preflight/jobs/${job.jobId}?project=${encodeURIComponent(job.projectId)}` };
+  }
+
+  function preflightRequestFailure(res: Response, error: unknown): void {
+    if (error instanceof PreflightStorageError) {
+      res.status(409).json({ ok: false, code: error.code, error: error.message, taskId: error.taskId, recoveryRequired: true });
+    } else if (error instanceof PreflightJobConflict) {
+      res.status(error.code === "PREFLIGHT_INVALID_OPTIONS" ? 400 : 409).json({ ok: false, code: error.code, error: error.message,
+        ...(error.job ? { job: error.job, jobId: error.job.jobId } : {}) });
+    } else res.status(500).json({ ok: false, code: "PREFLIGHT_REQUEST_FAILED",
+      error: error instanceof Error ? error.message : String(error) });
+  }
+
+  app.post("/api/tasks/:id/preflight", async (req: Request, res: Response) => {
+    const p = resolveFullPreflightProject(req, res);
+    if (!p) return;
+    const taskId = req.params.id as string;
+    const body = req.body as { mode?: unknown; force?: unknown; preserveApprovals?: unknown } | undefined;
+    if ((body?.mode !== undefined && body.mode !== "auto" && body.mode !== "deterministic") ||
+      (body?.force !== undefined && typeof body.force !== "boolean") ||
+      (body?.preserveApprovals !== undefined && typeof body.preserveApprovals !== "boolean") ||
+      (body?.preserveApprovals === true && body.force !== true)) {
+      res.status(400).json({ error: "Expected mode auto/deterministic and boolean force/preserveApprovals; preserveApprovals requires force:true", code: "PREFLIGHT_INVALID_OPTIONS" }); return;
+    }
+    try {
+      const input = await fullPreflightInput(p, taskId, body?.mode ?? "auto", res);
+      if (!input) return;
+      const reserved = await p.preflightWorker!.start(taskId, input, {
+        force: body?.force === true, ...(body?.preserveApprovals === true ? { preserveApprovals: true } : {}),
+      });
+      res.status(202).json({ ...preflightJobResponse(reserved.job), created: reserved.created });
+    } catch (error) { preflightRequestFailure(res, error); }
+  });
+
+  // Restore row status with one scoped request; full reports stay on exact-job reads.
+  app.get("/api/preflight/jobs", (req: Request, res: Response) => {
+    const p = resolveFullPreflightProject(req, res);
+    if (!p) return;
+    try {
+      const worker = p.preflightWorker!;
+      const { jobs, storageIssues } = worker.getStatusSnapshot();
+      res.json({ ok: true, jobs, storageIssues });
+    } catch (error) { preflightRequestFailure(res, error); }
+  });
+
+  // Register latest first so it is never interpreted as an immutable job UUID.
+  app.get("/api/tasks/:id/preflight/jobs/latest", async (req: Request, res: Response) => {
+    const p = resolveFullPreflightProject(req, res);
+    if (!p) return;
+    try {
+      const taskId = req.params.id as string;
+      await p.preflightWorker!.store.recover(taskId);
+      const job = p.preflightWorker!.getJob(taskId);
+      res.json(job ? preflightJobResponse(job) : { ok: true, taskId, job: null });
+    } catch (error) { preflightRequestFailure(res, error); }
+  });
+
+  app.get("/api/tasks/:id/preflight/jobs/:jobId", async (req: Request, res: Response) => {
+    const p = resolveFullPreflightProject(req, res);
+    if (!p) return;
+    const jobId = req.params.jobId as string;
+    if (!preflightJobIdSchema.safeParse(jobId).success) {
+      res.status(400).json({ code: "PREFLIGHT_INVALID_JOB_ID", error: "Invalid preflight job id" }); return;
+    }
+    try {
+      await p.preflightWorker!.store.recover(req.params.id as string);
+      const job = p.preflightWorker!.getJob(req.params.id as string, jobId);
+      if (!job) { res.status(404).json({ code: "PREFLIGHT_JOB_NOT_FOUND", error: "Preflight job not found" }); return; }
+      res.json(preflightJobResponse(job));
+    } catch (error) { preflightRequestFailure(res, error); }
+  });
+
+  app.post("/api/tasks/:id/preflight/jobs/:jobId/reconcile", async (req: Request, res: Response) => {
+    const p = resolveFullPreflightProject(req, res);
+    if (!p) return;
+    const body = req.body as Record<string, unknown> | undefined;
+    if (!preflightJobIdSchema.safeParse(req.params.jobId).success ||
+      !Number.isInteger(body?.revision) || typeof body?.confirmationToken !== "string" ||
+      body.processTreeConfirmedStopped !== true) {
+      res.status(400).json({ code: "PREFLIGHT_INVALID_CONFIRMATION",
+        error: "Recovery requires the current revision/token and explicit process-tree stop confirmation" }); return;
+    }
+    try {
+      const job = await p.preflightWorker!.reconcile(req.params.id as string, req.params.jobId as string,
+        body.revision as number, body.confirmationToken, true);
+      res.json(preflightJobResponse(job));
+    } catch (error) { preflightRequestFailure(res, error); }
   });
 
   app.get("/api/tasks/:id/preflight", async (req: Request, res: Response) => {
@@ -8046,7 +8054,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         return;
       }
 
-      res.json(state.preflight);
+      res.json(toOperatorPreflightResult(state));
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       res.status(500).json({ error: `Failed to read preflight result: ${msg}` });
@@ -8728,20 +8736,17 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     federatedHostId: string | undefined,
     federatedLeaseId: string | undefined,
   ): Promise<boolean> {
-    if (!project.projectRoot || !federatedJobId || !federatedHostId || !federatedLeaseId) {
-      return false;
-    }
-    const record = await loadFederatedJob(project.projectRoot, federatedJobId);
-    return Boolean(
-      record &&
-      record.projectId === project.projectId &&
-      record.taskId === taskId &&
-      record.hostId === federatedHostId &&
-      record.lease?.leaseId === federatedLeaseId &&
-      record.lease.hostId === federatedHostId &&
-      !leaseExpired(record) &&
-      ["assigned", "running", "verifying", "fixing"].includes(record.status),
-    );
+    return Boolean(await resolveFederatedStartClaim({
+      projectRoot: project.projectRoot,
+      projectId: project.projectId,
+      taskId,
+      jobId: federatedJobId,
+      hostId: federatedHostId,
+      leaseId: federatedLeaseId,
+      onRefusal: (reason) => console.warn(JSON.stringify({
+        event: "federated_start_claim_refused", reason, projectId: project.projectId, taskId,
+      })),
+    }));
   }
 
   async function hasRegisteredFederatedListeners(
@@ -8836,9 +8841,9 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       ));
 
     if (
-      !localSmokeOnly &&
-      !federatedWorkerStart &&
-      (await hasRegisteredFederatedListeners(p.projectRoot))
+      (claimsFederatedStart && !federatedWorkerStart) ||
+      (!localSmokeOnly && !federatedWorkerStart &&
+       (await hasRegisteredFederatedListeners(p.projectRoot)))
     ) {
       res.status(409).json({
         ok: false,
@@ -8846,9 +8851,9 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
           ? "federated_claim_unverified"
           : "direct_dispatch_blocked_in_swarm_mode",
         error: claimsFederatedStart
-          ? "Claimed federatedJobId/federatedHostId did not match an active job assigned to that host."
+          ? federatedClaimError
           : "Direct task dispatch is disabled while federated listeners are registered.",
-        hint: 'Queue work through POST /v1/federation/queue. For an isolated platform smoke run, pass {"localSmokeOnly":true}. Federated workers must include federatedJobId and federatedHostId matching their assigned job.',
+        hint: claimsFederatedStart ? federatedClaimHint : 'Queue work through POST /v1/federation/queue. For an isolated platform smoke run, pass {"localSmokeOnly":true}. Federated workers must include federatedJobId and federatedHostId matching their assigned job.',
       });
       return;
     }
@@ -9309,9 +9314,9 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       ));
 
     if (
-      !localSmokeOnly &&
-      !federatedWorkerStart &&
-      (await hasRegisteredFederatedListeners(p.projectRoot))
+      (claimsFederatedStart && !federatedWorkerStart) ||
+      (!localSmokeOnly && !federatedWorkerStart &&
+       (await hasRegisteredFederatedListeners(p.projectRoot)))
     ) {
       res.status(409).json({
         ok: false,
@@ -9319,9 +9324,9 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
           ? "federated_claim_unverified"
           : "direct_revision_blocked_in_swarm_mode",
         error: claimsFederatedStart
-          ? "Claimed federatedJobId/federatedHostId did not match an active job assigned to that host."
+          ? federatedClaimError
           : "Direct task revision is disabled while federated listeners are registered.",
-        hint: 'Queue fix work through POST /v1/federation/queue with jobType:"fix". For an isolated platform smoke run, pass {"localSmokeOnly":true}. Federated workers must include federatedJobId and federatedHostId matching their assigned job.',
+        hint: claimsFederatedStart ? federatedClaimHint : 'Queue fix work through POST /v1/federation/queue with jobType:"fix". For an isolated platform smoke run, pass {"localSmokeOnly":true}. Federated workers must include federatedJobId and federatedHostId matching their assigned job.',
       });
       return;
     }
@@ -10643,10 +10648,10 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
           stage,
           payload: payload as never,
         });
-      });
-
+      }, options.preflightWorkerRuntime);
       registry.register(context);
       try {
+        await context.preflightWorker?.recover();
         if (adapter.config.isolation?.method === "docker") {
           if (!context.dispatchManager) throw new Error("Dispatch manager is unavailable");
           await context.dispatchManager.checkDockerAvailability(
@@ -10728,6 +10733,9 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
         });
         return;
       }
+    }
+    if (context.preflightWorker?.hasActiveWork()) {
+      res.status(409).json({ error: "Cannot unregister project while full preflight is active or needs recovery." }); return;
     }
     if (context.prepWorker) {
       const activePrepJobs = context.prepWorker.getActiveJobs();
@@ -11104,6 +11112,10 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
             taskService: services.taskService,
             db: services.db,
             prepCache: sameContext ? (context?.prepCache ?? null) : prepCache,
+            schemaPolicyHash: sameContext
+              ? computeSchemaPolicyHash(context?.adapter.config.gate?.requiredSections)
+              : legacySchemaPolicyHash,
+            judgmentConfig: sameContext ? context?.adapter.config.judgment : legacyJudgmentConfig,
           };
           pendingWork.push(
             (async () => {
@@ -11651,11 +11663,13 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
     try {
       await quiesceMonitorForDrain("monitor stop requested");
     } catch {
-      // waitForMonitorDrainSafety performs bounded, real retries and exposes
+      // waitForOwnedMonitorWorkToStop performs bounded, real retries and exposes
       // the final concrete failure in its returned snapshot.
     }
-    const drainSnapshot = await waitForMonitorDrainSafety();
-    if (drainSnapshot.safeToTerminate !== true) {
+    // Close this monitor's resources even when retained diagnostic corruption
+    // prevents the stronger operator drain certificate. Admission stays refused.
+    const drainSnapshot = await waitForOwnedMonitorWorkToStop();
+    if (drainSnapshot.ownedWorkStopped !== true) {
       throw new Error(
         "Monitor shutdown refused: one or more dispatches could not be durably stopped. " +
           JSON.stringify(drainSnapshot),
@@ -11803,6 +11817,13 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
       }
     });
     runShutdownCleanup("admin runs stop", () => adminRuns.stopAll());
+    await awaitShutdownCleanup("legacy preflight worker stop", async () => {
+      if (!preflightWorker) return;
+      await preflightWorker.shutdownAll();
+      if (preflightWorker.hasActiveWork()) {
+        throw new Error("full-preflight process termination remains unconfirmed");
+      }
+    });
     runShutdownCleanup("legacy prep worker stop", () => {
       if (prepWorker && !prepWorker.killAll()) {
         throw new Error("one or more prep process trees could not be confirmed stopped");
@@ -11884,6 +11905,7 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
   }
 
   async function startInternal(): Promise<{ port: number; stop: () => Promise<void> }> {
+    await preflightWorker?.recover();
     startupPhase = "starting";
     // Recover or fail before binding the HTTP listener. This closes the
     // restart window where a journaled-but-uncommitted READY parent could be
@@ -12020,10 +12042,11 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
             stage,
             payload: payload as never,
           });
-        });
+        }, options.preflightWorkerRuntime);
         registry.register(context);
         return { adapter, context };
       });
+      await Promise.all(initializedProjectContexts.map(async ({ context }) => { await context.preflightWorker?.recover(); }));
       const registeredProjectRoots = initializedProjectContexts.map(
         ({ context }) => context.rootPath,
       );
@@ -12095,6 +12118,8 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
             taskService: context.taskService,
             prepCache: context.prepCache,
             db: context.db,
+            schemaPolicyHash: computeSchemaPolicyHash(adapter.config.gate?.requiredSections),
+            readinessJudgmentMode: adapter.config.judgment?.stages.readiness.mode,
           });
           const projTw = new TaskWatcher(
             projTaskDir,
@@ -12799,6 +12824,8 @@ export function createMonitorServer(options: MonitorServerOptions): MonitorServe
               taskService,
               prepCache,
               db: legacyDb,
+              schemaPolicyHash: legacySchemaPolicyHash,
+              readinessJudgmentMode: legacyJudgmentConfig?.stages.readiness.mode,
             })
           : null;
         const tw = new TaskWatcher(

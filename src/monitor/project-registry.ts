@@ -1,3 +1,5 @@
+import { generateProjectId } from "../core/project-id.js";
+import { computeSchemaPolicyHash } from "../gate/schema-policy.js";
 // ─── Project Registry ──────────────────────────────────────────────
 // Manages multiple project contexts in a single monitor instance.
 // Each project has its own adapter, event reader, dispatch manager, etc.
@@ -7,6 +9,7 @@ import { EventReader } from "./event-reader.js";
 import { DispatchManager } from "./dispatch-manager.js";
 import { PrepCache } from "./prep-cache.js";
 import { PrepWorker } from "./prep-worker.js";
+import { PreflightWorker, type PreflightWorkerOptions } from "./preflight-worker.js";
 import { PrepScheduler } from "./prep-scheduler.js";
 import { FleetController } from "../dispatcher/fleet-controller.js";
 import { CostVelocityTracker } from "../dispatcher/cost-velocity.js";
@@ -52,6 +55,8 @@ export interface ProjectContext {
   prepCache: PrepCache | null;
   /** Prep worker (if available) */
   prepWorker: PrepWorker | null;
+  /** Full-preflight worker; optional only for legacy embedded contexts. */
+  preflightWorker?: PreflightWorker | null;
   /** Prep scheduler (if available) */
   prepScheduler: PrepScheduler | null;
   /** Fleet controller (if available) */
@@ -206,13 +211,7 @@ export class ProjectRegistry {
  * Generate a project ID slug from a project name.
  * Converts to lowercase, replaces spaces/special chars with hyphens.
  */
-export function generateProjectId(name: string): string {
-  return name
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-}
+export { generateProjectId } from "../core/project-id.js";
 
 export function initializeProjectDb(
   dbPath: string,
@@ -249,6 +248,7 @@ export function buildProjectContext(
   adapter: ProjectAdapter,
   quackBin: string,
   eventCallback?: DispatchEventCallback,
+  preflightRuntime?: PreflightWorkerOptions["runtime"],
 ): ProjectContext {
   const projectId = generateProjectId(adapter.config.project.name);
   const logDir = path.resolve(adapter.projectRoot, adapter.config.logging.dir);
@@ -309,11 +309,17 @@ export function buildProjectContext(
         ),
     },
   );
+  const preflightWorker = new PreflightWorker(adapter.projectRoot, quackBin, {
+    projectId, logDir, keyManager: keyManager ?? undefined, runtime: preflightRuntime,
+    // The registered EventReader forwards the durable full-preflight events.
+  });
   const readiness = new ReadinessService({
     projectRoot: adapter.projectRoot,
     taskService,
     prepCache,
     db,
+    schemaPolicyHash: computeSchemaPolicyHash(adapter.config.gate?.requiredSections),
+    readinessJudgmentMode: adapter.config.judgment?.stages.readiness.mode,
   });
 
   // Load configs from adapter
@@ -377,6 +383,7 @@ export function buildProjectContext(
     taskService,
     prepCache,
     prepWorker,
+    preflightWorker,
     prepScheduler,
     fleetController,
     costVelocityTracker,
@@ -423,6 +430,13 @@ export async function teardownProjectContext(
   // appear while dynamic project unregistration is tearing the context down.
   runSyncCleanup("dispatch admission drain", () => context.dispatchManager?.beginTerminalDrain());
   runSyncCleanup("prep admission drain", () => context.prepWorker?.beginTerminalDrain());
+  runSyncCleanup("preflight admission drain", () => context.preflightWorker?.beginTerminalDrain());
+  if (context.preflightWorker) queueAsyncCleanup("preflight process close", async () => {
+    await context.preflightWorker!.shutdownAll();
+    if (context.preflightWorker!.hasActiveWork()) {
+      throw new Error("full-preflight process termination remains unconfirmed");
+    }
+  });
   runSyncCleanup("dispatch process termination", () => {
     if (context.dispatchManager && !context.dispatchManager.killAll()) {
       dispatchTerminationConfirmed = false;

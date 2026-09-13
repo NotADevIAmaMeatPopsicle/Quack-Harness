@@ -4,6 +4,7 @@
 
 import type { ContextSizeEstimate } from "../core/types.js";
 import type { Blueprint } from "../blueprint/blueprint-types.js";
+import type { BlueprintGenerationFailure } from "../blueprint/generation-failure.js";
 import type { SpecReviewResult } from "./spec-review-types.js";
 import type { RuntimeDiagnostics } from "../core/runtime-errors.js";
 
@@ -85,10 +86,17 @@ export interface PreflightResult {
   taskId: string;
   timestamp: string;
   contentHash: string;
+  /** Original input before an auto-decomposition transaction changes the parent. */
+  inputContentHash?: string;
+  /** Policy in effect at computation; gateSkipped still means no gate verdict. */
+  schemaPolicyHash?: string;
   gate: {
     ready: boolean;
     score: number;
     dimensions: Record<string, number>;
+    /** Actual rejection diagnostics; absent for pass/skip and legacy caches. */
+    reason?: string;
+    schemaErrors?: string[];
     /** ADVISORY-prefixed gate findings (low depth dimensions, artifact collisions). Informational, never blocking (TASK-1300). */
     advisories?: string[];
     /** TASK-1315: the readiness intent mode this result was computed under
@@ -122,6 +130,10 @@ export interface PreflightResult {
      * pre-1306 cache files. Consumers must treat absence as the legacy case.
      */
     structured?: Blueprint;
+    /** Fresh failed-synthesis evidence, including when an older brief is retained. */
+    generationFailure?: BlueprintGenerationFailure;
+    /** Synthesis timestamp retained even when structured data exceeds its size bound. */
+    generatedAt?: string;
     /**
      * TASK-1324 monotonic cache guard receipt: present when a fresh
      * fidelity-FAILED synthesis tried to overwrite a cached fidelity-ok
@@ -131,6 +143,7 @@ export interface PreflightResult {
     structuredPreserved?: {
       reason: "fidelity_monotonic_guard";
       preservedFrom: string;
+      preservedFromKind?: "generated_at" | "legacy_cache_timestamp";
       refusedCheckedAt: string;
     };
     /**
@@ -151,6 +164,8 @@ export interface PreflightResult {
     decomposed: boolean;
     subtaskIds: string[];
     subtaskFiles: string[];
+    /** Successful auto-decomposition Git commit (may still need status projection recovery). */
+    committedSha?: string;
     /** Commit exists, but durable recovery/authoritative status projection must finish before enqueue. */
     recoveryPending?: boolean;
     /** Exact decomposition transaction projection identity, when already materialized. */

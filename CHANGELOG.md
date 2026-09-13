@@ -3,6 +3,29 @@
 Notable changes to Quack Harness, newest first. Release tags and downloadable
 artifacts are listed on the repository's GitHub Releases page.
 
+## Unreleased — Feature and stability improvements
+
+- Durable asynchronous preflight attempts return promptly, coalesce duplicate
+  work and retain progress, failure diagnostics and recovery state after reload.
+- Both dashboards provide fresh-preflight controls, accurate prep labels and
+  score provenance. Failed blueprint regeneration preserves usable earlier work;
+  successful replacements require fresh approval.
+- Prep, preflight, cached readiness and scheduler diagnostics consistently honor
+  current task content and configured schema policy. Historical projections no
+  longer supply unproven current readiness scores.
+- Custom log paths and managed Docker log bindings reach event, approval,
+  checkpoint and worktree lifecycle paths consistently.
+- Windows recovery retains already verified live-monitor identity during later
+  OS-probe uncertainty. Remote workers can explicitly verify starts and revisions
+  against fresh headnode assignment and lease evidence.
+- Federation job reads, locks and updates reject unsafe identifiers and mismatched
+  record identities, preventing traversal into neighboring configuration files.
+- Derived documentation requirements reach the intent judge consistently.
+
+The public package retains its existing Node support, Router 7/Vite 7 dependency
+versions, license and installation behavior. No new registry package or release
+tag is published by this source update.
+
 ## 0.3.0 — Source and packed installation
 
 - Source installs now install the frontend dependencies needed by the build.

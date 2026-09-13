@@ -95,6 +95,7 @@ describe("session-service", () => {
       db: db as never,
       reader: reader as never,
       taskService: taskService as never,
+      resolveGateScore: () => Promise.resolve(4.9),
     });
 
     const sessions = await service.listSessions();
@@ -143,4 +144,27 @@ describe("session-service", () => {
       }),
     ]);
   });
+  it.each(["listSessions", "getTaskRuns"] as const)("%s preserves session details without trusting mixed DB scores", async method => {
+    const entry = row({ title: "Stored title" });
+    const getPrep = jest.fn(() => ({ depth_score: 5 }));
+    const service = new SessionService({ db: { getAllSessions: () => [entry], getSessionsForTask: () => [entry], getPrep } as never,
+      reader: { getAllSessions: () => [] } as never });
+    const sessions = method === "listSessions" ? await service.listSessions() : await service.getTaskRuns(entry.task_id);
+    expect(sessions).toEqual([sessionRowToMonitorSummary(entry)]);
+    expect(sessions[0]).toMatchObject({ sessionId: "s1", title: "Stored title", status: "completed", outcome: "approved",
+      totalCostUsd: 1.5, durationMs: 1200, turnsUsed: 4, gateScore: null });
+    expect(getPrep).not.toHaveBeenCalled();
+  });
+  it.each([[0, 0], [5, 5], [4.9, 4.9], [NaN, null], [Infinity, null], [-1, null], [6, null], [null, null]])("filters resolver score %s to %s without clamping", async (score, expected) => {
+    const service = new SessionService({ db: { getAllSessions: () => [row()], getSessionsForTask: () => [row()] } as never,
+      reader: {} as never, resolveGateScore: () => Promise.resolve(score) });
+    expect((await service.listSessions())[0].gateScore).toBe(expected);
+    expect((await service.getTaskRuns("TASK-001"))[0].gateScore).toBe(expected);
+  });
+  it("keeps a session visible when its current readiness resolver fails", async () => {
+    const service = new SessionService({ db: { getAllSessions: () => [row()] } as never, reader: {} as never,
+      resolveGateScore: () => Promise.reject(new Error("unavailable")) });
+    expect((await service.listSessions())[0]).toMatchObject({ sessionId: "s1", gateScore: null });
+  });
+
 });

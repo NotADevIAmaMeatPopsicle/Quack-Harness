@@ -239,6 +239,23 @@ describe("project scope write guard (TASK-1301) — multi-project registry", () 
     expect(parsed.hint).toContain("project");
   };
 
+  it("requires explicit matching prep scope for POST and paired attempt/result reads", async () => {
+    for (const route of ["prep", "prep/job"]) {
+      const unscoped = await httpGet(`http://127.0.0.1:${port}/api/tasks/TASK-777/${route}`);
+      expectScopeError(unscoped.status, unscoped.body);
+      const unknown = await httpGet(`http://127.0.0.1:${port}/api/tasks/TASK-777/${route}?project=unknown`);
+      expect(unknown.status).toBe(404); expect((JSON.parse(unknown.body) as { code?: string }).code).toBe("PROJECT_NOT_FOUND");
+      const known = await httpGet(`http://127.0.0.1:${port}/api/tasks/TASK-777/${route}?project=${idBeta}`);
+      expect(known.status).toBe(404); expect((JSON.parse(known.body) as { code?: string }).code).not.toBe("PROJECT_NOT_FOUND");
+    }
+    const unscoped = await httpPost(`http://127.0.0.1:${port}/api/tasks/TASK-777/prep`);
+    expectScopeError(unscoped.status, unscoped.body);
+    const unknown = await httpPost(`http://127.0.0.1:${port}/api/tasks/TASK-777/prep?project=unknown`);
+    expect(unknown.status).toBe(404); expect((JSON.parse(unknown.body) as { code?: string }).code).toBe("PROJECT_NOT_FOUND");
+    const conflict = await httpPost(`http://127.0.0.1:${port}/api/tasks/TASK-777/prep?project=${idAlpha}`, { projectId: idBeta });
+    expect(conflict.status).toBe(400); expect((JSON.parse(conflict.body) as { code?: string }).code).toBe("PROJECT_ID_CONFLICT");
+  });
+
   it("rejects an unscoped POST /v1/reviews", async () => {
     const resp = await httpPost(`http://127.0.0.1:${port}/v1/reviews`, {
       taskId: "TASK-777",

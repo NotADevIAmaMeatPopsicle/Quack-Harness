@@ -1837,20 +1837,31 @@ describe("federation job store lock", () => {
     let callbackCount = 0;
     const syncFailure = new Error("injected post-link directory sync failure");
 
-    await expect(
-      updateFederatedJob(
-        root,
-        initial.jobId,
-        (current) => {
-          callbackCount += 1;
-          return { ...current, status: "canceled" };
-        },
-        {
-          ...TEST_LOCK_OPTIONS,
-          syncDirectoryForTest: () => Promise.reject(syncFailure),
-        },
-      ),
-    ).rejects.toThrow("injected post-link directory sync failure");
+    const attempt = updateFederatedJob(
+      root,
+      initial.jobId,
+      (current) => {
+        callbackCount += 1;
+        return { ...current, status: "canceled" };
+      },
+      {
+        ...TEST_LOCK_OPTIONS,
+        syncDirectoryForTest: () => Promise.reject(syncFailure),
+      },
+    );
+    const failure: unknown = await attempt.then(() => undefined, (error: unknown) => error);
+    if (process.platform === "win32") {
+      expect(failure).toBe(syncFailure);
+    } else {
+      // Linux also requires durable directory publication of the release receipt.
+      // This hook fails both syncs; preserve both failures instead of hiding one.
+      expect(failure).toBeInstanceOf(AggregateError);
+      expect((failure as AggregateError).message).toContain("publication could not be made recoverable");
+      expect((failure as AggregateError).cause).toBe(syncFailure);
+      expect((failure as AggregateError).errors).toHaveLength(2);
+      expect((failure as AggregateError).errors[0]).toBe(syncFailure);
+      expect((failure as AggregateError).errors[1]).toBe(syncFailure);
+    }
     expect(callbackCount).toBe(0);
 
     await expect(

@@ -450,6 +450,7 @@ function buildDocsIntentRequest(
   review: ReviewBundleInput,
   taskContent: string | undefined,
   decision: JudgmentDecision,
+  requiredWikiActions: readonly WikiAction[],
 ): IntentJudgmentRequest | undefined {
   const content = taskContent ?? "";
   const sections = extractIntentSections(content);
@@ -465,10 +466,10 @@ function buildDocsIntentRequest(
     stageContext: {
       verdict: review.verdict,
       docsImpact: review.docsImpact,
-      requiredWikiActions: review.requiredWikiActions ?? [],
-      wikiArtifacts: review.wikiArtifacts ?? [],
-      supportDocCandidates: review.supportDocCandidates ?? [],
-      findings: review.findings ?? [],
+      requiredWikiActions: [...requiredWikiActions],
+      wikiArtifacts: [...(review.wikiArtifacts ?? [])],
+      supportDocCandidates: [...(review.supportDocCandidates ?? [])],
+      findings: [...(review.findings ?? [])],
       summary: review.summary,
       reviewNotes: review.reviewNotes,
       reviewer: review.reviewer,
@@ -533,7 +534,12 @@ export async function evaluateReviewGateWithJudgment(
     };
   }
 
-  const request = buildDocsIntentRequest(review, taskContent, gate.judgmentDecision);
+  const request = buildDocsIntentRequest(
+    review,
+    taskContent,
+    gate.judgmentDecision,
+    gate.requiredWikiActions,
+  );
   const runner =
     options.runner ??
     (mode !== "off" && request ? createIntentJudgmentRunner(options.config?.runner) : undefined);

@@ -1,6 +1,7 @@
 import { verificationEntrySchema } from "../verification-schema.js";
 import { assertVerificationDatabaseAvailable } from "../verification-store.js";
 import { admitFederatedQueueRecord } from "../federation/queue-admission.js";
+import { isSafeFederatedJobId, invalidFederatedJobIdResponse } from "../federation/job-id.js";
 import type { Express, Request, Response } from "express";
 import { execFileSync } from "node:child_process";
 import { promises as fsPromises } from "node:fs";
@@ -101,6 +102,10 @@ const federatedHostSchema = z.object({
 });
 
 export type FederationRouteProject = FederationProjectContext;
+
+const portableTaskIdSchema = z.string().trim().min(1).max(64).refine(
+  isSafeFederatedJobId, "Task identifier must be a portable filename stem.",
+);
 
 export type FederationWriteScopeResult =
   | {
@@ -624,7 +629,7 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
     }
 
     const schema = z.object({
-      taskId: z.string().trim().min(1),
+      taskId: portableTaskIdSchema,
       jobType: z.enum(["intake", "verify", "fix", "dispatch"]).default("dispatch"),
       correlationId: z.string().trim().min(1).optional(),
       parentJobId: z.string().trim().min(1).optional(),
@@ -812,7 +817,7 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       summary: z.string().trim().min(1).optional(),
     });
     const schema = z.object({
-      taskId: z.string().trim().min(1),
+      taskId: portableTaskIdSchema,
       source: z.string().trim().min(1).default("hermes"),
       sourceCardId: z.string().trim().min(1).optional(),
       sourceRunId: z.string().trim().min(1).optional(),
@@ -1200,7 +1205,7 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
     }
 
     const schema = z.object({
-      taskId: z.string().trim().min(1),
+      taskId: portableTaskIdSchema,
       jobType: z.enum(["intake", "verify", "fix", "dispatch"]).default("dispatch"),
       correlationId: z.string().trim().min(1).optional(),
       preferredHostId: z.string().trim().min(1).optional(),
@@ -2373,6 +2378,10 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
   app.post("/v1/federation/jobs/:jobId/admin-closeout", async (req: Request, res: Response) => {
     const tokenId = requireServiceScope(req, res, "federation:write");
     if (!tokenId) return;
+    if (!isSafeFederatedJobId(req.params.jobId)) {
+      res.status(400).json(invalidFederatedJobIdResponse());
+      return;
+    }
 
     const scope = resolveProjectForWrite(req);
     if (!scope.ok) {
@@ -2400,7 +2409,7 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
       return;
     }
 
-    const jobId = req.params.jobId as string;
+    const jobId = req.params.jobId;
     const existing = await loadFederatedJob(p.projectRoot, jobId);
     if (!existing) {
       res.status(404).json({
@@ -2706,13 +2715,17 @@ export function registerFederationRoutes(app: Express, deps: FederationRouteDeps
   });
 
   app.get("/v1/federation/jobs/:jobId", async (req: Request, res: Response) => {
+    if (!isSafeFederatedJobId(req.params.jobId)) {
+      res.status(400).json(invalidFederatedJobIdResponse());
+      return;
+    }
     const p = resolveProject(req);
     if (!p.projectRoot) {
       res.status(404).json({ error: "Project root not configured" });
       return;
     }
 
-    const jobId = req.params.jobId as string;
+    const jobId = req.params.jobId;
     const record = await loadFederatedJob(p.projectRoot, jobId);
     if (!record) {
       res.status(404).json({

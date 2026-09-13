@@ -1,3 +1,4 @@
+import { DEFAULT_SCHEMA_POLICY_HASH } from "../../src/gate/schema-policy";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -128,6 +129,8 @@ function writePassingPrep(projectRoot: string, taskId: string): void {
       {
         taskId,
         preparedAt: "2999-01-01T00:00:00.000Z",
+        schemaPolicyHash: DEFAULT_SCHEMA_POLICY_HASH,
+        contentHash: sha256(fs.readFileSync(path.join(projectRoot, "docs", "tasks", `${taskId}-fixture.md`), "utf8")),
         schemaValid: true,
         schemaErrors: [],
         depthScore: 4.9,
@@ -157,6 +160,8 @@ function writePrep(
       {
         taskId,
         preparedAt: "2999-01-01T00:00:00.000Z",
+        schemaPolicyHash: DEFAULT_SCHEMA_POLICY_HASH,
+        contentHash: sha256(fs.readFileSync(path.join(projectRoot, "docs", "tasks", `${taskId}-fixture.md`), "utf8")),
         schemaValid: true,
         schemaErrors: [],
         depthScore,
@@ -184,6 +189,7 @@ function writePassingPreflight(projectRoot: string, taskId: string): void {
         taskId,
         timestamp: "2999-01-01T00:00:00.000Z",
         contentHash: sha256(taskContent),
+        schemaPolicyHash: DEFAULT_SCHEMA_POLICY_HASH,
         gate: {
           ready: true,
           score: 5.0,

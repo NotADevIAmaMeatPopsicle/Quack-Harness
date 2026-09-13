@@ -81,6 +81,12 @@ import {
 } from "../dispatcher/worktree-lifecycle.js";
 import { WORKTREE_INIT_FRESH_ENV } from "../dispatcher/worktree-init.js";
 import { runTrustedGitSync } from "../dispatcher/trusted-git.js";
+import {
+  hasNativeWorktreeBinding,
+  prepareNativeRuntimeDirectories,
+  unlinkNativeWorktreeLinks,
+  UnsafeWorktreeRuntimeError,
+} from "./worktree-runtime-directories.js";
 import { isRateLimitError, parseRetryAfter, type KeyManager } from "../dispatcher/key-manager.js";
 import {
   archivePausedRunState,
@@ -567,15 +573,6 @@ interface ResolvedWorktreeCleanupPolicy {
   protectedOwners: string[];
   protectedPatterns: string[];
   requireOwnerOverride: boolean;
-}
-
-function pathExistsViaLstat(candidate: string): boolean {
-  try {
-    fs.lstatSync(candidate);
-    return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code !== "ENOENT";
-  }
 }
 
 function shortHash(hash: string | undefined): string {
@@ -2244,9 +2241,35 @@ export class DispatchManager {
     return [...new Set(reasons)];
   }
 
-  private createJunction(targetPath: string, junctionPath: string): void {
-    if (pathExistsViaLstat(junctionPath)) return;
-    fs.symlinkSync(targetPath, junctionPath, "junction");
+  private prepareNativeRuntimeDirectories(worktreePath: string, reused = false): void {
+    const readLogging = (root: string): string => {
+      try {
+        const raw: unknown = JSON.parse(fs.readFileSync(path.join(root, ".quack", "adapter.json"), "utf8"));
+        // The native loader uses this same schema; Docker-only environment
+        // bindings are scrubbed before native child launch.
+        const parsed = AdapterConfigSchema.safeParse(raw);
+        if (!parsed.success) throw new Error("invalid adapter configuration");
+        return parsed.data.logging.dir;
+      } catch {
+        throw new UnsafeWorktreeRuntimeError(`cannot validate adapter logging at ${root}`);
+      }
+    };
+    const configuredLogDir = readLogging(this.projectRoot);
+    const childConfiguredLogDir = readLogging(worktreePath);
+    const monitorLogs = path.resolve(this.projectRoot, this.logDir);
+    if ([configuredLogDir, childConfiguredLogDir].some(
+      (setting) => path.relative(monitorLogs, path.resolve(this.projectRoot, setting)) !== "",
+    )) {
+      throw new UnsafeWorktreeRuntimeError("monitor and adapter log locations disagree; restore the original configuration before dispatch");
+    }
+    prepareNativeRuntimeDirectories({
+      projectRoot: this.projectRoot,
+      worktreePath,
+      logDir: this.logDir,
+      configuredLogDir,
+      prepDir: resolvePrepStorageDirSync(this.projectRoot),
+      reused,
+    });
   }
 
   private managedWorktreesRoot(): string {
@@ -2604,8 +2627,11 @@ export class DispatchManager {
             fs.rmSync(record.path, { recursive: true, force: true });
           }
           if (!fs.existsSync(record.path)) pruned.push(record.path);
-        } catch {
-          // Leave failures in retained[] for operator follow-up.
+        } catch (error) {
+          record.skipReasons.push(error instanceof UnsafeWorktreeRuntimeError
+            ? "link_cleanup_failed" : "worktree_removal_failed");
+          record.skipReasons = [...new Set(record.skipReasons)];
+          record.pruneEligible = false;
         }
       }
       try {
@@ -2765,6 +2791,14 @@ export class DispatchManager {
    * Unlinking first prevents wiping shared log/prep directories.
    */
   private unlinkJunctions(worktreePath: string): void {
+    if (!this.dockerManager || hasNativeWorktreeBinding(worktreePath)) {
+      const resolved = path.resolve(worktreePath);
+      if (!this.managedWorktreeRoots().some((root) => path.dirname(resolved) === path.resolve(root.root))) {
+        throw new UnsafeWorktreeRuntimeError(`refusing cleanup outside an exact managed worktree: ${resolved}`);
+      }
+      unlinkNativeWorktreeLinks(resolved);
+      return;
+    }
     const wtQuack = path.join(worktreePath, ".quack");
     for (const name of ["logs", "prep"]) {
       const junctionPath = path.join(wtQuack, name);
@@ -3042,31 +3076,13 @@ export class DispatchManager {
 
       // Create junctions for gitignored .quack subdirectories so that
       // events written in the worktree reach the monitor's log watcher.
-      const mainQuack = path.join(this.projectRoot, ".quack");
       const wtQuack = path.join(worktreePath, ".quack");
       fs.mkdirSync(wtQuack, { recursive: true });
 
-      if (linkRuntimeDirectories) {
-        // Junction: worktree/.quack/logs → main/.quack/logs
-        const mainLogs = path.join(mainQuack, "logs");
-        const wtLogs = path.join(wtQuack, "logs");
-        fs.mkdirSync(mainLogs, { recursive: true });
-        this.createJunction(mainLogs, wtLogs);
-
-        // Junction: worktree/.quack/prep → main/.quack/prep
-        const mainPrep = resolvePrepStorageDirSync(this.projectRoot);
-        const wtPrep = path.join(wtQuack, "prep");
-        if (fs.existsSync(mainPrep)) {
-          try {
-            this.createJunction(mainPrep, wtPrep);
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            console.warn(`[dispatch] prep junction setup failed for ${taskId}: ${msg}`);
-          }
-        }
-      }
-
       this.ensureWorktreeAdapterFreshness(worktreePath);
+      if (linkRuntimeDirectories) {
+        this.prepareNativeRuntimeDirectories(worktreePath);
+      }
 
       // Legacy adapters that explicitly disable initialization can reuse the
       // parent's frontend dependencies. Initialization-owned or guard-protected
@@ -3086,7 +3102,8 @@ export class DispatchManager {
       // destructive operation this preflight exists to prevent.
       if (
         err instanceof OrphanedQuarantineRefusalError ||
-        err instanceof InvalidDispatchGitReferenceError
+        err instanceof InvalidDispatchGitReferenceError ||
+        err instanceof UnsafeWorktreeRuntimeError
       ) {
         throw err;
       }
@@ -3190,7 +3207,12 @@ export class DispatchManager {
       console.error(`[dispatch] Preserving ${worktreePath}: Docker cleanup could not be confirmed`);
       return false;
     }
-    this.unlinkJunctions(worktreePath);
+    try {
+      this.unlinkJunctions(worktreePath);
+    } catch (error) {
+      console.error(`[dispatch] Preserving ${worktreePath}: runtime link cleanup failed: ${String(error)}`);
+      return false;
+    }
     // Docker absence was already proved above, before changing any worktree
     // evidence. The lifecycle helper now performs only the Git removal.
     lifecycleRemoveWorktree(
@@ -4706,6 +4728,9 @@ export class DispatchManager {
         `Blocked ${taskId}: stale worktree adapter bundle ` +
           `(local ${shortHash(adapterFreshness.localHash)}, authoritative ${shortHash(adapterFreshness.authoritativeHash)})`,
       );
+    }
+    if (worktreePath && shouldReuse) {
+      this.prepareNativeRuntimeDirectories(worktreePath, true);
     }
 
     // A first degraded run records its pristine checkout baseline. Recovery

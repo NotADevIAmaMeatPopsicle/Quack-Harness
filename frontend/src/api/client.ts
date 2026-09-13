@@ -12,6 +12,8 @@ import type {
   DashboardLoginResponse,
   DeploymentMonitoringResponse,
   FleetHealthResponse,
+  FullPreflightJob,
+  FullPreflightJobResponse,
   FleetStatusResponse,
   FleetVelocityResponse,
   FederationQueueResponse,
@@ -333,23 +335,36 @@ export const stopTask = (taskId: string): Promise<{ ok: boolean; message?: strin
     body: JSON.stringify({}),
   });
 
-export const prepTask = (taskId: string): Promise<unknown> =>
-  request(`/api/tasks/${encodeURIComponent(taskId)}/prep`, {
+export const prepTask = (taskId: string, projectId: string): Promise<unknown> =>
+  request(`/api/tasks/${encodeURIComponent(taskId)}/prep?project=${encodeURIComponent(projectId)}`, {
     method: "POST",
     body: JSON.stringify({}),
   });
 
-export const preflightTask = (taskId: string): Promise<unknown> =>
-  request(`/api/tasks/${encodeURIComponent(taskId)}/preflight`, {
-    method: "POST",
-    body: JSON.stringify({}),
+export const preflightTask = (taskId: string, projectId: string, fresh = false): Promise<FullPreflightJobResponse> =>
+  request(`/api/tasks/${encodeURIComponent(taskId)}/preflight?project=${encodeURIComponent(projectId)}`, {
+    method: "POST", signal: AbortSignal.timeout(10000),
+    body: JSON.stringify(fresh ? { force: true, preserveApprovals: true } : { force: false }),
+  });
+
+export const replanTask = (taskId: string, projectId: string): Promise<FullPreflightJobResponse> =>
+  request(`/api/tasks/${encodeURIComponent(taskId)}/blueprint/replan?project=${encodeURIComponent(projectId)}`, {
+    method: "POST", signal: AbortSignal.timeout(10000), body: JSON.stringify({}),
+  });
+
+export const getFullPreflightJob = (taskId: string, projectId: string): Promise<FullPreflightJobResponse> =>
+  request(`/api/tasks/${encodeURIComponent(taskId)}/preflight/jobs/latest?project=${encodeURIComponent(projectId)}`, { signal: AbortSignal.timeout(10000) });
+
+export const reconcileFullPreflightJob = (job: FullPreflightJob): Promise<FullPreflightJobResponse> =>
+  request(`/api/tasks/${encodeURIComponent(job.taskId)}/preflight/jobs/${job.jobId}/reconcile?project=${encodeURIComponent(job.projectId)}`, {
+    method: "POST", signal: AbortSignal.timeout(10000), body: JSON.stringify({ revision: job.revision, confirmationToken: job.confirmationToken, processTreeConfirmedStopped: true }),
   });
 
 export const getTaskRuns = (taskId: string): Promise<unknown[]> =>
   request(`/api/tasks/${encodeURIComponent(taskId)}/runs`);
 
-export const getTaskPrep = (taskId: string): Promise<unknown> =>
-  request(`/api/tasks/${encodeURIComponent(taskId)}/prep`);
+export const getTaskPrep = (taskId: string, projectId: string): Promise<unknown> =>
+  request(`/api/tasks/${encodeURIComponent(taskId)}/prep?project=${encodeURIComponent(projectId)}`);
 
 // ─── Queue mutations ───────────────────────────────────────────────
 

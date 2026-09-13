@@ -96,13 +96,24 @@ Logs, checkpoints, databases, queue state, generated worktrees, and credentials 
 
 Docker isolation has a deliberately narrow host-mount contract:
 
-- `logging.dir` must be exactly the project's `.quack/logs` directory. That host-owned tree is never writable by the container. Each dispatch writes to a fresh disposable output leaf inside its task worktree. A host bridge validates task, session, project, provenance, event type, and payload schema before copying live progress into the monitor log; control artifacts are imported only after container exit and are accepted from a strict allowlist.
+- The configured host `logging.dir` is never writable by the container. Each dispatch writes to a fresh disposable output leaf inside its task worktree. A host bridge validates task, session, project, provenance, event type, and payload schema before copying live progress into the monitor log; control artifacts are imported only after container exit and are accepted from a strict allowlist. Managed container log bindings also reach adapter loading, so event and checkpoint paths agree.
 - The task-specific Git worktree is mounted read-write. Quack's runtime, prep cache, and adapter policy files are separate read-only mounts. The container receives a private Git directory inside that disposable worktree and read-only access to the authoritative object store; it never receives writable authoritative refs, configuration, hooks, or linked-worktree metadata.
 - A successful container result is content-address validated and pinned under a host-created recovery ref before publication. Push, pull-request creation, merge, task-status update, and branch cleanup run on the trusted host under a durable journal. If a required step fails, `resume` continues that exact publication without rerunning the container or discarding its approval/worktree ownership.
 - Additional `volumes` must be explicit project-relative or project-contained bind sources ending in exactly `:ro`. They are remapped to the task worktree, checked for links and aliases, and may be mounted only below the inert `/quack-inputs/` namespace. Named volumes, operating-system/runtime destinations, and option variants such as `:ro,z`, `:Z`, or `:rw` are rejected.
 - `keep_on_failure` and `always_keep` are durable retention policies. A confirmed stopped retained container does not block unrelated work, but the same task remains reserved until an operator explicitly cleans up retained resources.
 
 ## Optional capabilities
+
+Native worktree dispatch supports nested relative log paths and absolute paths.
+In-project runtime logs must be ignored by Git and must not be tracked. The
+monitor and worktree adapter copies must agree on the configured location;
+host-local configuration changes are not automatically propagated to other
+adapters. Retain each worktree's runtime-log binding with its original logs
+during recovery. Ambiguous or mismatched bindings refuse reuse explicitly.
+
+Configured required schema sections apply consistently to prep and preflight.
+Changing that policy invalidates cached admission authority; it does not erase
+historical diagnostics. Fresh preparation stamps the active policy identity.
 
 The schema also supports optional sections for:
 

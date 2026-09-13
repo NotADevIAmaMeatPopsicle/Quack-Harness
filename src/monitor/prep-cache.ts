@@ -1,3 +1,8 @@
+import {
+  fidelityBlueprintFailure,
+  blueprintFailureGuidance,
+} from "../blueprint/generation-failure.js";
+import { parseFullPreflightResult } from "./preflight-job-result.js";
 // ─── Prep Cache ────────────────────────────────────────────────────
 // Manages cached gate prep results in .quack/prep/{taskId}.json
 // Provides read/write/invalidate operations and staleness detection.
@@ -9,6 +14,7 @@ import * as path from "node:path";
 
 import type { PreflightResult } from "../preflight/preflight-types.js";
 import { ensurePrepStorageDir, resolvePrepStorageDirSync } from "../core/prep-storage.js";
+import { matchesSchemaPolicy } from "../gate/schema-policy.js";
 
 export interface PrepResult {
   taskId: string;
@@ -24,6 +30,8 @@ export interface PrepResult {
   stale: boolean;
   /** SHA-256 hash of the task spec content + relevant file hashes */
   contentHash?: string;
+  /** Policy captured at evaluation; absent legacy policy is unknown. */
+  schemaPolicyHash?: string;
 }
 
 /**
@@ -64,6 +72,7 @@ export class PrepCache {
     taskId: string,
     taskFilePath?: string,
     contentHash?: string,
+    expectedSchemaPolicyHash?: string,
   ): Promise<PrepResult | null> {
     const filePath = this.prepFilePath(taskId);
     if (!fs.existsSync(filePath)) {
@@ -76,7 +85,12 @@ export class PrepCache {
 
       // Content hash match is authoritative for currentness.
       if (contentHash && result.contentHash && result.contentHash === contentHash) {
-        return { ...result, stale: false };
+        return {
+          ...result,
+          stale:
+            expectedSchemaPolicyHash !== undefined &&
+            !matchesSchemaPolicy(result.schemaPolicyHash, expectedSchemaPolicyHash),
+        };
       }
 
       // If the caller knows the current spec hash and it differs from the
@@ -91,7 +105,13 @@ export class PrepCache {
         stale = taskStat.mtimeMs > prepTime;
       }
 
-      return { ...result, stale };
+      return {
+        ...result,
+        stale:
+          stale ||
+          (expectedSchemaPolicyHash !== undefined &&
+            !matchesSchemaPolicy(result.schemaPolicyHash, expectedSchemaPolicyHash)),
+      };
     } catch {
       return null;
     }
@@ -175,6 +195,7 @@ export class PrepCache {
     taskId: string,
     contentHash?: string,
     expectedReadinessMode?: "off" | "shadow" | "enforce",
+    expectedSchemaPolicyHash?: string,
   ): Promise<PreflightResult | null> {
     const filePath = this.preflightFilePath(taskId);
     if (!fs.existsSync(filePath)) {
@@ -188,6 +209,12 @@ export class PrepCache {
       // If a content hash is provided, validate it matches
       if (contentHash && result.contentHash !== contentHash) {
         return null; // Stale — task spec changed
+      }
+      if (
+        expectedSchemaPolicyHash !== undefined &&
+        !matchesSchemaPolicy(result.schemaPolicyHash, expectedSchemaPolicyHash)
+      ) {
+        return null;
       }
 
       // TASK-1315: a readiness-judgment mode flip changes gate AUTHORITY
@@ -210,18 +237,20 @@ export class PrepCache {
   /**
    * Write preflight result to cache.
    *
-   * TASK-1324 monotonic guard (closes QPI-046 leg 2): a fresh synthesis
-   * whose brief FAILED the fidelity audit never overwrites a cached
+   * TASK-1356 extends the TASK-1324 monotonic guard to the real producer's
+   * failed-generation evidence, including omitted structured data. It returns
+   * the effective report for coherent caller/SQLite/job publication. A failed
+   * synthesis never overwrites a cached
    * fidelity-ok brief for the SAME contentHash — the exact overwrite
    * that destroyed replan-1's good blueprint with replan-2's stub during
    * the TASK-1273 cycle. The whole blueprint section (counts + markdown
    * + structured) is preserved coherently, the refused synthesis is
    * recorded on the result (`structuredPreserved`), and everything else
-   * in the fresh result (gate, complexity, timestamps) writes normally.
+   * synthesis-independent evidence (gate, timestamps) remains fresh.
    * A different contentHash means the SPEC changed, so the old brief is
    * legitimately obsolete and the guard stands aside.
    */
-  async writePreflight(result: PreflightResult): Promise<void> {
+  async writePreflight(result: PreflightResult): Promise<PreflightResult> {
     const filePath = this.preflightFilePath(result.taskId);
 
     // Ensure prep directory exists
@@ -229,31 +258,100 @@ export class PrepCache {
 
     let toWrite = result;
     const incoming = result.blueprint.structured;
-    if (incoming?.fidelity?.status === "failed") {
+    const fidelity = result.blueprint.fidelity ?? incoming?.fidelity;
+    const failure =
+      result.blueprint.generationFailure ??
+      incoming?.generationFailure ??
+      (fidelity?.status === "failed" ? fidelityBlueprintFailure(fidelity) : undefined);
+    if (failure) {
+      toWrite = {
+        ...result,
+        mode: "deterministic",
+        blueprint: { ...result.blueprint, generationFailure: failure },
+        degraded: result.degraded ?? {
+          reason: blueprintFailureGuidance(failure),
+          diagnostics: failure,
+          checksRun: [],
+          checksSkipped: ["blueprint.llm"],
+        },
+      };
       try {
         const prior = await this.readPreflight(result.taskId, result.contentHash);
         const existing = prior?.blueprint.structured;
         const existingUsable =
           existing &&
-          existing.fidelity?.status !== "failed" &&
+          existing.taskId === result.taskId &&
+          Array.isArray(existing.fileAnalyses) &&
+          Array.isArray(existing.codeExamples) &&
+          Array.isArray(existing.verificationPatterns) &&
+          Array.isArray(existing.antiPatterns) &&
+          Array.isArray(existing.preconditions) &&
+          existing.fileAnalyses.every(
+            (file) =>
+              file &&
+              typeof file.filePath === "string" &&
+              file.filePath.trim().length > 0 &&
+              ["Create", "Modify", "Delete", "Reference"].includes(file.action),
+          ) &&
+          typeof prior.blueprint.formattedMarkdown === "string" &&
+          prior.blueprint.formattedMarkdown.trim().length > 0 &&
+          !existing.generationFailure &&
+          (existing.fidelity === undefined || existing.fidelity.status === "ok") &&
+          prior.blueprint.fidelity?.status !== "failed" &&
           (existing.fileAnalyses.length > 0 ||
-            (existing.importsToUse?.length ?? 0) > 0 ||
-            (existing.entryPoints?.length ?? 0) > 0);
-        if (prior && existingUsable) {
+            (Array.isArray(existing.importsToUse) &&
+              existing.importsToUse.some(
+                (item) =>
+                  item &&
+                  typeof item.symbol === "string" &&
+                  item.symbol.trim().length > 0 &&
+                  typeof item.fromFile === "string" &&
+                  item.fromFile.trim().length > 0,
+              )) ||
+            (Array.isArray(existing.entryPoints) &&
+              existing.entryPoints.some(
+                (item) =>
+                  item &&
+                  typeof item.symbol === "string" &&
+                  item.symbol.trim().length > 0 &&
+                  typeof item.file === "string" &&
+                  item.file.trim().length > 0,
+              )));
+        // A size-omitted structured object still leaves a fully validated paid
+        // rendering and a positive fidelity audit. Unknown legacy blobs do not.
+        const omittedUsable =
+          prior &&
+          !existing &&
+          prior.blueprint.fidelity?.status === "ok" &&
+          prior.blueprint.formattedMarkdown.trim().length > 0 &&
+          prior.blueprint.fileAnalyses > 0 &&
+          Boolean(parseFullPreflightResult(prior));
+        if (prior && (existingUsable || omittedUsable)) {
           // Round-2 F4: everything DERIVED FROM the preserved synthesis
           // travels with it — blueprint section, context estimate, and
           // complexity — so approval decisions, the operator view, and
           // the worker context all describe the SAME brief. Only
           // synthesis-independent facts (gate, timestamps, specReview)
           // stay fresh.
+          const generatedAt = existing?.generatedAt ?? prior.blueprint.generatedAt;
+          const hasGeneratedAt =
+            typeof generatedAt === "string" &&
+            /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(generatedAt) &&
+            Number.isFinite(Date.parse(generatedAt));
           toWrite = {
-            ...result,
+            ...toWrite,
             blueprint: {
               ...prior.blueprint,
+              generationFailure: failure,
               structuredPreserved: {
                 reason: "fidelity_monotonic_guard",
-                preservedFrom: prior.timestamp,
-                refusedCheckedAt: incoming.fidelity.checkedAt,
+                preservedFrom:
+                  prior.blueprint.structuredPreserved?.preservedFrom ??
+                  (hasGeneratedAt ? generatedAt : prior.timestamp),
+                preservedFromKind:
+                  prior.blueprint.structuredPreserved?.preservedFromKind ??
+                  (hasGeneratedAt ? "generated_at" : "legacy_cache_timestamp"),
+                refusedCheckedAt: fidelity?.checkedAt ?? failure.failedAt,
               },
             },
             contextEstimate: prior.contextEstimate,
@@ -268,6 +366,7 @@ export class PrepCache {
 
     const content = JSON.stringify(toWrite, null, 2) + "\n";
     await fs.promises.writeFile(filePath, content, "utf-8");
+    return toWrite;
   }
 
   /**

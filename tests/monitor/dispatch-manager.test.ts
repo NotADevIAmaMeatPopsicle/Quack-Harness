@@ -31,6 +31,15 @@ const mockCleanupWorktreeContainers = cleanupWorktreeContainers as jest.MockedFu
 >;
 const TRUSTED_MANAGED_IMAGE = `node@sha256:${"a".repeat(64)}`;
 
+function nativeFixtureAdapter(overrides: Record<string, unknown>): string {
+  const minimal = JSON.parse(fs.readFileSync(
+    path.resolve(__dirname, "../fixtures/adapters/minimal/.quack/adapter.json"), "utf8",
+  )) as Record<string, unknown>;
+  return JSON.stringify({ ...minimal, ...overrides,
+    git: { ...(minimal.git as Record<string, unknown>), ...(overrides.git as Record<string, unknown>) },
+  });
+}
+
 /**
  * Test-only operator authorization for the exact bare origin created by a
  * fixture. Production obtains the same value from the process-owned adapter
@@ -841,7 +850,7 @@ describe("DispatchManager", () => {
 
     test("unlinkJunctions handles missing .quack directory gracefully", () => {
       const mgr = new DispatchManager(tmpDir, "/fake/bin.js");
-      const worktreePath = path.join(tmpDir, "nonexistent-worktree");
+      const worktreePath = path.join(tmpDir, ".quack", "worktrees", "TASK-MISSING");
 
       // Should not throw even when .quack doesn't exist
       const unlinkJunctions = (mgr as unknown as Record<string, (p: string) => void>)[
@@ -853,7 +862,7 @@ describe("DispatchManager", () => {
 
     test("unlinkJunctions skips non-symlink directories", () => {
       const mgr = new DispatchManager(tmpDir, "/fake/bin.js");
-      const worktreePath = path.join(tmpDir, "worktree");
+      const worktreePath = path.join(tmpDir, ".quack", "worktrees", "TASK-REAL");
       const wtQuack = path.join(worktreePath, ".quack");
 
       // Create real directories (not junctions) at logs and prep
@@ -890,12 +899,13 @@ describe("DispatchManager", () => {
       git(repoDir, ["config", "user.email", "quack@example.test"]);
       git(repoDir, ["config", "user.name", "Quack Test"]);
       fs.writeFileSync(path.join(repoDir, "tracked.txt"), "fresh\n");
+      fs.writeFileSync(path.join(repoDir, ".gitignore"), ".quack/logs\n.quack/prep\n.quack/worktrees/\n");
       fs.mkdirSync(path.join(repoDir, ".quack"), { recursive: true });
       fs.writeFileSync(
         path.join(repoDir, ".quack", "adapter.json"),
-        JSON.stringify({ git: { baseBranch: "dev", branchPrefix: "quack/" } }),
+        nativeFixtureAdapter({ git: { baseBranch: "dev", branchPrefix: "quack/" } }),
       );
-      git(repoDir, ["add", "tracked.txt"]);
+      git(repoDir, ["add", "tracked.txt", ".gitignore"]);
       git(repoDir, ["commit", "-m", "initial"]);
       git(repoDir, ["branch", "-M", "dev"]);
       git(repoDir, ["remote", "add", "origin", originDir]);
@@ -1833,12 +1843,13 @@ describe("DispatchManager", () => {
       git(repoDir, ["config", "user.email", "quack@example.test"]);
       git(repoDir, ["config", "user.name", "Quack Test"]);
       fs.writeFileSync(path.join(repoDir, "tracked.txt"), "fresh\n");
+      fs.writeFileSync(path.join(repoDir, ".gitignore"), ".quack/logs\n.quack/prep\n.quack/worktrees/\n");
       fs.mkdirSync(path.join(repoDir, ".quack"), { recursive: true });
       fs.writeFileSync(
         path.join(repoDir, ".quack", "adapter.json"),
-        JSON.stringify({ git: { baseBranch: "dev", branchPrefix: "quack/" } }),
+        nativeFixtureAdapter({ git: { baseBranch: "dev", branchPrefix: "quack/" } }),
       );
-      git(repoDir, ["add", "tracked.txt"]);
+      git(repoDir, ["add", "tracked.txt", ".gitignore"]);
       git(repoDir, ["commit", "-m", "initial"]);
       git(repoDir, ["branch", "-M", "dev"]);
       git(repoDir, ["remote", "add", "origin", originDir]);
@@ -1865,12 +1876,13 @@ describe("DispatchManager", () => {
       git(repoDir, ["config", "user.email", "quack@example.test"]);
       git(repoDir, ["config", "user.name", "Quack Test"]);
       fs.writeFileSync(path.join(repoDir, "tracked.txt"), "stale\n");
+      fs.writeFileSync(path.join(repoDir, ".gitignore"), ".quack/logs\n.quack/prep\n.quack/worktrees/\n");
       fs.mkdirSync(path.join(repoDir, ".quack"), { recursive: true });
       fs.writeFileSync(
         path.join(repoDir, ".quack", "adapter.json"),
-        JSON.stringify({ git: { baseBranch: "dev", branchPrefix: "quack/" } }),
+        nativeFixtureAdapter({ git: { baseBranch: "dev", branchPrefix: "quack/" } }),
       );
-      git(repoDir, ["add", "tracked.txt"]);
+      git(repoDir, ["add", "tracked.txt", ".gitignore"]);
       git(repoDir, ["commit", "-m", "initial"]);
       git(repoDir, ["branch", "-M", "dev"]);
       git(repoDir, ["remote", "add", "origin", originDir]);
@@ -1921,7 +1933,7 @@ describe("DispatchManager", () => {
       const adapterPath = path.join(repoDir, ".quack", "adapter.json");
       fs.writeFileSync(
         adapterPath,
-        JSON.stringify({
+        nativeFixtureAdapter({
           git: { baseBranch: "dev", branchPrefix: "quack/" },
           dispatch: { worktreeInit: [] },
           sandbox: {
@@ -1948,7 +1960,7 @@ describe("DispatchManager", () => {
       const adapterPath = path.join(repoDir, ".quack", "adapter.json");
       fs.writeFileSync(
         adapterPath,
-        JSON.stringify({
+        nativeFixtureAdapter({
           git: { baseBranch: "dev", branchPrefix: "quack/" },
           dispatch: { worktreeInit: [] },
           sandbox: { deniedPaths: [], disposablePaths: [] },
@@ -1970,41 +1982,29 @@ describe("DispatchManager", () => {
       mgr.killAll();
     });
 
-    test("prep junction failures do not mark worktree creation degraded", () => {
+    test("prep junction failures refuse creation without shared-checkout fallback", () => {
       const repoDir = initRepoWithOrigin(tmpDir);
       const mgr = createLocalOriginFixtureManager(repoDir, "/fake/bin.js");
-      const realCreateJunction = (
-        mgr as unknown as {
-          createJunction(targetPath: string, junctionPath: string): void;
-        }
-      ).createJunction.bind(mgr);
-      (
-        mgr as unknown as {
-          createJunction(targetPath: string, junctionPath: string): void;
-        }
-      ).createJunction = (targetPath: string, junctionPath: string) => {
-        if (junctionPath.endsWith(`${path.sep}prep`)) {
+      fs.mkdirSync(path.join(repoDir, ".quack", "prep"), { recursive: true });
+      const nativeFs = jest.requireActual<typeof import("node:fs")>("node:fs");
+      const realSymlink = nativeFs.symlinkSync;
+      const symlink = jest.spyOn(nativeFs, "symlinkSync").mockImplementation((target, destination, type) => {
+        if (String(destination).endsWith(`${path.sep}prep`)) {
           const err = new Error("prep exists already") as NodeJS.ErrnoException;
           err.code = "EEXIST";
           throw err;
         }
-        realCreateJunction(targetPath, junctionPath);
-      };
+        realSymlink(target, destination, type);
+      });
 
       try {
-        const worktreePath = (
+        expect(() => (
           mgr as unknown as { createWorktree(taskId: string): string | undefined }
-        ).createWorktree.call(mgr, "TASK-PREP");
-
-        expect(worktreePath).toBeDefined();
+        ).createWorktree.call(mgr, "TASK-PREP")).toThrow(/Unsafe worktree runtime directories/);
         expect(mgr.isWorktreeDegraded()).toBe(false);
-        expect(fs.existsSync(path.join(worktreePath!, ".quack"))).toBe(true);
+        expect(mgr.getJob("TASK-PREP")).toBeUndefined();
       } finally {
-        (
-          mgr as unknown as {
-            createJunction(targetPath: string, junctionPath: string): void;
-          }
-        ).createJunction = realCreateJunction;
+        symlink.mockRestore();
         mgr.killAll();
       }
     });
@@ -2090,7 +2090,7 @@ describe("DispatchManager", () => {
       // branch itself: staleBranch = "" + "dev" = "dev" (protected).
       fs.writeFileSync(
         path.join(repoDir, ".quack", "adapter.json"),
-        JSON.stringify({ git: { baseBranch: "dev", branchPrefix: "" } }),
+        nativeFixtureAdapter({ git: { baseBranch: "dev", branchPrefix: "" } }),
       );
 
       const mgr = createLocalOriginFixtureManager(repoDir, "/fake/bin.js");
@@ -2156,7 +2156,8 @@ describe("DispatchManager", () => {
       git(cloneDir, ["config", "user.email", "quack@example.test"]);
       git(cloneDir, ["config", "user.name", "Quack Test"]);
       fs.writeFileSync(path.join(cloneDir, "tracked.txt"), "commit-A\n");
-      git(cloneDir, ["add", "tracked.txt"]);
+      fs.writeFileSync(path.join(cloneDir, ".gitignore"), ".quack/logs\n.quack/prep\n.quack/worktrees/\n");
+      git(cloneDir, ["add", "tracked.txt", ".gitignore"]);
       git(cloneDir, ["commit", "-m", "A"]);
       git(cloneDir, ["branch", "-M", "dev"]);
       git(cloneDir, ["remote", "add", "origin", originDir]);
@@ -2171,7 +2172,7 @@ describe("DispatchManager", () => {
       fs.mkdirSync(path.join(repoDir, ".quack"), { recursive: true });
       fs.writeFileSync(
         path.join(repoDir, ".quack", "adapter.json"),
-        JSON.stringify({ git: { baseBranch: "dev", branchPrefix: "quack/" } }),
+        nativeFixtureAdapter({ git: { baseBranch: "dev", branchPrefix: "quack/" } }),
       );
       git(repoDir, ["add", "."]);
       git(repoDir, ["commit", "-m", "local-initial"]);
@@ -2204,7 +2205,7 @@ describe("DispatchManager", () => {
       const repoDir = initRepoWithOrigin(tmpDir);
       fs.writeFileSync(
         path.join(repoDir, ".quack", "adapter.json"),
-        JSON.stringify({ git: { baseBranch: "-c", branchPrefix: "quack/" } }),
+        nativeFixtureAdapter({ git: { baseBranch: "-c", branchPrefix: "quack/" } }),
         "utf8",
       );
       const mgr = createLocalOriginFixtureManager(repoDir, "/fake/bin.js");

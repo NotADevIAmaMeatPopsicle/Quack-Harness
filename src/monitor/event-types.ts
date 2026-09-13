@@ -1,3 +1,4 @@
+import type { BlueprintGenerationFailure } from "../blueprint/generation-failure.js";
 import type { PrepJob } from "./prep-worker.js";
 // ─── Event Types ───────────────────────────────────────────────────
 // Defines the QuackEvent schema used for all pipeline event logging.
@@ -68,6 +69,9 @@ export type EventStage =
   | "prep_depth_done"
   | "prep_complete"
   | "prep_job_completed"
+  | "preflight_job_started"
+  | "preflight_job_completed"
+  | "preflight_job_failed"
   | "prep_failed"
   | "preflight_start"
   | "preflight_gate"
@@ -379,14 +383,15 @@ export interface BlueprintGeneratedPayload {
  * A freshly synthesized Brief was the empty agent/provider fallback shape.
  * This is terminal for the dispatch attempt: there is no substantive
  * artifact to checkpoint, review, or approve. The operator can repair the
- * provider/runtime and retry (or explicitly re-plan an existing approval).
+ * provider/runtime before retrying; non-retryable causes require inspection first.
  */
 export interface BlueprintFidelityFailedPayload {
   taskId: string;
   reason: "empty_brief";
   message: string;
-  retryable: true;
-  recovery: "replan_or_retry";
+  retryable: boolean;
+  generationFailure?: BlueprintGenerationFailure;
+  recovery: "replan_or_retry" | "inspect_configuration";
   producerProvenancePresent: boolean;
   violations: BriefFidelityViolation[];
 }

@@ -12,6 +12,7 @@ import { promisify } from "node:util";
 
 import { resolveWindowsPowerShellPath } from "../../worker/codex-process-containment.js";
 import type { FederatedJobRecord } from "./types.js";
+import { assertFederatedJobIdentity, assertSafeFederatedJobId, isSafeFederatedJobId } from "./job-id.js";
 
 const LOCK_RETRY_MS = 10;
 const LOCK_ATTEMPTS = 500;
@@ -523,8 +524,20 @@ export async function currentFederatedLockProcessIdentity(
 export async function probeFederatedLockProcessIdentity(
   projectRoot: string,
   pid: number,
+  options: { reuseVerifiedSelfIdentity?: boolean } = {},
 ): Promise<FederatedJobProcessProbe> {
-  return resolveLockOptions({}, projectRoot).processIdentityProbe(pid);
+  const runtime = resolveLockOptions({}, projectRoot);
+  // Preflight recovery may reuse this process's native proof. Shared merge-lock
+  // callers retain fresh probes and their existing conservative reclaim policy.
+  if (options.reuseVerifiedSelfIdentity && pid === process.pid &&
+    runtime.cacheCurrentProcessIdentityGlobally && currentProcessIdentityPromise) {
+    try {
+      return { state: "alive", identity: { ...await currentProcessIdentityPromise } };
+    } catch {
+      return { state: "unknown" };
+    }
+  }
+  return runtime.processIdentityProbe(pid);
 }
 
 function positiveInteger(value: number | undefined, fallback: number, name: string): number {
@@ -2448,6 +2461,7 @@ export async function saveFederatedJob(
   projectRoot: string,
   record: FederatedJobRecord,
 ): Promise<void> {
+  assertSafeFederatedJobId(record.jobId);
   const dir = federationDir(projectRoot);
   await fsPromises.mkdir(dir, { recursive: true });
   await withFederatedJobLock(projectRoot, record.jobId, async () => {
@@ -2456,6 +2470,7 @@ export async function saveFederatedJob(
 }
 
 async function persistFederatedJob(projectRoot: string, record: FederatedJobRecord): Promise<void> {
+  assertSafeFederatedJobId(record.jobId);
   const dir = federationDir(projectRoot);
   const target = path.join(dir, `${record.jobId}.json`);
   const temporary = `${target}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
@@ -2513,6 +2528,7 @@ export async function withFederatedJobLock<T>(
   action: () => Promise<T>,
   lockOptions: FederatedJobLockOptions = {},
 ): Promise<T> {
+  assertSafeFederatedJobId(jobId);
   return withOwnerFencedFileLock(
     path.join(federationDir(projectRoot), `${jobId}.lock`),
     projectRoot,
@@ -2675,6 +2691,7 @@ export async function updateFederatedJob(
       if (!current) return { changed: false };
       const next = update(current);
       if (!next) return { record: current, changed: false };
+      assertFederatedJobIdentity(next.jobId, jobId);
       await persistFederatedJob(projectRoot, next);
       return { record: next, changed: true };
     },
@@ -2702,6 +2719,7 @@ export async function updateFederatedJobExclusive(
       if (!current) return { changed: false };
       const next = await update(current);
       if (!next) return { record: current, changed: false };
+      assertFederatedJobIdentity(next.jobId, jobId);
       await persistFederatedJob(projectRoot, next);
       return { record: next, changed: true };
     },
@@ -2741,6 +2759,7 @@ export async function updateFederatedJobWithPostPersistEffect<T>(
       if (!current) return { changed: false };
       const plan = await prepare(current);
       if (!plan) return { record: current, changed: false };
+      assertFederatedJobIdentity(plan.record.jobId, jobId);
       await persistFederatedJob(projectRoot, plan.record);
       const effectResult = await plan.effect();
       return { record: plan.record, changed: true, effectResult };
@@ -2753,12 +2772,16 @@ export async function loadFederatedJob(
   projectRoot: string,
   jobId: string,
 ): Promise<FederatedJobRecord | undefined> {
+  if (!isSafeFederatedJobId(jobId)) return undefined;
   try {
     const raw = await fsPromises.readFile(
       path.join(federationDir(projectRoot), `${jobId}.json`),
       "utf-8",
     );
-    return JSON.parse(raw) as FederatedJobRecord;
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
+        !("jobId" in parsed) || parsed.jobId !== jobId) return undefined;
+    return parsed as FederatedJobRecord;
   } catch {
     return undefined;
   }
@@ -2771,14 +2794,7 @@ export async function listFederatedJobs(projectRoot: string): Promise<FederatedJ
     const jobs = await Promise.all(
       entries
         .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
-        .map(async (entry) => {
-          try {
-            const raw = await fsPromises.readFile(path.join(dir, entry.name), "utf-8");
-            return JSON.parse(raw) as FederatedJobRecord;
-          } catch {
-            return undefined;
-          }
-        }),
+        .map((entry) => loadFederatedJob(projectRoot, entry.name.slice(0, -5))),
     );
     return jobs.filter((job): job is FederatedJobRecord => Boolean(job));
   } catch {

@@ -182,6 +182,39 @@ describe("federation lifecycle project scoping (TASK-1302)", () => {
     if (fixture) await cleanupFixture(fixture);
   });
 
+  it("refuses traversal before multi-project job lookup and never reflects the malformed ID", async () => {
+    fixture = await startFixture();
+    const canary = JSON.stringify({ serviceToken: "fictional-path-canary" });
+    for (const root of fixture.roots) {
+      fs.mkdirSync(path.join(root, ".quack", "federation", "jobs"), { recursive: true });
+      fs.writeFileSync(path.join(root, ".quack", "federation", "peer.json"), canary);
+    }
+    for (const suffix of ["reconcile", "events", "pause/release", "resume/request", "resume/claim", "resume/ack", "lease/renew", "cancel", "admin-closeout"]) {
+      const response = await request(fixture.port, "POST", `/v1/federation/jobs/..%2Fpeer/${suffix}`, {});
+      expect(response.status).toBe(400);
+      expect(response.body.code).toBe("INVALID_FEDERATED_JOB_ID");
+      expect(JSON.stringify(response.body)).not.toContain("../peer");
+      expect(JSON.stringify(response.body)).not.toContain("fictional-path-canary");
+    }
+    for (const root of fixture.roots) {
+      expect(fs.readFileSync(path.join(root, ".quack", "federation", "peer.json"), "utf8")).toBe(canary);
+      expect(fs.readdirSync(path.join(root, ".quack", "federation", "jobs"))).toEqual([]);
+    }
+  });
+
+  it("rejects unsafe task identifiers before new queue or legacy-job writes", async () => {
+    fixture = await startFixture();
+    for (const taskId of ["../peer", "..", "bad\\task", "bad:task", "x".repeat(65)]) {
+      for (const route of ["queue", "jobs"]) {
+        const response = await request(fixture.port, "POST", `/v1/federation/${route}`, {
+          projectId: fixture.ids[0], taskId, autoSchedule: false,
+        });
+        expect(response.status).toBe(400);
+        expect(JSON.stringify(response.body)).not.toContain(taskId);
+      }
+    }
+  });
+
   it("requires scope for new multi-project lifecycle writes and stamps created jobs", async () => {
     fixture = await startFixture();
 

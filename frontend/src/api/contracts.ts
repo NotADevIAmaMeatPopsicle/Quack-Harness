@@ -1306,3 +1306,35 @@ export interface WorkerEnrollmentBootstrapResponse {
     scopes: string[];
   };
 }
+
+
+export interface FullPreflightJob {
+  jobId: string;
+  taskId: string;
+  projectId: string;
+  status: "accepted" | "running" | "completed" | "failed" | "recovery_required";
+  revision: number;
+  confirmationToken: string;
+  acceptedAt: string;
+  error?: string;
+  errorType?: string;
+  eventError?: string;
+  claimants?: string[];
+  preserveApprovals?: boolean;
+  replan?: { prepared?: boolean };
+  result?: {
+    mode?: "full" | "deterministic";
+    timestamp: string;
+    gate: { ready: boolean; gateSkipped?: boolean; score: number; reason?: string };
+    blueprint: { formattedMarkdown: string; structuredPreserved?: unknown;
+      fidelity?: { status: string }; structured?: { fidelity?: { status: string } } };
+    degraded?: { reason: string; checksSkipped: string[] };
+  };
+}
+export interface FullPreflightJobResponse {
+  ok: boolean;
+  created?: boolean;
+  job: FullPreflightJob | null;
+  jobId?: string;
+  statusUrl?: string;
+}

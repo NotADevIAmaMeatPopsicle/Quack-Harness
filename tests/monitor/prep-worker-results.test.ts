@@ -1,3 +1,4 @@
+import { DEFAULT_SCHEMA_POLICY_HASH } from "../../src/gate/schema-policy";
 import { PrepJobStore } from "../../src/monitor/prep-job-store";
 import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
@@ -72,6 +73,8 @@ describe("prep terminal result contract", () => {
     { outcome: "pass" },
     { ...pass, schemaValid: false },
     { ...pass, depthScore: "5" },
+    { ...pass, schemaPolicyHash: "not-a-policy-hash" },
+    { ...pass, schemaPolicyHash: null },
     { ...pass, depthReady: false },
     { ...pass, schemaErrors: [42] },
     { ...pass, outcome: ["pass"] },
@@ -93,6 +96,14 @@ describe("prep terminal result contract", () => {
       expect(onTerminal).toHaveBeenCalledTimes(1);
     },
   );
+
+  it("preserves the producer policy stamp in terminal observations", () => {
+    const job = worker.start("TASK-001");
+    child.stdout.emit("data", Buffer.from(JSON.stringify({ ...pass, schemaPolicyHash: DEFAULT_SCHEMA_POLICY_HASH })));
+    finish();
+    expect(job.result).toMatchObject({ schemaPolicyHash: DEFAULT_SCHEMA_POLICY_HASH });
+    expect(new PrepWorker(root, "unused.js").getJob("TASK-001")?.result).toMatchObject({ schemaPolicyHash: DEFAULT_SCHEMA_POLICY_HASH });
+  });
 
   it("waits for closed stdout, including a late final chunk, before accepting the result", async () => {
     const job = worker.start("TASK-001");

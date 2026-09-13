@@ -166,13 +166,12 @@ export class SessionService {
 
   private async buildGateScoreLookup(rows: SessionRow[]): Promise<Map<string, number>> {
     const scores = new Map<string, number>();
-    const db = this.deps.db;
     if (this.deps.resolveGateScore) {
       const uniqueTaskIds = [...new Set(rows.map((row) => row.task_id))];
       for (const taskId of uniqueTaskIds) {
         try {
           const score = await this.deps.resolveGateScore(taskId);
-          if (typeof score === "number") {
+          if (typeof score === "number" && Number.isFinite(score) && score >= 0 && score <= 5) {
             scores.set(taskId, score);
           }
         } catch {
@@ -182,19 +181,8 @@ export class SessionService {
       return scores;
     }
 
-    if (!db) return scores;
-
-    try {
-      const uniqueTaskIds = [...new Set(rows.map((row) => row.task_id))];
-      for (const taskId of uniqueTaskIds) {
-        const prep = db.getPrep(taskId);
-        if (prep?.depth_score) {
-          scores.set(taskId, prep.depth_score);
-        }
-      }
-    } catch {
-      // Non-critical: gate score badges are supplemental.
-    }
+    // Mixed prep_cache columns cannot establish currentness or evaluated origin.
+    // A monitor without a readiness resolver can still show the session itself.
     return scores;
   }
 }

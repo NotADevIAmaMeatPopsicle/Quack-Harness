@@ -1,3 +1,4 @@
+import { DEFAULT_SCHEMA_POLICY_HASH } from "../../src/gate/schema-policy";
 // ─── TASK-1323: Dispatch provenance ────────────────────────────────
 // Every job records its entry channel, token identity, and origin.
 // Pins: the single mint API (compile + runtime), route-derived channel
@@ -457,6 +458,8 @@ describe("TASK-1323 route stamps (HTTP)", () => {
         {
           taskId,
           preparedAt: "2999-01-01T00:00:00.000Z",
+          schemaPolicyHash: DEFAULT_SCHEMA_POLICY_HASH,
+          contentHash: computeContentHash(fs.readFileSync(path.join(root, "docs", "tasks", `${taskId}-fixture.md`), "utf8")),
           schemaValid: true,
           schemaErrors: [],
           depthScore: 4.9,
@@ -1279,6 +1282,7 @@ describe("TASK-1323 route stamps (HTTP)", () => {
           taskId,
           timestamp: "2026-08-10T16:38:41.000Z",
           contentHash: computeContentHash(taskContent),
+          schemaPolicyHash: DEFAULT_SCHEMA_POLICY_HASH,
           gate: { ready: false, score: 0, dimensions: {}, activeOutcome: "rejected" },
           blueprint: {
             fileAnalyses: 0,
@@ -1326,6 +1330,8 @@ describe("TASK-1323 route stamps (HTTP)", () => {
         {
           taskId: "TASK-910",
           preparedAt: "2999-01-01T00:00:00.000Z",
+          schemaPolicyHash: DEFAULT_SCHEMA_POLICY_HASH,
+          contentHash: computeContentHash(fs.readFileSync(path.join(projectRoot, "docs", "tasks", "TASK-910-fixture.md"), "utf8")),
           schemaValid: true,
           schemaErrors: [],
           depthScore: 3.9,

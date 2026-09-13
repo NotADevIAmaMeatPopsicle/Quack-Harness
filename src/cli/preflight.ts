@@ -5,14 +5,36 @@
 import * as path from "node:path";
 
 import { loadAdapter } from "../core/adapter-loader.js";
-import { resolveTaskFile } from "../core/task-file-resolver.js";
+import { resolveTaskFile, listDuplicateClaimants } from "../core/task-file-resolver.js";
 import { runPreflight } from "../preflight/preflight-runner.js";
+import { computeSchemaPolicyHash } from "../gate/schema-policy.js";
+import { computeContentHash } from "../monitor/prep-cache.js";
+import { EventWriter, type IEventWriter } from "../monitor/event-emitter.js";
+import { FULL_PREFLIGHT_OUTPUT_LIMIT, preflightJobIdSchema, preflightHashSchema } from "../monitor/preflight-job-result.js";
 import { formatDuplicateClaimantsMessage } from "../core/duplicate-claimants.js";
 
 export interface PreflightCommandOptions {
   project?: string;
   json?: boolean;
   force?: boolean;
+  mode?: "auto" | "deterministic";
+  /** Supervisor-owned correlation and input fence. Not general CLI switches. */
+  jobId?: string;
+  projectId?: string;
+  expectedContentHash?: string;
+  expectedSchemaPolicyHash?: string;
+  expectedReadinessMode?: "off" | "shadow" | "enforce";
+}
+
+async function writeJson(stream: NodeJS.WriteStream, value: unknown, limit?: number): Promise<void> {
+  const text = JSON.stringify(value) + "\n";
+  if (limit && Buffer.byteLength(text) > limit) throw new Error("Preflight output exceeds its bounded result size");
+  // POSIX pipes are asynchronous: process.exit must follow the write callback.
+  await new Promise<void>((resolve, reject) => stream.write(text, (error) => error ? reject(error) : resolve()));
+}
+
+class PreflightCommandFailure extends Error {
+  constructor(readonly errorType: string, message: string, readonly claimants?: string[]) { super(message); }
 }
 
 export async function preflightCommand(
@@ -22,6 +44,19 @@ export async function preflightCommand(
   const projectRoot = path.resolve(options.project ?? process.cwd());
 
   try {
+    if (options.mode !== undefined && options.mode !== "auto" && options.mode !== "deterministic") {
+      throw new PreflightCommandFailure("PREFLIGHT_INVALID_MODE", "Mode must be auto or deterministic");
+    }
+    if (options.jobId) {
+      preflightJobIdSchema.parse(options.jobId);
+      preflightHashSchema.parse(options.expectedContentHash);
+      preflightHashSchema.parse(options.expectedSchemaPolicyHash);
+      if (!options.json || !options.projectId || !["off", "shadow", "enforce"].includes(options.expectedReadinessMode ?? "")) {
+        throw new PreflightCommandFailure("PREFLIGHT_INVALID_JOB_ARGUMENTS", "Job output requires JSON and complete input identity");
+      }
+    } else if (options.expectedContentHash || options.expectedSchemaPolicyHash || options.expectedReadinessMode || options.projectId) {
+      throw new PreflightCommandFailure("PREFLIGHT_INVALID_JOB_ARGUMENTS", "Input identity switches require a job id");
+    }
     const adapter = await loadAdapter(projectRoot);
 
     // Find and parse task file
@@ -33,14 +68,35 @@ export async function preflightCommand(
 
     const { task } = resolved;
 
-    // Run pre-flight pipeline
+    let events: IEventWriter | undefined;
+    if (options.jobId) {
+      const claimants = await listDuplicateClaimants(taskDir, taskId);
+      if (claimants.length > 1) {
+        throw new PreflightCommandFailure("duplicate_claimants",
+          formatDuplicateClaimantsMessage(taskId, claimants), claimants);
+      }
+      if (computeContentHash(task.rawContent) !== options.expectedContentHash ||
+        computeSchemaPolicyHash(adapter.config.gate?.requiredSections) !== options.expectedSchemaPolicyHash ||
+        (adapter.config.judgment?.stages.readiness.mode ?? "off") !== options.expectedReadinessMode) {
+        throw new PreflightCommandFailure("PREFLIGHT_INPUT_CHANGED", "Task or readiness policy changed after preflight was accepted");
+      }
+      const writer = new EventWriter({ sessionId: "preflight", taskId,
+        project: options.projectId!, logDir: path.resolve(projectRoot, adapter.config.logging.dir) });
+      events = { sessionId: writer.sessionId, taskId, project: writer.project,
+        emit: (stage, payload) => writer.emit(stage, { ...payload, jobId: options.jobId }),
+        recordSession: (status, extra) => writer.recordSession(status, extra) };
+    }
+
     const result = await runPreflight(task, adapter, {
-      force: options.force,
+      force: options.force, mode: options.mode, ...(events ? { events } : {}),
     });
 
     const refusal = result.decomposition?.refused;
     if (refusal?.errorType === "duplicate_claimants") {
       const message = formatDuplicateClaimantsMessage(taskId, refusal.claimants);
+      if (options.jobId) {
+        throw new PreflightCommandFailure("duplicate_claimants", message, refusal.claimants);
+      }
       if (options.json) {
         console.error(
           JSON.stringify({
@@ -58,7 +114,8 @@ export async function preflightCommand(
     }
 
     if (options.json) {
-      console.log(JSON.stringify(result, null, 2));
+      await writeJson(process.stdout, options.jobId ? { jobId: options.jobId, result } : result,
+        options.jobId ? FULL_PREFLIGHT_OUTPUT_LIMIT : undefined);
     } else {
       // Human-readable output
       console.log(`\n── Pre-Flight Report: ${taskId} ──\n`);
@@ -106,7 +163,11 @@ export async function preflightCommand(
     process.exit(0);
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : String(error);
-    if (options.json) {
+    if (options.jobId) {
+      await writeJson(process.stderr, { jobId: options.jobId,
+        errorType: error instanceof PreflightCommandFailure ? error.errorType : "PREFLIGHT_CHILD_FAILED",
+        message: msg, ...(error instanceof PreflightCommandFailure && error.claimants ? { claimants: error.claimants } : {}) });
+    } else if (options.json) {
       console.error(JSON.stringify({ error: msg }));
     } else {
       console.error(`Error: ${msg}`);

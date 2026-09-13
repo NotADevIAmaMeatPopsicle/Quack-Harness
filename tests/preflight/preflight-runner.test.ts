@@ -1,3 +1,7 @@
+import { QuackRuntimeError } from "../../src/core/runtime-errors";
+import { QuackDB } from "../../src/db";
+import { blueprintFailure } from "../../src/blueprint/generation-failure";
+import { parseFullPreflightResult } from "../../src/monitor/preflight-job-result";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -289,6 +293,74 @@ describe("runPreflight", () => {
     expect(result.complexity.recommendDecomposition).toBe(false);
   });
 
+  it.each(["requested", "fallback"])("configured schema rejection survives %s deterministic preflight", async (entry) => {
+    task = makeTask({ filesToModify: [], testingRequirements: ["Test required schema"] });
+    adapter.config.gate = { requiredSections: ["filesToModify"] };
+    if (entry === "fallback") mockRunReadinessGate.mockRejectedValue(new Error("runtime unavailable"));
+    const result = await runPreflight(task, adapter, { force: true, ...(entry === "requested" ? { mode: "deterministic" as const } : {}) });
+    expect(result.gate).toMatchObject({ ready: false, score: 0,
+      reason: "Schema validation failed", schemaErrors: ["files_to_modify (required by project config)"] });
+    const cached = await new PrepCache(tmpDir).readPreflight(task.id, result.contentHash);
+    expect(cached?.gate).toEqual(result.gate);
+  });
+
+  it("invalidates cached preflight when required sections change but task content does not", async () => {
+    task = makeTask({ filesToModify: [], testingRequirements: ["Exercise schema policy"] });
+    adapter.config.gate = { requiredSections: [] };
+    const prior = await runPreflight(task, adapter, { force: true });
+    expect(prior.gate.ready).toBe(true);
+    adapter.config.gate = { requiredSections: ["filesToModify"] };
+    const current = await runPreflight(task, adapter, { mode: "deterministic" });
+    expect(current.contentHash).toBe(prior.contentHash);
+    expect(current.gate).toMatchObject({
+      ready: false, score: 0,
+      schemaErrors: ["files_to_modify (required by project config)"],
+    });
+  });
+
+  it("does not treat an unstamped legacy cache as default-policy evidence", async () => {
+    task = makeTask({ testingRequirements: ["Exercise legacy policy"] });
+    adapter.config.gate = { requiredSections: [] };
+    const prior = await runPreflight(task, adapter, { force: true });
+    expect(prior.gate.score).toBe(5);
+    const legacy = { ...prior } as PreflightResult & { schemaPolicyHash?: string };
+    delete legacy.schemaPolicyHash;
+    await new PrepCache(tmpDir).writePreflight(legacy);
+    const current = await runPreflight(task, adapter, { mode: "deterministic" });
+    expect(current.contentHash).toBe(prior.contentHash);
+    expect(current.gate.score).toBe(3);
+  });
+
+  it("retains full schema rejection diagnostics without inventing them for depth or pass", async () => {
+    mockRunReadinessGate.mockResolvedValue({ outcome: "rejected", reason: "Schema validation failed",
+      details: { valid: false, missing: ["configured field"], warnings: [] } });
+    const schema = await runPreflight(task, adapter, { force: true });
+    expect(schema.gate).toMatchObject({ reason: "Schema validation failed", schemaErrors: ["configured field"] });
+    expect((await new PrepCache(tmpDir).readPreflight(task.id, schema.contentHash))?.gate).toEqual(schema.gate);
+    mockRunReadinessGate.mockResolvedValue({ outcome: "rejected", reason: "Depth evidence too thin",
+      details: { ready: false, overallScore: 3, scores: {}, deficiencies: ["thin"] } } as GateResult);
+    const depth = await runPreflight(task, adapter, { force: true });
+    expect(depth.gate).toMatchObject({ reason: "Depth evidence too thin" });
+    expect(depth.gate).not.toHaveProperty("schemaErrors");
+    mockRunReadinessGate.mockResolvedValue({ outcome: "pass", task });
+    const passed = await runPreflight(task, adapter, { force: true });
+    const skipped = await runPreflight(task, adapter, { force: true, skipGate: true });
+    for (const result of [passed, skipped]) {
+      expect(result.gate).not.toHaveProperty("reason");
+      expect(result.gate).not.toHaveProperty("schemaErrors");
+    }
+  });
+
+  it("valid configured deterministic tasks retain score three without failure diagnostics", async () => {
+    task = makeTask({ testingRequirements: ["Test required schema"] });
+    adapter.config.gate = { requiredSections: ["filesToModify"] };
+    const result = await runPreflight(task, adapter, { force: true, mode: "deterministic" });
+    expect(parseFullPreflightResult(result)).toEqual(result);
+    expect(result.gate).toMatchObject({ ready: true, score: 3 });
+    expect(result.gate).not.toHaveProperty("reason");
+    expect(result.gate).not.toHaveProperty("schemaErrors");
+  });
+
   it("surfaces ADVISORY gate findings on the result (TASK-1300)", async () => {
     mockRunReadinessGate.mockResolvedValue({
       outcome: "pass",
@@ -317,7 +389,7 @@ describe("runPreflight", () => {
 
     expect(mockRunReadinessGate).toHaveBeenCalledWith(
       task,
-      adapter,
+      { ...adapter, config: { ...adapter.config, gate: { requiredSections: [] } } },
       { skipEnrichment: true },
       undefined,
     );
@@ -408,6 +480,7 @@ describe("runPreflight", () => {
       force: true,
     });
     expect(skipped.gate.gateSkipped).toBe(true);
+    expect(parseFullPreflightResult(skipped)).toEqual(skipped);
     const persistedSkipped = JSON.parse(
       fsSync.readFileSync(persistedPath, "utf-8"),
     ) as PreflightResult;
@@ -468,6 +541,24 @@ describe("runPreflight", () => {
 
     await runPreflight(task, adapter, { force: true });
     expect(mockGenerateBlueprint).toHaveBeenCalledTimes(1);
+  });
+
+  it("only an explicit force bypasses a same-content generation failure after the provider recovers", async () => {
+    const failure = blueprintFailure({ source: "claude-sdk", code: "sdk_error", kind: "runtime_unavailable",
+      retryable: true, message: "Provider disconnected" });
+    mockGenerateBlueprint.mockResolvedValueOnce({ ...mockBlueprint, fileAnalyses: [], generationFailure: failure });
+    const failed = await runPreflight(task, adapter, { force: true });
+    expect(failed.blueprint.generationFailure).toBeDefined();
+    mockGenerateBlueprint.mockClear(); mockRunReadinessGate.mockClear();
+    const cached = await runPreflight(task, adapter);
+    expect(cached.blueprint.generationFailure).toEqual(failed.blueprint.generationFailure);
+    expect(mockGenerateBlueprint).not.toHaveBeenCalled();
+    expect(mockRunReadinessGate).not.toHaveBeenCalled();
+    const fresh = await runPreflight(task, adapter, { force: true });
+    expect(mockGenerateBlueprint).toHaveBeenCalledTimes(1);
+    expect(mockRunReadinessGate).toHaveBeenCalledTimes(1);
+    expect(fresh.blueprint.generationFailure).toBeUndefined();
+    expect(fresh.contentHash).toBe(failed.contentHash);
   });
 
   it("emits stage lifecycle events and heartbeats for long-running blueprint work", async () => {
@@ -702,8 +793,118 @@ describe("runPreflight", () => {
     expect(degradedEvent?.payload).toMatchObject({
       taskId: task.id,
       mode: "deterministic",
-      reason: "runtime_unavailable",
+      reason: "validation_failed", retryable: false,
     });
+    expect(result.blueprint.generationFailure?.code).toBe("fidelity_failed");
+  });
+
+  it.each(["generated", "legacy"])("preserves a paid %s brief through repeated failures across return, file, SQLite and job serialization", async (provenance) => {
+    const generatedAt = "2026-07-15T00:00:00.000Z";
+    mockGenerateBlueprint.mockResolvedValue({ ...mockBlueprint, ...(provenance === "generated" ? { generatedAt } : {}) });
+    const good = await runPreflight(task, adapter, { force: true });
+    const failure = blueprintFailure({ source: "claude-sdk", code: "sdk_error", sdkSubtype: "error_max_turns",
+      sdkErrors: ["Maximum turns reached"], kind: "runtime_unavailable", retryable: true, message: "Maximum turns reached" });
+    mockGenerateBlueprint.mockResolvedValue({ ...mockBlueprint, fileAnalyses: [], generationFailure: failure });
+    mockAssembleContext.mockResolvedValue({ ...mockContext, contextSizeEstimate: { ...mockContextSizeEstimate, total: 1_000_000 } });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      // Gate evidence stays fresh even while the same-content blueprint is retained.
+      adapter.config.gate = { requiredSections: ["filesToModify"] };
+      (adapter.config as unknown as Record<string, unknown>).judgment = {
+        stages: { readiness: { mode: attempt === 0 ? "shadow" : "enforce" } },
+      };
+      const emitted: Array<{ stage: string; payload: unknown }> = [];
+      const result = await runPreflight(task, adapter, { force: true, events: makeEventWriter(emitted) });
+      expect(emitted.find((event) => event.stage === "preflight_complete")?.payload)
+        .toMatchObject({ recommendDecomposition: result.complexity.recommendDecomposition });
+      expect(result.mode).toBe("deterministic");
+      expect(result.degraded?.diagnostics).toMatchObject({ code: "sdk_error", retryable: true });
+      expect(result.blueprint.structured).toEqual(good.blueprint.structured);
+      expect(result.blueprint.formattedMarkdown).toBe(good.blueprint.formattedMarkdown);
+      expect(result.contextEstimate).toEqual(good.contextEstimate);
+      expect(result.complexity).toEqual(good.complexity);
+      expect(result.schemaPolicyHash).not.toBe(good.schemaPolicyHash);
+      expect(result.gate.readinessJudgmentMode).toBe(attempt === 0 ? "shadow" : "enforce");
+      expect(result.blueprint.structuredPreserved).toMatchObject({
+        preservedFrom: provenance === "generated" ? generatedAt : good.timestamp,
+        preservedFromKind: provenance === "generated" ? "generated_at" : "legacy_cache_timestamp",
+      });
+      const expected: unknown = JSON.parse(JSON.stringify(result));
+      expect(await new PrepCache(tmpDir).readPreflight(task.id, result.contentHash)).toEqual(expected);
+      expect(JSON.parse(JSON.stringify(parseFullPreflightResult(result)))).toEqual(expected);
+      const db = new QuackDB(path.join(tmpDir, ".quack", "quack.db"));
+      try {
+        expect(JSON.parse(db.getReadinessSnapshot(task.id, result.contentHash)!.preflight_data!)).toEqual(expected);
+        expect(JSON.parse(db.getPrep(task.id)!.preflight_data!)).toEqual(expected);
+      } finally { db.close(); }
+    }
+  });
+
+  it.each([true, false])("retains a prior size-omitted paid rendering only with a known positive audit (%s)", async (audited) => {
+    mockGenerateBlueprint.mockResolvedValue({ ...mockBlueprint, antiPatterns: ["x".repeat(300_000)],
+      generatedAt: "2026-09-01T00:00:00.000Z",
+      ...(audited ? { fidelity: { status: "ok" as const, violations: [], checkedAt: "2026-09-01T00:00:00.000Z", scope: "typed-surface+file-existence" as const } } : {}) });
+    const good = await runPreflight(task, adapter, { force: true });
+    expect(good.blueprint.structured).toBeUndefined();
+    mockGenerateBlueprint.mockRejectedValueOnce(new Error("provider disconnected"));
+    const result = await runPreflight(task, adapter, { force: true });
+    expect(Boolean(result.blueprint.structuredPreserved)).toBe(audited);
+    if (audited) {
+      expect(result.blueprint.formattedMarkdown).toBe(good.blueprint.formattedMarkdown);
+      expect(result.blueprint.fileAnalyses).toBe(good.blueprint.fileAnalyses);
+      expect(result.blueprint.generatedAt).toBe(good.blueprint.generatedAt);
+      expect(result.blueprint.structuredPreserved?.preservedFrom).toBe(good.blueprint.generatedAt);
+      expect(result.contextEstimate).toEqual(good.contextEstimate);
+    }
+    expect(result.blueprint.structured).toBeUndefined();
+    expect(result.mode).toBe("deterministic");
+  });
+
+  it("a later successful synthesis replaces retained evidence and clears the failure", async () => {
+    await runPreflight(task, adapter, { force: true });
+    mockGenerateBlueprint.mockRejectedValueOnce(new Error("provider failed"));
+    expect((await runPreflight(task, adapter, { force: true })).blueprint.structuredPreserved).toBeDefined();
+    mockFormatBlueprintForPrompt.mockReturnValue("Fresh successful replacement");
+    const result = await runPreflight(task, adapter, { force: true });
+    expect(result.mode).toBe("full");
+    expect(result.degraded).toBeUndefined();
+    expect(result.blueprint.generationFailure).toBeUndefined();
+    expect(result.blueprint.structuredPreserved).toBeUndefined();
+    expect(result.blueprint.formattedMarkdown).toBe("Fresh successful replacement");
+    expect((await new PrepCache(tmpDir).readPreflight(task.id))?.blueprint).toEqual(result.blueprint);
+  });
+
+  it("gate fallback events keep their actual kind and do not invent blueprint-provider failures", async () => {
+    mockRunReadinessGate.mockRejectedValueOnce(new QuackRuntimeError("bad gate payload", {
+      kind: "validation_failed", stage: "preflight.gate", retryable: false,
+    }));
+    const emitted: Array<{ stage: string; payload: unknown }> = [];
+    const result = await runPreflight(task, adapter, { force: true, events: makeEventWriter(emitted) });
+    expect(result.degraded?.diagnostics.kind).toBe("validation_failed");
+    expect(emitted.find((event) => event.stage === "preflight_degraded")?.payload)
+      .toMatchObject({ reason: "validation_failed", retryable: false });
+    expect(result.blueprint.generationFailure).toBeUndefined();
+    expect(mockGenerateBlueprint).not.toHaveBeenCalled();
+  });
+
+  it.each(["changed", "absent"])("does not retain a previous brief for %s content evidence", async (prior) => {
+    if (prior === "changed") await runPreflight(task, adapter, { force: true });
+    task.rawContent += "\nNew task requirements";
+    mockGenerateBlueprint.mockRejectedValue(new Error("provider crashed"));
+    const result = await runPreflight(task, adapter, { force: true });
+    expect(result.blueprint.structured).toBeUndefined();
+    expect(result.blueprint.structuredPreserved).toBeUndefined();
+    expect(result.blueprint.generationFailure).toMatchObject({ code: "exception", kind: "internal_error", retryable: false });
+  });
+
+  it("preserves paid content when a huge failed synthesis loses its structured rendering", async () => {
+    const good = await runPreflight(task, adapter, { force: true });
+    mockGenerateBlueprint.mockResolvedValue({ ...mockBlueprint, antiPatterns: ["x".repeat(300_000)],
+      fidelity: { status: "failed", violations: [{ kind: "missing_file", detail: "Missing source" }],
+        checkedAt: new Date().toISOString(), scope: "typed-surface+file-existence" } });
+    const result = await runPreflight(task, adapter, { force: true });
+    expect(result.blueprint.structured).toEqual(good.blueprint.structured);
+    expect(result.blueprint.generationFailure).toMatchObject({ code: "fidelity_failed", kind: "validation_failed", retryable: false });
+    expect(result.degraded?.reason).toContain("Missing source");
   });
 
   it("leaves structured ABSENT on the deterministic path (honesty over stubs)", async () => {
@@ -713,6 +914,7 @@ describe("runPreflight", () => {
     });
     expect(result.mode).toBe("deterministic");
     expect(result.blueprint.structured).toBeUndefined();
+    expect(result.blueprint.generationFailure).toBeUndefined();
   });
 
   it("omits structured past the 256KB guard with an event note, storing the rest", async () => {

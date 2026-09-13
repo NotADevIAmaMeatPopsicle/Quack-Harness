@@ -1,3 +1,4 @@
+import { assertNoPreflightSupersession, replacementForRejection, consumesReplacement } from "../monitor/preflight-supersession.js";
 import { withClaudeApiKeysScope } from "../sdk/claude-auth.js";
 // ─── Task Dispatcher ────────────────────────────────────────────────
 // Main dispatch pipeline. Orchestrates the full lifecycle of a task:
@@ -10,6 +11,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import type { ProjectAdapter } from "../core/adapter-loader.js";
+import { computeSchemaPolicyHash } from "../gate/schema-policy.js";
 import type { JobProvenance } from "../monitor/federation/types.js";
 import { listDuplicateClaimants, resolveTaskFile } from "../core/task-file-resolver.js";
 import {
@@ -542,6 +544,7 @@ async function dispatchTaskWithAuth(
           })
         : await loadAdmittedTask();
     let task = loadedTask.task;
+    await assertNoPreflightSupersession(adapter, taskId);
     if (task.status === "DECOMPOSED") {
       throw new Error(`Task ${taskId} is DECOMPOSED and cannot be dispatched.`);
     }
@@ -941,6 +944,7 @@ async function dispatchTaskWithAuth(
     // Auto-skip gate when cached preflight score is high enough
     let gateAutoSkipped = false;
     if (!options?.skipGate && !completedStages.has("gate")) {
+      await assertNoPreflightSupersession(adapter, taskId);
       const preflightPrepCache = new PrepCache(adapter.projectRoot);
       try {
         // TASK-1332 round-10 (R10-2): use the spec path THIS RUN resolved,
@@ -963,6 +967,7 @@ async function dispatchTaskWithAuth(
           taskId,
           preflightHash,
           adapter.config.judgment?.stages.readiness.mode ?? "off",
+          computeSchemaPolicyHash(adapter.config.gate?.requiredSections ?? []),
         );
         // TASK-1315 r2-F1: score alone is not authority — the cached
         // gate must have actually RUN, been ready, and not carry a
@@ -1074,6 +1079,8 @@ async function dispatchTaskWithAuth(
     };
     let blueprintMarkdown = "";
     let usedCachedBlueprint = false;
+    let consumedPreflight: PreflightResult | undefined;
+    await assertNoPreflightSupersession(adapter, taskId);
     const prepCache = new PrepCache(adapter.projectRoot);
 
     // A resumed approval/revision must use the exact Brief that was reviewed.
@@ -1084,7 +1091,8 @@ async function dispatchTaskWithAuth(
       try {
         const { loadApproval } = await import("./blueprint-approval.js");
         const savedApproval = await loadApproval(taskId, logDir);
-        if (savedApproval?.blueprint) {
+        const replacement = replacementForRejection(adapter, taskId, logDir, savedApproval, computeContentHash(task.rawContent));
+        if (savedApproval?.blueprint && !replacement) {
           // ── TASK-1332 / QPI-045: the damage seam ──────────────────
           // THIS is where a stale brief becomes executed work, not the
           // approve click. The blueprint checkpoint is marked before
@@ -1166,6 +1174,7 @@ async function dispatchTaskWithAuth(
     // the approval file shows humans the real plan, and blueprint-derived
     // judge checks survive the cache hit. Legacy caches (no `structured`)
     // keep the old empty-stub behavior exactly.
+    await assertNoPreflightSupersession(adapter, taskId);
     if (!usedCachedBlueprint) {
       try {
         const taskContent = task.rawContent;
@@ -1174,6 +1183,7 @@ async function dispatchTaskWithAuth(
 
         const resolved = resolveCachedBlueprint(cachedPreflight);
         if (resolved) {
+          consumedPreflight = cachedPreflight ?? undefined;
           blueprintMarkdown = resolved.blueprintMarkdown;
           blueprint = resolved.blueprint;
           usedCachedBlueprint = true;
@@ -1299,14 +1309,19 @@ async function dispatchTaskWithAuth(
         const message =
           "Blueprint synthesis produced an unusable empty brief" +
           (violationSummary ? `: ${violationSummary}` : ".") +
-          " Restore the configured blueprint provider/runtime, then retry dispatch or request a replan." +
+          (freshBlueprint.generationFailure
+            ? ` Provider failure (${freshBlueprint.generationFailure.code}): ${freshBlueprint.generationFailure.message}. ${freshBlueprint.generationFailure.retryable
+              ? "Restore the provider/runtime, then retry dispatch or request a replan."
+              : "Inspect configuration/workspace and validation findings before retrying dispatch."}`
+            : " Restore the configured blueprint provider/runtime, then retry dispatch or request a replan.") +
           " The empty brief was not checkpointed or sent for review.";
         events.emit("blueprint_fidelity_failed", {
           taskId,
           reason: "empty_brief",
           message,
-          retryable: true,
-          recovery: "replan_or_retry",
+          ...(freshBlueprint.generationFailure ? { generationFailure: freshBlueprint.generationFailure } : {}),
+          retryable: freshBlueprint.generationFailure?.retryable ?? true,
+          recovery: freshBlueprint.generationFailure?.retryable === false ? "inspect_configuration" : "replan_or_retry",
           producerProvenancePresent: freshBlueprint.producerProvenance !== undefined,
           violations: freshBlueprint.fidelity!.violations,
         });
@@ -1348,9 +1363,16 @@ async function dispatchTaskWithAuth(
     }
 
     // ── Step 2.6: Blueprint approval gate ──────────────────────
+    await assertNoPreflightSupersession(adapter, taskId);
+    const { loadApproval: loadReplanApproval } = await import("./blueprint-approval.js");
+    const replanForGate = replacementForRejection(adapter, taskId, logDir,
+      await loadReplanApproval(taskId, logDir), computeContentHash(task.rawContent));
+    if (replanForGate && completedStages.has("approve")) {
+      throw new Error("Start a fresh dispatch after replan; the old approved checkpoint cannot authorize the replacement.");
+    }
     const blueprintApprovalConfig = adapter.config.preflight?.blueprintApproval;
     const blueprintGateEnabled =
-      effectiveExecutionMode === "loop" || blueprintApprovalConfig?.enabled === true;
+      effectiveExecutionMode === "loop" || blueprintApprovalConfig?.enabled === true || replanForGate !== undefined;
     if (blueprintGateEnabled && !options?.dryRun && !completedStages.has("approve")) {
       const {
         evaluateAutoApprove,
@@ -1365,6 +1387,9 @@ async function dispatchTaskWithAuth(
       // Check if a human already approved this blueprint (resume after approval)
       let existingApproval = await loadApproval(taskId, logDir);
       let retiredStaleRejection = false;
+      const retiredReplannedRejection = consumesReplacement(consumedPreflight,
+        replacementForRejection(adapter, taskId, logDir, existingApproval, computeContentHash(task.rawContent)));
+      if (retiredReplannedRejection) existingApproval = null;
 
       if (existingApproval?.state === "rejected") {
         const rejectionComparison = compareResolvedSpecIdentity(
@@ -1570,10 +1595,10 @@ async function dispatchTaskWithAuth(
         const thresholdsPass =
           autoApproveRules !== undefined &&
           evaluateAutoApprove(blueprint as Blueprint, preflightResult, autoApproveRules);
-        const shouldAutoApprove =
+        const shouldAutoApprove = !retiredReplannedRejection && (
           effectiveExecutionMode === "loop"
             ? loopReview?.reviewGate.eligibleForAutoApproval === true && thresholdsPass
-            : thresholdsPass;
+            : thresholdsPass);
 
         if (loopReview) {
           const nextState = shouldAutoApprove ? "auto-approved" : "pending";
