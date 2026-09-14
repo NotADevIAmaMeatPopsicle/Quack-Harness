@@ -84,7 +84,11 @@ three task packets and the roadmap above. No feature is claimed implemented.
   depth 4.6 and eight spec ambiguities. A fresh independent Codex spec review
   returned AMEND, session 01a0a16c-72c0-7e63-a7e8-83c376f3de9e. Its four
   findings and the prep feedback are dispositioned in the amended task packet.
-  Passing prep on the amended content remains required before dispatch.
+  Amended packet dbd295fe is published. Second preflight
+  e75a6239-6755-4eb8-8bea-7b822446c4f6 passed the depth gate at 4.9; its full
+  blueprint is still running at this checkpoint. Automated spec review reported
+  seven remaining ambiguities to inspect when the full report is available;
+  a passing depth score does not waive those findings or the independent brief gate.
 - Transport setup found that the stock listener sends no local dashboard
   credential. An isolated real-middleware probe returns 401 for that request
   shape and 200 for the scoped authenticated control, with zero real dispatches.
@@ -95,3 +99,10 @@ three task packets and the roadmap above. No feature is claimed implemented.
   is pending from the maintainer. The independent spec review above ran on the
   laptop's existing provider without credential transfer. Do not disable the
   cross-model gates or claim a worker started while this prerequisite is unresolved.
+
+Next operator action: read the second preflight's final blueprint/review output,
+disposition material findings, resolve the headnode reviewer login with the
+maintainer's chosen method, and run exactly TASK-1401 through the canonical queue.
+Use an authenticated operator worker bridge for the known listener gap, with
+exact assigned job/host/lease markers, lease renewal and normal evidence reporting.
+No task is queued for automatic implementation while those prerequisites remain.
