@@ -49,7 +49,7 @@ describe("Reviews dashboard readiness and blockers", () => {
 
   function write(bundle: Bundle) {
     fs.writeFileSync(
-      path.join(root, ".quack/reviews", `${bundle.reviewId}.json`),
+      path.join(root, ".quack/reviews", `${String(bundle.reviewId)}.json`),
       JSON.stringify(bundle),
     );
   }
@@ -153,7 +153,7 @@ describe("Reviews dashboard readiness and blockers", () => {
     ]) {
       await panel().getByRole("heading", { name, exact: true }).waitFor();
     }
-    expect(await panel().innerText()).toContain("P3 — Minor style issue (resolved)");
+    expect(await panel().innerText()).toContain("P3 � Minor style issue (resolved)");
     expect(await panel().innerText()).toContain("Missing: None missing");
     await panel().getByText("docs/changelog/example.md", { exact: true }).waitFor();
     await panel().getByText("abc1234", { exact: true }).waitFor();
@@ -317,11 +317,11 @@ describe("Reviews dashboard readiness and blockers", () => {
     let focused = false;
     for (let i = 0; i < 40; i++) {
       await page.keyboard.press("Tab");
-      focused = await button("review-b").evaluate((el) => el === document.activeElement);
+      focused = await button("review-b").evaluate("el => el === document.activeElement");
       if (focused) break;
     }
     expect(focused).toBe(true);
-    expect(await button("review-b").evaluate((el) => getComputedStyle(el).outlineStyle)).not.toBe(
+    expect(await button("review-b").evaluate("el => getComputedStyle(el).outlineStyle")).not.toBe(
       "none",
     );
     await page.keyboard.press("Space");
@@ -344,7 +344,7 @@ describe("Reviews dashboard readiness and blockers", () => {
     expect(await panel().innerText()).toContain(markup);
     await button("review-a").focus();
     await page.keyboard.press("Tab");
-    expect(await details.locator("summary").evaluate((el) => el === document.activeElement)).toBe(
+    expect(await details.locator("summary").evaluate("el => el === document.activeElement")).toBe(
       true,
     );
     await page.keyboard.press("Enter");
@@ -405,7 +405,7 @@ describe("Reviews dashboard readiness and blockers", () => {
     await noReady();
     expect(Date.now() - start).toBeLessThan(5000);
     // Receipt of the held request proves a new fetch rather than reuse of cached detail.
-    await page.waitForFunction(() => document.querySelector('[role="status"]') !== null);
+    await page.waitForFunction("document.querySelector('[role=\"status\"]') !== null");
     expect(requests).toBeGreaterThan(initial);
     release();
     await summary("Not ready");
