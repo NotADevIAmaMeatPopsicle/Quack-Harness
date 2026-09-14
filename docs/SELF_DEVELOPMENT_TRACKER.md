@@ -11,7 +11,8 @@ codex/TASK-1400-public-self-development. Project ID: quack-harness.
 The public repository had no adapter or task backlog at kickoff. TASK-1400 is
 operator setup (this adapter, conventions, tracker and initial task packets),
 not a completed worker implementation. Runtime registration and the first
-dispatch are pending until recorded below.
+dispatch are recorded below. Registration is complete; no worker implementation
+has started or been accepted at this checkpoint.
 
 Use one implementation lane for the pilot. The operator owns task preparation,
 review decisions and Git integration. Workers use isolated worktrees, do not
@@ -71,4 +72,26 @@ commands before dispatching another feature area. No automatic main merge.
 
 Created an isolated bootstrap branch, a public-only self-development adapter,
 three task packets and the roadmap above. No feature is claimed implemented.
-The operator will record registration, prep and dispatch results after readback.
+
+- Bootstrap is published on public main at 82c677cf. Adapter/schema validation
+  succeeds and all three task packets parse with nonempty file maps and zero warnings.
+- The canonical headnode now registers quack-harness as a separate project.
+  Its accepted running code is unchanged. Other project execution holds remain intact.
+- Clean public install, full Linux build, TSX lint and a Chromium startup probe
+  pass on Node 20.20.2. Both existing review API suites pass: 42 tests in 17.534s.
+  These are baseline checks, not evidence that the new panel exists.
+- TASK-1401 first preflight 39a8e495-79ab-4e63-b0b4-68948c999726 completed with
+  depth 4.6 and eight spec ambiguities. A fresh independent Codex spec review
+  returned AMEND, session 01a0a16c-72c0-7e63-a7e8-83c376f3de9e. Its four
+  findings and the prep feedback are dispositioned in the amended task packet.
+  Passing prep on the amended content remains required before dispatch.
+- Transport setup found that the stock listener sends no local dashboard
+  credential. An isolated real-middleware probe returns 401 for that request
+  shape and 200 for the scoped authenticated control, with zero real dispatches.
+  The operator is tracking the defect separately. Preserve dashboard auth;
+  an authenticated worker-internal start with real assigned federation markers
+  is the bounded pilot workaround, with normal leases and evidence reporting.
+- The headnode's Codex reviewer is not logged in. Reviewer provisioning choice
+  is pending from the maintainer. The independent spec review above ran on the
+  laptop's existing provider without credential transfer. Do not disable the
+  cross-model gates or claim a worker started while this prerequisite is unresolved.
