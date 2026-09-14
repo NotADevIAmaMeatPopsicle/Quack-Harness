@@ -198,6 +198,11 @@ describe("Reviews dashboard readiness and blockers", () => {
     },
   );
   const malformed: Array<[string, (bundle: ReturnType<typeof ready>) => Bundle]> = [
+    ["missing task identity", (b) => ({ ...b, taskId: undefined })],
+    ["invalid task identity", (b) => ({ ...b, taskId: 7 })],
+    ["missing verdict", (b) => ({ ...b, verdict: undefined })],
+    ["invalid verdict type", (b) => ({ ...b, verdict: 7 })],
+    ["unrecognized verdict", (b) => ({ ...b, verdict: "DONE" })],
     ["null issue", (b) => ({ ...b, gate: { ...b.gate, issues: [null] } })],
     [
       "partial issue",
