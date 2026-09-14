@@ -188,3 +188,18 @@ not a worker implementation or acceptance. Next: inspect its exact blueprint
 and fidelity result, then resume only public TASK-1401 through the normal
 federation and independent approval gates. The stopped first attempt remains
 failed; the one-job pilot listener is inactive until a fresh dispatch is ready.
+
+
+20:48Z: preflight 16c43e3a-1542-4ad1-9446-fc9f2e7e3188 completed at
+20:46:42Z with zero spec ambiguities, four file analyses, four code examples
+and a passing fidelity audit (zero violations). The artifact records Azure
+Codex gpt-5.6-sol producer provenance. A fresh canonical federation attempt
+fed-task-1401-mu1psr0j-7zv53q is running on beastmode-public-pilot, local
+session quack-TASK-1401-2fcbf9ce-e6c1-4d11-8c03-11969912b10d, base 7e769fc3.
+Live API and process output both identify quack-harness and its isolated public
+worktree. Adapter freshness is confirmed. Independent brief/diff review remain
+required; no new UI implementation or acceptance is claimed at this checkpoint.
+The clean first-attempt source ref was preserved as
+codex/archive-TASK-1401-first-pilot before normal fresh-worktree replacement.
+Next action: inspect the native brief-review result and record the operator
+decision through the existing gate, then monitor the bounded implementation.
