@@ -68,14 +68,20 @@ query behavior as specified below; avoid new global polling or project-selection
    gate stays negative even with no blocking issues: judgment can legitimately
    block without adding an issue. Do not recompute its decision from issue counts.
 6. List query keeps its existing 10-second refresh. Detail query uses its own
-   `refetchInterval: 10000`, enabled only with a selected ID, preserving App
-   query defaults and the existing `["review", selectedReviewId]` key. On a
+   `refetchInterval: 10000`, enabled only with a selected ID, preserving the
+   existing `["review", selectedReviewId]` key and other queries' defaults. On a
    successful list response which removes the selected ID, select the first
    remaining ID or clear selection if empty. Do not clear on a list error.
    Detail initial loading, background refetch and any detail error take display
    precedence over cached readiness: show **Loading review details…** while
    fetching or **Unable to refresh review details** on failure, without a
-   current positive readiness banner. Cached success on reselection or later
+   current positive readiness banner. Override the App's five-second default
+   freshness window for the detail query with `staleTime: 0` and
+   `refetchOnMount: "always"`, or implement an equivalent explicit selection
+   generation/fresh-response guard. A cached A -> B -> A reselection must fetch
+   A again even within five seconds, and cannot show A's cached positive banner
+   while that response is pending. Keep the list/global freshness policy intact.
+   Cached success on reselection or later
    error must not masquerade as fresh. Use no new global timer or effect loop.
 7. Select with a `<button type="button">` labelled `Select review <reviewId>`
    and `aria-pressed` state. Native Tab, Enter and Space operate it; no custom
@@ -146,6 +152,7 @@ not arbitrary clickable URLs. Never use dangerouslySetInnerHTML.
 - [ ] Detail refresh covers cached reselection, delayed A-to-B responses, success-to-refresh-error, a successful empty-list transition and changing details while list summaries stay identical; no stale Ready banner remains during fetching/error. Keyboard checks cover Tab, Enter, Space, pressed state and the diagnostic disclosure.
 
 ## Testing Requirements
+- [ ] Cached reselection is a distinct regression: load ready A, select B, change A's fixture to blocked, then select A again within five seconds while delaying its new response. Assert a new A request occurs, cached Ready stays hidden while it is pending, and the final blocked state appears. Separately change the selected bundle while returning byte-identical list summaries and prove its own detail refresh updates the panel.
 - [ ] Follow tests/monitor/preflight-dashboard-browser.test.ts for disposable fixture/server/browser lifecycle, but never invoke real workers or paid providers. Ensure server and browser close after failures.
 - [ ] Run npm run build before npx jest tests/monitor/reviews-dashboard-browser.test.ts --runInBand. Assert rendered text and interaction, not source-code strings. Use actual persisted bundle shapes; fixture HTTP responses are acceptable for deterministic malformed/error cases.
 - [ ] Run npx jest tests/monitor/reviews-v1-api.test.ts tests/monitor/review-docs-ui-api.test.ts --runInBand to preserve the API contract.
@@ -205,5 +212,12 @@ retained in operator evidence; no credentials were transferred.
   are exactly reviews-v1-api.test.ts and review-docs-ui-api.test.ts named in the
   mandated command. No unrelated suite is implied.
 
-Re-run prep on this amended packet; it is not passing merely because findings
-are dispositioned. Changes remain inside the original four-file UI scope.
+The second preflight passed depth at 4.9. A real headnode Codex brief review
+(azure / gpt-5.6-terra, session 01a0a17c-c93b-7130-b280-9b4539d81eb4) then
+returned FIX_FIRST for one material generated-blueprint defect: adding only an
+interval plus isFetching guards does not invalidate cached reselection during
+the App's default freshness window. Accepted: section 6 now requires an explicit
+freshness override or equivalent response-generation guard; the testing section
+defines the distinct within-five-seconds A -> B -> A case. No implementation
+started on the rejected brief. Re-run prep and independent brief review on this
+amended packet. Changes remain inside the original four-file UI scope.

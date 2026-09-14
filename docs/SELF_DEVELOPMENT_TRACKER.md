@@ -99,9 +99,13 @@ three task packets and the roadmap above. No feature is claimed implemented.
   Azure provider. The service now receives its existing host credential and
   headless Codex home; both adapter reviewers explicitly select Azure and its
   credential variable. The host's configured model remains gpt-5.6-terra.
-  A real brief review through Quack's scrubbed runner is in progress. No key was
-  transferred from the laptop or committed. Do not disable the
-  cross-model gates or claim a worker started while this prerequisite is unresolved.
+  The actual runner completed a 143-second independent brief review, session
+  01a0a17c-c93b-7130-b280-9b4539d81eb4, with no new working-tree changes. This
+  proves live provider access and source inspection. Its FIX_FIRST verdict
+  identified one real cached-reselection defect, now amended in TASK-1401.
+  The obsolete legacy key file received HTTP 401; the existing headless Azure
+  environment credential received HTTP 200 and is now the monitor's source.
+  No key was transferred from the laptop or committed. Do not disable review gates.
 
 Second automated spec review disposition: findings 1, 2, 5, 6 and 7 are covered by
 the packet's empty-state rules, exact producer fields, fetch/error precedence,
@@ -115,8 +119,8 @@ against those rules. The decomposition heuristic counted the page, helper,
 tests and documentation as independent features. They form one four-file feature
 and will remain one task, with the operator recording that decision at dispatch.
 
-Next operator action: obtain the real Azure brief-review result, disposition
-material blueprint findings, and run exactly TASK-1401 through the canonical queue.
+Next operator action: regenerate prep for the amended freshness rule, obtain a
+clean independent brief review, and run TASK-1401 through the canonical queue.
 Use an authenticated operator worker bridge for the known listener gap, with
 exact assigned job/host/lease markers, lease renewal and normal evidence reporting.
 No task is queued for automatic implementation while those prerequisites remain.
