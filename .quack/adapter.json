@@ -34,6 +34,14 @@
   "automation": { "autoPrep": { "enabled": false } },
   "preflight": { "autoRun": false, "autoDecompose": { "enabled": false, "writeSpecs": false } },
   "executionMode": "loop",
+  "evaluationProviders": {
+    "blueprint": {
+      "runner": "codex-cli",
+      "model": "gpt-5.6-sol",
+      "timeoutMs": 300000,
+      "codex": { "binaryPath": "codex", "sandbox": "read-only", "provider": "azure", "credentialEnvVar": "AZURE_OPENAI_API_KEY" }
+    }
+  },
   "loop": {
     "briefReview": { "reviewer": { "runner": "codex-cli", "maxTurns": 30, "timeoutMs": 600000, "codex": { "binaryPath": "codex", "sandbox": "read-only", "provider": "azure", "credentialEnvVar": "AZURE_OPENAI_API_KEY" } }, "requireCrossModel": true },
     "diffReview": { "reviewer": { "runner": "codex-cli", "maxTurns": 30, "timeoutMs": 600000, "codex": { "binaryPath": "codex", "sandbox": "read-only", "provider": "azure", "credentialEnvVar": "AZURE_OPENAI_API_KEY" } }, "requireCrossModel": true },

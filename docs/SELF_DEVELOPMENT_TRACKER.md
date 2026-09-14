@@ -119,8 +119,8 @@ against those rules. The decomposition heuristic counted the page, helper,
 tests and documentation as independent features. They form one four-file feature
 and will remain one task, with the operator recording that decision at dispatch.
 
-Next operator action: supervise the fresh blueprint and independent brief review
-inside the assigned TASK-1401 dispatch. Do not approve failed fidelity or reviewer
+Next operator action: finish the project-scoped notification repair, then retry
+TASK-1401 with the supported Azure Codex blueprint runner and independent review. Do not approve failed fidelity or reviewer
 evidence. The authenticated operator worker bridge retains exact assigned
 job/host/lease markers, lease renewal and ordinary evidence reporting.
 
@@ -153,3 +153,22 @@ authenticated read returned TASK-1401 with HTTP 200. It retains ordinary
 federation lease/resume/evidence behavior and does not execute host refresh
 commands. This is a temporary operator workaround for the tracked listener
 credential gap, not a change to the running harness source.
+
+
+At 20:26Z the operator stopped the first dispatch after its planner repeated
+the preflight stall. Process-tree termination and stop cleanup were confirmed;
+federation records the attempt as failed and the local job as stopped. The
+preserved worktree has no implementation changes. The planner guessed /root/task
+then delegated a broad filesystem search through Task/Bash. QPI-073 tracks the
+planner tool-policy/discovery defect. This adapter now selects the existing
+read-only Azure Codex gpt-5.6-sol blueprint runner with a 300-second timeout;
+independent brief/diff reviewers remain Azure gpt-5.6-terra. Runtime proof of
+this planner change remains pending. No failed artifact has been approved.
+
+The maintainer identified a misleading Slack notification: Salon has an unrelated
+TASK-1401 and the bridge enriched the public event using an unscoped task lookup.
+The scoped API result, actual worker prompt and worktree confirm this attempt
+was the Quack Reviews dashboard task. QPI-074 tracks the notification repair in
+Quack-Quack; project-scoped lookups and thread mapping pass 216 focused checks
+and the build. Publication/deployment are pending independent review. No Salon
+task was dispatched, modified or accepted by this operator.
