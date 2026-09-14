@@ -110,6 +110,7 @@ claude-progress.txt
 
 # Quack runtime subdirectories (prep cache, analytics)
 .quack/prep/
+.quack/preflight-jobs/
 .quack/analytics/
 
 # Debug logs
