@@ -172,3 +172,19 @@ was the Quack Reviews dashboard task. QPI-074 tracks the notification repair in
 Quack-Quack; project-scoped lookups and thread mapping pass 216 focused checks
 and the build. Publication/deployment are pending independent review. No Salon
 task was dispatched, modified or accepted by this operator.
+
+
+20:45Z checkpoint: QPI-074 is repaired and deployed in the Slack bridge at
+810d042 (GitHub main, laptop source and Beastmode runtime). Five focused suites
+pass 220 tests; build and edited-file lint pass. Independent Azure reviewer
+01a0a1a6-886b-7123-ae17-814564c75fe7 returned SHIP after both command-scope and
+ambiguous-event findings were fixed. Socket Mode and SSE reconnected cleanly.
+The Quack monitor was not restarted. Historical Slack messages remain unchanged.
+
+Public adapter/main 1c44ccb8 is synchronized to laptop and Beastmode. Fresh
+preflight 16c43e3a-1542-4ad1-9446-fc9f2e7e3188 started at 20:40:53Z and is
+running with native Codex children in the public repository. This is planning,
+not a worker implementation or acceptance. Next: inspect its exact blueprint
+and fidelity result, then resume only public TASK-1401 through the normal
+federation and independent approval gates. The stopped first attempt remains
+failed; the one-job pilot listener is inactive until a fresh dispatch is ready.
