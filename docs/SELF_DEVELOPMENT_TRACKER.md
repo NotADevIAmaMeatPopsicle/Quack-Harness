@@ -124,3 +124,16 @@ clean independent brief review, and run TASK-1401 through the canonical queue.
 Use an authenticated operator worker bridge for the known listener gap, with
 exact assigned job/host/lease markers, lease renewal and normal evidence reporting.
 No task is queued for automatic implementation while those prerequisites remain.
+
+Current attempt: 3809c472-c693-405c-b153-dca8052dd008, started at
+2026-09-14T19:59:02Z against dc798ad0. Depth passed at 4.9; automated spec
+ambiguities fell to three. Blueprint generation is still running with regular
+heartbeats as of 20:06Z. Read its final report before dispatch; the older
+FIX_FIRST verdict has not been waived. No feature implementation is accepted.
+
+The dedicated public pilot transport is registered with one slot and the
+quack-public-pilot capability. Five scope-refusal checks passed, and an
+authenticated read returned TASK-1401 with HTTP 200. It retains ordinary
+federation lease/resume/evidence behavior and does not execute host refresh
+commands. This is a temporary operator workaround for the tracked listener
+credential gap, not a change to the running harness source.
