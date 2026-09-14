@@ -30,11 +30,11 @@ status labeling on network errors. Link fresh-retry/reconcile guidance to the
 existing controls without adding requests or weakening confirmation/fencing.
 
 ## Files to Modify
-| File | Change |
-| --- | --- |
-| frontend/src/pages/TaskDetailPage.tsx | Attempt detail and diagnostic presentation |
-| tests/monitor/preflight-dashboard-browser.test.ts | Focused browser regression scenarios |
-| docs/MONITOR_GUIDE.md | Document displayed evidence and existing recovery controls |
+| File | Action | Description |
+| --- | --- | --- |
+| frontend/src/pages/TaskDetailPage.tsx | Modify | Attempt detail and diagnostic presentation |
+| tests/monitor/preflight-dashboard-browser.test.ts | Modify | Focused browser regression scenarios |
+| docs/MONITOR_GUIDE.md | Modify | Document displayed evidence and existing recovery controls |
 
 ## Scope Boundaries
 No server/store/worker changes, polling redesign, approval writes, automatic

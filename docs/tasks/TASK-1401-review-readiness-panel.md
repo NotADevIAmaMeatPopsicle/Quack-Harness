@@ -40,12 +40,12 @@ readiness as current. Refresh selected details along with the list, using existi
 query behavior; avoid new global polling or project-selection behavior.
 
 ## Files to Modify
-| File | Change |
-| --- | --- |
-| frontend/src/pages/ReviewsPage.tsx | Accessible review selection and structured detail display |
-| frontend/src/lib/review-readiness.ts | Optional defensive presentation helper; no server gate logic |
-| tests/monitor/reviews-dashboard-browser.test.ts | New isolated Chromium regression coverage of built UI |
-| docs/MONITOR_GUIDE.md | Explain the panel and distinction between code/documentation readiness |
+| File | Action | Description |
+| --- | --- | --- |
+| frontend/src/pages/ReviewsPage.tsx | Modify | Accessible review selection and structured detail display |
+| frontend/src/lib/review-readiness.ts | Create | Optional defensive presentation helper; no server gate logic |
+| tests/monitor/reviews-dashboard-browser.test.ts | Create | New isolated Chromium regression coverage of built UI |
+| docs/MONITOR_GUIDE.md | Modify | Explain the panel and distinction between code/documentation readiness |
 
 ## Scope Boundaries
 Only the four listed files are allowed. No new endpoint, merge/approval action,

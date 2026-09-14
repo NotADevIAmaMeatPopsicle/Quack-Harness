@@ -30,11 +30,11 @@ gaps. Any proposal that writes approval/admission authority is explicitly held
 for direct operator review; read-only UI work can be separately dispatched.
 
 ## Files to Modify
-| File | Change |
-| --- | --- |
-| docs/APPROVAL_COMPLETION_PLAN.md | Source-backed coverage and gap matrix |
-| docs/tasks/TASK-1403-approval-ui-scope.md | Record evidence and proposed child boundaries |
-| docs/SELF_DEVELOPMENT_TRACKER.md | Link reviewed coverage and the next bounded packets |
+| File | Action | Description |
+| --- | --- | --- |
+| docs/APPROVAL_COMPLETION_PLAN.md | Create | Source-backed coverage and gap matrix |
+| docs/tasks/TASK-1403-approval-ui-scope.md | Modify | Record evidence and proposed child boundaries |
+| docs/SELF_DEVELOPMENT_TRACKER.md | Modify | Link reviewed coverage and the next bounded packets |
 
 ## Scope Boundaries
 Documentation and read-only analysis only. No runtime, tests, adapter, secrets,
