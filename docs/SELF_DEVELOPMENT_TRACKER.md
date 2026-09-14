@@ -11,11 +11,12 @@ codex/TASK-1400-public-self-development. Project ID: quack-harness.
 The public repository had no adapter or task backlog at kickoff. TASK-1400 is
 operator setup (this adapter, conventions, tracker and initial task packets),
 not a completed worker implementation. Runtime registration and the first
-dispatch are recorded below. TASK-1401 now has a preserved worker draft plus
-operator corrections on `codex/TASK-1401-review-readiness-acceptance` at
-`7bff0654`. Full build and changed-file lint pass. Browser verification passed
-40/43 cases; three test assertion defects are corrected and awaiting rerun.
-Independent Azure diff review is running. Implementation is not accepted yet.
+dispatch are recorded below. TASK-1401 is VERIFIED: accepted source `47e53bd3`,
+48/48 browser tests, 42/42 API tests, full build and scoped lint, and independent
+Azure SHIP. Canonical review `review-task-1401-1789421071297` is merge-ready;
+verification API recorded 8/8 criteria. Accepted code is integrated in public main.
+The worker required operator recovery; the original federation attempt failed.
+TASK-1402 is next for source/spec revalidation before dispatch.
 
 Use one implementation lane for the pilot. The operator owns task preparation,
 review decisions and Git integration. Workers use isolated worktrees, do not
@@ -27,7 +28,7 @@ operator agent's decision, not as a personal review by the maintainer.
 
 | Task | Outcome | State / dispatch condition |
 | --- | --- | --- |
-| TASK-1401 | Actionable read-only review/merge-readiness detail panel | Implementation under acceptance review; build/lint pass, final browser rerun and independent diff decision pending |
+| TASK-1401 | Actionable read-only review/merge-readiness detail panel | VERIFIED and integrated; 48 browser + 42 API tests, build/lint, independent SHIP, canonical review recorded |
 | TASK-1402 | Clear current preflight attempt timing, diagnostics and recovery presentation | BACKLOG; source revalidation, spec review and task-specific verification required |
 | TASK-1403 | Reconcile and define remaining approval identity UI clauses | BACKLOG; analysis/spec task only; no approval-authority changes |
 
@@ -248,3 +249,18 @@ passed in 76 seconds. The three failures were test assertion defects; corrected
 in `7bff0654`, awaiting rerun. Both existing review API suites passed 42/42 tests.
 Independent Azure Codex diff review is in progress. No feature acceptance or
 main integration is claimed until validation and the canonical review record pass.
+
+### 2026-09-14: TASK-1401 verified and integrated
+
+Accepted source `47e53bd3` passes all 48 browser tests in 77.891 seconds, the
+42 existing API tests, full build, changed-file ESLint and lint:diff. Independent
+Azure gpt-5.6-terra session `01a0a1cb-02ba-70b3-a7db-be9d5a30d477` returned SHIP;
+both earlier findings are resolved. Verification class is fast-required: no
+backend behavior or Docker workload changed. Spec/file, false-completion,
+producer-contract and all eight success-criterion checks passed.
+
+Wiki evidence `c88499b` contains the changelog and dashboard feature update.
+Canonical review `review-task-1401-1789421071297` returned HTTP 201/mergeReady true;
+verification returned HTTP 200/applied true with 8/8 criteria at the exact source
+commit. Git integration follows those records. No runtime restart is part of
+this read-only UI task. TASK-1402 remains unstarted, pending source/spec review.
