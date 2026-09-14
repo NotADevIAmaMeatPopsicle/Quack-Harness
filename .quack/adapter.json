@@ -43,8 +43,8 @@
     }
   },
   "loop": {
-    "briefReview": { "reviewer": { "runner": "codex-cli", "maxTurns": 30, "timeoutMs": 600000, "codex": { "binaryPath": "codex", "sandbox": "read-only", "provider": "azure", "credentialEnvVar": "AZURE_OPENAI_API_KEY" } }, "requireCrossModel": true },
-    "diffReview": { "reviewer": { "runner": "codex-cli", "maxTurns": 30, "timeoutMs": 600000, "codex": { "binaryPath": "codex", "sandbox": "read-only", "provider": "azure", "credentialEnvVar": "AZURE_OPENAI_API_KEY" } }, "requireCrossModel": true },
+    "briefReview": { "reviewer": { "runner": "codex-cli", "model": "gpt-5.6-terra", "maxTurns": 30, "timeoutMs": 600000, "codex": { "binaryPath": "codex", "sandbox": "read-only", "provider": "azure", "credentialEnvVar": "AZURE_OPENAI_API_KEY" } }, "requireCrossModel": true },
+    "diffReview": { "reviewer": { "runner": "codex-cli", "model": "gpt-5.6-terra", "maxTurns": 30, "timeoutMs": 600000, "codex": { "binaryPath": "codex", "sandbox": "read-only", "provider": "azure", "credentialEnvVar": "AZURE_OPENAI_API_KEY" } }, "requireCrossModel": true },
     "recordOnFinalize": true
   }
 }
