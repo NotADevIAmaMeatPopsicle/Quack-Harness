@@ -6,8 +6,9 @@ TypeScript lint. It is not a universal verification policy for every backlog ite
 Each task adds its own required regression commands; the operator updates the
 adapter's required suite selection before dispatching a different feature area.
 
-For TASK-1401, also run its real-browser regression suite and directly lint
-changed TSX files; the existing lint-diff script only discovers `.ts` files.
+For TASK-1401, the adapter additionally requires its real-browser regression
+suite and direct page TSX lint; the existing lint-diff script only discovers `.ts` files.
+frontend/.eslintrc.cjs points TSX lint at the frontend TypeScript project.
 Never silently omit a task-mandated check because the adapter's baseline passes.
 Do not change scripts/lint-diff.js as part of this UI task.
 

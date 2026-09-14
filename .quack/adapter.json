@@ -21,6 +21,8 @@
     "commands": [
       { "name": "build", "command": "npm run build", "required": true, "timeout": 180000 },
       { "name": "review-api-tests", "command": "npx jest tests/monitor/reviews-v1-api.test.ts tests/monitor/review-docs-ui-api.test.ts --runInBand", "required": true, "timeout": 180000 },
+      { "name": "review-browser-tests", "command": "npx jest tests/monitor/reviews-dashboard-browser.test.ts --runInBand", "required": true, "timeout": 180000 },
+      { "name": "review-tsx-lint", "command": "npx eslint frontend/src/pages/ReviewsPage.tsx", "required": true, "timeout": 120000 },
       { "name": "lint", "command": "npm run lint:diff", "required": true, "timeout": 120000 }
     ],
     "smartTesting": { "enabled": true, "mode": "related", "baselineEnabled": false, "failOnPreExisting": false, "outputDir": ".quack/test-results" }

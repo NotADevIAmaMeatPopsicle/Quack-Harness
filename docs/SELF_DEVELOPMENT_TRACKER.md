@@ -61,8 +61,8 @@ task's focused suites and appropriate build instead of repeating unrelated tests
 GitHub CI does not block this loop. Public packaging must remain intact.
 
 The initial adapter is scoped to the Reviews pilot. It requires full build,
-existing review API tests and changed-TypeScript lint. TASK-1401 additionally
-requires a real-browser suite and direct TSX lint. Configure appropriate required
+existing review API tests, changed-TypeScript lint, the TASK-1401 real-browser
+suite and direct page TSX lint. Configure appropriate required
 commands before dispatching another feature area. No automatic main merge.
 
 ## Session log
