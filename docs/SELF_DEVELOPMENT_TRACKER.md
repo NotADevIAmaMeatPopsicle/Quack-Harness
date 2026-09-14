@@ -86,8 +86,8 @@ three task packets and the roadmap above. No feature is claimed implemented.
   findings and the prep feedback are dispositioned in the amended task packet.
   Amended packet dbd295fe is published. Second preflight
   e75a6239-6755-4eb8-8bea-7b822446c4f6 passed the depth gate at 4.9; its full
-  blueprint is still running at this checkpoint. Automated spec review reported
-  seven remaining ambiguities to inspect when the full report is available;
+  blueprint completed in 366 seconds. Automated spec review reported
+  seven remaining ambiguities, reviewed against the complete task packet;
   a passing depth score does not waive those findings or the independent brief gate.
 - Transport setup found that the stock listener sends no local dashboard
   credential. An isolated real-middleware probe returns 401 for that request
@@ -95,14 +95,28 @@ three task packets and the roadmap above. No feature is claimed implemented.
   The operator is tracking the defect separately. Preserve dashboard auth;
   an authenticated worker-internal start with real assigned federation markers
   is the bounded pilot workaround, with normal leases and evidence reporting.
-- The headnode's Codex reviewer is not logged in. Reviewer provisioning choice
-  is pending from the maintainer. The independent spec review above ran on the
-  laptop's existing provider without credential transfer. Do not disable the
+- The maintainer confirmed that headnode reviewers must use the existing Sweden
+  Azure provider. The service now receives its existing host credential and
+  headless Codex home; both adapter reviewers explicitly select Azure and its
+  credential variable. The host's configured model remains gpt-5.6-terra.
+  A real brief review through Quack's scrubbed runner is in progress. No key was
+  transferred from the laptop or committed. Do not disable the
   cross-model gates or claim a worker started while this prerequisite is unresolved.
 
-Next operator action: read the second preflight's final blueprint/review output,
-disposition material findings, resolve the headnode reviewer login with the
-maintainer's chosen method, and run exactly TASK-1401 through the canonical queue.
+Second automated spec review disposition: findings 1, 2, 5, 6 and 7 are covered by
+the packet's empty-state rules, exact producer fields, fetch/error precedence,
+keyboard requirements and required browser scenarios. Exact fixture code and
+decorative layout are implementation choices. Finding 3 does not require a new
+color/icon contract: the separate Verdict and Documentation gate columns, with
+the conservative combined detail summary, provide the required distinction.
+Finding 4 is covered by the explicit positive rule and malformed/contradictory
+evidence rules; the independent brief review must still check generated examples
+against those rules. The decomposition heuristic counted the page, helper,
+tests and documentation as independent features. They form one four-file feature
+and will remain one task, with the operator recording that decision at dispatch.
+
+Next operator action: obtain the real Azure brief-review result, disposition
+material blueprint findings, and run exactly TASK-1401 through the canonical queue.
 Use an authenticated operator worker bridge for the known listener gap, with
 exact assigned job/host/lease markers, lease renewal and normal evidence reporting.
 No task is queued for automatic implementation while those prerequisites remain.

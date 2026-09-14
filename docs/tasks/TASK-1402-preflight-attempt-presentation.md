@@ -19,8 +19,9 @@ the current attempt. Improve presentation without changing recovery authority.
 TaskDetailPage.tsx already uses project/task query keys, jobId correlation,
 accepted/running/recovery_required states and guarded retry/replan. Preserve
 those behaviors. Revalidate available timestamp/error fields against the
-FullPreflightJob contract before finalizing implementation; missing data must
-stay unknown. This packet is not READY until that mapping and review are recorded.
+FullPreflightJob contract before implementation; missing data must stay unknown.
+The source mapping below is complete at dbd295fe; independent spec review and
+task-specific verification policy remain required before marking READY.
 
 ## Recommended Approach
 Map the real response fields and current state rendering. Add compact textual
@@ -29,10 +30,31 @@ running, failed, completed and recovery-required states; preserve last-known
 status labeling on network errors. Link fresh-retry/reconcile guidance to the
 existing controls without adding requests or weakening confirmation/fencing.
 
+## Source Mapping and Display Contract
+
+src/monitor/preflight-job-store.ts already defines acceptedAt as required and
+startedAt/completedAt as optional ISO datetimes. Failed/completed terminal
+records require completedAt. frontend/src/api/contracts.ts currently exposes
+acceptedAt but omits the two optional timestamps. Add those two optional string
+fields to the frontend interface only; do not change server responses.
+
+Display **Queued at**, **Started at**, and **Finished at** with the existing date
+formatter. Missing/invalid values display **Unknown**. Display **Run duration**
+only when startedAt and completedAt are valid and nondecreasing; otherwise show
+**Unknown**. No new timer or fabricated live duration. result.timestamp is a
+report timestamp, not a substitute for completedAt. Keep jobId visible.
+
+Use existing job.error/errorType for terminal/recovery diagnostics and eventError
+for incomplete event recording; do not expose confirmationToken or owner/process
+metadata. Preserve the existing last-known warning on refresh errors. Preserve
+the current status predicates, project/task query keys, retry coalescing notice,
+captured-attempt toast correlation and explicit reconciliation confirmation.
+
 ## Files to Modify
 | File | Action | Description |
 | --- | --- | --- |
 | frontend/src/pages/TaskDetailPage.tsx | Modify | Attempt detail and diagnostic presentation |
+| frontend/src/api/contracts.ts | Modify | Add only startedAt/completedAt optional timestamp fields already returned by the server |
 | tests/monitor/preflight-dashboard-browser.test.ts | Modify | Focused browser regression scenarios |
 | docs/MONITOR_GUIDE.md | Modify | Document displayed evidence and existing recovery controls |
 
