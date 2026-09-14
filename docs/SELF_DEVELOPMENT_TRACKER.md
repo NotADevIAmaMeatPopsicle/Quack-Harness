@@ -24,7 +24,7 @@ operator agent's decision, not as a personal review by the maintainer.
 
 | Task | Outcome | State / dispatch condition |
 | --- | --- | --- |
-| TASK-1401 | Actionable read-only review/merge-readiness detail panel | READY specification; must pass prep and independent brief review before implementation |
+| TASK-1401 | Actionable read-only review/merge-readiness detail panel | Pipeline running; fresh blueprint and independent brief review required before implementation |
 | TASK-1402 | Clear current preflight attempt timing, diagnostics and recovery presentation | BACKLOG; source revalidation, spec review and task-specific verification required |
 | TASK-1403 | Reconcile and define remaining approval identity UI clauses | BACKLOG; analysis/spec task only; no approval-authority changes |
 
@@ -119,17 +119,33 @@ against those rules. The decomposition heuristic counted the page, helper,
 tests and documentation as independent features. They form one four-file feature
 and will remain one task, with the operator recording that decision at dispatch.
 
-Next operator action: regenerate prep for the amended freshness rule, obtain a
-clean independent brief review, and run TASK-1401 through the canonical queue.
-Use an authenticated operator worker bridge for the known listener gap, with
-exact assigned job/host/lease markers, lease renewal and normal evidence reporting.
-No task is queued for automatic implementation while those prerequisites remain.
+Next operator action: supervise the fresh blueprint and independent brief review
+inside the assigned TASK-1401 dispatch. Do not approve failed fidelity or reviewer
+evidence. The authenticated operator worker bridge retains exact assigned
+job/host/lease markers, lease renewal and ordinary evidence reporting.
 
 Current attempt: 3809c472-c693-405c-b153-dca8052dd008, started at
 2026-09-14T19:59:02Z against dc798ad0. Depth passed at 4.9; automated spec
-ambiguities fell to three. Blueprint generation is still running with regular
-heartbeats as of 20:06Z. Read its final report before dispatch; the older
-FIX_FIRST verdict has not been waived. No feature implementation is accepted.
+ambiguities fell to three. Blueprint generation timed out after 600 seconds;
+the attempt completed at 20:09:58Z with a deterministic fallback and FAILED
+fidelity. Completion is not acceptance. The older FIX_FIRST verdict has not
+been waived. The normal dispatch path rejects the failed cached blueprint and
+generates a fresh one before review. No feature implementation is accepted.
+
+Third ambiguity-review disposition: the helper's defensive-evidence contract
+owns contradictory-data classification; the page conditionally replaces the
+summary with the specified loading/error messages; both taskId and reviewId
+are displayed, with separator/layout left to implementation. These are covered
+by the existing task contract and do not require another specification rewrite.
+
+At 20:23Z, the canonical queue assigned fed-task-1401-mu1owqvv-nvj001 to
+beastmode-public-pilot. Local session:
+quack-TASK-1401-59bd2c76-bec9-4287-b813-97cdd24fb034. Exact base: 2d041129.
+Isolated worktree: /home/quack/Quack-Harness/.quack/worktrees/TASK-1401.
+The pipeline reached blueprint_start; no implementation turn is claimed yet.
+Automatic retries and merging are off. The operator accepted one cohesive
+four-file feature instead of the heuristic's page/helper/test/docs decomposition;
+readiness admission and independent review gates remain active.
 
 The dedicated public pilot transport is registered with one slot and the
 quack-public-pilot capability. Five scope-refusal checks passed, and an
