@@ -11,8 +11,11 @@ codex/TASK-1400-public-self-development. Project ID: quack-harness.
 The public repository had no adapter or task backlog at kickoff. TASK-1400 is
 operator setup (this adapter, conventions, tracker and initial task packets),
 not a completed worker implementation. Runtime registration and the first
-dispatch are recorded below. Registration is complete; no worker implementation
-has started or been accepted at this checkpoint.
+dispatch are recorded below. TASK-1401 now has a preserved worker draft plus
+operator corrections on `codex/TASK-1401-review-readiness-acceptance` at
+`7bff0654`. Full build and changed-file lint pass. Browser verification passed
+40/43 cases; three test assertion defects are corrected and awaiting rerun.
+Independent Azure diff review is running. Implementation is not accepted yet.
 
 Use one implementation lane for the pilot. The operator owns task preparation,
 review decisions and Git integration. Workers use isolated worktrees, do not
@@ -24,7 +27,7 @@ operator agent's decision, not as a personal review by the maintainer.
 
 | Task | Outcome | State / dispatch condition |
 | --- | --- | --- |
-| TASK-1401 | Actionable read-only review/merge-readiness detail panel | Pipeline running; fresh blueprint and independent brief review required before implementation |
+| TASK-1401 | Actionable read-only review/merge-readiness detail panel | Implementation under acceptance review; build/lint pass, final browser rerun and independent diff decision pending |
 | TASK-1402 | Clear current preflight attempt timing, diagnostics and recovery presentation | BACKLOG; source revalidation, spec review and task-specific verification required |
 | TASK-1403 | Reconcile and define remaining approval identity UI clauses | BACKLOG; analysis/spec task only; no approval-authority changes |
 
@@ -225,3 +228,23 @@ old job before any next dispatch. The temporary pilot's missing exact-task
 federated-resume/arm allowlist entry is corrected on disk for its next start.
 No Salon task or branch is involved. Next: wait for sealing and focused tests,
 inspect independent diff review, fix real findings, and reconcile transport state.
+
+### 2026-09-14: worker recovery and acceptance validation
+
+The native brief review accepted the packet. After approval, the local worker
+continued without the original federation binding (QPI-075). The worker was
+stopped with confirmed process-tree cleanup and its four-file draft was preserved
+at `6af5baed`. The operator is completing the implementation in a separate
+acceptance branch; this is not evidence of a successful end-to-end federated run.
+The original retry job `fed-task-1401-mu1psr0j-7zv53q` now reports `failed` and the
+bounded pilot service is inactive. No Salon task was started.
+
+Operator validation found malformed arrays could produce positive readiness.
+The parser now marks all structural problems incomplete and retains usable text;
+invalid or mismatched detail envelopes show an explicit error. Browser coverage
+was rewritten to exercise actual cache changes, stable list responses, native
+keyboard behavior, and invalid evidence. At `343e5844`, 40 of 43 browser cases
+passed in 76 seconds. The three failures were test assertion defects; corrected
+in `7bff0654`, awaiting rerun. Both existing review API suites passed 42/42 tests.
+Independent Azure Codex diff review is in progress. No feature acceptance or
+main integration is claimed until validation and the canonical review record pass.
