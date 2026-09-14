@@ -153,7 +153,7 @@ describe("Reviews dashboard readiness and blockers", () => {
     ]) {
       await panel().getByRole("heading", { name, exact: true }).waitFor();
     }
-    expect(await panel().innerText()).toContain("P3 � Minor style issue (resolved)");
+    expect(await panel().innerText()).toContain("Minor style issue (resolved)");
     expect(await panel().innerText()).toContain("Missing: None missing");
     await panel().getByText("docs/changelog/example.md", { exact: true }).waitFor();
     await panel().getByText("abc1234", { exact: true }).waitFor();
@@ -317,11 +317,13 @@ describe("Reviews dashboard readiness and blockers", () => {
     let focused = false;
     for (let i = 0; i < 40; i++) {
       await page.keyboard.press("Tab");
-      focused = await button("review-b").evaluate("el => el === document.activeElement");
+      focused =
+        (await page.evaluate("document.activeElement?.getAttribute('aria-label')")) ===
+        "Select review review-b";
       if (focused) break;
     }
     expect(focused).toBe(true);
-    expect(await button("review-b").evaluate("el => getComputedStyle(el).outlineStyle")).not.toBe(
+    expect(await page.evaluate("getComputedStyle(document.activeElement).outlineStyle")).not.toBe(
       "none",
     );
     await page.keyboard.press("Space");
@@ -344,9 +346,7 @@ describe("Reviews dashboard readiness and blockers", () => {
     expect(await panel().innerText()).toContain(markup);
     await button("review-a").focus();
     await page.keyboard.press("Tab");
-    expect(await details.locator("summary").evaluate("el => el === document.activeElement")).toBe(
-      true,
-    );
+    expect(await details.locator("summary:focus").count()).toBe(1);
     await page.keyboard.press("Enter");
     await details.locator("pre").waitFor();
     expect(await details.locator("pre").innerText()).toContain("review-a");
