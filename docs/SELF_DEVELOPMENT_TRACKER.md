@@ -203,3 +203,25 @@ The clean first-attempt source ref was preserved as
 codex/archive-TASK-1401-first-pilot before normal fresh-worktree replacement.
 Next action: inspect the native brief-review result and record the operator
 decision through the existing gate, then monitor the bounded implementation.
+
+
+21:03Z checkpoint: the brief reviewer returned SHIP with zero findings in
+128.8 seconds. The recorded gate lacked reviewer model provenance because the
+adapter inherited the host model. Native review session
+01a0a1ad-41aa-73a1-a7dc-89078b351e13 explicitly records gpt-5.6-terra, distinct
+from the gpt-5.6-sol blueprint producer. Operator receipt and approval reason
+preserve this corroboration; public 40f471ac now pins both reviewers explicitly.
+The exited POSIX process group was confirmed absent and its survivor marker
+reconciled through the supported API before approval.
+
+The approval route resumed locally before the listener had armed federation
+pause state. Implementation is now in local session
+quack-TASK-1401-d49e928f-4776-4015-b889-b444354139ec in the original public
+worktree; original federation job fed-task-1401-mu1psr0j-7zv53q remains attached
+to the earlier session. QPI-075 records the mismatch. Preserve useful source
+work and independent review, but do not claim a clean federation round trip or
+bind the new completion to the old job by editing audit records. Reconcile the
+old job before any next dispatch. The temporary pilot's missing exact-task
+federated-resume/arm allowlist entry is corrected on disk for its next start.
+No Salon task or branch is involved. Next: wait for sealing and focused tests,
+inspect independent diff review, fix real findings, and reconcile transport state.
