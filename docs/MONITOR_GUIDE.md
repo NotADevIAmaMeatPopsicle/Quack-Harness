@@ -26,6 +26,27 @@ Open `http://localhost:3333`.
 
 Available routes depend on the build and configured features. The UI calls relative API paths so it can be hosted locally or behind a secured reverse proxy.
 
+## Reviews: readiness and blockers
+
+The Reviews table presents the code **Verdict** separately from the **Documentation gate**. A list flag of **Ready** means the gate recorded an affirmative value; **Not confirmed** means it was false or absent; **Unknown** means the evidence could not be determined. The list value is not combined merge readiness and does not distinguish a missing gate from a recorded negative one.
+
+The detail panel shows a combined summary for the selected review. The four possible states are:
+
+- **Ready for operator review** — explicit VERIFIED verdict plus an explicit ready documentation gate, with no structural inconsistency or contradiction in the evidence.
+- **Not ready** — the verdict or gate is explicitly negative.
+- **Unknown** — the gate readiness value could not be determined.
+- **Incomplete evidence** — required fields are missing, malformed, or the recorded values contradict each other (for example, a ready gate alongside blocking issues or open P1 findings).
+
+Only an explicit VERIFIED verdict plus an explicit ready documentation gate and consistent evidence can produce the positive summary. A FAILED or PARTIAL verdict is never ready, even when documentation is ready. A valid false gate stays negative even with no blocking issues.
+
+The list and selected detail each refresh every ten seconds independently. After a selection change, background refresh, or failed detail request, cached readiness is suppressed until current evidence arrives. The panel shows **Loading review details…** while a fetch is in progress and **Unable to refresh review details** when a refresh fails, without showing a cached positive banner.
+
+Each review in the table is selected using a native button that supports Tab, Enter, and Space and displays its pressed state. Switching reviews, loading, failed fetches, and empty lists cannot show a previous review's readiness as current.
+
+Artifact paths and commit identifiers are displayed as inert text, not links. The full persisted payload is available under the collapsed **Raw review JSON** disclosure for diagnostics.
+
+This read-only page cannot approve or merge changes.
+
 ## Configuration
 
 The monitor reads registered projects and optional environment monitors from the Quack configuration file. Use synthetic values in shared examples:
