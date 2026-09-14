@@ -37,7 +37,7 @@ export function ReviewsPage() {
     reviewDetail.isSuccess &&
     !reviewDetail.isFetching &&
     !reviewDetail.isError &&
-    reviewDetail.data.ok === true &&
+    reviewDetail.data?.ok === true &&
     reviewDetail.data.reviewId === selectedReviewId &&
     detailReview !== null &&
     typeof detailReview === "object" &&
@@ -128,22 +128,25 @@ export function ReviewsPage() {
         {selectedReviewId && reviewDetail.isFetching && !readiness && (
           <p role="status">Loading review details…</p>
         )}
-        {selectedReviewId && reviewDetail.isError && (
-          <p className="error" role="alert">
-            Unable to refresh review details
-          </p>
-        )}
-        {selectedReviewId && !reviewDetail.isFetching && !reviewDetail.isError && !readiness && !reviewDetail.isSuccess && (
-          <p role="status">Loading review details…</p>
-        )}
+        {selectedReviewId &&
+          !reviewDetail.isFetching &&
+          (reviewDetail.isError || (reviewDetail.isSuccess && !readiness)) && (
+            <p className="error" role="alert">
+              Unable to refresh review details
+            </p>
+          )}
+        {selectedReviewId &&
+          !reviewDetail.isFetching &&
+          !reviewDetail.isError &&
+          !readiness &&
+          !reviewDetail.isSuccess && <p role="status">Loading review details…</p>}
         {readiness && (
           <div>
             <h3>
               {readiness.taskId ?? "Unknown task"} / {readiness.reviewId ?? "Unknown review"}
             </h3>
             <p>
-              <strong>Summary:</strong>{" "}
-              {readinessSummaryText(readiness)}
+              <strong>Summary:</strong> <span>{readinessSummaryText(readiness)}</span>
             </p>
             {readiness.evidenceProblems.length > 0 && (
               <ul className="error">
@@ -245,9 +248,7 @@ export function ReviewsPage() {
                     ) : (
                       <span className="error">missing commit</span>
                     )}
-                    {artifact.action ? (
-                      <span className="muted"> ({artifact.action})</span>
-                    ) : null}
+                    {artifact.action ? <span className="muted"> ({artifact.action})</span> : null}
                     {artifact.incomplete ? (
                       <span className="error"> — incomplete artifact evidence</span>
                     ) : null}

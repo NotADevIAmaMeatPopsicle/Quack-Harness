@@ -60,7 +60,6 @@ function parseIssues(raw: unknown, problems: string[]): ReviewIssueView[] {
     const message = typeof item.message === "string" ? item.message : "";
     if (!code || !message) {
       problems.push("gate.issues member is missing code or message");
-      continue;
     }
     let disposition: IssueDisposition;
     if (item.blocking === true) {
@@ -71,9 +70,14 @@ function parseIssues(raw: unknown, problems: string[]): ReviewIssueView[] {
       disposition = "unknown";
       problems.push(`gate.issues member "${code}" has non-boolean blocking field`);
     }
+    for (const field of ["field", "blockReasonCode"]) {
+      if (item[field] !== undefined && typeof item[field] !== "string") {
+        problems.push(`gate.issues member has invalid ${field}`);
+      }
+    }
     result.push({
-      code,
-      message,
+      code: code || "Unknown issue code",
+      message: message || "Missing issue message",
       disposition,
       field: typeof item.field === "string" ? item.field : undefined,
       blockReasonCode: typeof item.blockReasonCode === "string" ? item.blockReasonCode : undefined,
@@ -83,7 +87,7 @@ function parseIssues(raw: unknown, problems: string[]): ReviewIssueView[] {
 }
 
 function parseFindings(raw: unknown, problems: string[]): ReviewFindingView[] {
-  if (raw === undefined || raw === null) {
+  if (raw === undefined) {
     // Optional field; valid absence
     return [];
   }
@@ -100,7 +104,6 @@ function parseFindings(raw: unknown, problems: string[]): ReviewFindingView[] {
     const title = typeof item.title === "string" ? item.title : "";
     if (!title) {
       problems.push("findings member is missing title");
-      continue;
     }
     let severity: ReviewFindingView["severity"];
     if (item.severity === "P1" || item.severity === "P2" || item.severity === "P3") {
@@ -110,7 +113,7 @@ function parseFindings(raw: unknown, problems: string[]): ReviewFindingView[] {
       problems.push(`findings member "${title}" has unknown severity`);
     }
     let status: ReviewFindingView["status"];
-    if (item.status === undefined || item.status === null) {
+    if (item.status === undefined) {
       // Omitted status means open per producer
       status = "open";
     } else if (item.status === "open" || item.status === "resolved" || item.status === "waived") {
@@ -119,8 +122,11 @@ function parseFindings(raw: unknown, problems: string[]): ReviewFindingView[] {
       status = "unknown";
       problems.push(`findings member "${title}" has unknown status`);
     }
+    if (item.file !== undefined && typeof item.file !== "string") {
+      problems.push("findings member has invalid file");
+    }
     result.push({
-      title,
+      title: title || "Missing finding title",
       severity,
       status,
       file: typeof item.file === "string" ? item.file : undefined,
@@ -130,7 +136,7 @@ function parseFindings(raw: unknown, problems: string[]): ReviewFindingView[] {
 }
 
 function parseArtifacts(raw: unknown, problems: string[]): ReviewArtifactView[] {
-  if (raw === undefined || raw === null) {
+  if (raw === undefined) {
     // Optional field; valid absence
     return [];
   }
@@ -147,24 +153,15 @@ function parseArtifacts(raw: unknown, problems: string[]): ReviewArtifactView[] 
     }
     const pagePath = typeof item.pagePath === "string" ? item.pagePath : undefined;
     const commitSha = typeof item.commitSha === "string" ? item.commitSha : undefined;
-    let linkedTaskIds: string[] = [];
-    if (Array.isArray(item.linkedTaskIds)) {
-      linkedTaskIds = item.linkedTaskIds.filter((id): id is string => typeof id === "string");
+    const problemCount = problems.length;
+    const linkedTaskIds =
+      parseStringArray(item.linkedTaskIds, "wikiArtifacts.linkedTaskIds", problems) ?? [];
+    if (!pagePath) problems.push("wikiArtifacts member is missing pagePath");
+    if (!commitSha) problems.push("wikiArtifacts member is missing commitSha");
+    if (item.action !== undefined && typeof item.action !== "string") {
+      problems.push("wikiArtifacts member has invalid action");
     }
-
-    let incomplete = false;
-    if (!pagePath) {
-      problems.push("wikiArtifacts member is missing pagePath");
-      incomplete = true;
-    }
-    if (!commitSha) {
-      problems.push("wikiArtifacts member is missing commitSha");
-      incomplete = true;
-    }
-    if (!Array.isArray(item.linkedTaskIds) || linkedTaskIds.length === 0) {
-      problems.push("wikiArtifacts member is missing linkedTaskIds");
-      incomplete = true;
-    }
+    const incomplete = problems.length > problemCount;
 
     result.push({
       pagePath,
@@ -186,7 +183,7 @@ function parseStringArray(raw: unknown, fieldName: string, problems: string[]): 
   for (const item of raw) {
     if (typeof item !== "string") {
       problems.push(`${fieldName} contains a non-string member`);
-      return null;
+      continue;
     }
     result.push(item);
   }
@@ -248,13 +245,11 @@ export function presentReviewReadiness(value: unknown): ReviewReadinessView {
   let issues: ReviewIssueView[] = [];
   let requiredActions: string[] | null = null;
   let missingActions: string[] | null = null;
-  let hasIncompleteGateArrays = false;
 
   const gate = value.gate;
   if (!isRecord(gate)) {
     problems.push("review.gate is missing or not an object");
     documentation = "unknown";
-    hasIncompleteGateArrays = true;
   } else {
     if (gate.mergeReady === true) {
       mergeReady = true;
@@ -268,34 +263,20 @@ export function presentReviewReadiness(value: unknown): ReviewReadinessView {
     }
 
     issues = parseIssues(gate.issues, problems);
-    if (!Array.isArray(gate.issues)) {
-      hasIncompleteGateArrays = true;
-    }
 
-    requiredActions = parseStringArray(gate.requiredWikiActions, "gate.requiredWikiActions", problems);
-    if (requiredActions === null) hasIncompleteGateArrays = true;
+    requiredActions = parseStringArray(
+      gate.requiredWikiActions,
+      "gate.requiredWikiActions",
+      problems,
+    );
 
     missingActions = parseStringArray(gate.missingWikiActions, "gate.missingWikiActions", problems);
-    if (missingActions === null) hasIncompleteGateArrays = true;
   }
 
   const findings = parseFindings(value.findings, problems);
   const artifacts = parseArtifacts(value.wikiArtifacts, problems);
 
-  const hasArtifactIncomplete = artifacts.some((a) => a.incomplete);
-  const hasIssueUnknownBlocking = issues.some((i) => i.disposition === "unknown");
-  const hasFindingUnknown = findings.some((f) => f.severity === "unknown" || f.status === "unknown");
-
-  const isStructurallyIncomplete =
-    !taskId ||
-    !reviewId ||
-    !verdict ||
-    (verdict !== "VERIFIED" && verdict !== "PARTIAL" && verdict !== "FAILED") ||
-    !isRecord(gate) ||
-    hasIncompleteGateArrays ||
-    hasArtifactIncomplete ||
-    hasIssueUnknownBlocking ||
-    hasFindingUnknown;
+  const isStructurallyIncomplete = problems.length > 0;
 
   const contradictory =
     mergeReady !== undefined
@@ -303,7 +284,9 @@ export function presentReviewReadiness(value: unknown): ReviewReadinessView {
       : false;
 
   if (contradictory) {
-    problems.push("gate.mergeReady true contradicts blocking issues, missing actions, or open P1 findings");
+    problems.push(
+      "gate.mergeReady true contradicts blocking issues, missing actions, or open P1 findings",
+    );
   }
 
   let readiness: Readiness;

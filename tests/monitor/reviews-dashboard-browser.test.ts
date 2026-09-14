@@ -1,159 +1,44 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 import { chromium, type Browser, type Page, type Route } from "playwright";
 import { createMonitorServer } from "../../src/monitor/server";
 
-jest.setTimeout(90_000);
+jest.setTimeout(30_000);
 
-// ── Persisted bundle fixture shapes ──────────────────────────────────────────
-
-function makeReadyBundle(reviewId: string, taskId = "TASK-1001") {
+function ready(reviewId = "review-a", taskId = "TASK-1001") {
   return {
     reviewId,
     taskId,
     verdict: "VERIFIED",
     docsImpact: "changelog_only",
-    createdAt: new Date().toISOString(),
-    requiredWikiActions: ["changelog_entry"],
-    wikiArtifacts: [
-      {
-        pagePath: "docs/changelog/2026-09-14.md",
-        commitSha: "abc1234def5678",
-        linkedTaskIds: [taskId],
-        action: "changelog_entry",
-      },
-    ],
+    createdAt: "2026-09-14T12:00:00Z",
     findings: [{ title: "Minor style issue", severity: "P3", status: "resolved" }],
-    summary: "Verification complete.",
-    reviewer: "reviewer-a",
-    reviewNotes: "Looks good.",
-    gate: {
-      mergeReady: true,
-      requiredWikiActions: ["changelog_entry"],
-      missingWikiActions: [],
-      issues: [],
-    },
-  };
-}
-
-function makeDocsBlockedBundle(reviewId: string, taskId = "TASK-1002") {
-  return {
-    reviewId,
-    taskId,
-    verdict: "VERIFIED",
-    docsImpact: "feature_page_update",
-    createdAt: new Date().toISOString(),
-    requiredWikiActions: ["changelog_entry", "feature_page_update"],
-    wikiArtifacts: [],
-    findings: [],
-    gate: {
-      mergeReady: false,
-      requiredWikiActions: ["changelog_entry", "feature_page_update"],
-      missingWikiActions: ["changelog_entry", "feature_page_update"],
-      issues: [
-        {
-          code: "missing_wiki_artifacts",
-          message: "Missing required wiki artifacts for actions: changelog_entry, feature_page_update",
-          blocking: true,
-          field: "wikiArtifacts",
-        },
-      ],
-    },
-  };
-}
-
-function makeFailedDocsReadyBundle(reviewId: string, taskId = "TASK-1003") {
-  return {
-    reviewId,
-    taskId,
-    verdict: "FAILED",
-    docsImpact: "changelog_only",
-    createdAt: new Date().toISOString(),
-    requiredWikiActions: ["changelog_entry"],
     wikiArtifacts: [
       {
-        pagePath: "docs/changelog/failed.md",
-        commitSha: "dead1234beef5678",
+        pagePath: "docs/changelog/example.md",
+        commitSha: "abc1234",
         linkedTaskIds: [taskId],
         action: "changelog_entry",
       },
     ],
-    findings: [],
     gate: {
       mergeReady: true,
       requiredWikiActions: ["changelog_entry"],
-      missingWikiActions: [],
-      issues: [],
+      missingWikiActions: [] as string[],
+      issues: [] as Array<{ code: string; message: string; blocking: boolean }>,
     },
   };
 }
-
-function makePartialDocsReadyBundle(reviewId: string, taskId = "TASK-1004") {
-  return {
-    reviewId,
-    taskId,
-    verdict: "PARTIAL",
-    docsImpact: "changelog_only",
-    createdAt: new Date().toISOString(),
-    requiredWikiActions: ["changelog_entry"],
-    wikiArtifacts: [
-      {
-        pagePath: "docs/changelog/partial.md",
-        commitSha: "cafe0123abcd4567",
-        linkedTaskIds: [taskId],
-        action: "changelog_entry",
-      },
-    ],
-    findings: [],
-    gate: {
-      mergeReady: true,
-      requiredWikiActions: ["changelog_entry"],
-      missingWikiActions: [],
-      issues: [],
-    },
-  };
+function blocked(reviewId = "review-b", taskId = "TASK-1002") {
+  const bundle = ready(reviewId, taskId);
+  bundle.gate.mergeReady = false;
+  bundle.gate.missingWikiActions = ["changelog_entry"];
+  bundle.gate.issues = [{ code: "missing_docs", message: "Add the changelog", blocking: true }];
+  return bundle;
 }
 
-function makeMalformedBundle(reviewId: string, taskId = "TASK-1005") {
-  return {
-    reviewId,
-    taskId,
-    verdict: "VERIFIED",
-    docsImpact: "changelog_only",
-    createdAt: new Date().toISOString(),
-    // gate.issues has a member with non-boolean blocking
-    gate: {
-      mergeReady: true,
-      requiredWikiActions: ["changelog_entry"],
-      missingWikiActions: [],
-      issues: [
-        {
-          code: "bad_issue",
-          message: "This issue has non-boolean blocking",
-          blocking: "yes",
-          field: "test",
-        },
-      ],
-    },
-    findings: [],
-    wikiArtifacts: [],
-  };
-}
-
-function writeBundle(root: string, bundle: Record<string, unknown>): void {
-  const reviewsDir = path.join(root, ".quack", "reviews");
-  fs.mkdirSync(reviewsDir, { recursive: true });
-  const reviewId = bundle.reviewId as string;
-  fs.writeFileSync(
-    path.join(reviewsDir, `${reviewId}.json`),
-    JSON.stringify(bundle, null, 2) + "\n",
-    "utf-8",
-  );
-}
-
-// ── Test suite ────────────────────────────────────────────────────────────────
+type Bundle = Record<string, unknown>;
 
 describe("Reviews dashboard readiness and blockers", () => {
   let root: string;
@@ -162,36 +47,46 @@ describe("Reviews dashboard readiness and blockers", () => {
   let stop: (() => Promise<void>) | undefined;
   let port: number;
 
+  function write(bundle: Bundle) {
+    fs.writeFileSync(
+      path.join(root, ".quack/reviews", `${bundle.reviewId}.json`),
+      JSON.stringify(bundle),
+    );
+  }
   beforeEach(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), "quack-reviews-browser-"));
-    fs.mkdirSync(path.join(root, ".quack", "reviews"), { recursive: true });
+    fs.mkdirSync(path.join(root, ".quack/reviews"), { recursive: true });
     fs.writeFileSync(
-      path.join(root, ".quack", "auth.json"),
+      path.join(root, ".quack/auth.json"),
       JSON.stringify({ users: [], sessionSecret: "fixture", sessionTtlMs: 86400000 }),
     );
     jest.spyOn(console, "log").mockImplementation(() => undefined);
     jest.spyOn(console, "warn").mockImplementation(() => undefined);
   });
-
   afterEach(async () => {
-    await browser?.close();
-    browser = undefined;
-    await stop?.();
-    stop = undefined;
-    jest.restoreAllMocks();
-    fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-  });
-
-  async function boot(): Promise<void> {
-    const uiBuildDir = path.resolve(__dirname, "../../frontend/dist");
-    if (!fs.existsSync(path.join(uiBuildDir, "index.html"))) {
-      throw new Error("Build the frontend before browser verification");
+    try {
+      await browser?.close();
+    } finally {
+      browser = undefined;
+      try {
+        await stop?.();
+      } finally {
+        stop = undefined;
+        jest.restoreAllMocks();
+        fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      }
     }
+  });
+  async function boot(...bundles: Bundle[]) {
+    bundles.forEach(write);
+    const uiBuildDir = path.resolve(__dirname, "../../frontend/dist");
+    if (!fs.existsSync(path.join(uiBuildDir, "index.html")))
+      throw new Error("Build frontend first");
     const monitor = createMonitorServer({
       projectRoot: root,
       quackRoot: root,
       taskDir: "docs/tasks",
-      logDir: path.join(root, ".quack", "logs"),
+      logDir: path.join(root, ".quack/logs"),
       host: "127.0.0.1",
       port: 0,
       uiBuildDir,
@@ -201,599 +96,377 @@ describe("Reviews dashboard readiness and blockers", () => {
     port = started.port;
     browser = await chromium.launch({ headless: true });
     page = await browser.newPage();
+    page.setDefaultTimeout(5000);
   }
-
-  async function goReviews(): Promise<void> {
+  async function open() {
     await page.goto(`http://127.0.0.1:${port}/reviews`);
   }
-
-  async function waitForText(text: string): Promise<void> {
-    await page.getByText(text, { exact: true }).first().waitFor({ state: "visible" });
+  function panel() {
+    return page.getByRole("region", { name: "Review Detail", exact: true });
+  }
+  function button(id: string) {
+    return page.getByRole("button", { name: `Select review ${id}`, exact: true });
+  }
+  async function summary(value: string, timeout = 5000) {
+    await panel()
+      .locator("p")
+      .filter({ hasText: `Summary: ${value}` })
+      .first()
+      .waitFor({ timeout });
+  }
+  async function noReady() {
+    expect(await panel().getByText("Ready for operator review", { exact: true }).count()).toBe(0);
+  }
+  async function detailResponse(value: unknown) {
+    await page.route("**/v1/reviews/review-a*", (route) => route.fulfill({ json: value }));
+  }
+  async function renderDetail(bundle: Bundle) {
+    await boot(ready());
+    await detailResponse({ ok: true, reviewId: "review-a", review: bundle });
+    await open();
+  }
+  async function holdDetail(id: string) {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await page.route(`**/v1/reviews/${id}*`, async (route: Route) => {
+      await pending;
+      await route.continue();
+    });
+    return release;
   }
 
   test("shows well-formed ready bundle identity and subsections", async () => {
-    const bundle = makeReadyBundle("review-task-1001-ready");
-    writeBundle(root, bundle);
-    await boot();
-    await goReviews();
-
-    // Select the review via keyboard-accessible button
-    const btn = page.getByRole("button", { name: `Select review ${bundle.reviewId}`, exact: true });
-    await btn.waitFor({ state: "visible" });
-    await btn.click();
-
-    // Identity heading
-    await waitForText(`${bundle.taskId} / ${bundle.reviewId}`);
-
-    // Combined summary
-    await waitForText("Ready for operator review");
-
-    // Code verification subsection
-    await page.getByText("Code verification", { exact: true }).waitFor();
-    await page.getByText("VERIFIED", { exact: true }).first().waitFor();
-
-    // Documentation gate subsection
-    await page.getByText("Documentation gate", { exact: true }).waitFor();
-    await page.getByText("Ready", { exact: true }).first().waitFor();
-
-    // Blocking issues — empty
-    await page.getByText("Blocking issues", { exact: true }).waitFor();
-    const blockingSection = page.locator("h4", { hasText: "Blocking issues" });
-    await blockingSection.waitFor();
-
-    // Other issues — empty
-    await page.getByText("Other issues", { exact: true }).waitFor();
-
-    // Findings section
-    await page.getByText("Findings", { exact: true }).waitFor();
-    await page.getByText("Minor style issue", { exact: true }).waitFor();
-    await page.getByText("resolved", { exact: true }).waitFor();
-
-    // Documentation actions
-    await page.getByText("Documentation actions", { exact: true }).waitFor();
-    await page.getByText("changelog_entry", { exact: true }).first().waitFor();
-    await page.getByText("None missing", { exact: true }).waitFor();
-
-    // Artifacts
-    await page.getByText("Artifacts", { exact: true }).waitFor();
-    await page.getByText("docs/changelog/2026-09-14.md", { exact: true }).waitFor();
-    await page.getByText("abc1234def5678", { exact: true }).waitFor();
-
-    // Raw JSON collapsed
-    const details = page.locator("details");
-    await details.first().waitFor();
-    await page.getByText("Raw review JSON", { exact: true }).waitFor();
+    await boot(ready());
+    await open();
+    await summary("Ready for operator review");
+    await panel().getByRole("heading", { name: "TASK-1001 / review-a" }).waitFor();
+    for (const name of [
+      "Code verification",
+      "Documentation gate",
+      "Blocking issues",
+      "Other issues",
+      "Findings",
+      "Documentation actions",
+      "Artifacts",
+    ]) {
+      await panel().getByRole("heading", { name, exact: true }).waitFor();
+    }
+    expect(await panel().innerText()).toContain("P3 — Minor style issue (resolved)");
+    expect(await panel().innerText()).toContain("Missing: None missing");
+    await panel().getByText("docs/changelog/example.md", { exact: true }).waitFor();
+    await panel().getByText("abc1234", { exact: true }).waitFor();
+    expect(await panel().locator("details").getAttribute("open")).toBeNull();
+    expect(await panel().locator("a").count()).toBe(0);
+    await page.getByRole("columnheader", { name: "Documentation gate", exact: true }).waitFor();
+    expect(await page.getByRole("columnheader", { name: "Merge ready" }).count()).toBe(0);
   });
 
-  test("shows docs-blocked VERIFIED with blocking issues and missing actions", async () => {
-    const bundle = makeDocsBlockedBundle("review-task-1002-blocked");
-    writeBundle(root, bundle);
-    await boot();
-    await goReviews();
-
-    const btn = page.getByRole("button", { name: `Select review ${bundle.reviewId}`, exact: true });
-    await btn.waitFor({ state: "visible" });
-    await btn.click();
-
-    await waitForText(`${bundle.taskId} / ${bundle.reviewId}`);
-    await waitForText("Not ready");
-
-    // Documentation gate shows Not confirmed
-    await page.getByText("Documentation gate", { exact: true }).waitFor();
-    await page.getByText("Not confirmed", { exact: true }).first().waitFor();
-
-    // Blocking issues present
-    await page.getByText("missing_wiki_artifacts", { exact: true }).waitFor();
-    await page.getByText("Missing required wiki artifacts for actions: changelog_entry, feature_page_update", { exact: true }).waitFor();
-
-    // Missing actions listed
-    await page.getByText("Documentation actions", { exact: true }).waitFor();
-    const missingText = await page.locator("p", { hasText: "Missing:" }).innerText();
-    expect(missingText).toContain("changelog_entry");
-    expect(missingText).toContain("feature_page_update");
-
-    // Artifacts — none recorded
-    await page.getByText("Artifacts", { exact: true }).waitFor();
-    await page.getByText("None recorded", { exact: true }).first().waitFor();
+  test.each(["FAILED", "PARTIAL"])("%s with ready docs stays not-ready", async (verdict) => {
+    await renderDetail({ ...ready(), verdict });
+    await summary("Not ready");
+    await noReady();
+    await panel().getByText(verdict, { exact: true }).waitFor();
+    await panel().getByText("Ready", { exact: true }).waitFor();
+  });
+  test("docs-blocked review shows blocking, other issues, findings and missing actions", async () => {
+    const bundle = blocked("review-a");
+    bundle.gate.issues.push({ code: "advice", message: "Optional follow-up", blocking: false });
+    await renderDetail(bundle);
+    await summary("Not ready");
+    await noReady();
+    const text = await panel().innerText();
+    expect(text).toContain("missing_docs: Add the changelog");
+    expect(text).toContain("[nonblocking] advice: Optional follow-up");
+    expect(text).toContain("Missing: changelog_entry");
+  });
+  test("a false gate with no issues remains negative", async () => {
+    const bundle = ready();
+    bundle.gate.mergeReady = false;
+    await renderDetail(bundle);
+    await summary("Not ready");
+    await noReady();
+  });
+  test.each([undefined, "true", 1, null])(
+    "invalid mergeReady %s stays unknown",
+    async (mergeReady) => {
+      const bundle = ready();
+      await renderDetail({ ...bundle, gate: { ...bundle.gate, mergeReady } });
+      await summary("Unknown");
+      await noReady();
+    },
+  );
+  const malformed: Array<[string, (bundle: ReturnType<typeof ready>) => Bundle]> = [
+    ["null issue", (b) => ({ ...b, gate: { ...b.gate, issues: [null] } })],
+    [
+      "partial issue",
+      (b) => ({
+        ...b,
+        gate: { ...b.gate, issues: [{ message: "Keep this message", blocking: false }] },
+      }),
+    ],
+    [
+      "nonboolean blocking",
+      (b) => ({
+        ...b,
+        gate: {
+          ...b.gate,
+          issues: [{ code: "x", message: "Keep this message", blocking: "false" }],
+        },
+      }),
+    ],
+    ["missing gate arrays", (b) => ({ ...b, gate: { mergeReady: true } })],
+    [
+      "mixed actions",
+      (b) => ({ ...b, gate: { ...b.gate, requiredWikiActions: ["Keep this action", 7] } }),
+    ],
+    ["wrong findings shape", (b) => ({ ...b, findings: "bad" })],
+    ["null findings", (b) => ({ ...b, findings: null })],
+    ["null finding", (b) => ({ ...b, findings: [null] })],
+    [
+      "unknown severity",
+      (b) => ({ ...b, findings: [{ title: "Keep this finding", severity: "P9" }] }),
+    ],
+    [
+      "null status",
+      (b) => ({ ...b, findings: [{ title: "Keep this finding", severity: "P3", status: null }] }),
+    ],
+    [
+      "unknown status",
+      (b) => ({
+        ...b,
+        findings: [{ title: "Keep this finding", severity: "P3", status: "closed" }],
+      }),
+    ],
+    ["null artifacts", (b) => ({ ...b, wikiArtifacts: null })],
+    [
+      "mixed linked IDs",
+      (b) => ({
+        ...b,
+        wikiArtifacts: [{ ...b.wikiArtifacts[0], linkedTaskIds: ["TASK-1001", 7] }],
+      }),
+    ],
+    [
+      "partial artifact",
+      (b) => ({
+        ...b,
+        wikiArtifacts: [{ pagePath: "docs/changelog/example.md", linkedTaskIds: [] }],
+      }),
+    ],
+    [
+      "blocking contradiction",
+      (b) => ({
+        ...b,
+        gate: { ...b.gate, issues: [{ code: "blocked", message: "Blocked", blocking: true }] },
+      }),
+    ],
+    [
+      "missing action contradiction",
+      (b) => ({ ...b, gate: { ...b.gate, missingWikiActions: ["changelog_entry"] } }),
+    ],
+    [
+      "omitted P1 status means open",
+      (b) => ({ ...b, findings: [{ title: "Open blocker", severity: "P1" }] }),
+    ],
+  ];
+  test.each(malformed)("%s suppresses Ready and retains usable text", async (_name, mutate) => {
+    const bundle = mutate(ready());
+    await renderDetail(bundle);
+    await summary("Incomplete evidence");
+    await noReady();
+    if (JSON.stringify(bundle).includes("Keep this"))
+      expect(await panel().innerText()).toContain("Keep this");
+    if (JSON.stringify(bundle).includes("docs/changelog/example.md")) {
+      await panel().getByText("docs/changelog/example.md", { exact: true }).waitFor();
+    }
+  });
+  test("omitted optional arrays and empty artifact links are valid", async () => {
+    const bundle: Bundle = ready();
+    delete bundle.findings;
+    delete bundle.wikiArtifacts;
+    await renderDetail(bundle);
+    await summary("Ready for operator review");
+    expect(await panel().innerText()).toContain("None recorded");
+  });
+  test("empty artifact links and omitted non-P1 status are valid", async () => {
+    const bundle = ready();
+    bundle.wikiArtifacts[0].linkedTaskIds = [];
+    await renderDetail({ ...bundle, findings: [{ title: "Open note", severity: "P2" }] });
+    await summary("Ready for operator review");
+    expect(await panel().innerText()).toContain("Open note (open)");
+  });
+  test.each([
+    null,
+    { ok: false },
+    { ok: true, reviewId: "wrong", review: ready() },
+    { ok: true, reviewId: "review-a", review: { ...ready(), reviewId: "wrong" } },
+    { ok: true, reviewId: "review-a", review: [] },
+  ])("invalid envelope shows error: %j", async (response) => {
+    await boot(ready());
+    await detailResponse(response);
+    await open();
+    await panel().getByRole("alert").waitFor();
+    await noReady();
   });
 
-  test("FAILED with ready docs stays not-ready", async () => {
-    const bundle = makeFailedDocsReadyBundle("review-task-1003-failed-docs-ready");
-    writeBundle(root, bundle);
-    await boot();
-    await goReviews();
-
-    const btn = page.getByRole("button", { name: `Select review ${bundle.reviewId}`, exact: true });
-    await btn.waitFor({ state: "visible" });
-    await btn.click();
-
-    await waitForText(`${bundle.taskId} / ${bundle.reviewId}`);
-    await waitForText("Incomplete evidence");
-
-    // Code verification shows FAILED
-    await page.getByText("FAILED", { exact: true }).first().waitFor();
-    // Documentation gate shows Ready
-    await page.getByText("Documentation gate", { exact: true }).waitFor();
-    await page.getByText("Ready", { exact: true }).first().waitFor();
-
-    // Combined result must NOT be "Ready for operator review"
-    const readyText = await page.getByText("Ready for operator review", { exact: true }).count();
-    expect(readyText).toBe(0);
-  });
-
-  test("PARTIAL with ready docs stays not-ready", async () => {
-    const bundle = makePartialDocsReadyBundle("review-task-1004-partial-docs-ready");
-    writeBundle(root, bundle);
-    await boot();
-    await goReviews();
-
-    const btn = page.getByRole("button", { name: `Select review ${bundle.reviewId}`, exact: true });
-    await btn.waitFor({ state: "visible" });
-    await btn.click();
-
-    await waitForText(`${bundle.taskId} / ${bundle.reviewId}`);
-
-    // Must be incomplete due to contradiction (mergeReady=true + PARTIAL verdict)
-    await waitForText("Incomplete evidence");
-
-    // Must NOT show ready
-    expect(await page.getByText("Ready for operator review", { exact: true }).count()).toBe(0);
-  });
-
-  test("malformed evidence shows Incomplete evidence and does not crash", async () => {
-    const bundle = makeMalformedBundle("review-task-1005-malformed");
-    writeBundle(root, bundle);
-    await boot();
-    await goReviews();
-
-    const btn = page.getByRole("button", { name: `Select review ${bundle.reviewId}`, exact: true });
-    await btn.waitFor({ state: "visible" });
-    await btn.click();
-
-    await waitForText(`${bundle.taskId} / ${bundle.reviewId}`);
-    await waitForText("Incomplete evidence");
-    expect(await page.getByText("Ready for operator review", { exact: true }).count()).toBe(0);
-
-    // Evidence problems are visible
-    await page.getByText(/non-boolean blocking/).first().waitFor();
-  });
-
-  test("list table shows Documentation gate column, not Merge ready", async () => {
-    const bundle = makeReadyBundle("review-task-1001-list-col");
-    writeBundle(root, bundle);
-    await boot();
-    await goReviews();
-
-    await page.getByText("Documentation gate", { exact: true }).waitFor();
-    expect(await page.getByText("Merge ready", { exact: true }).count()).toBe(0);
-
-    // Ready shows in list
-    const rows = page.locator("table tbody tr");
-    await rows.first().waitFor();
-    const rowText = await rows.first().innerText();
-    // List gate value shows Ready (not Yes)
-    expect(rowText).toContain("Ready");
-  });
-
-  test("keyboard selection: Tab, Enter, Space and aria-pressed", async () => {
-    const bundle = makeReadyBundle("review-task-1001-keyboard");
-    writeBundle(root, bundle);
-    const bundle2 = makeDocsBlockedBundle("review-task-1002-keyboard");
-    writeBundle(root, bundle2);
-    await boot();
-    await goReviews();
-
-    // Wait for both buttons to appear
-    await page.getByRole("button", { name: `Select review ${bundle.reviewId}`, exact: true }).waitFor();
-    await page.getByRole("button", { name: `Select review ${bundle2.reviewId}`, exact: true }).waitFor();
-
-    // Focus first button via keyboard tab, press Enter to select
-    const btn1 = page.getByRole("button", { name: `Select review ${bundle.reviewId}`, exact: true });
-    const btn2 = page.getByRole("button", { name: `Select review ${bundle2.reviewId}`, exact: true });
-
-    // Click to select first (sorted newest first, bundle2 may come first since created later)
-    await btn1.click();
-    // aria-pressed should be true on selected
-    expect(await btn1.getAttribute("aria-pressed")).toBe("true");
-    expect(await btn2.getAttribute("aria-pressed")).toBe("false");
-
-    // Use Space to select btn2
-    await btn2.focus();
+  test("keyboard selection uses Tab, Enter, Space, pressed state and visible focus", async () => {
+    await boot(ready(), blocked());
+    await open();
+    await button("review-a").waitFor();
+    let focused = false;
+    for (let i = 0; i < 40; i++) {
+      await page.keyboard.press("Tab");
+      focused = await button("review-b").evaluate((el) => el === document.activeElement);
+      if (focused) break;
+    }
+    expect(focused).toBe(true);
+    expect(await button("review-b").evaluate((el) => getComputedStyle(el).outlineStyle)).not.toBe(
+      "none",
+    );
     await page.keyboard.press("Space");
-    expect(await btn2.getAttribute("aria-pressed")).toBe("true");
-    expect(await btn1.getAttribute("aria-pressed")).toBe("false");
-
-    // Use Enter to re-select btn1
-    await btn1.focus();
+    await summary("Not ready");
+    expect(await button("review-b").getAttribute("aria-pressed")).toBe("true");
+    await page.keyboard.press("Shift+Tab");
     await page.keyboard.press("Enter");
-    expect(await btn1.getAttribute("aria-pressed")).toBe("true");
-    expect(await btn2.getAttribute("aria-pressed")).toBe("false");
+    await summary("Ready for operator review");
+    expect(await button("review-a").getAttribute("aria-pressed")).toBe("true");
+    expect(await button("review-b").getAttribute("aria-pressed")).toBe("false");
   });
-
-  test("raw JSON disclosure is closed by default and markup is inert", async () => {
-    const bundle = makeReadyBundle("review-task-1001-rawjson");
-    // Embed markup in a string field to ensure it's rendered as text
-    (bundle as Record<string, unknown>).summary = "<script>alert('xss')</script>";
-    writeBundle(root, bundle);
-    await boot();
-    await goReviews();
-
-    const btn = page.getByRole("button", { name: `Select review ${bundle.reviewId}`, exact: true });
-    await btn.waitFor({ state: "visible" });
-    await btn.click();
-
-    await waitForText(`${bundle.taskId} / ${bundle.reviewId}`);
-
-    // Details element is closed by default
-    const details = page.locator("details").first();
-    await details.waitFor();
-    const isOpen = await details.evaluate("el => el.open");
-    expect(isOpen).toBe(false);
-
-    // Check that summary text reads "Raw review JSON"
-    await page.getByText("Raw review JSON", { exact: true }).waitFor();
-
-    // The markup in the page should be rendered as inert text (no script execution)
-    // Verify the literal text appears rather than executed script
-    const summaryField = page.getByText("Review summary:", { exact: true });
-    await summaryField.waitFor();
-  });
-
-  test("loading state shown while fetching detail, error state on failure", async () => {
-    const bundle = makeReadyBundle("review-task-1001-loading");
-    writeBundle(root, bundle);
-    await boot();
-    await goReviews();
-
-    // Hold all requests to /v1/reviews/:id so we can observe the loading state
-    let resolveRoute: (() => void) | null = null;
-    const routePromise = new Promise<void>((res) => { resolveRoute = res; });
-
-    await page.route(`**/v1/reviews/${bundle.reviewId}*`, async (route: Route) => {
-      await routePromise;
-      await route.continue();
-    });
-
-    const btn = page.getByRole("button", { name: `Select review ${bundle.reviewId}`, exact: true });
-    await btn.waitFor({ state: "visible" });
-    await btn.click();
-
-    // Should show loading state
-    await page.getByText("Loading review details…", { exact: true }).waitFor({ timeout: 5000 });
-    expect(await page.getByText("Ready for operator review", { exact: true }).count()).toBe(0);
-
-    // Release the route
-    resolveRoute!();
-    await page.unroute(`**/v1/reviews/${bundle.reviewId}*`);
-    await waitForText("Ready for operator review");
-  });
-
-  test("error state shown when detail request fails", async () => {
-    const bundle = makeReadyBundle("review-task-1001-error");
-    writeBundle(root, bundle);
-    await boot();
-    await goReviews();
-
-    // First request succeeds so the review appears in the list
-    let requestCount = 0;
-    await page.route(`**/v1/reviews/${bundle.reviewId}*`, async (route: Route) => {
-      requestCount++;
-      if (requestCount === 1) {
-        await route.abort();
-      } else {
-        await route.continue();
-      }
-    });
-
-    const btn = page.getByRole("button", { name: `Select review ${bundle.reviewId}`, exact: true });
-    await btn.waitFor({ state: "visible" });
-    await btn.click();
-
-    // Should show error alert
-    const errorEl = page.locator('[role="alert"]');
-    await errorEl.waitFor({ state: "visible", timeout: 10000 });
-    const errorText = await errorEl.innerText();
-    expect(errorText).toContain("Unable to refresh review details");
-
-    // Should not show ready
-    expect(await page.getByText("Ready for operator review", { exact: true }).count()).toBe(0);
-
-    await page.unroute(`**/v1/reviews/${bundle.reviewId}*`);
-  });
-
-  test("empty list state shown when no reviews exist", async () => {
-    // No bundles written
-    await boot();
-    await goReviews();
-    await waitForText("No review bundles have been recorded yet.");
-  });
-
-  test("delayed A-to-B response suppresses cached A readiness", async () => {
-    const bundleA = makeReadyBundle("review-task-a-delay", "TASK-A");
-    const bundleB = makeDocsBlockedBundle("review-task-b-delay", "TASK-B");
-    writeBundle(root, bundleA);
-    writeBundle(root, bundleB);
-    await boot();
-    await goReviews();
-
-    // Select A and wait for its readiness to show
-    const btnA = page.getByRole("button", { name: `Select review ${bundleA.reviewId}`, exact: true });
-    await btnA.waitFor({ state: "visible" });
-    await btnA.click();
-    await waitForText("Ready for operator review");
-
-    // Now hold B's detail response
-    let resolveBRoute: (() => void) | null = null;
-    const bRoutePromise = new Promise<void>((res) => { resolveBRoute = res; });
-    await page.route(`**/v1/reviews/${bundleB.reviewId}*`, async (route: Route) => {
-      await bRoutePromise;
-      await route.continue();
-    });
-
-    // Select B
-    const btnB = page.getByRole("button", { name: `Select review ${bundleB.reviewId}`, exact: true });
-    await btnB.click();
-
-    // While B is loading, A's ready state should not be visible
-    await page.getByText("Loading review details…", { exact: true }).waitFor({ timeout: 5000 });
-    expect(await page.getByText("Ready for operator review", { exact: true }).count()).toBe(0);
-
-    // Release B
-    resolveBRoute!();
-    await page.unroute(`**/v1/reviews/${bundleB.reviewId}*`);
-    await waitForText("Not ready");
-    expect(await page.getByText("Ready for operator review", { exact: true }).count()).toBe(0);
-  });
-
-  test("within-five-seconds A-to-B-to-A reselection forces refetch, hides cached Ready while pending", async () => {
-    const bundleA = makeReadyBundle("review-task-a-reselect", "TASK-A-RESEL");
-    const bundleB = makeDocsBlockedBundle("review-task-b-reselect", "TASK-B-RESEL");
-    writeBundle(root, bundleA);
-    writeBundle(root, bundleB);
-    await boot();
-    await goReviews();
-
-    // Count A requests
-    let aRequestCount = 0;
-    let resolveSecondARoute: (() => void) | null = null;
-    const secondARoutePromise = new Promise<void>((res) => { resolveSecondARoute = res; });
-
-    await page.route(`**/v1/reviews/${bundleA.reviewId}*`, async (route: Route) => {
-      aRequestCount++;
-      if (aRequestCount >= 2) {
-        // Hold the second request
-        await secondARoutePromise;
-      }
-      await route.continue();
-    });
-
-    // Select A, see Ready
-    const btnA = page.getByRole("button", { name: `Select review ${bundleA.reviewId}`, exact: true });
-    await btnA.waitFor({ state: "visible" });
-    await btnA.click();
-    await waitForText("Ready for operator review");
-    expect(aRequestCount).toBe(1);
-
-    // Quickly switch to B
-    const btnB = page.getByRole("button", { name: `Select review ${bundleB.reviewId}`, exact: true });
-    await btnB.click();
-    await waitForText("Not ready");
-
-    // Now switch back to A within 5 seconds; staleTime: 0 forces a new fetch
-    await btnA.click();
-
-    // While the second A request is pending, cached Ready should not show
-    await page.getByText("Loading review details…", { exact: true }).waitFor({ timeout: 5000 });
-    expect(await page.getByText("Ready for operator review", { exact: true }).count()).toBe(0);
-    expect(aRequestCount).toBeGreaterThanOrEqual(2);
-
-    // Release the second A route
-    resolveSecondARoute!();
-    await page.unroute(`**/v1/reviews/${bundleA.reviewId}*`);
-    await waitForText("Ready for operator review");
-  });
-
-  test("independent 10-second detail refresh updates panel while list summaries remain byte-identical", async () => {
-    // Start with ready bundle A, then update its file between refreshes
-    const bundleA = makeReadyBundle("review-task-a-refresh", "TASK-A-REFRESH");
-    writeBundle(root, bundleA);
-    await boot();
-    await goReviews();
-
-    const btnA = page.getByRole("button", { name: `Select review ${bundleA.reviewId}`, exact: true });
-    await btnA.waitFor({ state: "visible" });
-    await btnA.click();
-    await waitForText("Ready for operator review");
-
-    // Now update the bundle file to be docs-blocked
-    const updatedBundle = makeDocsBlockedBundle(bundleA.reviewId, bundleA.taskId);
-    // Override with same reviewId
-    (updatedBundle as Record<string, unknown>).reviewId = bundleA.reviewId;
-    (updatedBundle as Record<string, unknown>).taskId = bundleA.taskId;
-    writeBundle(root, updatedBundle);
-
-    // Wait for the 10-second refresh to fire and show the updated state
-    // We wait up to 15 seconds for it
-    await page.waitForFunction(
-      "!document.body.innerText.includes('Ready for operator review')",
-      { timeout: 15_000 },
+  test("raw JSON is closed by default, keyboard operated, and markup is inert", async () => {
+    const markup = '<img src=x onerror="window.injected=true">';
+    await boot({ ...ready(), summary: markup });
+    await open();
+    await summary("Ready for operator review");
+    const details = panel().locator("details");
+    expect(await details.getAttribute("open")).toBeNull();
+    expect(await panel().locator("img").count()).toBe(0);
+    expect(await panel().innerText()).toContain(markup);
+    await button("review-a").focus();
+    await page.keyboard.press("Tab");
+    expect(await details.locator("summary").evaluate((el) => el === document.activeElement)).toBe(
+      true,
     );
-
-    const panelText = await page.locator(".card").last().innerText();
-    expect(panelText).not.toContain("Ready for operator review");
+    await page.keyboard.press("Enter");
+    await details.locator("pre").waitFor();
+    expect(await details.locator("pre").innerText()).toContain("review-a");
+    expect(await details.locator("pre").innerText()).toContain("onerror");
+    expect(await page.evaluate("window.injected")).toBeUndefined();
+    await page.keyboard.press("Space");
+    expect(await details.getAttribute("open")).toBeNull();
   });
-
-  test("success-to-refresh-error hides cached readiness", async () => {
-    const bundle = makeReadyBundle("review-task-1001-refresh-error");
-    writeBundle(root, bundle);
-    await boot();
-    await goReviews();
-
-    const btn = page.getByRole("button", { name: `Select review ${bundle.reviewId}`, exact: true });
-    await btn.waitFor({ state: "visible" });
-    await btn.click();
-    await waitForText("Ready for operator review");
-
-    // Now make all future detail requests fail
-    let firstRequest = true;
-    await page.route(`**/v1/reviews/${bundle.reviewId}*`, async (route: Route) => {
-      if (firstRequest) {
-        // Let first (already completed) pass through — only block future ones
-        firstRequest = false;
-        await route.continue();
-      } else {
-        await route.abort();
-      }
+  test("initial loading hides readiness and failed detail displays an alert", async () => {
+    await boot(ready());
+    const release = await holdDetail("review-a");
+    await open();
+    await panel().getByRole("status").waitFor();
+    await noReady();
+    release();
+    await summary("Ready for operator review");
+  });
+  test("failed detail fetch shows error", async () => {
+    await boot(ready());
+    await page.route("**/v1/reviews/review-a*", (route) =>
+      route.fulfill({ status: 500, body: "failed" }),
+    );
+    await open();
+    await panel().getByRole("alert").waitFor();
+    await noReady();
+  });
+  test("delayed A-to-B hides A readiness", async () => {
+    await boot(ready(), blocked());
+    await open();
+    await button("review-a").click();
+    await summary("Ready for operator review");
+    const release = await holdDetail("review-b");
+    await button("review-b").click();
+    await panel().getByRole("status").waitFor();
+    await noReady();
+    release();
+    await summary("Not ready");
+  });
+  test("A-to-B-to-A within five seconds refetches changed A without cached Ready", async () => {
+    await boot(ready(), blocked());
+    let requests = 0;
+    page.on("request", (req) => {
+      if (new URL(req.url()).pathname === "/v1/reviews/review-a") requests++;
     });
-
-    // Wait for the next refresh attempt (up to 15s)
-    await page.waitForFunction(
-      "document.querySelector('[role=\"alert\"]') !== null",
-      { timeout: 15_000 },
-    );
-
-    const alert = page.locator('[role="alert"]');
-    const alertText = await alert.innerText();
-    expect(alertText).toContain("Unable to refresh review details");
-    // Cached ready banner should be hidden
-    expect(await page.getByText("Ready for operator review", { exact: true }).count()).toBe(0);
-
-    await page.unroute(`**/v1/reviews/${bundle.reviewId}*`);
+    await open();
+    await button("review-a").click();
+    await summary("Ready for operator review");
+    const start = Date.now();
+    const initial = requests;
+    await button("review-b").click();
+    await summary("Not ready");
+    write(blocked("review-a", "TASK-1001"));
+    const release = await holdDetail("review-a");
+    await button("review-a").click();
+    await panel().getByRole("status").waitFor();
+    await noReady();
+    expect(Date.now() - start).toBeLessThan(5000);
+    // Receipt of the held request proves a new fetch rather than reuse of cached detail.
+    await page.waitForFunction(() => document.querySelector('[role="status"]') !== null);
+    expect(requests).toBeGreaterThan(initial);
+    release();
+    await summary("Not ready");
+    await noReady();
   });
-
-  test("successful empty-list transition clears selection", async () => {
-    const bundle = makeReadyBundle("review-task-1001-clearsel");
-    writeBundle(root, bundle);
-    await boot();
-    await goReviews();
-
-    const btn = page.getByRole("button", { name: `Select review ${bundle.reviewId}`, exact: true });
-    await btn.waitFor({ state: "visible" });
-    await btn.click();
-    await waitForText("Ready for operator review");
-
-    // Remove the review file so the list returns empty on next poll
-    fs.rmSync(path.join(root, ".quack", "reviews", `${bundle.reviewId}.json`));
-
-    // Wait for the list to refresh (10 seconds max)
-    await page.waitForFunction(
-      "document.body.innerText.includes('No review bundles have been recorded yet.')",
-      { timeout: 15_000 },
-    );
-
-    // Selection cleared, detail section shows select prompt
-    await waitForText("Select a review bundle to inspect its persisted detail.");
-  });
-
-  test("list error retains selection", async () => {
-    const bundle = makeReadyBundle("review-task-1001-list-error");
-    writeBundle(root, bundle);
-    await boot();
-    await goReviews();
-
-    const btn = page.getByRole("button", { name: `Select review ${bundle.reviewId}`, exact: true });
-    await btn.waitFor({ state: "visible" });
-    await btn.click();
-    await waitForText("Ready for operator review");
-
-    // Make the list endpoint fail
-    await page.route("**/v1/reviews*", async (route: Route) => {
-      const url = route.request().url();
-      if (!url.includes("/v1/reviews/")) {
-        await route.abort();
-      } else {
-        await route.continue();
-      }
+  test("own detail poll updates while list responses stay byte-identical", async () => {
+    await boot(ready());
+    let listBody: string | undefined;
+    let polls = 0;
+    await page.route(/\/v1\/reviews(?:\?.*)?$/, async (route) => {
+      polls++;
+      if (listBody === undefined) listBody = await (await route.fetch()).text();
+      await route.fulfill({ contentType: "application/json", body: listBody });
     });
-
-    // Wait a bit for the list error to appear
-    await delay(3000);
-
-    // Still showing the detail (list error should not clear selection)
-    await waitForText("Ready for operator review");
-    await waitForText("Failed to load review bundles.");
-
-    await page.unroute("**/v1/reviews*");
+    await open();
+    await summary("Ready for operator review");
+    write(blocked("review-a", "TASK-1001"));
+    await summary("Not ready", 15000);
+    await noReady();
+    expect(polls).toBeGreaterThan(1);
+    expect(await page.locator("tbody tr").innerText()).toContain("Ready");
   });
-
-  test("changing details while list summaries stay identical updates the panel", async () => {
-    // This uses a Playwright route interceptor to intercept the detail endpoint
-    const bundle = makeReadyBundle("review-task-a-change", "TASK-A-CHANGE");
-    writeBundle(root, bundle);
-    await boot();
-    await goReviews();
-
-    const btn = page.getByRole("button", { name: `Select review ${bundle.reviewId}`, exact: true });
-    await btn.waitFor({ state: "visible" });
-    await btn.click();
-    await waitForText("Ready for operator review");
-
-    // Swap the file to docs-blocked
-    const newBundle = { ...makeDocsBlockedBundle(bundle.reviewId, bundle.taskId) };
-    writeBundle(root, newBundle);
-
-    // Wait for refresh to pick up the change (up to 15s)
-    await page.waitForFunction(
-      "!document.body.innerText.includes('Ready for operator review')",
-      { timeout: 15_000 },
+  test("success-to-refresh-error suppresses cached readiness", async () => {
+    await boot(ready());
+    await open();
+    await summary("Ready for operator review");
+    await page.route("**/v1/reviews/review-a*", (route) =>
+      route.fulfill({ status: 500, body: "failed" }),
     );
-    await waitForText("Not ready");
+    await panel().getByRole("alert").waitFor({ timeout: 15000 });
+    await noReady();
   });
-
-  test("partial artifact path/commit text retained even when other field missing", async () => {
-    const bundle = makeReadyBundle("review-task-1001-partial-artifact");
-    // Override with partial artifact (missing commitSha)
-    (bundle as Record<string, unknown>).wikiArtifacts = [
-      {
-        pagePath: "docs/changelog/partial-artifact.md",
-        // commitSha is intentionally absent
-        linkedTaskIds: ["TASK-1001"],
-        action: "changelog_entry",
-      },
-    ];
-    writeBundle(root, bundle);
-    await boot();
-    await goReviews();
-
-    const btn = page.getByRole("button", { name: `Select review ${bundle.reviewId}`, exact: true });
-    await btn.waitFor({ state: "visible" });
-    await btn.click();
-
-    await waitForText(`${bundle.taskId} / ${bundle.reviewId}`);
-    // Should show incomplete evidence due to missing commitSha
-    await waitForText("Incomplete evidence");
-    // But the pagePath should still be visible
-    await page.getByText("docs/changelog/partial-artifact.md", { exact: true }).waitFor();
-    await page.getByText("missing commit", { exact: true }).waitFor();
+  test("successful list removal selects remaining review, then empty clears selection", async () => {
+    await boot(ready(), blocked());
+    await open();
+    await button("review-a").click();
+    await summary("Ready for operator review");
+    fs.rmSync(path.join(root, ".quack/reviews/review-a.json"));
+    await summary("Not ready", 15000);
+    expect(await button("review-b").getAttribute("aria-pressed")).toBe("true");
+    fs.rmSync(path.join(root, ".quack/reviews/review-b.json"));
+    await page
+      .getByText("No review bundles have been recorded yet.", { exact: true })
+      .waitFor({ timeout: 15000 });
+    await panel()
+      .getByText("Select a review bundle to inspect its persisted detail.", { exact: true })
+      .waitFor();
+    await noReady();
   });
-
-  test("raw disclosure is keyboard-navigable and contains JSON", async () => {
-    const bundle = makeReadyBundle("review-task-1001-disclosure");
-    writeBundle(root, bundle);
-    await boot();
-    await goReviews();
-
-    const btn = page.getByRole("button", { name: `Select review ${bundle.reviewId}`, exact: true });
-    await btn.waitFor({ state: "visible" });
-    await btn.click();
-
-    await waitForText("Ready for operator review");
-
-    // Find the details element summary
-    const summary = page.locator("summary", { hasText: "Raw review JSON" });
-    await summary.waitFor();
-
-    // Open via click
-    await summary.click();
-    const details = page.locator("details").first();
-    const isOpen = await details.evaluate("el => el.open");
-    expect(isOpen).toBe(true);
-
-    // The pre element should contain JSON
-    const pre = details.locator("pre");
-    await pre.waitFor();
-    const preText = await pre.innerText();
-    expect(preText).toContain(bundle.reviewId);
-    expect(preText).toContain("VERIFIED");
+  test("list error retains selected review", async () => {
+    await boot(ready(), blocked());
+    await open();
+    await button("review-b").click();
+    await summary("Not ready");
+    await page.route(/\/v1\/reviews(?:\?.*)?$/, (route) =>
+      route.fulfill({ status: 500, body: "failed" }),
+    );
+    await page
+      .getByText("Failed to load review bundles.", { exact: true })
+      .waitFor({ timeout: 15000 });
+    await summary("Not ready");
+    expect(await button("review-b").getAttribute("aria-pressed")).toBe("true");
   });
 });
