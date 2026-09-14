@@ -1,0 +1,40 @@
+{
+  "version": "1.0",
+  "project": {
+    "name": "quack-harness",
+    "root": ".",
+    "taskDir": "docs/tasks",
+    "conventionsDir": "docs/conventions",
+    "testPatterns": { "testDir": "tests", "sourceDir": "src", "suffixes": [".test.ts"], "prefixes": [], "autoConventions": ["mirror-source-structure"] }
+  },
+  "agent": { "runner": "claude-sdk", "model": "claude-sonnet-4-6", "judgeModel": "claude-sonnet-4-6", "enrichModel": "claude-sonnet-4-6", "maxTurns": 100, "maxBudgetPerTask": 15, "maxRetries": 1 },
+  "sandbox": {
+    "writablePaths": ["frontend/src/", "tests/", "docs/", "src/"],
+    "deniedPaths": [".git/", ".env", ".env.*", "node_modules/", "frontend/node_modules/", "dist/", "frontend/dist/", ".quack/adapter.json", ".quack/verify.js", ".quack/conventions.md", ".quack/judge-criteria.md", ".quack/templates/", "scripts/", "package.json", "package-lock.json", "frontend/package.json", "frontend/package-lock.json"],
+    "disposablePaths": ["node_modules/", "frontend/node_modules/"],
+    "allowedBashPatterns": ["npm test*", "npm run build*", "npm run lint*", "npm --prefix frontend run build*", "npx jest*", "npx tsc*", "npx eslint*", "git status*", "git diff*", "git log*", "git show*", "git rev-parse*", "git merge-base*", "ls *", "cat *"],
+    "deniedBashPatterns": ["git push*", "git reset --hard*", "npm publish*", "curl *", "wget *", "ssh *", "systemctl *", "sudo *"]
+  },
+  "git": { "baseBranch": "main", "branchPrefix": "quack/", "commitFormat": "[{taskId}] {message}", "commitTrailer": "Automated-By: Quack Harness", "autoCreatePr": false, "autoPush": false, "autoMerge": false, "autoMergeTarget": "main", "autoMergeStrategy": "squash" },
+  "verification": {
+    "hostExecution": "direct",
+    "commands": [
+      { "name": "build", "command": "npm run build", "required": true, "timeout": 180000 },
+      { "name": "review-api-tests", "command": "npx jest tests/monitor/reviews-v1-api.test.ts tests/monitor/review-docs-ui-api.test.ts --runInBand", "required": true, "timeout": 180000 },
+      { "name": "lint", "command": "npm run lint:diff", "required": true, "timeout": 120000 }
+    ],
+    "smartTesting": { "enabled": true, "mode": "related", "baselineEnabled": false, "failOnPreExisting": false, "outputDir": ".quack/test-results" }
+  },
+  "dispatch": { "worktreeInit": [ { "command": "npm ci --no-audit --no-fund", "cwd": ".", "label": "Install public dependencies, frontend via postinstall, and native SQLite" } ] },
+  "logging": { "dir": ".quack/logs", "level": "info", "retainDays": 30 },
+  "isolation": { "method": "worktree" },
+  "queue": { "maxConcurrent": 1, "autoStartOnEnqueue": false },
+  "automation": { "autoPrep": { "enabled": false } },
+  "preflight": { "autoRun": false, "autoDecompose": { "enabled": false, "writeSpecs": false } },
+  "executionMode": "loop",
+  "loop": {
+    "briefReview": { "reviewer": { "runner": "codex-cli", "maxTurns": 30, "timeoutMs": 600000, "codex": { "binaryPath": "codex", "sandbox": "read-only" } }, "requireCrossModel": true },
+    "diffReview": { "reviewer": { "runner": "codex-cli", "maxTurns": 30, "timeoutMs": 600000, "codex": { "binaryPath": "codex", "sandbox": "read-only" } }, "requireCrossModel": true },
+    "recordOnFinalize": true
+  }
+}
